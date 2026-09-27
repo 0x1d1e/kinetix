@@ -3583,6 +3583,18 @@ fn merge_selected_capability_overrides(
     overrides
 }
 
+fn operator_parameter_support_overrides(parameters: &Value) -> Value {
+    let mut overrides = serde_json::Map::new();
+    if let Some(parameters) = parameters.as_object() {
+        for (name, spec) in parameters {
+            if let Some(supported) = spec.get("supported").and_then(Value::as_bool) {
+                overrides.insert(name.clone(), Value::Bool(supported));
+            }
+        }
+    }
+    Value::Object(overrides)
+}
+
 /// Apply an explicit reconciliation decision. Observations never reach this
 /// path on their own; every mutation here represents an operator action.
 pub async fn update_model_reconciliation(
@@ -3603,6 +3615,7 @@ pub async fn update_model_reconciliation(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("model not found"))?;
     let discovery = discovery_object(&row);
+    let observed = latest_reconciliation_observation(&discovery).clone();
     let mut reconciliation = discovery
         .get("reconciliation")
         .cloned()
@@ -3702,29 +3715,30 @@ pub async fn update_model_reconciliation(
             let mut prices = row.prices();
             let mut accepted_prices = false;
             let mut accepted_transport: Option<String> = None;
+            let mut accepted_discovery = serde_json::Map::new();
 
             for field in &selected {
                 match field.as_str() {
                     "display_name" => {
-                        if let Some(value) = discovery.get("display_name").and_then(Value::as_str) {
+                        if let Some(value) = observed.get("display_name").and_then(Value::as_str) {
                             display_name = value.to_string();
                         }
                     }
                     "context_window" => {
-                        if let Some(value) = discovery.get("context_window").and_then(Value::as_i64)
+                        if let Some(value) = observed.get("context_window").and_then(Value::as_i64)
                         {
                             context_window = Some(value);
                         }
                     }
                     "max_output_tokens" => {
                         if let Some(value) =
-                            discovery.get("max_output_tokens").and_then(Value::as_i64)
+                            observed.get("max_output_tokens").and_then(Value::as_i64)
                         {
                             max_output_tokens = Some(value);
                         }
                     }
                     "thinking_map" => {
-                        if let Some(value) = discovery.get("thinking_map") {
+                        if let Some(value) = observed.get("thinking_map") {
                             if let Ok(parsed) = serde_json::from_value::<ThinkingMap>(value.clone())
                             {
                                 validate_thinking_map(&parsed)?;
@@ -3732,15 +3746,20 @@ pub async fn update_model_reconciliation(
                             }
                         }
                     }
+                    "reasoning_capability" | "modalities" => {
+                        if let Some(value) = observed.get(field) {
+                            accepted_discovery.insert(field.clone(), value.clone());
+                        }
+                    }
                     "transport" => {
-                        accepted_transport = discovery
+                        accepted_transport = observed
                             .pointer("/transport/format")
                             .and_then(Value::as_str)
                             .map(str::to_string);
                     }
                     field if field.starts_with("capabilities.") => {
                         let key = field.trim_start_matches("capabilities.");
-                        if let Some(value) = discovery
+                        if let Some(value) = observed
                             .pointer(&format!("/capabilities/{key}"))
                             .and_then(Value::as_bool)
                         {
@@ -3752,7 +3771,7 @@ pub async fn update_model_reconciliation(
                     }
                     field if field.starts_with("prices.") => {
                         let key = field.trim_start_matches("prices.");
-                        let value = discovery
+                        let value = observed
                             .pointer(&format!("/prices/{key}"))
                             .and_then(Value::as_f64);
                         match key {
@@ -3777,7 +3796,7 @@ pub async fn update_model_reconciliation(
                 context_window,
                 max_output_tokens,
                 normalize_model_capabilities(&capabilities),
-                serde_json::to_value(&prices).map_err(ApiError::internal)?,
+                serde_json::to_value(row.prices()).map_err(ApiError::internal)?,
                 serde_json::to_value(row.params()).unwrap_or_else(|_| json!({})),
                 serde_json::to_value(&thinking_map).map_err(ApiError::internal)?,
                 row.extra_request_value(),
@@ -3803,24 +3822,28 @@ pub async fn update_model_reconciliation(
             {
                 let capability_overrides =
                     merge_selected_capability_overrides(&discovery, &capabilities, &selected);
+                accepted_discovery.insert(
+                    "operator_capability_overrides".into(),
+                    Value::Object(capability_overrides),
+                );
+            }
+            if !accepted_discovery.is_empty() {
                 db::merge_model_discovery(
                     &state.pool,
                     &id,
-                    &json!({
-                        "operator_capability_overrides": Value::Object(capability_overrides)
-                    }),
+                    &Value::Object(accepted_discovery),
                 )
                 .await
                 .map_err(ApiError::internal)?;
             }
 
-            if accepted_prices && prices.is_configured() {
+            if accepted_prices {
                 let mut fields = effective_price_fields(&discovery, &row.prices());
                 for selected_field in selected
                     .iter()
                     .filter_map(|field| field.strip_prefix("prices."))
                 {
-                    let accepted_from = discovery
+                    let accepted_from = observed
                         .pointer(&format!("/price_sources/{selected_field}"))
                         .cloned()
                         .unwrap_or(Value::Null);
@@ -3831,24 +3854,18 @@ pub async fn update_model_reconciliation(
                         json!({ "accepted_from": accepted_from }),
                     );
                 }
-                let source = effective_price_source(&fields, &prices);
+                let source = if prices.is_configured() {
+                    effective_price_source(&fields, &prices)
+                } else {
+                    "operator_accept".to_string()
+                };
                 let metadata = json!({ "fields": fields });
-                let version_id =
-                    db::ensure_price_version(&state.pool, &id, &prices, &source, &metadata)
-                        .await
-                        .map_err(ApiError::internal)?;
-                db::merge_model_discovery(
+                db::commit_effective_model_pricing(
                     &state.pool,
                     &id,
-                    &json!({
-                        "effective_pricing": {
-                            "source": source,
-                            "fields": fields,
-                            "metadata": metadata,
-                            "price_version_id": version_id,
-                            "updated_at": db::now_iso(),
-                        }
-                    }),
+                    &prices,
+                    &source,
+                    &metadata,
                 )
                 .await
                 .map_err(ApiError::internal)?;
@@ -3985,28 +4002,33 @@ pub(crate) async fn sync_provider_pricing_id(
     let mut skipped_manual = Vec::new();
 
     for row in models {
-        let mut discovery = discovery_object(&row);
+        let discovery = discovery_object(&row);
+        let mut observation = latest_reconciliation_observation(&discovery).clone();
         let resolution =
             crate::model_catalog::resolve(&provider.base_url, &row.upstream_id, Some(&models_dev));
-        let pricing_patch = models_dev_pricing_patch(&discovery, &resolution);
-        apply_top_level_discovery_patch(&mut discovery, &pricing_patch);
-        db::merge_model_discovery(&state.pool, &row.id, &pricing_patch)
-            .await
-            .map_err(ApiError::internal)?;
+        let pricing_patch = models_dev_pricing_patch(&observation, &resolution);
+        apply_top_level_discovery_patch(&mut observation, &pricing_patch);
+        db::merge_model_discovery(
+            &state.pool,
+            &row.id,
+            &json!({ "latest_observation": observation.clone() }),
+        )
+        .await
+        .map_err(ApiError::internal)?;
 
-        let observed: Prices = discovery
+        let observed: Prices = observation
             .get("prices")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
-        if !has_automatic_price_observation(&observed, &discovery) {
+        if !has_automatic_price_observation(&observed, &observation) {
             continue;
         }
 
         let current = row.prices();
         let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &discovery);
-        let catalog_source_state = discovery
+            merge_automatic_price_observation(&current, &observed, &observation);
+        let catalog_source_state = observation
             .pointer("/catalog/source_state")
             .cloned()
             .unwrap_or(Value::Null);
@@ -6315,7 +6337,10 @@ pub async fn create_model(
         db::merge_model_discovery(
             &state.pool,
             &id,
-            &json!({ "operator_capability_overrides": caps.clone() }),
+            &json!({
+                "operator_capability_overrides": caps.clone(),
+                "operator_parameter_overrides": operator_parameter_support_overrides(&body.parameters),
+            }),
         )
         .await
         .map_err(ApiError::internal)?;
@@ -6411,6 +6436,32 @@ pub async fn update_model(
         validate_model_transport_override(&provider, body.transport_override.as_deref())?;
     let caps = normalize_model_capabilities(&body.capabilities);
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
+    let existing_discovery = discovery_object(&model);
+    let previous_prices = model.prices();
+    let mut price_fields = effective_price_fields(&existing_discovery, &previous_prices);
+    for field in PRICE_FIELDS {
+        let previous = price_field(&previous_prices, field);
+        let next = price_field(&prices, field);
+        if previous != next {
+            if next.is_some() {
+                set_price_field_provenance(
+                    &mut price_fields,
+                    field,
+                    "operator",
+                    json!({ "configured_by": "admin" }),
+                );
+            } else {
+                price_fields.remove(field);
+            }
+        }
+    }
+    let price_source = if prices.is_configured() {
+        effective_price_source(&price_fields, &prices)
+    } else {
+        "operator".to_string()
+    };
+    let price_metadata = json!({ "fields": price_fields });
+
     validate_thinking_map(&body.thinking_map)?;
     db::update_model(
         &state.pool,
@@ -6420,7 +6471,7 @@ pub async fn update_model(
         body.context_window,
         body.max_output_tokens,
         caps.clone(),
-        serde_json::to_value(&prices).unwrap(),
+        serde_json::to_value(&previous_prices).unwrap(),
         body.parameters.clone(),
         serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible"),
         body.extra_request.clone(),
@@ -6442,55 +6493,28 @@ pub async fn update_model(
         .await
         .map_err(ApiError::internal)?;
     }
-    if prices.is_configured() {
-        let existing_discovery = discovery_object(&model);
-        let previous_prices = model.prices();
-        let mut fields = effective_price_fields(&existing_discovery, &previous_prices);
-        for field in PRICE_FIELDS {
-            let previous = price_field(&previous_prices, field);
-            let next = price_field(&prices, field);
-            if previous != next {
-                if next.is_some() {
-                    set_price_field_provenance(
-                        &mut fields,
-                        field,
-                        "operator",
-                        json!({ "configured_by": "admin" }),
-                    );
-                } else {
-                    fields.remove(field);
-                }
-            }
-        }
-        let source = effective_price_source(&fields, &prices);
-        let metadata = json!({ "fields": fields });
-        let version_id = db::ensure_price_version(&state.pool, &id, &prices, &source, &metadata)
-            .await
-            .map_err(ApiError::internal)?;
+    let existing_parameters =
+        serde_json::from_str::<Value>(&model.parameters).unwrap_or_else(|_| json!({}));
+    if existing_parameters != body.parameters {
         db::merge_model_discovery(
             &state.pool,
             &id,
             &json!({
-                "effective_pricing": {
-                    "source": source,
-                    "fields": fields,
-                    "metadata": metadata,
-                    "price_version_id": version_id,
-                    "updated_at": db::now_iso(),
-                }
+                "operator_parameter_overrides": operator_parameter_support_overrides(&body.parameters)
             }),
         )
         .await
         .map_err(ApiError::internal)?;
-    } else {
-        db::merge_model_discovery(
-            &state.pool,
-            &id,
-            &json!({ "effective_pricing": Value::Null }),
-        )
-        .await
-        .map_err(ApiError::internal)?;
     }
+    db::commit_effective_model_pricing(
+        &state.pool,
+        &id,
+        &prices,
+        &price_source,
+        &price_metadata,
+    )
+    .await
+    .map_err(ApiError::internal)?;
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -11912,7 +11936,7 @@ mod reasoning_discovery_control_plane_tests {
         );
 
         let response = discover_models(
-            State(state),
+            State(state.clone()),
             AdminAuth {
                 actor: "admin".into(),
                 token: "test".into(),
@@ -11972,6 +11996,46 @@ mod reasoning_discovery_control_plane_tests {
                 "output_per_1m": 19.99
             })
         );
+
+        // Fresh reconciliation metadata is observational only. Even after the
+        // registry reloads from DB, runtime reasoning stays at the configured
+        // value until the operator explicitly accepts the drift.
+        state.registry.reload(&pool).await.unwrap();
+        let snapshot = state.registry.snapshot();
+        let runtime_provider = snapshot.providers.get(&provider_id).unwrap();
+        let runtime_model = snapshot.models.get(&model_id).unwrap();
+        let before_accept =
+            crate::adapters::resolve_execution_profile(runtime_provider, runtime_model).unwrap();
+        assert_eq!(before_accept.capabilities.reasoning, Some(false));
+        assert!(before_accept.thinking_map.levels.is_empty());
+
+        update_model_reconciliation(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(model_id.clone()),
+            Json(ReconciliationActionBody {
+                action: "accept".into(),
+                fields: vec![
+                    "capabilities.reasoning".into(),
+                    "reasoning_capability".into(),
+                    "thinking_map".into(),
+                ],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = state.registry.snapshot();
+        let runtime_provider = snapshot.providers.get(&provider_id).unwrap();
+        let runtime_model = snapshot.models.get(&model_id).unwrap();
+        let after_accept =
+            crate::adapters::resolve_execution_profile(runtime_provider, runtime_model).unwrap();
+        assert_eq!(after_accept.capabilities.reasoning, Some(true));
+        assert!(after_accept.thinking_map.level_is_executable("low"));
+        assert!(after_accept.thinking_map.level_is_executable("high"));
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(home);
