@@ -1079,6 +1079,31 @@ pub async fn insert_price_version(pool: &Pool, model_id: &str, p: &Prices) -> Re
     insert_price_version_with_source(pool, model_id, p, "operator", &serde_json::json!({})).await
 }
 
+fn stable_price_provenance_metadata(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => {
+            let mut stable = serde_json::Map::new();
+            for (key, value) in fields {
+                if matches!(
+                    key.as_str(),
+                    "observed_at" | "retrieved_at" | "etag" | "last_modified" | "freshness"
+                ) {
+                    continue;
+                }
+                stable.insert(key.clone(), stable_price_provenance_metadata(value));
+            }
+            Value::Object(stable)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(stable_price_provenance_metadata)
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
 fn price_provenance_matches(
     stored_source: &str,
     stored_metadata: &str,
@@ -1088,7 +1113,10 @@ fn price_provenance_matches(
     if stored_source != source {
         return false;
     }
-    serde_json::from_str::<Value>(stored_metadata).is_ok_and(|stored| stored == *source_metadata)
+    serde_json::from_str::<Value>(stored_metadata).is_ok_and(|stored| {
+        stable_price_provenance_metadata(&stored)
+            == stable_price_provenance_metadata(source_metadata)
+    })
 }
 
 fn price_snapshot_matches(
@@ -1960,16 +1988,80 @@ pub async fn purge_old_route_traces(pool: &Pool, retain_days: i64) -> Result<u64
 
 #[cfg(test)]
 mod price_version_identity_tests {
-    use super::price_provenance_matches;
+    use super::*;
     use serde_json::json;
 
     #[test]
-    fn equal_numeric_prices_do_not_dedupe_across_provenance_changes() {
+    fn volatile_catalog_metadata_does_not_change_price_identity() {
+        let stored = json!({
+            "fields": {
+                "input_per_1m": {
+                    "source": "models.dev:provider",
+                    "metadata": {
+                        "observed_at": "2026-09-27T00:00:00Z",
+                        "catalog_source_state": {
+                            "source": "models.dev",
+                            "retrieved_at": "2026-09-27T00:00:00Z",
+                            "freshness": "fresh",
+                            "etag": "etag-1",
+                            "last_modified": "Sun, 27 Sep 2026 00:00:00 GMT"
+                        }
+                    }
+                }
+            },
+            "catalog_source_state": {
+                "source": "models.dev",
+                "retrieved_at": "2026-09-27T00:00:00Z",
+                "freshness": "fresh",
+                "etag": "etag-1"
+            }
+        });
+        let refreshed = json!({
+            "fields": {
+                "input_per_1m": {
+                    "source": "models.dev:provider",
+                    "metadata": {
+                        "observed_at": "2026-09-28T00:00:00Z",
+                        "catalog_source_state": {
+                            "source": "models.dev",
+                            "retrieved_at": "2026-09-28T00:00:00Z",
+                            "freshness": "stale",
+                            "etag": "etag-2",
+                            "last_modified": "Mon, 28 Sep 2026 00:00:00 GMT"
+                        }
+                    }
+                }
+            },
+            "catalog_source_state": {
+                "source": "models.dev",
+                "retrieved_at": "2026-09-28T00:00:00Z",
+                "freshness": "stale",
+                "etag": "etag-2"
+            }
+        });
+
         assert!(price_provenance_matches(
             "models.dev",
-            r#"{"reference":"models.dev:provider/openai/gpt"}"#,
+            &stored.to_string(),
             "models.dev",
-            &json!({"reference":"models.dev:provider/openai/gpt"}),
+            &refreshed,
+        ));
+    }
+
+    #[test]
+    fn stable_price_ownership_change_changes_identity() {
+        assert!(!price_provenance_matches(
+            "mixed",
+            r#"{"fields":{"input_per_1m":{"source":"models.dev:provider","metadata":{}}}}"#,
+            "mixed",
+            &json!({
+                "fields": {
+                    "input_per_1m": {
+                        "source": "operator",
+                        "metadata": {"configured_by": "admin"}
+                    }
+                }
+            }),
         ));
         assert!(!price_provenance_matches(
             "models.dev",
@@ -1977,11 +2069,123 @@ mod price_version_identity_tests {
             "operator_accept",
             &json!({"accepted_from":"models.dev"}),
         ));
-        assert!(!price_provenance_matches(
-            "models.dev",
-            r#"{"reference":"old"}"#,
-            "models.dev",
-            &json!({"reference":"new"}),
+    }
+
+    #[tokio::test]
+    async fn unchanged_prices_reuse_version_across_catalog_refresh_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-price-version-{}",
+            uuid::Uuid::new_v4().simple()
         ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("test.db").display());
+        let pool = connect(&url).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        let provider_id = insert_provider(
+            &pool,
+            &NewProvider {
+                name: "Provider",
+                base_url: "https://example.test",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 120_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "example.test",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let prices = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(5.0),
+            ..Default::default()
+        };
+        let model_id = insert_model(
+            &pool,
+            &NewModel {
+                provider_id: &provider_id,
+                upstream_id: "model",
+                display_name: "Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: serde_json::to_value(&prices).unwrap(),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+
+        let first_metadata = json!({
+            "fields": {
+                "input_per_1m": {
+                    "source": "models.dev:provider",
+                    "metadata": {"observed_at": "2026-09-27T00:00:00Z"}
+                }
+            },
+            "catalog_source_state": {
+                "source": "models.dev",
+                "retrieved_at": "2026-09-27T00:00:00Z",
+                "etag": "etag-1",
+                "freshness": "fresh"
+            }
+        });
+        let second_metadata = json!({
+            "fields": {
+                "input_per_1m": {
+                    "source": "models.dev:provider",
+                    "metadata": {"observed_at": "2026-09-28T00:00:00Z"}
+                }
+            },
+            "catalog_source_state": {
+                "source": "models.dev",
+                "retrieved_at": "2026-09-28T00:00:00Z",
+                "etag": "etag-2",
+                "freshness": "fresh"
+            }
+        });
+
+        let first = ensure_price_version(
+            &pool,
+            &model_id,
+            &prices,
+            "models.dev",
+            &first_metadata,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let second = ensure_price_version(
+            &pool,
+            &model_id,
+            &prices,
+            "models.dev",
+            &second_metadata,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(first, second);
+        drop(pool);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

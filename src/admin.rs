@@ -2649,6 +2649,13 @@ fn model_reconciliation_locks(
     LOCKS.get_or_init(dashmap::DashMap::new)
 }
 
+fn model_reconciliation_lock(provider_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    model_reconciliation_locks()
+        .entry(provider_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// `POST /admin/api/providers/:id/discover` — fetch the upstream model list
 /// using the provider's credentials (FR-10.4).
 pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<Value, ApiError> {
@@ -2656,10 +2663,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
     // work per provider so overlapping refreshes cannot race observation,
     // ignore, or pin state. Pricing sync shares the same provider lock but has
     // an independent state machine and never invokes reconciliation implicitly.
-    let lock = model_reconciliation_locks()
-        .entry(id.to_string())
-        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-        .clone();
+    let lock = model_reconciliation_lock(id);
     let _guard = lock.lock().await;
     let provider = db::get_provider(&state.pool, &id)
         .await
@@ -3103,13 +3107,23 @@ fn merge_automatic_price_observation(
         .unwrap_or(Value::Null);
 
     for field in PRICE_FIELDS {
-        let Some(value) = price_field(observed, field) else {
+        let observed_value = price_field(observed, field);
+        let authoritative_absence = observed_value.is_none()
+            && discovery
+                .pointer(&format!("/price_sources/{field}"))
+                .is_some_and(Value::is_null);
+        if observed_value.is_none() && !authoritative_absence {
             continue;
-        };
+        }
         if price_field_operator_owned(&fields, current, field) {
             preserved_manual = true;
             continue;
         }
+        let Some(value) = observed_value else {
+            set_price_field(&mut effective, field, None);
+            fields.remove(field);
+            continue;
+        };
         set_price_field(&mut effective, field, Some(value));
         let source = discovery
             .pointer(&format!("/price_sources/{field}"))
@@ -3198,6 +3212,13 @@ pub async fn update_model_reconciliation(
     Path(id): Path<String>,
     Json(body): Json<ReconciliationActionBody>,
 ) -> ApiResult {
+    let provider_id = db::get_model(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("model not found"))?
+        .provider_id;
+    let lock = model_reconciliation_lock(&provider_id);
+    let _guard = lock.lock().await;
     let row = db::get_model(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?
@@ -3562,10 +3583,7 @@ pub(crate) async fn sync_provider_pricing_id(
     state: &AppState,
     id: &str,
 ) -> Result<Value, ApiError> {
-    let lock = model_reconciliation_locks()
-        .entry(id.to_string())
-        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-        .clone();
+    let lock = model_reconciliation_lock(id);
     let _guard = lock.lock().await;
 
     let provider = db::get_provider(&state.pool, id)
@@ -3602,7 +3620,12 @@ pub(crate) async fn sync_provider_pricing_id(
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
-        if !observed.is_configured() {
+        let has_authoritative_absence = PRICE_FIELDS.iter().any(|field| {
+            discovery
+                .pointer(&format!("/price_sources/{field}"))
+                .is_some_and(Value::is_null)
+        });
+        if !observed.is_configured() && !has_authoritative_absence {
             continue;
         }
 
@@ -4226,6 +4249,48 @@ mod model_lifecycle_regression_tests {
     }
 
     #[test]
+    fn authoritative_price_absence_clears_automatic_field() {
+        let current = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(5.0),
+            ..Default::default()
+        };
+        let observed = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: None,
+            ..Default::default()
+        };
+        let discovery = json!({
+            "price_sources": {
+                "input_per_1m": "models.dev:provider",
+                "output_per_1m": null
+            },
+            "effective_pricing": {
+                "source": "models.dev:provider",
+                "fields": {
+                    "input_per_1m": {"source": "models.dev:provider", "metadata": {}},
+                    "output_per_1m": {"source": "models.dev:provider", "metadata": {}}
+                }
+            },
+            "catalog": {
+                "source_state": {
+                    "source": "models.dev",
+                    "retrieved_at": "2026-09-27T01:00:00Z",
+                    "freshness": "fresh"
+                }
+            }
+        });
+
+        let (effective, fields, preserved_manual) =
+            merge_automatic_price_observation(&current, &observed, &discovery);
+
+        assert_eq!(effective.input_per_1m, Some(1.0));
+        assert_eq!(effective.output_per_1m, None);
+        assert!(!preserved_manual);
+        assert!(!fields.contains_key("output_per_1m"));
+    }
+
+    #[test]
     fn partial_capability_accept_only_promotes_selected_keys() {
         let discovery = json!({
             "operator_capability_overrides": {
@@ -4369,6 +4434,36 @@ mod model_lifecycle_regression_tests {
     }
 
     #[tokio::test]
+    async fn provider_lifecycle_lock_serializes_operator_mutations() {
+        let provider_id = format!(
+            "provider-lock-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let automatic = model_reconciliation_lock(&provider_id);
+        let automatic_guard = automatic.lock().await;
+        let operator = model_reconciliation_lock(&provider_id);
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                operator.lock(),
+            )
+            .await
+            .is_err()
+        );
+
+        drop(automatic_guard);
+        let operator_guard = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            operator.lock(),
+        )
+        .await
+        .expect("operator mutation should proceed after lifecycle work releases the lock");
+        drop(operator_guard);
+        model_reconciliation_locks().remove(&provider_id);
+    }
+
+    #[tokio::test]
     async fn scheduled_discovery_payload_survives_for_later_api_read() {
         let root = std::env::temp_dir().join(format!(
             "kinetix-model-lifecycle-{}",
@@ -4444,6 +4539,41 @@ mod model_lifecycle_regression_tests {
             item.pointer("/scope/account_id").and_then(Value::as_str) == Some("account-b")
                 && item.get("status").and_then(Value::as_str) == Some("unsupported")
         }));
+    }
+
+    #[test]
+    fn inconclusive_probe_keeps_previous_conclusive_same_scope() {
+        let mut evidence = serde_json::Map::new();
+        let key = "tool_calling".to_string();
+        let scope = json!({
+            "provider_id": "provider",
+            "account_id": "account-a",
+            "model_id": "model",
+            "transport": "openai"
+        });
+        upsert_probe_evidence(
+            &mut evidence,
+            key.clone(),
+            json!({
+                "status": "supported",
+                "fresh_until": "2999-01-01T00:00:00Z",
+                "scope": scope.clone()
+            }),
+        );
+        upsert_probe_evidence(
+            &mut evidence,
+            key.clone(),
+            json!({
+                "status": "inconclusive",
+                "fresh_until": "2999-01-01T00:00:00Z",
+                "scope": scope
+            }),
+        );
+
+        let entries = evidence[&key].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["status"], "supported");
+        assert_eq!(entries[1]["status"], "inconclusive");
     }
 
     #[tokio::test]
@@ -4650,7 +4780,13 @@ fn upsert_probe_evidence(
         Some(existing @ Value::Object(_)) => vec![existing],
         _ => Vec::new(),
     };
-    entries.retain(|existing| !same_probe_scope(existing, &evidence_value));
+    let conclusive = matches!(
+        evidence_value.get("status").and_then(Value::as_str),
+        Some("supported" | "unsupported")
+    );
+    if conclusive {
+        entries.retain(|existing| !same_probe_scope(existing, &evidence_value));
+    }
     entries.push(evidence_value);
     evidence.insert(key, Value::Array(entries));
 }
@@ -5417,6 +5553,13 @@ pub async fn update_model(
     Path(id): Path<String>,
     Json(body): Json<ModelBody>,
 ) -> ApiResult {
+    let provider_id = db::get_model(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("model not found"))?
+        .provider_id;
+    let lock = model_reconciliation_lock(&provider_id);
+    let _guard = lock.lock().await;
     let model = db::get_model(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?

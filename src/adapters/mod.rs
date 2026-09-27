@@ -144,6 +144,17 @@ fn fresh_probe_status_entry<'a>(
     evidence.get("status").and_then(serde_json::Value::as_str)
 }
 
+fn fresh_conclusive_probe_status_entry<'a>(
+    evidence: &'a serde_json::Value,
+    provider_id: &str,
+    model_id: &str,
+    account_id: Option<&str>,
+    transport: &TargetTransport,
+) -> Option<&'a str> {
+    let status = fresh_probe_status_entry(evidence, provider_id, model_id, account_id, transport)?;
+    matches!(status, "supported" | "unsupported").then_some(status)
+}
+
 fn fresh_probe_status<'a>(
     evidence: &'a serde_json::Value,
     provider_id: &str,
@@ -152,13 +163,26 @@ fn fresh_probe_status<'a>(
     transport: &TargetTransport,
 ) -> Option<&'a str> {
     match evidence {
-        // New storage keeps one entry per execution scope under the capability
-        // key. Search newest-first so re-probing the same scope wins.
+        // New storage keeps probe history per execution scope. Search
+        // newest-first for fresh conclusive evidence; inconclusive attempts do
+        // not supersede a still-fresh supported/unsupported result.
         serde_json::Value::Array(entries) => entries.iter().rev().find_map(|entry| {
-            fresh_probe_status_entry(entry, provider_id, model_id, account_id, transport)
+            fresh_conclusive_probe_status_entry(
+                entry,
+                provider_id,
+                model_id,
+                account_id,
+                transport,
+            )
         }),
         // Legacy single-entry storage remains readable.
-        _ => fresh_probe_status_entry(evidence, provider_id, model_id, account_id, transport),
+        _ => fresh_conclusive_probe_status_entry(
+            evidence,
+            provider_id,
+            model_id,
+            account_id,
+            transport,
+        ),
     }
 }
 
@@ -2088,6 +2112,43 @@ mod execution_profile_tests {
             TargetTransport::OpenAiResponses
         );
         assert_eq!(account_a_responses.capabilities.tool_calling, Some(false));
+    }
+
+    #[test]
+    fn inconclusive_probe_does_not_override_fresh_conclusive_evidence() {
+        let provider = provider();
+        let mut model = model();
+        model.discovery = serde_json::json!({
+            "probe_evidence": {
+                "tool_calling": [
+                    {
+                        "status": "supported",
+                        "fresh_until": "2999-01-01T00:00:00Z",
+                        "scope": {
+                            "provider_id": "provider",
+                            "account_id": "account-a",
+                            "model_id": "model",
+                            "transport": "openai"
+                        }
+                    },
+                    {
+                        "status": "inconclusive",
+                        "fresh_until": "2999-01-01T00:00:00Z",
+                        "scope": {
+                            "provider_id": "provider",
+                            "account_id": "account-a",
+                            "model_id": "model",
+                            "transport": "openai"
+                        }
+                    }
+                ]
+            }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        assert_eq!(profile.capabilities.tool_calling, Some(true));
     }
 
     #[test]
