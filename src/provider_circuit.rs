@@ -602,13 +602,13 @@ mod tests {
     }
 
     #[test]
-    fn accountless_provider_can_correlate_failures_across_targets() {
+    fn accountless_provider_can_correlate_failures_across_serving_models() {
         let circuits = ProviderCircuits::default();
         circuits
             .begin_attempt_with_policy(
                 "p",
                 "noauth",
-                "route-a",
+                "model-a",
                 ProviderCorrelationPolicy::AccountlessTargets,
             )
             .unwrap()
@@ -617,7 +617,7 @@ mod tests {
             .begin_attempt_with_policy(
                 "p",
                 "noauth",
-                "route-b",
+                "model-b",
                 ProviderCorrelationPolicy::AccountlessTargets,
             )
             .unwrap()

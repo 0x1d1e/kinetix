@@ -4262,7 +4262,7 @@ pub async fn metrics(State(state): State<AppState>, _auth: AdminAuth) -> Respons
     );
     body.push_str("# TYPE kinetix_provider_circuit_recoveries_total counter\n");
     body.push_str(
-        "# HELP kinetix_provider_circuit_rejects_total Attempts rejected by an open provider circuit\n",
+        "# HELP kinetix_provider_circuit_rejects_total Target candidates rejected by an open provider circuit; one request may count more than once\n",
     );
     body.push_str("# TYPE kinetix_provider_circuit_rejects_total counter\n");
     body.push_str(

@@ -25,11 +25,18 @@ quota observations.
 
 Telemetry keeps separate counters for rate limits, quota exhaustion, server
 errors, connection errors, timeouts, authentication errors, target errors, and
-bad requests. Rate-limit headers provide bucket headroom and reset evidence for
-adaptive routing; generic zero-remaining headers do not exhaust the whole
-account. Account exhaustion requires an explicit account-global quota signal.
-Quota resets accept countdowns such as `2m59.56s`, numeric seconds or Unix
-timestamps, and RFC3339 timestamps. Expired observations are neutral to routing.
+bad requests. Rate-limit headers remain visible as bucket headroom and reset
+diagnostics, and may set a 429 cooldown. Their scope can be request- or
+model-specific, so they do not affect account-wide adaptive ordering or exhaust
+an account. Adaptive quota preference and hard exhaustion use explicit
+account-global evidence, such as account quota status or a plugin health probe.
+Kinetix parses countdown reset values with `ms`, `s`, `m`, and `h` units, as
+well as numeric seconds, Unix timestamps, and RFC3339 timestamps. Expired
+observations are neutral to routing.
+
+The Runtime Health provider-circuit rejection count is a target-candidate count,
+not a unique-request count. A logical request may contribute multiple rejects
+when it skips multiple targets behind an open provider circuit.
 
 ## Metrics
 

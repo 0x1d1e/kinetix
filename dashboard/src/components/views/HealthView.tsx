@@ -279,7 +279,7 @@ export function HealthView() {
               <th className="p-3">Auth / target / bad request</th>
               <th className="p-3">Fallback use / failures</th>
               <th className="p-3">Cancelled</th>
-              <th className="p-3">Saturation / circuit reject</th>
+              <th className="p-3">Saturation / circuit rejects (candidates)</th>
             </tr>
           </thead>
           <tbody>

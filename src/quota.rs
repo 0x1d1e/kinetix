@@ -65,8 +65,6 @@ impl QuotaSnapshot {
 pub struct QuotaHeaderObservation {
     pub remaining_fraction: f64,
     pub reset_at: Option<DateTime<Utc>>,
-    /// Generic rate-limit buckets do not establish account-global exhaustion.
-    pub account_global_exhaustion: bool,
 }
 
 impl QuotaHeaderObservation {
@@ -85,7 +83,10 @@ pub struct QuotaPluginObservation {
 
 #[derive(Clone, Default)]
 pub struct QuotaRegistry {
+    /// Latest evidence from any source, retained for operator diagnostics.
     inner: Arc<DashMap<(String, String), QuotaSnapshot>>,
+    /// Only explicitly account-global evidence may influence adaptive routing.
+    account_global: Arc<DashMap<(String, String), QuotaSnapshot>>,
 }
 
 impl QuotaRegistry {
@@ -113,6 +114,30 @@ impl QuotaRegistry {
         );
     }
 
+    pub fn observe_account_global(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        remaining_fraction: Option<f64>,
+        reset_at: Option<DateTime<Utc>>,
+        source: impl Into<String>,
+        max_age: Duration,
+    ) {
+        let remaining_fraction = remaining_fraction
+            .filter(|value| value.is_finite())
+            .map(|value| value.clamp(0.0, 1.0));
+        let key = (provider_id.to_string(), account_id.to_string());
+        let snapshot = QuotaSnapshot {
+            remaining_fraction,
+            reset_at,
+            observed_at: Utc::now(),
+            source: source.into(),
+            max_age_secs: max_age.as_secs().max(1),
+        };
+        self.inner.insert(key.clone(), snapshot.clone());
+        self.account_global.insert(key, snapshot);
+    }
+
     pub fn observe_exhausted(
         &self,
         provider_id: &str,
@@ -120,7 +145,7 @@ impl QuotaRegistry {
         reset_at: Option<DateTime<Utc>>,
         source: &str,
     ) {
-        self.observe(
+        self.observe_account_global(
             provider_id,
             account_id,
             Some(0.0),
@@ -148,7 +173,7 @@ impl QuotaRegistry {
             .map(|value| value.clamp(0.0, 1.0));
         let exhausted = remaining_fraction.is_some_and(|remaining| remaining <= 0.0);
         if quota_state.is_some() || reset_at.is_some() {
-            self.observe(
+            self.observe_account_global(
                 provider_id,
                 account_id,
                 remaining_fraction,
@@ -211,9 +236,6 @@ impl QuotaRegistry {
             return Some(QuotaHeaderObservation {
                 remaining_fraction,
                 reset_at,
-                // These headers describe rate-limit buckets, which may be
-                // request-, model-, or period-scoped rather than account-wide.
-                account_global_exhaustion: false,
             });
         }
         None
@@ -222,6 +244,13 @@ impl QuotaRegistry {
     pub fn snapshot(&self, provider_id: &str, account_id: &str) -> Option<QuotaSnapshot> {
         let key = (provider_id.to_string(), account_id.to_string());
         let value = self.inner.get(&key)?.clone();
+        value.is_fresh(Utc::now()).then_some(value)
+    }
+
+    /// Fresh account-global observations available to adaptive routing.
+    pub fn adaptive_snapshot(&self, provider_id: &str, account_id: &str) -> Option<QuotaSnapshot> {
+        let key = (provider_id.to_string(), account_id.to_string());
+        let value = self.account_global.get(&key)?.clone();
         value.is_fresh(Utc::now()).then_some(value)
     }
 
@@ -236,8 +265,7 @@ impl QuotaRegistry {
 
     /// Operator-facing view retains stale observations so the dashboard can
     /// distinguish stale evidence from a source that has never reported quota.
-    /// Routing still consumes only `snapshot()` / `snapshots()`, which fail
-    /// stale data closed to unknown.
+    /// Adaptive routing uses `adaptive_snapshot()` and account-global sources only.
     pub fn observations(&self) -> Vec<(String, String, QuotaSnapshot, bool)> {
         let now = Utc::now();
         self.inner
@@ -358,6 +386,7 @@ fn parse_reset_duration_secs(raw: &str) -> Option<f64> {
             match bytes.get(index).copied()? {
                 b's' => (1, 1.0),
                 b'm' => (1, 60.0),
+                b'h' => (1, 3600.0),
                 _ => return None,
             }
         };
@@ -453,6 +482,14 @@ mod tests {
                 Some(0.0),
                 "quota_state={quota_state:?}"
             );
+            assert_eq!(
+                registry
+                    .adaptive_snapshot("p", "a")
+                    .unwrap()
+                    .remaining_fraction,
+                Some(0.0),
+                "quota_state={quota_state:?}"
+            );
         }
 
         let registry = QuotaRegistry::default();
@@ -464,21 +501,49 @@ mod tests {
     }
 
     #[test]
-    fn successful_zero_remaining_rate_limit_header_is_not_account_exhaustion() {
+    fn successful_zero_remaining_header_is_diagnostic_not_account_global_routing_evidence() {
         let registry = QuotaRegistry::default();
         let mut headers = HeaderMap::new();
         headers.insert("x-ratelimit-remaining-requests", "0".parse().unwrap());
         headers.insert("x-ratelimit-reset-requests", "2m59.56s".parse().unwrap());
 
         let observation = registry.observe_headers("p", "a", &headers).unwrap();
-        assert!(!observation.account_global_exhaustion);
         assert_eq!(observation.remaining_fraction, 0.0);
         let reset_in_ms = (observation.reset_at.unwrap() - Utc::now()).num_milliseconds();
         assert!((179_000..=179_560).contains(&reset_in_ms));
+        let diagnostic = registry.snapshot("p", "a").unwrap();
+        assert_eq!(diagnostic.remaining_fraction, Some(0.0));
         assert_eq!(
-            registry.snapshot("p", "a").unwrap().remaining_fraction,
-            Some(0.0)
+            diagnostic.source,
+            "response_header:x-ratelimit-remaining-requests"
         );
+        assert!(registry.adaptive_snapshot("p", "a").is_none());
+    }
+
+    #[test]
+    fn ambiguous_header_does_not_overwrite_explicit_account_global_routing_evidence() {
+        let registry = QuotaRegistry::default();
+        registry.observe_account_global(
+            "p",
+            "a",
+            Some(0.75),
+            None,
+            "account_quota",
+            Duration::from_secs(60),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining-requests", "0".parse().unwrap());
+        registry.observe_headers("p", "a", &headers).unwrap();
+
+        let diagnostic = registry.snapshot("p", "a").unwrap();
+        assert_eq!(
+            diagnostic.source,
+            "response_header:x-ratelimit-remaining-requests"
+        );
+        assert_eq!(diagnostic.remaining_fraction, Some(0.0));
+        let routing = registry.adaptive_snapshot("p", "a").unwrap();
+        assert_eq!(routing.source, "account_quota");
+        assert_eq!(routing.remaining_fraction, Some(0.75));
     }
 
     #[test]
@@ -488,9 +553,9 @@ mod tests {
         headers.insert("ratelimit-remaining", "0".parse().unwrap());
 
         let observation = registry.observe_headers("p", "a", &headers).unwrap();
-        assert!(!observation.account_global_exhaustion);
         assert_eq!(observation.remaining_fraction, 0.0);
         assert_eq!(observation.reset_at, None);
+        assert!(registry.adaptive_snapshot("p", "a").is_none());
     }
 
     #[test]
@@ -501,7 +566,6 @@ mod tests {
         headers.insert("x-ratelimit-reset-requests", "60s".parse().unwrap());
 
         let observation = registry.observe_headers("p", "a", &headers).unwrap();
-        assert!(!observation.account_global_exhaustion);
         let reset_in_secs = (observation.reset_at.unwrap() - Utc::now()).num_seconds();
         assert!((55..=60).contains(&reset_in_secs));
     }
@@ -512,6 +576,8 @@ mod tests {
             ("1s", 1.0),
             ("500ms", 0.5),
             ("1m30s", 90.0),
+            ("1h", 3600.0),
+            ("1h30m", 5400.0),
             ("2m59.56s", 179.56),
         ] {
             assert_eq!(parse_reset_duration_secs(raw), Some(expected_secs), "{raw}");
@@ -555,6 +621,10 @@ mod tests {
         let snapshot = registry.snapshot("p", "a").unwrap();
         assert_eq!(snapshot.remaining_fraction, Some(0.0));
         assert_eq!(snapshot.source, "upstream_error");
+        assert_eq!(
+            registry.adaptive_snapshot("p", "a").unwrap().source,
+            "upstream_error"
+        );
     }
 
     #[test]

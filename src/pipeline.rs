@@ -1268,10 +1268,7 @@ pub async fn run(
         let provider_attempt = match state.provider_circuits.begin_attempt_with_policy(
             &target.provider.id,
             &target.account.id,
-            target
-                .route_target_id
-                .as_deref()
-                .unwrap_or(target.model.id.as_str()),
+            provider_correlation_target_id(target),
             correlation_policy,
         ) {
             Ok(attempt) => attempt,
@@ -1339,19 +1336,6 @@ pub async fn run(
                     &target.account.id,
                     resp.headers(),
                 );
-                if let Some(quota) =
-                    quota_observation.filter(|observation| observation.account_global_exhaustion)
-                {
-                    let _ = pool::mark_exhausted(
-                        &state.pool,
-                        &target.account.id,
-                        quota.reset_at,
-                        default_quota_window(&target.account),
-                        "upstream response headers established account-global quota exhaustion",
-                    )
-                    .await;
-                    let _ = state.registry.reload(&state.pool).await;
-                }
                 if resp.status().is_success() {
                     let upstream_request_id = extract_upstream_request_id(&resp);
                     let first_event_remaining =
@@ -1831,6 +1815,11 @@ fn traffic_key(t: &ResolvedTarget) -> crate::upstream_traffic::TargetKey {
         t.account.id.clone(),
         t.model.id.clone(),
     )
+}
+
+/// Route target IDs are configuration row identities; model IDs identify the serving target.
+fn provider_correlation_target_id(target: &ResolvedTarget) -> &str {
+    target.model.id.as_str()
 }
 
 fn adaptive_candidate_key(t: &ResolvedTarget) -> String {
@@ -3027,7 +3016,7 @@ async fn order_route_targets(
             .filter_map(|target| {
                 state
                     .quota
-                    .snapshot(&target.provider.id, &target.account.id)
+                    .adaptive_snapshot(&target.provider.id, &target.account.id)
                     .map(|snapshot| (adaptive_candidate_key(target), snapshot))
             })
             .collect::<std::collections::HashMap<_, _>>()
@@ -5347,11 +5336,45 @@ mod route_policy_tests {
     use super::*;
 
     #[test]
+    fn accountless_failures_from_duplicate_route_rows_share_serving_identity() {
+        let circuits = crate::provider_circuit::ProviderCircuits::default();
+        let mut first = target();
+        first.provider.credential_mode = "none".into();
+        first.model.id = "model_shared".into();
+        first.route_target_id = Some("route_row_one".into());
+        let mut second = first.clone();
+        second.route_target_id = Some("route_row_two".into());
+
+        assert_ne!(first.route_target_id, second.route_target_id);
+        assert_eq!(
+            provider_correlation_target_id(&first),
+            provider_correlation_target_id(&second)
+        );
+        for candidate in [&first, &second] {
+            circuits
+                .begin_attempt_with_policy(
+                    &candidate.provider.id,
+                    &candidate.account.id,
+                    provider_correlation_target_id(candidate),
+                    crate::provider_circuit::ProviderCorrelationPolicy::AccountlessTargets,
+                )
+                .unwrap()
+                .finish_failure(FailureKind::ServerError, Some(503));
+        }
+
+        let snapshot = circuits.snapshot(&first.provider.id);
+        assert_eq!(
+            snapshot.state,
+            crate::provider_circuit::ProviderCircuitState::Closed
+        );
+        assert_eq!(snapshot.distinct_failing_targets, 1);
+    }
+
+    #[test]
     fn generic_rate_limit_reset_sets_cooldown_without_account_exhaustion() {
         let observation = crate::quota::QuotaHeaderObservation {
             remaining_fraction: 0.0,
             reset_at: Some(chrono::Utc::now() + chrono::Duration::seconds(60)),
-            account_global_exhaustion: false,
         };
         let failure = apply_header_reset_to_rate_limit(
             UpstreamFailure {
@@ -5373,7 +5396,6 @@ mod route_policy_tests {
         let observation = crate::quota::QuotaHeaderObservation {
             remaining_fraction: 0.0,
             reset_at: Some(chrono::Utc::now() + chrono::Duration::seconds(60)),
-            account_global_exhaustion: false,
         };
         let failure = apply_header_reset_to_rate_limit(
             UpstreamFailure {
