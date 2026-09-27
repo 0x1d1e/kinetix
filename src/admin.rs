@@ -1941,11 +1941,10 @@ fn raw_discovery_metadata<'a>(payload: &'a Value, model_id: &str) -> Option<&'a 
 
 /// `POST /admin/api/providers/:id/discover` — fetch the upstream model list
 /// using the provider's credentials (FR-10.4).
-pub async fn discover_models(
-    State(state): State<AppState>,
-    _auth: AdminAuth,
-    Path(id): Path<String>,
-) -> ApiResult {
+pub(crate) async fn reconcile_provider_id(
+    state: &AppState,
+    id: &str,
+) -> Result<Value, ApiError> {
     let provider = db::get_provider(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?
@@ -2152,7 +2151,25 @@ pub async fn discover_models(
             "model_id": row.id,
         }));
     }
-    Ok(Json(json!({ "models": out, "disappeared": disappeared })))
+    Ok(json!({ "models": out, "disappeared": disappeared }))
+}
+
+/// Manual discovery and reconciliation share one implementation so scheduled
+/// checks cannot drift from the dashboard/API behavior.
+pub async fn discover_models(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+) -> ApiResult {
+    reconcile_provider_id(&state, &id).await.map(Json)
+}
+
+pub async fn reconcile_models(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+) -> ApiResult {
+    reconcile_provider_id(&state, &id).await.map(Json)
 }
 
 async fn credential_for_admin_action(
