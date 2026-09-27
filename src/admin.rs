@@ -11834,7 +11834,7 @@ mod reasoning_discovery_control_plane_tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = vec![0u8; 4096];
             let _ = socket.read(&mut request).await.unwrap();
-            let body = r#"{"data":[{"id":"reasoner","supportedThinkingEfforts":["low","high"]}]}"#;
+            let body = r#"{"data":[{"id":"reasoner","supportedThinkingEfforts":["low","high"],"capabilities":{"tool_calling":true}}]}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -11961,7 +11961,10 @@ mod reasoning_discovery_control_plane_tests {
             response.0["models"][0]["raw_metadata"],
             json!({
                 "id": "reasoner",
-                "supportedThinkingEfforts": ["low", "high"]
+                "supportedThinkingEfforts": ["low", "high"],
+                "capabilities": {
+                    "tool_calling": true
+                }
             })
         );
         assert_eq!(
@@ -11981,7 +11984,10 @@ mod reasoning_discovery_control_plane_tests {
             discovery["latest_observation"]["raw_metadata"],
             json!({
                 "id": "reasoner",
-                "supportedThinkingEfforts": ["low", "high"]
+                "supportedThinkingEfforts": ["low", "high"],
+                "capabilities": {
+                    "tool_calling": true
+                }
             })
         );
         assert_eq!(
@@ -12021,6 +12027,7 @@ mod reasoning_discovery_control_plane_tests {
         let before_accept =
             crate::adapters::resolve_execution_profile(runtime_provider, runtime_model).unwrap();
         assert_eq!(before_accept.capabilities.reasoning, Some(false));
+        assert_eq!(before_accept.capabilities.tool_calling, Some(false));
         assert!(before_accept.thinking_map.levels.is_empty());
 
         update_model_reconciliation(
@@ -12034,6 +12041,7 @@ mod reasoning_discovery_control_plane_tests {
                 action: "accept".into(),
                 fields: vec![
                     "capabilities.reasoning".into(),
+                    "capabilities.tool_calling".into(),
                     "reasoning_capability".into(),
                     "thinking_map".into(),
                 ],
@@ -12048,9 +12056,11 @@ mod reasoning_discovery_control_plane_tests {
         let after_accept =
             crate::adapters::resolve_execution_profile(runtime_provider, runtime_model).unwrap();
         assert_eq!(after_accept.capabilities.reasoning, Some(true));
+        assert_eq!(after_accept.capabilities.tool_calling, Some(true));
         assert!(after_accept.thinking_map.level_is_executable("low"));
         assert!(after_accept.thinking_map.level_is_executable("high"));
 
+        drop(state);
         pool.close().await;
         let _ = std::fs::remove_dir_all(home);
     }
