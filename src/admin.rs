@@ -2642,8 +2642,7 @@ fn raw_discovery_metadata<'a>(payload: &'a Value, model_id: &str) -> Option<&'a 
 }
 
 fn extend_unique_by_id<T>(target: &mut Vec<T>, incoming: Vec<T>, id: impl Fn(&T) -> String) {
-    let mut seen: std::collections::HashSet<String> =
-        target.iter().map(|item| id(item)).collect();
+    let mut seen: std::collections::HashSet<String> = target.iter().map(|item| id(item)).collect();
     for item in incoming {
         if seen.insert(id(&item)) {
             target.push(item);
@@ -4900,12 +4899,17 @@ mod probe_rejection_regression_tests {
 
     #[test]
     fn coupled_parameter_invalid_value_is_not_deterministic_rejection() {
-        assert!(!deterministic_probe_rejection(
-            "reasoning",
-            Some(&json!("high")),
-            400,
+        for body in [
             "invalid value for max_tokens when reasoning is enabled",
-        ));
+            "invalid value 'high' for max_tokens when reasoning_effort is enabled",
+        ] {
+            assert!(!deterministic_probe_rejection(
+                "reasoning",
+                Some(&json!("high")),
+                400,
+                body,
+            ));
+        }
     }
 
     #[test]
@@ -4994,14 +4998,6 @@ fn deterministic_probe_rejection(
         return true;
     }
 
-    let rejects_value = body.contains("invalid value")
-        || body.contains("unsupported value")
-        || body.contains("value is not supported")
-        || body.contains("value not supported");
-    if !rejects_value || !parameter_terms.iter().any(|term| body.contains(term)) {
-        return false;
-    }
-
     let Some(value) = value else {
         return false;
     };
@@ -5012,7 +5008,34 @@ fn deterministic_probe_rejection(
         Value::Null => "null".to_string(),
         _ => return false,
     };
-    !value.is_empty() && body.contains(&value)
+    if value.is_empty() {
+        return false;
+    }
+
+    parameter_terms.iter().any(|term| {
+        let value_forms = [
+            value.clone(),
+            format!("'{value}'"),
+            format!("\"{value}\""),
+        ];
+        value_forms.iter().any(|value| {
+            [
+                format!("invalid value {value} for {term}"),
+                format!("unsupported value {value} for {term}"),
+                format!("{term}: invalid value {value}"),
+                format!("{term}: unsupported value {value}"),
+                format!("{term} has invalid value {value}"),
+                format!("{term} value {value} is unsupported"),
+                format!("{term} value {value} is not supported"),
+                format!("{term} value {value} is not allowed"),
+                format!("{term} {value} is unsupported"),
+                format!("{term} {value} is not supported"),
+                format!("{term} {value} is not allowed"),
+            ]
+            .iter()
+            .any(|pattern| body.contains(pattern))
+        })
+    })
 }
 
 fn probe_evidence_key(capability: &str, value: Option<&Value>) -> String {
