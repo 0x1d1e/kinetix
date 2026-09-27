@@ -962,6 +962,25 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     <SketchButton
                       variant="secondary"
                       size="sm"
+                      disabled={lifecycleBusy === 'reconcile'}
+                      onClick={handleReconcileProvider}
+                      className="gap-1.5 font-heading"
+                    >
+                      <RefreshCw className={`w-4 h-4 ${lifecycleBusy === 'reconcile' ? 'animate-spin' : ''}`} />
+                      Reconcile
+                    </SketchButton>
+                    <SketchButton
+                      variant="secondary"
+                      size="sm"
+                      disabled={lifecycleBusy === 'pricing'}
+                      onClick={handleSyncPricing}
+                      className="gap-1.5 font-heading"
+                    >
+                      Sync Pricing
+                    </SketchButton>
+                    <SketchButton
+                      variant="secondary"
+                      size="sm"
                       onClick={() => openEditProvider(activeProvider)}
                       className="gap-1.5 font-heading"
                     >
@@ -1006,6 +1025,68 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                         <Trash2 className="w-3.5 h-3.5" />
                         <span>Delete Provider</span>
                       </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="mb-5 grid grid-cols-1 xl:grid-cols-2 gap-3">
+                  <div className="p-3 bg-[var(--paper)] border border-[var(--ink)] rounded text-xs font-mono">
+                    <strong className="font-heading text-sm block mb-2">Model lifecycle</strong>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label>
+                        Reconcile interval (sec)
+                        <input
+                          type="number"
+                          min={0}
+                          value={lifecycleSettings?.reconciliation_interval_secs ?? 0}
+                          onChange={(e) =>
+                            setLifecycleSettings((current) =>
+                              current
+                                ? { ...current, reconciliation_interval_secs: Number(e.target.value) }
+                                : current,
+                            )
+                          }
+                          className="mt-1 w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded"
+                        />
+                      </label>
+                      <label>
+                        Pricing sync interval (sec)
+                        <input
+                          type="number"
+                          min={0}
+                          value={lifecycleSettings?.pricing_sync_interval_secs ?? 0}
+                          onChange={(e) =>
+                            setLifecycleSettings((current) =>
+                              current
+                                ? { ...current, pricing_sync_interval_secs: Number(e.target.value) }
+                                : current,
+                            )
+                          }
+                          className="mt-1 w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded"
+                        />
+                      </label>
+                    </div>
+                    <div className="mt-2 flex items-center justify-between gap-2">
+                      <span className="text-[var(--ink)]/60">0 disables scheduling; minimum enabled interval is 300s.</span>
+                      <button
+                        type="button"
+                        disabled={!lifecycleSettings || savingLifecycleSettings}
+                        onClick={handleSaveLifecycleSettings}
+                        className="px-2 py-1 border border-[var(--ink)] rounded font-heading font-bold hover:bg-[var(--erased)] disabled:opacity-50"
+                      >
+                        {savingLifecycleSettings ? 'Saving…' : 'Save schedule'}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="p-3 bg-[var(--paper)] border border-[var(--ink)] rounded text-xs font-mono">
+                    <strong className="font-heading text-sm block mb-1">Lifecycle policy</strong>
+                    <div>Metadata reconciliation observes drift; it never silently changes configured model fields.</div>
+                    <div>Pricing sync preserves operator-owned prices and only adopts known upstream/catalog price fields.</div>
+                    <div>Capability probes are explicit, bounded, scoped, and expire after the configured freshness window.</div>
+                    {lifecycleNotice && (
+                      <div className="mt-2 pt-2 border-t border-[var(--ink)]/20 text-[var(--pen-blue)]">
+                        {lifecycleNotice}
+                      </div>
                     )}
                   </div>
                 </div>
@@ -1218,11 +1299,108 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                           </div>
                         </div>
 
+                        {modelReconciliation(m) && (
+                          <div className="mb-3 p-3 bg-[var(--erased-soft)] border border-[var(--ink)]/40 rounded text-xs font-mono">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <strong className="font-heading text-sm">Reconciliation</strong>
+                                <SketchBadge
+                                  variant={
+                                    modelReconciliation(m)?.status === 'changed' ||
+                                    modelReconciliation(m)?.status === 'missing' ||
+                                    modelReconciliation(m)?.status === 'deprecated'
+                                      ? 'yellow'
+                                      : modelReconciliation(m)?.status === 'unchanged' ||
+                                          modelReconciliation(m)?.status === 'accepted'
+                                        ? 'green'
+                                        : 'default'
+                                  }
+                                >
+                                  {modelReconciliation(m)?.status || 'unknown'}
+                                </SketchBadge>
+                                <span>
+                                  {modelReconciliation(m)?.diff?.length || 0} field(s) changed
+                                </span>
+                                {modelReconciliation(m)?.last_success_at && (
+                                  <span className="text-[var(--ink)]/60">
+                                    last success {new Date(modelReconciliation(m)!.last_success_at!).toLocaleString()}
+                                  </span>
+                                )}
+                              </div>
+                              {!!modelReconciliation(m)?.diff?.length && (
+                                <div className="flex flex-wrap gap-1">
+                                  <button
+                                    type="button"
+                                    disabled={lifecycleBusy === `accept:${m.id}`}
+                                    onClick={() => handleReconciliationAction(m.id, 'accept')}
+                                    className="px-2 py-1 border border-[var(--pen-green)] text-[var(--pen-green)] rounded font-bold"
+                                  >
+                                    Accept
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={lifecycleBusy === `ignore:${m.id}`}
+                                    onClick={() => handleReconciliationAction(m.id, 'ignore')}
+                                    className="px-2 py-1 border border-[var(--ink)] rounded font-bold"
+                                  >
+                                    Ignore
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={lifecycleBusy === `pin:${m.id}`}
+                                    onClick={() => handleReconciliationAction(m.id, 'pin')}
+                                    className="px-2 py-1 border border-[var(--pen-blue)] text-[var(--pen-blue)] rounded font-bold"
+                                  >
+                                    Pin configured
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                            {!!modelReconciliation(m)?.diff?.length && (
+                              <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[var(--ink)]/70">
+                                {modelReconciliation(m)?.diff?.slice(0, 6).map((diff) => (
+                                  <span key={diff.field}>Δ {diff.field}</span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        <div className="mb-3 p-3 bg-[var(--paper)] border border-[var(--ink)]/40 rounded text-xs font-mono">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <strong className="font-heading text-sm">Verified capability probes</strong>
+                              <span className="ml-2 text-[var(--ink)]/60">
+                                transport {modelProbeEvidence(m).transport?.status || '—'} ·
+                                reasoning {modelProbeEvidence(m).reasoning?.status || '—'} ·
+                                tools {modelProbeEvidence(m).tool_calling?.status || '—'} ·
+                                structured {modelProbeEvidence(m).structured_output?.status || '—'}
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap gap-1">
+                              {(['transport', 'reasoning', 'tool_calling', 'structured_output'] as const).map((capability) => (
+                                <button
+                                  key={capability}
+                                  type="button"
+                                  disabled={lifecycleBusy === `probe:${m.id}:${capability}`}
+                                  onClick={() => handleProbeModel(m.id, capability)}
+                                  className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
+                                >
+                                  Probe {capability.replace('_', ' ')}
+                                  {probeStatus[`${m.id}:${capability}`]
+                                    ? ` · ${probeStatus[`${m.id}:${capability}`]}`
+                                    : ''}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+
                         {/* Prices & Parameter policies */}
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs font-mono">
                           <div className="bg-[var(--paper)] p-2 border border-[var(--ink)] rounded">
                             <strong className="font-heading text-sm text-[var(--ink)] block mb-1">
-                              💵 Token Pricing (Admin Defined)
+                              💵 Token Pricing · ${modelPricingSource(m)}
                             </strong>
                             <div>Input: {m.prices.inputPer1M == null ? 'unknown' : `${m.prices.inputPer1M} / 1M`}</div>
                             <div>Output: {m.prices.outputPer1M == null ? 'unknown' : `${m.prices.outputPer1M} / 1M`}</div>
