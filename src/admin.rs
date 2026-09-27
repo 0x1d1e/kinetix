@@ -2546,7 +2546,15 @@ fn preserve_last_known_catalog_observation(
             }
         }
 
-        observation.catalog = previous.get("catalog").cloned();
+        observation.catalog = previous.get("catalog").cloned().map(|mut catalog| {
+            if let Some(source_state) = catalog
+                .get_mut("source_state")
+                .and_then(Value::as_object_mut)
+            {
+                source_state.insert("freshness".into(), json!("stale"));
+            }
+            catalog
+        });
         observation.canonical_identity = previous.get("canonical_identity").cloned();
         observation.canonical_model_id = previous
             .get("canonical_model_id")
@@ -3595,9 +3603,10 @@ fn merge_selected_capability_overrides(
         let Some(key) = field.strip_prefix("capabilities.") else {
             continue;
         };
-        if let Some(value) = configured.get(key) {
-            overrides.insert(key.to_string(), value.clone());
-        }
+        overrides.insert(
+            key.to_string(),
+            configured.get(key).cloned().unwrap_or(Value::Null),
+        );
     }
     overrides
 }
@@ -5625,6 +5634,14 @@ mod model_lifecycle_regression_tests {
             "models.dev"
         );
         assert_eq!(
+            observation.catalog.as_ref().unwrap()["source_state"]["retrieved_at"],
+            "2026-09-27T00:00:00Z"
+        );
+        assert_eq!(
+            observation.catalog.as_ref().unwrap()["source_state"]["freshness"],
+            "stale"
+        );
+        assert_eq!(
             observation.canonical_model_id.as_deref(),
             Some("openai/model")
         );
@@ -5860,6 +5877,38 @@ mod probe_rejection_regression_tests {
     }
 
     #[test]
+    fn parameter_value_rejection_is_inconclusive_for_parameter_support() {
+        assert!(!deterministic_probe_rejection(
+            "parameter.temperature",
+            Some(&json!(2)),
+            400,
+            "invalid value 2 for temperature",
+        ));
+        assert!(!deterministic_probe_rejection(
+            "parameter.temperature",
+            Some(&json!(2)),
+            422,
+            "temperature value 2 is unsupported",
+        ));
+    }
+
+    #[test]
+    fn explicit_parameter_rejection_is_deterministic() {
+        assert!(deterministic_probe_rejection(
+            "parameter.temperature",
+            Some(&json!(2)),
+            400,
+            "temperature is unsupported",
+        ));
+        assert!(deterministic_probe_rejection(
+            "parameter.temperature",
+            Some(&json!(2)),
+            422,
+            "unknown parameter temperature",
+        ));
+    }
+
+    #[test]
     fn forced_tool_choice_rejection_is_inconclusive_for_base_tool_support() {
         for body in [
             "tool_choice is unsupported",
@@ -5996,6 +6045,13 @@ fn deterministic_probe_rejection(
     });
     if explicitly_rejects_parameter {
         return true;
+    }
+
+    // Rejection of one probed value does not establish that a general model
+    // parameter is unsupported. Reasoning efforts are intentionally different:
+    // their evidence is value-scoped by probe_evidence_key().
+    if capability.starts_with("parameter.") {
+        return false;
     }
 
     let Some(value) = value else {
@@ -13674,6 +13730,112 @@ mod credential_enrollment_regression_tests {
         assert_eq!(effective.output_per_1m, Some(5.0));
         assert!(preserved_manual);
         assert_eq!(fields["output_per_1m"]["source"], "operator_pin");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pin_action_materializes_unknown_capability_ownership() {
+        let (state, root) = test_state("pin-unknown-ownership").await;
+        let provider_id = insert_provider(
+            &state,
+            "pin-unknown-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "pin-unknown-model",
+                display_name: "Pin Unknown Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({
+                    "operator_capability_overrides": {},
+                    "latest_observation": {
+                        "capabilities": {"tool_calling": true}
+                    },
+                    "reconciliation": {
+                        "status": "changed",
+                        "diff": [{
+                            "field": "capabilities.tool_calling",
+                            "configured": null,
+                            "observed": true
+                        }]
+                    }
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let _ = update_model_reconciliation(
+            State(state.clone()),
+            auth(),
+            Path(model_id.clone()),
+            Json(ReconciliationActionBody {
+                action: "pin".into(),
+                fields: vec!["capabilities.tool_calling".into()],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let pinned = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pinned_discovery = discovery_object(&pinned);
+        assert!(pinned_discovery
+            .pointer("/operator_capability_overrides/tool_calling")
+            .is_some_and(Value::is_null));
+
+        db::merge_model_discovery(
+            &state.pool,
+            &model_id,
+            &json!({
+                "probe_evidence": {
+                    "tool_calling": {
+                        "status": "supported",
+                        "fresh_until": "2999-01-01T00:00:00Z",
+                        "scope": {
+                            "provider_id": provider_id.clone(),
+                            "account_id": "account-a",
+                            "model_id": model_id.clone(),
+                            "transport": "openai"
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let pinned = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let profile = crate::adapters::resolve_execution_profile_for_target(
+            &provider,
+            &pinned,
+            Some("account-a"),
+        )
+        .unwrap();
+        assert_eq!(profile.capabilities.tool_calling, None);
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);
