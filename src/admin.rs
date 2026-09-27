@@ -13447,7 +13447,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
 
-        update_model_reconciliation(
+        let _ = update_model_reconciliation(
             State(state.clone()),
             auth(),
             Path(model_id.clone()),

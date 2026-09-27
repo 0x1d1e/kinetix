@@ -2065,6 +2065,7 @@ mod execution_profile_tests {
         assert_eq!(profile.capabilities.tool_calling, None);
 
         model.discovery = serde_json::json!({
+            "operator_capability_overrides": {},
             "capabilities": {"text": null, "vision": true}
         })
         .to_string();
