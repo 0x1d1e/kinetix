@@ -178,8 +178,8 @@ fn token_count_exact_target(
                 &target.model,
                 Some(target.account.id.as_str()),
             )
-                .map(|profile| profile_satisfies_needs(&profile.capabilities, &needs))
-                .unwrap_or(false);
+            .map(|profile| profile_satisfies_needs(&profile.capabilities, &needs))
+            .unwrap_or(false);
         (allowed_providers.is_empty() || allowed_providers.contains(&target.provider.id))
             && capabilities_match
     };
@@ -285,10 +285,10 @@ pub async fn count_tokens(
         return Ok(estimate());
     };
     let profile = crate::adapters::resolve_execution_profile_for_target(
-                &target.provider,
-                &target.model,
-                Some(target.account.id.as_str()),
-            )?;
+        &target.provider,
+        &target.model,
+        Some(target.account.id.as_str()),
+    )?;
     let adapter = state.adapters.for_transport(&profile.transport)?;
     if !adapter.supports_count_tokens() {
         return Ok(estimate());
@@ -906,23 +906,22 @@ pub async fn run(
 
         // Resolve target transport and its execution metadata before any
         // target-specific credential lookup or network dispatch.
-        let profile =
-            match crate::adapters::resolve_execution_profile_for_target(
-                &target.provider,
-                &target.model,
-                Some(target.account.id.as_str()),
-            ) {
-                Ok(profile) => profile,
-                Err(error) => {
-                    trace.step(
-                        "skip",
-                        Some(target.model.display_name.clone()),
-                        format!("invalid execution profile: {}", error.message),
-                    );
-                    last_error = Some(error);
-                    continue;
-                }
-            };
+        let profile = match crate::adapters::resolve_execution_profile_for_target(
+            &target.provider,
+            &target.model,
+            Some(target.account.id.as_str()),
+        ) {
+            Ok(profile) => profile,
+            Err(error) => {
+                trace.step(
+                    "skip",
+                    Some(target.model.display_name.clone()),
+                    format!("invalid execution profile: {}", error.message),
+                );
+                last_error = Some(error);
+                continue;
+            }
+        };
         trace.resolved_transport(
             target.model.display_name.clone(),
             profile.transport.as_str(),
@@ -3571,14 +3570,14 @@ fn target_profile_supports_request(
     needs: &crate::types::CapabilityNeeds,
 ) -> bool {
     crate::adapters::resolve_execution_profile_for_target(
-                &target.provider,
-                &target.model,
-                Some(target.account.id.as_str()),
-            )
-        .map(|profile| {
-            !target.provider.strict() || profile_satisfies_needs(&profile.capabilities, needs)
-        })
-        .unwrap_or(false)
+        &target.provider,
+        &target.model,
+        Some(target.account.id.as_str()),
+    )
+    .map(|profile| {
+        !target.provider.strict() || profile_satisfies_needs(&profile.capabilities, needs)
+    })
+    .unwrap_or(false)
 }
 
 fn profile_satisfies_needs(
