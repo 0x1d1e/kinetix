@@ -65,7 +65,15 @@ impl QuotaSnapshot {
 pub struct QuotaHeaderObservation {
     pub remaining_fraction: f64,
     pub reset_at: Option<DateTime<Utc>>,
-    pub exhausted: bool,
+    /// Generic rate-limit buckets do not establish account-global exhaustion.
+    pub account_global_exhaustion: bool,
+}
+
+impl QuotaHeaderObservation {
+    pub fn retry_after_secs(self, now: DateTime<Utc>) -> Option<u64> {
+        let millis = (self.reset_at? - now).num_milliseconds();
+        (millis > 0).then(|| (millis as u64 + 999) / 1000)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -181,8 +189,8 @@ impl QuotaRegistry {
                 continue;
             };
             let reset_at = parse_reset_header(headers);
-            let (remaining_fraction, exhausted) = if remaining <= 0.0 {
-                (0.0, true)
+            let remaining_fraction = if remaining <= 0.0 {
+                0.0
             } else {
                 let Some(limit) = header_f64(headers, limit_name) else {
                     continue;
@@ -190,7 +198,7 @@ impl QuotaRegistry {
                 if limit <= 0.0 {
                     continue;
                 }
-                ((remaining / limit).clamp(0.0, 1.0), false)
+                (remaining / limit).clamp(0.0, 1.0)
             };
             self.observe(
                 provider_id,
@@ -203,7 +211,9 @@ impl QuotaRegistry {
             return Some(QuotaHeaderObservation {
                 remaining_fraction,
                 reset_at,
-                exhausted,
+                // These headers describe rate-limit buckets, which may be
+                // request-, model-, or period-scoped rather than account-wide.
+                account_global_exhaustion: false,
             });
         }
         None
@@ -280,16 +290,85 @@ fn parse_reset_header(headers: &HeaderMap) -> Option<DateTime<Utc>> {
         let Some(raw) = headers.get(name).and_then(|value| value.to_str().ok()) else {
             continue;
         };
+        let raw = raw.trim();
         if let Ok(value) = DateTime::parse_from_rfc3339(raw) {
             return Some(value.with_timezone(&Utc));
         }
-        if let Ok(epoch) = raw.trim().parse::<i64>() {
-            if let Some(value) = DateTime::from_timestamp(epoch, 0) {
-                return Some(value);
+        if let Ok(value) = raw.parse::<f64>() {
+            if value.is_finite()
+                && value >= 0.0
+                && value >= 1_000_000_000_000.0
+                && value <= i64::MAX as f64
+            {
+                return DateTime::from_timestamp_millis(value as i64);
+            }
+            if value.is_finite() && value >= 1_000_000_000.0 && value <= i64::MAX as f64 {
+                return DateTime::from_timestamp(value as i64, 0);
+            }
+            if let Some(reset_at) = reset_after_seconds(value) {
+                return Some(reset_at);
+            }
+        } else if let Some(seconds) = parse_reset_duration_secs(raw) {
+            if let Some(reset_at) = reset_after_seconds(seconds) {
+                return Some(reset_at);
             }
         }
     }
     None
+}
+
+fn reset_after_seconds(seconds: f64) -> Option<DateTime<Utc>> {
+    let millis = seconds * 1000.0;
+    (seconds.is_finite() && seconds >= 0.0 && millis <= i64::MAX as f64).then(|| {
+        Utc::now().checked_add_signed(chrono::Duration::milliseconds(millis.round() as i64))
+    })?
+}
+
+/// Parse provider countdowns such as `60s`, `500ms`, and `2m59.56s`.
+fn parse_reset_duration_secs(raw: &str) -> Option<f64> {
+    let value = raw.trim().to_ascii_lowercase();
+    let bytes = value.as_bytes();
+    let (mut index, mut total, mut parts) = (0, 0.0, 0);
+    while index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index == bytes.len() {
+            break;
+        }
+        let start = index;
+        let mut decimal = false;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'0'..=b'9' => index += 1,
+                b'.' if !decimal => {
+                    decimal = true;
+                    index += 1;
+                }
+                _ => break,
+            }
+        }
+        let amount = value[start..index].parse::<f64>().ok()?;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let (unit, multiplier) = if value[index..].starts_with("ms") {
+            (2, 0.001)
+        } else {
+            match bytes.get(index).copied()? {
+                b's' => (1, 1.0),
+                b'm' => (1, 60.0),
+                _ => return None,
+            }
+        };
+        total += amount * multiplier;
+        if !total.is_finite() {
+            return None;
+        }
+        index += unit;
+        parts += 1;
+    }
+    (parts > 0).then_some(total)
 }
 
 #[cfg(test)]
@@ -385,18 +464,97 @@ mod tests {
     }
 
     #[test]
-    fn zero_remaining_header_is_reported_as_hard_exhaustion() {
+    fn successful_zero_remaining_rate_limit_header_is_not_account_exhaustion() {
         let registry = QuotaRegistry::default();
         let mut headers = HeaderMap::new();
-        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-remaining-requests", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset-requests", "2m59.56s".parse().unwrap());
 
         let observation = registry.observe_headers("p", "a", &headers).unwrap();
-        assert!(observation.exhausted);
+        assert!(!observation.account_global_exhaustion);
         assert_eq!(observation.remaining_fraction, 0.0);
+        let reset_in_ms = (observation.reset_at.unwrap() - Utc::now()).num_milliseconds();
+        assert!((179_000..=179_560).contains(&reset_in_ms));
         assert_eq!(
             registry.snapshot("p", "a").unwrap().remaining_fraction,
             Some(0.0)
         );
+    }
+
+    #[test]
+    fn generic_zero_remaining_without_reset_is_not_account_exhaustion() {
+        let registry = QuotaRegistry::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("ratelimit-remaining", "0".parse().unwrap());
+
+        let observation = registry.observe_headers("p", "a", &headers).unwrap();
+        assert!(!observation.account_global_exhaustion);
+        assert_eq!(observation.remaining_fraction, 0.0);
+        assert_eq!(observation.reset_at, None);
+    }
+
+    #[test]
+    fn throttled_zero_remaining_header_parses_short_duration_reset() {
+        let registry = QuotaRegistry::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining-requests", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset-requests", "60s".parse().unwrap());
+
+        let observation = registry.observe_headers("p", "a", &headers).unwrap();
+        assert!(!observation.account_global_exhaustion);
+        let reset_in_secs = (observation.reset_at.unwrap() - Utc::now()).num_seconds();
+        assert!((55..=60).contains(&reset_in_secs));
+    }
+
+    #[test]
+    fn reset_duration_parser_handles_fractional_compound_and_millisecond_values() {
+        for (raw, expected_secs) in [
+            ("1s", 1.0),
+            ("500ms", 0.5),
+            ("1m30s", 90.0),
+            ("2m59.56s", 179.56),
+        ] {
+            assert_eq!(parse_reset_duration_secs(raw), Some(expected_secs), "{raw}");
+        }
+        assert_eq!(parse_reset_duration_secs("1m30s "), Some(90.0));
+    }
+
+    #[test]
+    fn reset_header_supports_numeric_seconds_and_absolute_timestamps() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-reset-requests", "60".parse().unwrap());
+        let relative = parse_reset_header(&headers).unwrap();
+        assert!((55..=60).contains(&(relative - Utc::now()).num_seconds()));
+
+        for (raw, expected) in [
+            (
+                "1800000000",
+                DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+            ),
+            (
+                "1800000000000",
+                DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+            ),
+            (
+                "2030-01-01T00:00:00Z",
+                DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+        ] {
+            headers.insert("x-ratelimit-reset-requests", raw.parse().unwrap());
+            assert_eq!(parse_reset_header(&headers), Some(expected), "{raw}");
+        }
+    }
+
+    #[test]
+    fn explicit_account_quota_exhaustion_remains_distinct_from_headers() {
+        let registry = QuotaRegistry::default();
+        registry.observe_exhausted("p", "a", None, "upstream_error");
+
+        let snapshot = registry.snapshot("p", "a").unwrap();
+        assert_eq!(snapshot.remaining_fraction, Some(0.0));
+        assert_eq!(snapshot.source, "upstream_error");
     }
 
     #[test]

@@ -405,6 +405,7 @@ struct Attempt {
     /// validation. This is a per-gap timer, never a total stream lifetime.
     idle_timeout: Duration,
     adapter: Arc<dyn Adapter>,
+    is_sse: bool,
     /// Same-format passthrough is only possible when the upstream is actually
     /// SSE. A JSON response is normalized through parse_full_response().
     passthrough: bool,
@@ -958,47 +959,18 @@ pub async fn run(
             continue;
         }
 
-        // Provider-wide transient outage gate. It is checked before credential
-        // resolution so an open provider does not churn sibling credentials.
+        // Check provider eligibility before credential work, but do not reserve
+        // the exclusive HALF_OPEN network probe until immediately before dispatch.
+        if let Err(reject) = state.provider_circuits.check_available(&target.provider.id) {
+            last_error = Some(record_provider_circuit_reject(
+                state, target, &mut meta, &mut trace, reject,
+            ));
+            continue;
+        }
         let correlation_policy = if target.provider.credential_mode == "none" {
             crate::provider_circuit::ProviderCorrelationPolicy::AccountlessTargets
         } else {
             crate::provider_circuit::ProviderCorrelationPolicy::DistinctAccounts
-        };
-        let provider_attempt = match state.provider_circuits.begin_attempt_with_policy(
-            &target.provider.id,
-            &target.account.id,
-            target
-                .route_target_id
-                .as_deref()
-                .unwrap_or(target.model.id.as_str()),
-            correlation_policy,
-        ) {
-            Ok(attempt) => attempt,
-            Err(reject) => {
-                let detail = format!(
-                    "provider_circuit_open: retry in {}s",
-                    reject.retry_after_secs
-                );
-                trace.step("skip", Some(target.account.label.clone()), detail.clone());
-                meta.fallback_path
-                    .push(format!("{}:provider_circuit_open", target.account.label));
-                state.record_skip();
-                state
-                    .target_telemetry
-                    .record(crate::target_telemetry::TelemetryEvent::synthetic(
-                        traffic_key(target),
-                        crate::target_telemetry::TelemetryOutcome::ProviderCircuitReject,
-                    ));
-                last_error = Some(ProxyError::all_unavailable(
-                    format!(
-                        "provider '{}' temporarily unavailable",
-                        target.provider.name
-                    ),
-                    Some(reject.retry_after_secs),
-                ));
-                continue;
-            }
         };
 
         // Credential. A provider bound to a plugin credential strategy
@@ -1280,6 +1252,37 @@ pub async fn run(
             None
         };
 
+        // Kinetix-attributable dispatch overhead (auth, limits, routing,
+        // predicates, body build) — recorded for the p95 added-latency alert
+        // (Monitoring). Excludes upstream network time.
+        crate::alerts::record_added_latency(started.elapsed().as_millis() as u64);
+
+        let provider_timeout = provider_phase_timeout(&target.provider);
+        let Some((phase_deadline, send_budget)) = phase_budget(deadline, provider_timeout) else {
+            trace.step("skip", None, "pre-commit deadline exceeded");
+            break;
+        };
+
+        // Reserve HALF_OPEN exclusively only after all local validation,
+        // credential resolution, adaptive admission, and deadline checks pass.
+        let provider_attempt = match state.provider_circuits.begin_attempt_with_policy(
+            &target.provider.id,
+            &target.account.id,
+            target
+                .route_target_id
+                .as_deref()
+                .unwrap_or(target.model.id.as_str()),
+            correlation_policy,
+        ) {
+            Ok(attempt) => attempt,
+            Err(reject) => {
+                last_error = Some(record_provider_circuit_reject(
+                    state, target, &mut meta, &mut trace, reject,
+                ));
+                continue;
+            }
+        };
+
         let attempt_started = Instant::now();
         attempts_done += 1;
         previous_provider_id = Some(target.provider.id.clone());
@@ -1309,16 +1312,6 @@ pub async fn run(
             let _ = db::touch_probe_at(&state.pool, &target.account.id).await;
         }
 
-        // Kinetix-attributable dispatch overhead (auth, limits, routing,
-        // predicates, body build) — recorded for the p95 added-latency alert
-        // (Monitoring). Excludes upstream network time.
-        crate::alerts::record_added_latency(started.elapsed().as_millis() as u64);
-
-        let provider_timeout = provider_phase_timeout(&target.provider);
-        let Some((phase_deadline, send_budget)) = phase_budget(deadline, provider_timeout) else {
-            trace.step("skip", None, "pre-commit deadline exceeded");
-            break;
-        };
         let send_result = match tokio::time::timeout(
             send_budget,
             send_upstream(
@@ -1341,22 +1334,23 @@ pub async fn run(
 
         match send_result {
             Ok(resp) => {
-                if let Some(quota) = state.quota.observe_headers(
+                let quota_observation = state.quota.observe_headers(
                     &target.provider.id,
                     &target.account.id,
                     resp.headers(),
-                ) {
-                    if quota.exhausted {
-                        let _ = pool::mark_exhausted(
-                            &state.pool,
-                            &target.account.id,
-                            quota.reset_at,
-                            default_quota_window(&target.account),
-                            "upstream response headers reported zero remaining quota",
-                        )
-                        .await;
-                        let _ = state.registry.reload(&state.pool).await;
-                    }
+                );
+                if let Some(quota) =
+                    quota_observation.filter(|observation| observation.account_global_exhaustion)
+                {
+                    let _ = pool::mark_exhausted(
+                        &state.pool,
+                        &target.account.id,
+                        quota.reset_at,
+                        default_quota_window(&target.account),
+                        "upstream response headers established account-global quota exhaustion",
+                    )
+                    .await;
+                    let _ = state.registry.reload(&state.pool).await;
                 }
                 if resp.status().is_success() {
                     let upstream_request_id = extract_upstream_request_id(&resp);
@@ -1489,6 +1483,7 @@ pub async fn run(
                         precommit_usage: prepared.precommit_usage,
                         idle_timeout: provider_timeout,
                         adapter: adapter.clone(),
+                        is_sse: prepared.is_sse,
                         passthrough: use_passthrough && prepared.is_sse,
                         traffic_permit,
                         provider_attempt,
@@ -1538,6 +1533,7 @@ pub async fn run(
                         }
                     }
                 };
+                let failure = apply_header_reset_to_rate_limit(failure, quota_observation);
                 if let Some(permit) = traffic_permit.as_ref() {
                     permit.finish(traffic_outcome_for_failure(failure.kind));
                 }
@@ -2734,6 +2730,17 @@ fn preserve_anthropic_error(
     error
 }
 
+fn apply_header_reset_to_rate_limit(
+    mut failure: UpstreamFailure,
+    quota: Option<crate::quota::QuotaHeaderObservation>,
+) -> UpstreamFailure {
+    if failure.kind == FailureKind::RateLimit && failure.retry_after_secs.is_none() {
+        failure.retry_after_secs =
+            quota.and_then(|observation| observation.retry_after_secs(chrono::Utc::now()));
+    }
+    failure
+}
+
 fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> ProxyError {
     match failure.kind {
         FailureKind::RateLimit | FailureKind::QuotaExhausted => {
@@ -2756,6 +2763,36 @@ fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> Proxy
             ProxyError::upstream(failure.message.clone())
         }
     }
+}
+
+fn record_provider_circuit_reject(
+    state: &AppState,
+    target: &ResolvedTarget,
+    meta: &mut RequestMeta,
+    trace: &mut RouteTrace,
+    reject: crate::provider_circuit::ProviderCircuitReject,
+) -> ProxyError {
+    let detail = format!(
+        "provider_circuit_open: retry in {}s",
+        reject.retry_after_secs
+    );
+    trace.step("skip", Some(target.account.label.clone()), detail);
+    meta.fallback_path
+        .push(format!("{}:provider_circuit_open", target.account.label));
+    state.record_skip();
+    state
+        .target_telemetry
+        .record(crate::target_telemetry::TelemetryEvent::synthetic(
+            traffic_key(target),
+            crate::target_telemetry::TelemetryOutcome::ProviderCircuitReject,
+        ));
+    ProxyError::all_unavailable(
+        format!(
+            "provider '{}' temporarily unavailable",
+            target.provider.name
+        ),
+        Some(reject.retry_after_secs),
+    )
 }
 
 fn account_skip_detail(target: &ResolvedTarget, status: pool::AccountStatus) -> String {
@@ -3913,12 +3950,14 @@ async fn emit_translated_events(
     meta: &RequestMeta,
     started: Instant,
     usage: &mut TokenUsage,
+    measure_ttft: bool,
     ttft_ms: &mut Option<i64>,
     committed: &mut bool,
     trace: &mut RouteTrace,
     saw_reasoning: &mut bool,
     saw_tool: &mut bool,
 ) -> bool {
+    let mut streaming_marked = false;
     for ev in events {
         if let StreamEvent::Usage(u) = &ev {
             usage.merge(u);
@@ -3945,16 +3984,21 @@ async fn emit_translated_events(
             _ => {}
         }
         let frames = encoder.encode(ev);
-        if ttft_ms.is_none() && !frames.is_empty() {
-            *ttft_ms = Some(started.elapsed().as_millis() as i64);
-            state.live.set_ttft(&meta.request_id, ttft_ms.unwrap());
-            state.live.mark_streaming(&meta.request_id);
-            state.flight.record(
-                &meta.request_id,
-                started.elapsed().as_millis() as u64,
-                "upstream_first_frame",
-                "first upstream model event",
-            );
+        if !frames.is_empty() {
+            if measure_ttft && ttft_ms.is_none() {
+                *ttft_ms = Some(started.elapsed().as_millis() as i64);
+                state.live.set_ttft(&meta.request_id, ttft_ms.unwrap());
+                state.live.mark_streaming(&meta.request_id);
+                state.flight.record(
+                    &meta.request_id,
+                    started.elapsed().as_millis() as u64,
+                    "upstream_first_frame",
+                    "first upstream model event",
+                );
+            } else if !measure_ttft && !streaming_marked {
+                state.live.mark_streaming(&meta.request_id);
+                streaming_marked = true;
+            }
         }
         for frame in frames {
             if !*committed {
@@ -4025,6 +4069,7 @@ async fn drive_stream(
             &meta,
             started,
             &mut usage,
+            attempt.is_sse,
             &mut ttft_ms,
             &mut committed,
             &mut trace,
@@ -4170,6 +4215,7 @@ async fn drive_stream(
                                 &meta,
                                 started,
                                 &mut usage,
+                                attempt.is_sse,
                                 &mut ttft_ms,
                                 &mut committed,
                                 &mut trace,
@@ -4774,6 +4820,18 @@ async fn drive_aggregate(
     }
 }
 
+fn persisted_ttft_ms(is_sse: bool, ttft_ms: Option<i64>) -> Option<i64> {
+    is_sse.then_some(ttft_ms).flatten()
+}
+
+fn persisted_request_timing(
+    duration_ms: i64,
+    is_sse: bool,
+    ttft_ms: Option<i64>,
+) -> (i64, Option<i64>) {
+    (duration_ms, persisted_ttft_ms(is_sse, ttft_ms))
+}
+
 /// Compute cost and enqueue the usage row (never blocks the request path),
 /// persist the Route Trace, and record the flight-recorder terminal event.
 #[allow(clippy::too_many_arguments)]
@@ -4835,7 +4893,7 @@ async fn finalize_log(
         .attempt_started
         .saturating_duration_since(started)
         .as_millis() as i64;
-    let target_ttft_ms = ttft_ms
+    let target_ttft_ms = persisted_ttft_ms(attempt.is_sse, ttft_ms)
         .and_then(|value| value.checked_sub(attempt_offset_ms))
         .map(|value| value.max(0) as u64);
     record_target_telemetry(
@@ -4898,6 +4956,11 @@ async fn finalize_log(
         _ => "failed",
     });
 
+    let (latency_ms, ttft_ms) = persisted_request_timing(
+        started.elapsed().as_millis() as i64,
+        attempt.is_sse,
+        ttft_ms,
+    );
     let row = UsageLogRow {
         id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
         request_id: meta.request_id.clone(),
@@ -4913,7 +4976,7 @@ async fn finalize_log(
         fallback_path: serde_json::to_string(&meta.fallback_path).unwrap_or_else(|_| "[]".into()),
         status: status.to_string(),
         status_code,
-        latency_ms: Some(started.elapsed().as_millis() as i64),
+        latency_ms: Some(latency_ms),
         ttft_ms,
         input_tokens: usage.input.map(|v| v as i64),
         output_tokens: usage.output.map(|v| v as i64),
@@ -5282,6 +5345,64 @@ pub async fn dry_run(
 #[cfg(test)]
 mod route_policy_tests {
     use super::*;
+
+    #[test]
+    fn generic_rate_limit_reset_sets_cooldown_without_account_exhaustion() {
+        let observation = crate::quota::QuotaHeaderObservation {
+            remaining_fraction: 0.0,
+            reset_at: Some(chrono::Utc::now() + chrono::Duration::seconds(60)),
+            account_global_exhaustion: false,
+        };
+        let failure = apply_header_reset_to_rate_limit(
+            UpstreamFailure {
+                kind: FailureKind::RateLimit,
+                status: Some(429),
+                retry_after_secs: None,
+                message: "rate limit".into(),
+                quota_reset_at: None,
+            },
+            Some(observation),
+        );
+
+        assert_eq!(failure.kind, FailureKind::RateLimit);
+        assert!((59..=60).contains(&failure.retry_after_secs.unwrap()));
+    }
+
+    #[test]
+    fn generic_reset_does_not_downgrade_explicit_account_quota_exhaustion() {
+        let observation = crate::quota::QuotaHeaderObservation {
+            remaining_fraction: 0.0,
+            reset_at: Some(chrono::Utc::now() + chrono::Duration::seconds(60)),
+            account_global_exhaustion: false,
+        };
+        let failure = apply_header_reset_to_rate_limit(
+            UpstreamFailure {
+                kind: FailureKind::QuotaExhausted,
+                status: Some(429),
+                retry_after_secs: None,
+                message: "account quota exhausted".into(),
+                quota_reset_at: None,
+            },
+            Some(observation),
+        );
+
+        assert_eq!(failure.kind, FailureKind::QuotaExhausted);
+        assert_eq!(failure.retry_after_secs, None);
+    }
+
+    #[test]
+    fn persisted_timing_keeps_json_duration_separate_from_streaming_ttft() {
+        assert_eq!(
+            persisted_request_timing(30_000, false, Some(30_000)),
+            (30_000, None),
+            "a full JSON response keeps its duration but has no TTFT",
+        );
+        assert_eq!(
+            persisted_request_timing(20_000, true, Some(300)),
+            (20_000, Some(300)),
+            "streaming keeps first-event TTFT distinct from total duration",
+        );
+    }
 
     #[test]
     fn provider_circuit_open_transition_is_added_to_route_trace() {

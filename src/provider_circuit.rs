@@ -219,6 +219,35 @@ impl ProviderCircuits {
             .clone()
     }
 
+    /// Check whether a provider may be attempted without reserving the
+    /// exclusive HALF_OPEN network-probe lease. Call `begin_attempt` only
+    /// immediately before dispatch, after target-local work has succeeded.
+    pub fn check_available(&self, provider_id: &str) -> Result<(), ProviderCircuitReject> {
+        let circuit = self.circuit(provider_id);
+        let now = Utc::now();
+        let mut state = circuit.lock();
+        state.purge_old(now);
+
+        let retry_after_secs = match state.state {
+            ProviderCircuitState::Closed => None,
+            ProviderCircuitState::Open => state.retry_at.and_then(|retry_at| {
+                (retry_at > now).then(|| (retry_at - now).num_seconds().max(1) as u64)
+            }),
+            ProviderCircuitState::HalfOpen if state.half_open_inflight > 0 => Some(1),
+            ProviderCircuitState::HalfOpen => None,
+        };
+        if let Some(retry_after_secs) = retry_after_secs {
+            state.rejects = state.rejects.saturating_add(1);
+            let snapshot = state.snapshot(provider_id, now);
+            return Err(ProviderCircuitReject {
+                retry_after_secs,
+                snapshot,
+            });
+        }
+
+        Ok(())
+    }
+
     pub fn begin_attempt(
         &self,
         provider_id: &str,
@@ -756,6 +785,34 @@ mod tests {
             assert!(retry.finish_success().recovered, "kind={kind:?}");
             assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Closed);
         }
+    }
+
+    #[test]
+    fn eligibility_checks_do_not_reserve_expired_half_open_probes() {
+        let circuits = ProviderCircuits::default();
+        circuits
+            .begin_attempt("p", "a", "route-a")
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+        circuits
+            .begin_attempt("p", "b", "route-b")
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+        {
+            let circuit = circuits.circuit("p");
+            let mut state = circuit.lock();
+            state.retry_at = Some(Utc::now() - ChronoDuration::seconds(1));
+        }
+
+        circuits.check_available("p").unwrap();
+        // A candidate can pass this gate and fail local validation without
+        // consuming the network-probe lease.
+        circuits.check_available("p").unwrap();
+        assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Open);
+
+        let probe = circuits.begin_attempt("p", "c", "route-c").unwrap();
+        assert!(probe.is_half_open_probe());
+        assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::HalfOpen);
     }
 
     #[test]

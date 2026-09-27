@@ -25,9 +25,11 @@ quota observations.
 
 Telemetry keeps separate counters for rate limits, quota exhaustion, server
 errors, connection errors, timeouts, authentication errors, target errors, and
-bad requests. A quota observation becomes stale and neutral to adaptive routing
-when its reset time passes. A response header explicitly reporting zero
-remaining marks the account exhausted through the pool-health path.
+bad requests. Rate-limit headers provide bucket headroom and reset evidence for
+adaptive routing; generic zero-remaining headers do not exhaust the whole
+account. Account exhaustion requires an explicit account-global quota signal.
+Quota resets accept countdowns such as `2m59.56s`, numeric seconds or Unix
+timestamps, and RFC3339 timestamps. Expired observations are neutral to routing.
 
 ## Metrics
 
