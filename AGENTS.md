@@ -80,3 +80,13 @@ Release builds and real-client/provider acceptance are release activities, not r
 - Kinetix diagnostic response headers use `X-Kinetix-`.
 - Use current domain terms: Provider, Account, Model, Route, Target, credential enrollment.
 - Use Conventional Commits.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in this repo's GitHub Issues; use `gh`. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context layout: root `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
