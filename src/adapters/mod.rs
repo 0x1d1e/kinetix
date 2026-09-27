@@ -250,8 +250,7 @@ pub fn resolve_execution_profile_for_target(
     }
 
     let reasoning_ownership = discovery.get("operator_reasoning_overrides");
-    let operator_reasoning_overrides =
-        reasoning_ownership.and_then(serde_json::Value::as_object);
+    let operator_reasoning_overrides = reasoning_ownership.and_then(serde_json::Value::as_object);
     let owned_reasoning_capability =
         operator_reasoning_overrides.and_then(|overrides| overrides.get("reasoning_capability"));
     let reasoning_capability_owned = owned_reasoning_capability.is_some();
@@ -2687,5 +2686,4 @@ mod execution_profile_tests {
         assert!(reasoning.levels.iter().any(|level| level == "high"));
         assert!(profile.thinking_map.level_is_executable("high"));
     }
-
 }
