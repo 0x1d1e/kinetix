@@ -4,9 +4,6 @@ name: ci
 # scripts/run-ci.sh. Trigger this workflow manually from the Actions tab
 # (or `gh workflow run ci.yml`) if needed.
 on:
-  push:
-    branches:
-      - feat/model-maintenance-reconciliation-probes-pricing
   workflow_dispatch:
 
 env:
