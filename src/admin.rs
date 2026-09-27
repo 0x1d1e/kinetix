@@ -2914,8 +2914,9 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
     // plugin instead of the built-in adapter. A bound-but-unavailable plugin
     // fails closed rather than silently falling back to native discovery
     // (§6.0).
-    let (mut discovered, models_dev_available): (Vec<DiscoveredObservation>, bool) =
-        if let Some(pref) = provider.model_source_plugin_ref() {
+    let (mut discovered, models_dev_available) = if let Some(pref) =
+        provider.model_source_plugin_ref()
+    {
         let manager = plugin_manager(&state)?;
         let reference = format!("plugin:{}/{}", pref.plugin_id, pref.capability);
         let account_aware = manager
@@ -5203,8 +5204,7 @@ mod model_lifecycle_regression_tests {
         let pool = db::connect(&url).await.unwrap();
         db::migrate(&pool).await.unwrap();
 
-        let mut key =
-            lifecycle_setting_key("reconciliation", "last_attempt", "provider-jitter");
+        let mut key = lifecycle_setting_key("reconciliation", "last_attempt", "provider-jitter");
         while stable_schedule_jitter(&key, 300) == 0 {
             key.push('x');
         }
