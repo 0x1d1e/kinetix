@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Server, Plus, RefreshCw, CheckCircle2, Globe, Cpu, Sliders, ExternalLink, HelpCircle, Trash2, X, Pencil, Search } from 'lucide-react';
-import { Provider, ModelConfig } from '../../types';
+import { Provider, ModelConfig, Account } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { DESIGN_TOKENS } from '../../lib/designSystem';
 import { Kinetix, DiscoveredModel, ProviderLifecycleStatus } from '../../lib/resources';
@@ -69,10 +69,48 @@ const modelPricingSource = (model: ModelConfig) =>
     effective_pricing?: { source?: string | null; updated_at?: string | null } | null;
   } | undefined)?.effective_pricing?.source || 'untracked';
 
+type ProbeEvidenceEntry = {
+  status?: string;
+  verified_at?: string;
+  fresh_until?: string;
+  scope?: {
+    provider_id?: string;
+    account_id?: string;
+    model_id?: string;
+    transport?: string;
+  };
+};
+
 const modelProbeEvidence = (model: ModelConfig) =>
   (model.discovery as {
-    probe_evidence?: Record<string, { status?: string; verified_at?: string; fresh_until?: string }> | null;
+    probe_evidence?: Record<string, ProbeEvidenceEntry | ProbeEvidenceEntry[]> | null;
   } | undefined)?.probe_evidence || {};
+
+const probeEvidenceEntries = (model: ModelConfig, key: string): ProbeEvidenceEntry[] => {
+  const evidence = modelProbeEvidence(model)[key];
+  if (!evidence) return [];
+  return Array.isArray(evidence) ? evidence : [evidence];
+};
+
+const probeEvidenceSummary = (model: ModelConfig, key: string, accountId: string) => {
+  const entries = probeEvidenceEntries(model, key).filter(
+    (entry) => !accountId || entry.scope?.account_id === accountId,
+  );
+  if (!entries.length) return '—';
+  return entries
+    .map((entry) => `${entry.scope?.transport || 'unknown'}:${entry.status || '—'}`)
+    .join('/');
+};
+
+const modelProbeTransport = (model: ModelConfig, provider: Provider) => {
+  const discovery = model.discovery as {
+    transport?: { format?: string } | null;
+  } | undefined;
+  if (model.transportOverride) return model.transportOverride;
+  if (discovery?.transport?.format) return discovery.transport.format;
+  if (provider.wireFormat === 'plugin') return provider.wirePlugin || 'plugin';
+  return provider.wireFormat;
+};
 
 const modelReasoningLevels = (model: ModelConfig) => {
   const discovery = model.discovery as {
@@ -143,11 +181,19 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [savingLifecycleSettings, setSavingLifecycleSettings] = useState(false);
   const [providerLifecycle, setProviderLifecycle] = useState<ProviderLifecycleStatus | null>(null);
   const [reconciliationSelections, setReconciliationSelections] = useState<Record<string, string[]>>({});
+  const [probeAccounts, setProbeAccounts] = useState<Account[]>([]);
+  const [probeAccountByProvider, setProbeAccountByProvider] = useState<Record<string, string>>({});
 
   useEffect(() => {
     Kinetix.modelLifecycleSettings()
       .then(setLifecycleSettings)
       .catch(() => setLifecycleSettings(null));
+  }, []);
+
+  useEffect(() => {
+    Kinetix.accounts()
+      .then(setProbeAccounts)
+      .catch(() => setProbeAccounts([]));
   }, []);
 
 
@@ -230,6 +276,18 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     filteredProviders.find((p) => p.id === selectedProviderId) ||
     filteredProviders[0];
   const providerModels = models.filter((m) => m.providerId === activeProvider?.id);
+  const probeAccountsForProvider = (providerId: string) =>
+    probeAccounts.filter((account) => account.providerId === providerId);
+  const selectedProbeAccountId = (providerId: string) => {
+    const accounts = probeAccountsForProvider(providerId);
+    const selected = probeAccountByProvider[providerId];
+    if (selected && accounts.some((account) => account.id === selected)) return selected;
+    return accounts.find((account) => account.status === 'healthy')?.id || accounts[0]?.id || '';
+  };
+  const selectedProbeAccount = (providerId: string) => {
+    const accountId = selectedProbeAccountId(providerId);
+    return probeAccounts.find((account) => account.id === accountId);
+  };
 
   useEffect(() => {
     if (!activeProvider) {
@@ -342,14 +400,19 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   };
 
   const handleProbeModel = async (
-    modelId: string,
+    model: ModelConfig,
     capability: 'transport' | 'reasoning' | 'reasoning_disable' | 'tool_calling' | 'structured_output',
     value?: string,
   ) => {
-    const key = `${modelId}:${capability}${value ? `:${value}` : ''}`;
+    const key = `${model.id}:${capability}${value ? `:${value}` : ''}`;
+    const accountId = selectedProbeAccountId(model.providerId);
+    if (!accountId) {
+      setProbeStatus((prev) => ({ ...prev, [key]: 'select an account' }));
+      return;
+    }
     setLifecycleBusy(`probe:${key}`);
     try {
-      const result = await Kinetix.probeModel(modelId, capability, value);
+      const result = await Kinetix.probeModel(model.id, capability, value, undefined, accountId);
       setProbeStatus((prev) => ({ ...prev, [key]: result.status }));
       onRefresh?.();
     } catch (error) {
@@ -1506,15 +1569,45 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                             <div>
                               <strong className="font-heading text-sm">Verified capability probes</strong>
                               <span className="ml-2 text-[var(--ink)]/60">
-                                transport {modelProbeEvidence(m).transport?.status || '—'} ·
+                                transport {probeEvidenceSummary(m, 'transport', selectedProbeAccountId(m.providerId))} ·
                                 reasoning efforts {
-                                  Object.entries(modelProbeEvidence(m))
-                                    .filter(([key]) => key.startsWith('reasoning_effort_'))
-                                    .map(([key, evidence]) => `${key.replace('reasoning_effort_', '')}:${evidence.status || '—'}`)
+                                  Object.keys(modelProbeEvidence(m))
+                                    .filter((key) => key.startsWith('reasoning_effort_'))
+                                    .map((key) =>
+                                      `${key.replace('reasoning_effort_', '')}:${probeEvidenceSummary(
+                                        m,
+                                        key,
+                                        selectedProbeAccountId(m.providerId),
+                                      )}`,
+                                    )
                                     .join(', ') || '—'
                                 } ·
-                                tools {modelProbeEvidence(m).tool_calling?.status || '—'} ·
-                                structured {modelProbeEvidence(m).structured_output?.status || '—'}
+                                tools {probeEvidenceSummary(m, 'tool_calling', selectedProbeAccountId(m.providerId))} ·
+                                structured {probeEvidenceSummary(m, 'structured_output', selectedProbeAccountId(m.providerId))}
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2 text-[var(--ink)]/70">
+                              <label className="flex items-center gap-1">
+                                Probe account
+                                <select
+                                  value={selectedProbeAccountId(m.providerId)}
+                                  onChange={(event) =>
+                                    setProbeAccountByProvider((current) => ({
+                                      ...current,
+                                      [m.providerId]: event.target.value,
+                                    }))
+                                  }
+                                  className="bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded"
+                                >
+                                  {probeAccountsForProvider(m.providerId).map((account) => (
+                                    <option key={account.id} value={account.id}>
+                                      {account.label} · {account.status}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                              <span>
+                                Target: {activeProvider.name} / {selectedProbeAccount(m.providerId)?.label || 'no account'} / {m.upstreamModelId} / {modelProbeTransport(m, activeProvider)}
                               </span>
                             </div>
                             <div className="flex flex-wrap gap-1">
@@ -1522,8 +1615,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                 <button
                                   key={capability}
                                   type="button"
-                                  disabled={lifecycleBusy === `probe:${m.id}:${capability}`}
-                                  onClick={() => handleProbeModel(m.id, capability)}
+                                  disabled={
+                                    lifecycleBusy === `probe:${m.id}:${capability}`
+                                    || !selectedProbeAccountId(m.providerId)
+                                  }
+                                  onClick={() => handleProbeModel(m, capability)}
                                   className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
                                 >
                                   Probe {capability.replace('_', ' ')}
@@ -1538,8 +1634,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                   <button
                                     key={key}
                                     type="button"
-                                    disabled={lifecycleBusy === `probe:${key}`}
-                                    onClick={() => handleProbeModel(m.id, 'reasoning', level)}
+                                    disabled={
+                                      lifecycleBusy === `probe:${key}`
+                                      || !selectedProbeAccountId(m.providerId)
+                                    }
+                                    onClick={() => handleProbeModel(m, 'reasoning', level)}
                                     className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
                                   >
                                     Probe reasoning {level}
@@ -1550,8 +1649,11 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                               {modelCanProbeReasoningDisable(m) && (
                                 <button
                                   type="button"
-                                  disabled={lifecycleBusy === `probe:${m.id}:reasoning_disable:off`}
-                                  onClick={() => handleProbeModel(m.id, 'reasoning_disable', 'off')}
+                                  disabled={
+                                    lifecycleBusy === `probe:${m.id}:reasoning_disable:off`
+                                    || !selectedProbeAccountId(m.providerId)
+                                  }
+                                  onClick={() => handleProbeModel(m, 'reasoning_disable', 'off')}
                                   className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
                                 >
                                   Probe reasoning off
