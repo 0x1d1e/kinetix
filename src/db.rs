@@ -2069,6 +2069,12 @@ mod price_version_identity_tests {
             "operator_accept",
             &json!({"accepted_from":"models.dev"}),
         ));
+        assert!(!price_provenance_matches(
+            "models.dev",
+            r#"{"reference":"old"}"#,
+            "models.dev",
+            &json!({"reference":"new"}),
+        ));
     }
 
     #[tokio::test]

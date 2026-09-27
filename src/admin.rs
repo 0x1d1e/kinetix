@@ -3066,6 +3066,15 @@ fn price_field_operator_owned(
         .is_none_or(|source| !is_automatic_price_source(source))
 }
 
+fn has_automatic_price_observation(observed: &Prices, discovery: &Value) -> bool {
+    observed.is_configured()
+        || PRICE_FIELDS.iter().any(|field| {
+            discovery
+                .pointer(&format!("/price_sources/{field}"))
+                .is_some_and(Value::is_null)
+        })
+}
+
 fn effective_price_source(fields: &serde_json::Map<String, Value>, prices: &Prices) -> String {
     let sources: std::collections::BTreeSet<&str> = PRICE_FIELDS
         .iter()
@@ -3620,12 +3629,7 @@ pub(crate) async fn sync_provider_pricing_id(
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
-        let has_authoritative_absence = PRICE_FIELDS.iter().any(|field| {
-            discovery
-                .pointer(&format!("/price_sources/{field}"))
-                .is_some_and(Value::is_null)
-        });
-        if !observed.is_configured() && !has_authoritative_absence {
+        if !has_automatic_price_observation(&observed, &discovery) {
             continue;
         }
 
@@ -4251,24 +4255,17 @@ mod model_lifecycle_regression_tests {
     #[test]
     fn authoritative_price_absence_clears_automatic_field() {
         let current = Prices {
-            input_per_1m: Some(1.0),
             output_per_1m: Some(5.0),
             ..Default::default()
         };
-        let observed = Prices {
-            input_per_1m: Some(1.0),
-            output_per_1m: None,
-            ..Default::default()
-        };
+        let observed = Prices::default();
         let discovery = json!({
             "price_sources": {
-                "input_per_1m": "models.dev:provider",
                 "output_per_1m": null
             },
             "effective_pricing": {
                 "source": "models.dev:provider",
                 "fields": {
-                    "input_per_1m": {"source": "models.dev:provider", "metadata": {}},
                     "output_per_1m": {"source": "models.dev:provider", "metadata": {}}
                 }
             },
@@ -4281,13 +4278,43 @@ mod model_lifecycle_regression_tests {
             }
         });
 
+        assert!(has_automatic_price_observation(&observed, &discovery));
         let (effective, fields, preserved_manual) =
             merge_automatic_price_observation(&current, &observed, &discovery);
 
-        assert_eq!(effective.input_per_1m, Some(1.0));
         assert_eq!(effective.output_per_1m, None);
         assert!(!preserved_manual);
         assert!(!fields.contains_key("output_per_1m"));
+    }
+
+    #[test]
+    fn authoritative_price_absence_preserves_operator_field() {
+        let current = Prices {
+            output_per_1m: Some(7.0),
+            ..Default::default()
+        };
+        let observed = Prices::default();
+        let discovery = json!({
+            "price_sources": {
+                "output_per_1m": null
+            },
+            "effective_pricing": {
+                "source": "operator",
+                "fields": {
+                    "output_per_1m": {
+                        "source": "operator",
+                        "metadata": {"configured_by": "admin"}
+                    }
+                }
+            }
+        });
+
+        let (effective, fields, preserved_manual) =
+            merge_automatic_price_observation(&current, &observed, &discovery);
+
+        assert_eq!(effective.output_per_1m, Some(7.0));
+        assert!(preserved_manual);
+        assert_eq!(fields["output_per_1m"]["source"], "operator");
     }
 
     #[test]
@@ -4435,30 +4462,20 @@ mod model_lifecycle_regression_tests {
 
     #[tokio::test]
     async fn provider_lifecycle_lock_serializes_operator_mutations() {
-        let provider_id = format!(
-            "provider-lock-{}",
-            uuid::Uuid::new_v4().simple()
-        );
+        let provider_id = format!("provider-lock-{}", uuid::Uuid::new_v4().simple());
         let automatic = model_reconciliation_lock(&provider_id);
         let automatic_guard = automatic.lock().await;
         let operator = model_reconciliation_lock(&provider_id);
 
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                operator.lock(),
-            )
-            .await
-            .is_err()
-        );
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(10), operator.lock()).await;
+        assert!(blocked.is_err());
 
         drop(automatic_guard);
-        let operator_guard = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            operator.lock(),
-        )
-        .await
-        .expect("operator mutation should proceed after lifecycle work releases the lock");
+        let operator_guard =
+            tokio::time::timeout(std::time::Duration::from_millis(100), operator.lock())
+                .await
+                .expect("operator mutation should proceed after lifecycle work releases the lock");
         drop(operator_guard);
         model_reconciliation_locks().remove(&provider_id);
     }
