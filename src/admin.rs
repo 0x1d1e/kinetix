@@ -3436,14 +3436,16 @@ fn price_field_operator_owned(
     current: &Prices,
     field: &str,
 ) -> bool {
-    if price_field(current, field).is_none() {
-        return false;
-    }
-    fields
+    if let Some(source) = fields
         .get(field)
         .and_then(|value| value.get("source"))
         .and_then(Value::as_str)
-        .is_none_or(|source| !is_automatic_price_source(source))
+    {
+        return !is_automatic_price_source(source);
+    }
+    // Legacy configured prices predate per-field provenance and are operator
+    // owned. An absent value without provenance remains probe/sync-refinable.
+    price_field(current, field).is_some()
 }
 
 fn has_automatic_price_observation(observed: &Prices, discovery: &Value) -> bool {
@@ -3574,13 +3576,16 @@ fn merge_selected_capability_overrides(
     capabilities: &Value,
     selected: &[String],
 ) -> serde_json::Map<String, Value> {
-    let mut overrides = discovery
-        .get("operator_capability_overrides")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
     let Some(configured) = capabilities.as_object() else {
-        return overrides;
+        return serde_json::Map::new();
+    };
+    let mut overrides = match discovery.get("operator_capability_overrides") {
+        Some(value) => value.as_object().cloned().unwrap_or_default(),
+        None => {
+            // Materializing ownership for a legacy model must not silently
+            // demote its other configured capabilities to probe-refinable.
+            configured.clone()
+        }
     };
     for field in selected {
         let Some(key) = field.strip_prefix("capabilities.") else {
@@ -3591,6 +3596,37 @@ fn merge_selected_capability_overrides(
         }
     }
     overrides
+}
+
+
+fn pin_selected_price_fields(
+    discovery: &Value,
+    current: &Prices,
+    selected: &[String],
+) -> serde_json::Map<String, Value> {
+    let mut fields = effective_price_fields(discovery, current);
+    let pinned_at = db::now_iso();
+    for field in selected {
+        let Some(price_field_name) = field.strip_prefix("prices.") else {
+            continue;
+        };
+        let previous_source = fields
+            .get(price_field_name)
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "untracked".to_string());
+        set_price_field_provenance(
+            &mut fields,
+            price_field_name,
+            "operator_pin",
+            json!({
+                "pinned_at": pinned_at,
+                "previous_source": previous_source,
+            }),
+        );
+    }
+    fields
 }
 
 fn operator_parameter_support_overrides(parameters: &Value) -> Value {
@@ -3700,6 +3736,80 @@ pub async fn update_model_reconciliation(
                 }),
             );
             object.insert("decision_at".into(), json!(db::now_iso()));
+
+            let configured_capabilities =
+                serde_json::from_str::<Value>(&row.capabilities).unwrap_or_else(|_| json!({}));
+            let parameters =
+                serde_json::from_str::<Value>(&row.parameters).unwrap_or_else(|_| json!({}));
+            let thinking_map =
+                serde_json::to_value(row.thinking()).map_err(ApiError::internal)?;
+            let extra_request = row.extra_request_value();
+            let current_prices = row.prices();
+            let has_capability_pins =
+                pins.iter().any(|field| field.starts_with("capabilities."));
+            let has_price_pins = pins.iter().any(|field| field.starts_with("prices."));
+
+            let mut discovery_patch = serde_json::Map::new();
+            discovery_patch.insert("reconciliation".into(), reconciliation.clone());
+            if has_capability_pins {
+                let overrides = merge_selected_capability_overrides(
+                    &discovery,
+                    &configured_capabilities,
+                    &pins,
+                );
+                discovery_patch.insert(
+                    "operator_capability_overrides".into(),
+                    Value::Object(overrides),
+                );
+            }
+
+            let mut pinned_price_source = String::new();
+            let mut pinned_price_metadata = Value::Null;
+            if has_price_pins {
+                let fields = pin_selected_price_fields(&discovery, &current_prices, &pins);
+                pinned_price_source = if current_prices.is_configured() {
+                    effective_price_source(&fields, &current_prices)
+                } else {
+                    "operator_pin".to_string()
+                };
+                pinned_price_metadata = json!({ "fields": fields });
+            }
+            let pricing = if has_price_pins {
+                Some(db::ModelPricingMutation {
+                    prices: &current_prices,
+                    source: &pinned_price_source,
+                    metadata: &pinned_price_metadata,
+                })
+            } else {
+                None
+            };
+            let discovery_patch = Value::Object(discovery_patch);
+            db::commit_model_operator_mutation(
+                &state.pool,
+                &db::ModelOperatorMutation {
+                    id: &id,
+                    display_name: &row.display_name,
+                    enabled: row.enabled != 0,
+                    context_window: row.context_window,
+                    max_output_tokens: row.max_output_tokens,
+                    capabilities: &configured_capabilities,
+                    parameters: &parameters,
+                    thinking_map: &thinking_map,
+                    extra_request: &extra_request,
+                    update_transport: false,
+                    transport: None,
+                    discovery_patch: &discovery_patch,
+                    pricing,
+                },
+            )
+            .await
+            .map_err(ApiError::internal)?;
+            state
+                .registry
+                .reload(&state.pool)
+                .await
+                .map_err(ApiError::internal)?;
+            return Ok(Json(json!({ "ok": true })));
         }
         "accept" => {
             let safe_default: Vec<String> = available
@@ -3721,7 +3831,10 @@ pub async fn update_model_reconciliation(
             if !capabilities.is_object() {
                 capabilities = json!({});
             }
+            let parameters =
+                serde_json::from_str::<Value>(&row.parameters).unwrap_or_else(|_| json!({}));
             let mut thinking_map = row.thinking();
+            let extra_request = row.extra_request_value();
             let mut prices = row.prices();
             let mut accepted_prices = false;
             let mut accepted_transport: Option<String> = None;
@@ -3798,33 +3911,15 @@ pub async fn update_model_reconciliation(
                 }
             }
 
-            db::update_model(
-                &state.pool,
-                &id,
-                &display_name,
-                row.enabled != 0,
-                context_window,
-                max_output_tokens,
-                normalize_model_capabilities(&capabilities),
-                serde_json::to_value(row.prices()).map_err(ApiError::internal)?,
-                serde_json::to_value(row.params()).unwrap_or_else(|_| json!({})),
-                serde_json::to_value(&thinking_map).map_err(ApiError::internal)?,
-                row.extra_request_value(),
-            )
-            .await
-            .map_err(ApiError::internal)?;
-
-            if let Some(transport) = accepted_transport {
+            let transport_update = if let Some(transport) = accepted_transport.as_deref() {
                 let provider = db::get_provider(&state.pool, &row.provider_id)
                     .await
                     .map_err(ApiError::internal)?
                     .ok_or_else(|| ApiError::not_found("provider not found"))?;
-                let transport =
-                    validate_model_transport_override(&provider, Some(transport.as_str()))?;
-                db::set_model_transport_override(&state.pool, &id, transport.as_deref())
-                    .await
-                    .map_err(ApiError::internal)?;
-            }
+                Some(validate_model_transport_override(&provider, Some(transport))?)
+            } else {
+                None
+            };
 
             if selected
                 .iter()
@@ -3836,39 +3931,6 @@ pub async fn update_model_reconciliation(
                     "operator_capability_overrides".into(),
                     Value::Object(capability_overrides),
                 );
-            }
-            if !accepted_discovery.is_empty() {
-                db::merge_model_discovery(&state.pool, &id, &Value::Object(accepted_discovery))
-                    .await
-                    .map_err(ApiError::internal)?;
-            }
-
-            if accepted_prices {
-                let mut fields = effective_price_fields(&discovery, &row.prices());
-                for selected_field in selected
-                    .iter()
-                    .filter_map(|field| field.strip_prefix("prices."))
-                {
-                    let accepted_from = observed
-                        .pointer(&format!("/price_sources/{selected_field}"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    set_price_field_provenance(
-                        &mut fields,
-                        selected_field,
-                        "operator_accept",
-                        json!({ "accepted_from": accepted_from }),
-                    );
-                }
-                let source = if prices.is_configured() {
-                    effective_price_source(&fields, &prices)
-                } else {
-                    "operator_accept".to_string()
-                };
-                let metadata = json!({ "fields": fields });
-                db::commit_effective_model_pricing(&state.pool, &id, &prices, &source, &metadata)
-                    .await
-                    .map_err(ApiError::internal)?;
             }
 
             let remaining = remaining_reconciliation_diff(&reconciliation, &selected);
@@ -3886,11 +3948,75 @@ pub async fn update_model_reconciliation(
             object.insert("diff".into(), Value::Array(remaining));
             object.remove("ignored_diff");
             object.insert("decision_at".into(), json!(db::now_iso()));
+            accepted_discovery.insert("reconciliation".into(), reconciliation.clone());
+
+            let mut price_source = String::new();
+            let mut price_metadata = Value::Null;
+            if accepted_prices {
+                let mut fields = effective_price_fields(&discovery, &row.prices());
+                for selected_field in selected
+                    .iter()
+                    .filter_map(|field| field.strip_prefix("prices."))
+                {
+                    let accepted_from = observed
+                        .pointer(&format!("/price_sources/{selected_field}"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    set_price_field_provenance(
+                        &mut fields,
+                        selected_field,
+                        "operator_accept",
+                        json!({ "accepted_from": accepted_from }),
+                    );
+                }
+                price_source = if prices.is_configured() {
+                    effective_price_source(&fields, &prices)
+                } else {
+                    "operator_accept".to_string()
+                };
+                price_metadata = json!({ "fields": fields });
+            }
+            let pricing = if accepted_prices {
+                Some(db::ModelPricingMutation {
+                    prices: &prices,
+                    source: &price_source,
+                    metadata: &price_metadata,
+                })
+            } else {
+                None
+            };
+            let capabilities = normalize_model_capabilities(&capabilities);
+            let thinking_map =
+                serde_json::to_value(&thinking_map).map_err(ApiError::internal)?;
+            let discovery_patch = Value::Object(accepted_discovery);
+            db::commit_model_operator_mutation(
+                &state.pool,
+                &db::ModelOperatorMutation {
+                    id: &id,
+                    display_name: &display_name,
+                    enabled: row.enabled != 0,
+                    context_window,
+                    max_output_tokens,
+                    capabilities: &capabilities,
+                    parameters: &parameters,
+                    thinking_map: &thinking_map,
+                    extra_request: &extra_request,
+                    update_transport: transport_update.is_some(),
+                    transport: transport_update
+                        .as_ref()
+                        .and_then(|transport| transport.as_deref()),
+                    discovery_patch: &discovery_patch,
+                    pricing,
+                },
+            )
+            .await
+            .map_err(ApiError::internal)?;
             state
                 .registry
                 .reload(&state.pool)
                 .await
                 .map_err(ApiError::internal)?;
+            return Ok(Json(json!({ "ok": true })));
         }
         other => {
             return Err(ApiError::bad(format!(
@@ -4505,6 +4631,31 @@ pub struct CapabilityProbeBody {
     pub value: Option<Value>,
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub transport: Option<String>,
+}
+
+fn probe_execution_model(
+    provider: &db::ProviderRow,
+    model: &db::ModelRow,
+    candidate_transport: Option<&str>,
+) -> Result<db::ModelRow, ApiError> {
+    let Some(transport) =
+        validate_model_transport_override(provider, candidate_transport)?
+    else {
+        return Ok(model.clone());
+    };
+    let mut execution_model = model.clone();
+    let mut discovery = discovery_object(&execution_model);
+    if !discovery.is_object() {
+        discovery = json!({});
+    }
+    discovery
+        .as_object_mut()
+        .expect("probe discovery normalized to object")
+        .insert("configured_transport".into(), Value::String(transport));
+    execution_model.discovery = discovery.to_string();
+    Ok(execution_model)
 }
 
 fn probe_thinking_level(value: Option<&Value>) -> Result<crate::types::ThinkingLevel, ApiError> {
@@ -4723,6 +4874,51 @@ mod model_lifecycle_regression_tests {
         assert_eq!(effective.output_per_1m, Some(5.0));
         assert!(!preserved_manual);
         assert_eq!(fields["output_per_1m"]["source"], "models.dev:provider");
+    }
+
+
+    #[test]
+    fn pinned_price_field_survives_later_automatic_observation() {
+        let current = Prices {
+            output_per_1m: Some(5.0),
+            ..Default::default()
+        };
+        let mut discovery = json!({
+            "price_sources": {
+                "output_per_1m": "models.dev:provider"
+            },
+            "effective_pricing": {
+                "source": "models.dev:provider",
+                "fields": {
+                    "output_per_1m": {
+                        "source": "models.dev:provider",
+                        "metadata": {}
+                    }
+                }
+            }
+        });
+        let selected = vec!["prices.output_per_1m".to_string()];
+        let pinned = pin_selected_price_fields(&discovery, &current, &selected);
+        discovery
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "effective_pricing".into(),
+                json!({
+                    "source": "operator_pin",
+                    "fields": pinned
+                }),
+            );
+        let observed = Prices {
+            output_per_1m: Some(6.0),
+            ..Default::default()
+        };
+
+        let (effective, fields, preserved_manual) =
+            merge_automatic_price_observation(&current, &observed, &discovery);
+        assert_eq!(effective.output_per_1m, Some(5.0));
+        assert!(preserved_manual);
+        assert_eq!(fields["output_per_1m"]["source"], "operator_pin");
     }
 
     #[test]
@@ -5847,7 +6043,9 @@ pub async fn probe_model_capability(
             .ok_or_else(|| ApiError::bad("provider has no credentials to probe with"))?
     };
 
-    let profile = crate::adapters::resolve_execution_profile(&provider, &model)
+    let mut execution_model =
+        probe_execution_model(&provider, &model, body.transport.as_deref())?;
+    let profile = crate::adapters::resolve_execution_profile(&provider, &execution_model)
         .map_err(|error| ApiError::bad(error.message))?;
     let adapter = state
         .adapters
@@ -5872,7 +6070,6 @@ pub async fn probe_model_capability(
             effective_prices = prices;
         }
     }
-    let mut execution_model = model.clone();
     let probe_thinking_map = profile.thinking_map.clone();
     let mut probe_parameters = profile.parameters.clone();
 
@@ -6500,7 +6697,10 @@ pub async fn create_model(
         db::merge_model_discovery(
             &state.pool,
             &id,
-            &json!({ "operator_parameter_overrides": {} }),
+            &json!({
+                "operator_capability_overrides": {},
+                "operator_parameter_overrides": {}
+            }),
         )
         .await
         .map_err(ApiError::internal)?;
@@ -6623,52 +6823,49 @@ pub async fn update_model(
     let price_metadata = json!({ "fields": price_fields });
 
     validate_thinking_map(&body.thinking_map)?;
-    db::update_model(
-        &state.pool,
-        &id,
-        body.display_name.as_deref().unwrap_or(&body.upstream_id),
-        body.enabled,
-        body.context_window,
-        body.max_output_tokens,
-        caps.clone(),
-        serde_json::to_value(&previous_prices).unwrap(),
-        body.parameters.clone(),
-        serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible"),
-        body.extra_request.clone(),
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    db::set_model_transport_override(&state.pool, &id, transport_override.as_deref())
-        .await
-        .map_err(ApiError::internal)?;
     let existing_caps = normalize_model_capabilities(
         &serde_json::from_str::<Value>(&model.capabilities).unwrap_or_else(|_| json!({})),
     );
-    if existing_caps != caps {
-        db::merge_model_discovery(
-            &state.pool,
-            &id,
-            &json!({ "operator_capability_overrides": caps.clone() }),
-        )
-        .await
-        .map_err(ApiError::internal)?;
-    }
     let existing_parameters =
         serde_json::from_str::<Value>(&model.parameters).unwrap_or_else(|_| json!({}));
-    if existing_parameters != body.parameters {
-        db::merge_model_discovery(
-            &state.pool,
-            &id,
-            &json!({
-                "operator_parameter_overrides": operator_parameter_support_overrides(&body.parameters)
-            }),
-        )
-        .await
-        .map_err(ApiError::internal)?;
+    let mut discovery_patch = serde_json::Map::new();
+    if existing_caps != caps {
+        discovery_patch.insert("operator_capability_overrides".into(), caps.clone());
     }
-    db::commit_effective_model_pricing(&state.pool, &id, &prices, &price_source, &price_metadata)
-        .await
-        .map_err(ApiError::internal)?;
+    if existing_parameters != body.parameters {
+        discovery_patch.insert(
+            "operator_parameter_overrides".into(),
+            operator_parameter_support_overrides(&body.parameters),
+        );
+    }
+    let display_name = body.display_name.as_deref().unwrap_or(&body.upstream_id);
+    let thinking_map =
+        serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible");
+    let discovery_patch = Value::Object(discovery_patch);
+    db::commit_model_operator_mutation(
+        &state.pool,
+        &db::ModelOperatorMutation {
+            id: &id,
+            display_name,
+            enabled: body.enabled,
+            context_window: body.context_window,
+            max_output_tokens: body.max_output_tokens,
+            capabilities: &caps,
+            parameters: &body.parameters,
+            thinking_map: &thinking_map,
+            extra_request: &body.extra_request,
+            update_transport: true,
+            transport: transport_override.as_deref(),
+            discovery_patch: &discovery_patch,
+            pricing: Some(db::ModelPricingMutation {
+                prices: &prices,
+                source: &price_source,
+                metadata: &price_metadata,
+            }),
+        },
+    )
+    .await
+    .map_err(ApiError::internal)?;
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -12991,6 +13188,7 @@ mod credential_enrollment_regression_tests {
                 capability: "reasoning_disable".into(),
                 value: Some(json!("low")),
                 max_cost_usd: None,
+                transport: None,
             }),
         )
         .await
@@ -13006,6 +13204,7 @@ mod credential_enrollment_regression_tests {
                 capability: "reasoning_disable".into(),
                 value: None,
                 max_cost_usd: None,
+                transport: None,
             }),
         )
         .await

@@ -222,6 +222,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [reconciliationSelections, setReconciliationSelections] = useState<Record<string, string[]>>({});
   const [probeAccounts, setProbeAccounts] = useState<Account[]>([]);
   const [probeAccountByProvider, setProbeAccountByProvider] = useState<Record<string, string>>({});
+  const [probeTransportByModel, setProbeTransportByModel] = useState<Record<string, string>>({});
 
   useEffect(() => {
     Kinetix.modelLifecycleSettings()
@@ -327,6 +328,24 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     const accountId = selectedProbeAccountId(providerId);
     return probeAccounts.find((account) => account.id === accountId);
   };
+  const probeTransportInputValue = (model: ModelConfig) => {
+    if (Object.prototype.hasOwnProperty.call(probeTransportByModel, model.id)) {
+      return probeTransportByModel[model.id];
+    }
+    const provider = providers.find((candidate) => candidate.id === model.providerId);
+    return provider ? modelProbeTransport(model, provider) : '';
+  };
+  const selectedProbeTransport = (model: ModelConfig) => {
+    const provider = providers.find((candidate) => candidate.id === model.providerId);
+    const fallback = provider ? modelProbeTransport(model, provider) : '';
+    return probeTransportInputValue(model).trim() || fallback;
+  };
+  const probeStatusKey = (
+    model: ModelConfig,
+    capability: string,
+    value?: string,
+  ) =>
+    `${model.id}:${capability}${value ? `:${value}` : ''}:transport:${selectedProbeTransport(model)}`;
 
   useEffect(() => {
     if (!activeProvider) {
@@ -443,8 +462,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     capability: 'transport' | 'reasoning' | 'reasoning_disable' | 'tool_calling' | 'structured_output',
     value?: string,
   ) => {
-    const key = `${model.id}:${capability}${value ? `:${value}` : ''}`;
+    const key = probeStatusKey(model, capability, value);
     const accountId = selectedProbeAccountId(model.providerId);
+    const transport = selectedProbeTransport(model);
     if (!accountId) {
       setProbeStatus((prev) => ({ ...prev, [key]: 'select an account' }));
       return;
@@ -457,6 +477,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         value,
         PROBE_MAX_COST_USD,
         accountId,
+        transport,
       );
       setProbeStatus((prev) => ({ ...prev, [key]: result.status }));
       onRefresh?.();
@@ -1665,33 +1686,49 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                   ))}
                                 </select>
                               </label>
+                              <label className="flex items-center gap-1">
+                                Probe transport
+                                <input
+                                  type="text"
+                                  value={probeTransportInputValue(m)}
+                                  onChange={(event) =>
+                                    setProbeTransportByModel((current) => ({
+                                      ...current,
+                                      [m.id]: event.target.value,
+                                    }))
+                                  }
+                                  placeholder={modelProbeTransport(m, activeProvider)}
+                                  className="w-44 bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded font-mono"
+                                />
+                              </label>
                               <span>
-                                Target: {activeProvider.name} / {selectedProbeAccount(m.providerId)?.label || 'no account'} / {m.upstreamModelId} / {modelProbeTransport(m, activeProvider)}
+                                Target: {activeProvider.name} / {selectedProbeAccount(m.providerId)?.label || 'no account'} / {m.upstreamModelId} / {selectedProbeTransport(m)}
                               </span>
                               <span>
                                 Safety: {PROBE_MAX_REQUESTS} request · max cost ${PROBE_MAX_COST_USD.toFixed(2)}
                               </span>
                             </div>
                             <div className="flex flex-wrap gap-1">
-                              {(['transport', 'tool_calling', 'structured_output'] as const).map((capability) => (
-                                <button
-                                  key={capability}
-                                  type="button"
-                                  disabled={
-                                    lifecycleBusy === `probe:${m.id}:${capability}`
-                                    || !selectedProbeAccountId(m.providerId)
-                                  }
-                                  onClick={() => handleProbeModel(m, capability)}
-                                  className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
-                                >
-                                  Probe {capability.replace('_', ' ')}
-                                  {probeStatus[`${m.id}:${capability}`]
-                                    ? ` · ${probeStatus[`${m.id}:${capability}`]}`
-                                    : ''}
-                                </button>
-                              ))}
+                              {(['transport', 'tool_calling', 'structured_output'] as const).map((capability) => {
+                                const key = probeStatusKey(m, capability);
+                                return (
+                                  <button
+                                    key={key}
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `probe:${key}`
+                                      || !selectedProbeAccountId(m.providerId)
+                                    }
+                                    onClick={() => handleProbeModel(m, capability)}
+                                    className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
+                                  >
+                                    Probe {capability.replace('_', ' ')}
+                                    {probeStatus[key] ? ` · ${probeStatus[key]}` : ''}
+                                  </button>
+                                );
+                              })}
                               {modelReasoningLevels(m).map((level) => {
-                                const key = `${m.id}:reasoning:${level}`;
+                                const key = probeStatusKey(m, 'reasoning', level);
                                 return (
                                   <button
                                     key={key}
@@ -1708,22 +1745,23 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                   </button>
                                 );
                               })}
-                              {modelCanProbeReasoningDisable(m) && (
-                                <button
-                                  type="button"
-                                  disabled={
-                                    lifecycleBusy === `probe:${m.id}:reasoning_disable:off`
-                                    || !selectedProbeAccountId(m.providerId)
-                                  }
-                                  onClick={() => handleProbeModel(m, 'reasoning_disable', 'off')}
-                                  className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
-                                >
-                                  Probe reasoning off
-                                  {probeStatus[`${m.id}:reasoning_disable:off`]
-                                    ? ` · ${probeStatus[`${m.id}:reasoning_disable:off`]}`
-                                    : ''}
-                                </button>
-                              )}
+                              {modelCanProbeReasoningDisable(m) && (() => {
+                                const key = probeStatusKey(m, 'reasoning_disable', 'off');
+                                return (
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `probe:${key}`
+                                      || !selectedProbeAccountId(m.providerId)
+                                    }
+                                    onClick={() => handleProbeModel(m, 'reasoning_disable', 'off')}
+                                    className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
+                                  >
+                                    Probe reasoning off
+                                    {probeStatus[key] ? ` · ${probeStatus[key]}` : ''}
+                                  </button>
+                                );
+                              })()}
                             </div>
                           </div>
                         </div>

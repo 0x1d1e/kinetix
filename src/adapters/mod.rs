@@ -364,7 +364,8 @@ pub fn resolve_execution_profile_for_target(
 
     let configured_capabilities = serde_json::from_str::<serde_json::Value>(&model.capabilities)
         .unwrap_or_else(|_| serde_json::json!({}));
-    let operator_overrides = discovery.get("operator_capability_overrides");
+    let capability_ownership = discovery.get("operator_capability_overrides");
+    let operator_overrides = capability_ownership.and_then(serde_json::Value::as_object);
     let discovered_capabilities = discovery.get("capabilities");
     let probe_capability = |name: &str| {
         let evidence = discovery
@@ -377,11 +378,18 @@ pub fn resolve_execution_profile_for_target(
         }
     };
     let capability = |name: &str| {
-        if let Some(value) = operator_overrides
-            .and_then(|value| value.get(name))
-            .and_then(serde_json::Value::as_bool)
-        {
-            return Some(value);
+        if let Some(value) = operator_overrides.and_then(|overrides| overrides.get(name)) {
+            // Presence is authoritative even for an explicit null/unknown.
+            return value.as_bool();
+        }
+        // Before capability ownership was tracked, model.capabilities was the
+        // only configuration surface. Preserve those legacy values as
+        // operator-owned. An explicit ownership object (including {}) opts the
+        // model into probe/discovery refinement for unowned capabilities.
+        if capability_ownership.is_none() {
+            if let Some(value) = configured_capabilities.get(name) {
+                return value.as_bool();
+            }
         }
         if let Some(value) = probe_capability(name) {
             return Some(value);
@@ -2062,6 +2070,89 @@ mod execution_profile_tests {
         .to_string();
         let profile = resolve_execution_profile(&provider, &model).unwrap();
         assert_eq!(profile.capabilities.text, None);
+    }
+
+
+    #[test]
+    fn legacy_configured_capability_remains_operator_owned_against_probe() {
+        let provider = provider();
+        let mut model = model();
+        model.capabilities = serde_json::json!({"tool_calling": false}).to_string();
+        model.discovery = serde_json::json!({
+            "probe_evidence": {
+                "tool_calling": {
+                    "status": "supported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        assert_eq!(profile.capabilities.tool_calling, Some(false));
+    }
+
+    #[test]
+    fn explicit_empty_capability_ownership_allows_probe_refinement() {
+        let provider = provider();
+        let mut model = model();
+        model.capabilities = serde_json::json!({"tool_calling": false}).to_string();
+        model.discovery = serde_json::json!({
+            "operator_capability_overrides": {},
+            "probe_evidence": {
+                "tool_calling": {
+                    "status": "supported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        assert_eq!(profile.capabilities.tool_calling, Some(true));
+    }
+
+    #[test]
+    fn pinned_capability_override_beats_later_probe() {
+        let provider = provider();
+        let mut model = model();
+        model.capabilities = serde_json::json!({"tool_calling": false}).to_string();
+        model.discovery = serde_json::json!({
+            "operator_capability_overrides": {
+                "tool_calling": false
+            },
+            "probe_evidence": {
+                "tool_calling": {
+                    "status": "supported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        assert_eq!(profile.capabilities.tool_calling, Some(false));
     }
 
     #[test]

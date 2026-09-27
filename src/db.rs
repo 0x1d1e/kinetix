@@ -876,6 +876,28 @@ pub struct NewModel<'a> {
     pub discovery: Value,
 }
 
+pub struct ModelPricingMutation<'a> {
+    pub prices: &'a Prices,
+    pub source: &'a str,
+    pub metadata: &'a Value,
+}
+
+pub struct ModelOperatorMutation<'a> {
+    pub id: &'a str,
+    pub display_name: &'a str,
+    pub enabled: bool,
+    pub context_window: Option<i64>,
+    pub max_output_tokens: Option<i64>,
+    pub capabilities: &'a Value,
+    pub parameters: &'a Value,
+    pub thinking_map: &'a Value,
+    pub extra_request: &'a Value,
+    pub update_transport: bool,
+    pub transport: Option<&'a str>,
+    pub discovery_patch: &'a Value,
+    pub pricing: Option<ModelPricingMutation<'a>>,
+}
+
 pub async fn insert_model(pool: &Pool, m: &NewModel<'_>) -> Result<String> {
     let id = format!("model_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
@@ -1025,6 +1047,138 @@ pub async fn update_model(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+
+async fn update_model_configuration_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    mutation: &ModelOperatorMutation<'_>,
+) -> Result<()> {
+    let result = sqlx::query(
+        "UPDATE models SET display_name=?, enabled=?, context_window=?, max_output_tokens=?,
+         capabilities=?, parameters=?, thinking_map=?, extra_request=? WHERE id=?",
+    )
+    .bind(mutation.display_name)
+    .bind(mutation.enabled as i64)
+    .bind(mutation.context_window)
+    .bind(mutation.max_output_tokens)
+    .bind(mutation.capabilities.to_string())
+    .bind(mutation.parameters.to_string())
+    .bind(mutation.thinking_map.to_string())
+    .bind(mutation.extra_request.to_string())
+    .bind(mutation.id)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!(
+            "model '{}' disappeared while applying operator mutation",
+            mutation.id
+        );
+    }
+    Ok(())
+}
+
+async fn set_model_transport_override_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    transport: Option<&str>,
+) -> Result<()> {
+    match transport {
+        Some(transport) => {
+            sqlx::query(
+                "UPDATE models SET discovery = json_set(
+                    CASE WHEN json_valid(discovery) THEN
+                        CASE WHEN json_type(discovery) = 'object' THEN discovery ELSE '{}' END
+                    ELSE '{}' END, '$.configured_transport', ?) WHERE id = ?",
+            )
+            .bind(transport)
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "UPDATE models SET discovery = json_remove(
+                    CASE WHEN json_valid(discovery) THEN
+                        CASE WHEN json_type(discovery) = 'object' THEN discovery ELSE '{}' END
+                    ELSE '{}' END, '$.configured_transport') WHERE id = ?",
+            )
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn merge_model_discovery_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    fresh: &Value,
+) -> Result<()> {
+    let Some(fields) = fresh.as_object() else {
+        return Ok(());
+    };
+    if fields.is_empty() {
+        return Ok(());
+    }
+
+    let base = "CASE WHEN json_valid(discovery) THEN CASE \
+        WHEN json_type(discovery) = 'object' THEN discovery ELSE '{}' END \
+        ELSE '{}' END";
+    let mut expression = format!("json_set({base}");
+    for _ in fields {
+        expression.push_str(", '$.' || ?, json(?)");
+    }
+    expression.push(')');
+    if fresh.get("disappeared").and_then(Value::as_bool) == Some(false) {
+        expression = format!("json_remove({expression}, '$.flagged_at')");
+    }
+    let sql = format!("UPDATE models SET discovery = {expression} WHERE id = ?");
+    let mut query = sqlx::query(&sql);
+    for (key, value) in fields {
+        query = query.bind(key).bind(value.to_string());
+    }
+    let result = query.bind(id).execute(&mut **tx).await?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!("model '{id}' disappeared while merging discovery metadata");
+    }
+    Ok(())
+}
+
+/// Apply one operator-owned model mutation as a single database transaction.
+/// Runtime-visible fields, ownership metadata, transport, reconciliation state,
+/// and immutable/effective pricing either all commit or all roll back.
+pub async fn commit_model_operator_mutation(
+    pool: &Pool,
+    mutation: &ModelOperatorMutation<'_>,
+) -> Result<Option<String>> {
+    let lock = price_version_lock(mutation.id);
+    let _guard = lock.lock().await;
+    let mut tx = pool.begin().await?;
+
+    update_model_configuration_in_transaction(&mut tx, mutation).await?;
+    if mutation.update_transport {
+        set_model_transport_override_in_transaction(&mut tx, mutation.id, mutation.transport)
+            .await?;
+    }
+    merge_model_discovery_in_transaction(&mut tx, mutation.id, mutation.discovery_patch).await?;
+
+    let version_id = if let Some(pricing) = mutation.pricing.as_ref() {
+        apply_effective_model_pricing_transaction(
+            &mut tx,
+            mutation.id,
+            pricing.prices,
+            pricing.source,
+            pricing.metadata,
+        )
+        .await?
+    } else {
+        None
+    };
+
+    tx.commit().await?;
+    Ok(version_id)
 }
 
 pub async fn update_model_prices(pool: &Pool, id: &str, prices: &Prices) -> Result<()> {
@@ -1278,13 +1432,17 @@ async fn apply_effective_model_pricing_transaction(
 ) -> Result<Option<String>> {
     let version_id =
         ensure_price_version_in_transaction(tx, model_id, prices, source, source_metadata).await?;
-    let effective_pricing = if prices.is_configured() {
+    let fields = source_metadata
+        .get("fields")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let has_owned_fields = fields
+        .as_object()
+        .is_some_and(|fields| !fields.is_empty());
+    let effective_pricing = if prices.is_configured() || has_owned_fields {
         serde_json::json!({
             "source": source,
-            "fields": source_metadata
-                .get("fields")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({})),
+            "fields": fields,
             "metadata": source_metadata,
             "price_version_id": version_id,
             "updated_at": now_iso(),
@@ -2276,6 +2434,132 @@ mod price_version_identity_tests {
         assert_eq!(row.prices().output_per_1m, Some(2.0));
         let discovery: Value = serde_json::from_str(&row.discovery).unwrap();
         assert!(discovery.get("effective_pricing").is_none());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+
+    #[tokio::test]
+    async fn operator_mutation_rolls_back_model_reconciliation_and_pricing_together() {
+        let (pool, model_id, root) = pricing_test_model("operator-mutation-rollback").await;
+        let old_prices = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(2.0),
+            ..Prices::default()
+        };
+        let old_version = commit_effective_model_pricing(
+            &pool,
+            &model_id,
+            &old_prices,
+            "operator",
+            &json!({
+                "fields": {
+                    "input_per_1m": {"source": "operator", "metadata": {}},
+                    "output_per_1m": {"source": "operator", "metadata": {}}
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let original_reconciliation = json!({
+            "status": "changed",
+            "diff": [
+                {"field": "context_window", "configured": null, "observed": 200000},
+                {"field": "prices.output_per_1m", "configured": 2.0, "observed": 18.0}
+            ]
+        });
+        merge_model_discovery(
+            &pool,
+            &model_id,
+            &json!({"reconciliation": original_reconciliation.clone()}),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE TRIGGER reject_operator_price_version_insert
+             BEFORE INSERT ON price_versions
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected operator price version failure');
+             END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let capabilities = json!({"tool_calling": true});
+        let parameters = json!({});
+        let thinking_map = json!({});
+        let extra_request = json!({});
+        let discovery_patch = json!({
+            "reconciliation": {
+                "status": "accepted",
+                "diff": []
+            },
+            "operator_capability_overrides": {
+                "tool_calling": true
+            }
+        });
+        let next_prices = Prices {
+            input_per_1m: Some(9.0),
+            output_per_1m: Some(18.0),
+            ..Prices::default()
+        };
+        let price_metadata = json!({
+            "fields": {
+                "input_per_1m": {"source": "operator_accept", "metadata": {}},
+                "output_per_1m": {"source": "operator_accept", "metadata": {}}
+            }
+        });
+        let result = commit_model_operator_mutation(
+            &pool,
+            &ModelOperatorMutation {
+                id: &model_id,
+                display_name: "Changed Name",
+                enabled: true,
+                context_window: Some(200000),
+                max_output_tokens: Some(8192),
+                capabilities: &capabilities,
+                parameters: &parameters,
+                thinking_map: &thinking_map,
+                extra_request: &extra_request,
+                update_transport: false,
+                transport: None,
+                discovery_patch: &discovery_patch,
+                pricing: Some(ModelPricingMutation {
+                    prices: &next_prices,
+                    source: "operator_accept",
+                    metadata: &price_metadata,
+                }),
+            },
+        )
+        .await;
+        assert!(result.is_err());
+
+        let row = get_model(&pool, &model_id).await.unwrap().unwrap();
+        assert_eq!(row.display_name, "Priced Model");
+        assert_eq!(row.context_window, None);
+        assert_eq!(row.max_output_tokens, None);
+        assert_eq!(row.prices().input_per_1m, Some(1.0));
+        assert_eq!(row.prices().output_per_1m, Some(2.0));
+        assert_eq!(
+            serde_json::from_str::<Value>(&row.capabilities).unwrap(),
+            json!({})
+        );
+        let discovery: Value = serde_json::from_str(&row.discovery).unwrap();
+        assert_eq!(
+            discovery.get("reconciliation"),
+            Some(&original_reconciliation)
+        );
+        assert_eq!(
+            discovery
+                .pointer("/effective_pricing/price_version_id")
+                .and_then(Value::as_str),
+            Some(old_version.as_str())
+        );
+        assert!(discovery.get("operator_capability_overrides").is_none());
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);

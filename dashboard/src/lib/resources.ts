@@ -520,12 +520,14 @@ export const Kinetix = {
     value?: unknown,
     max_cost_usd?: number,
     account_id?: string,
+    transport?: string,
   ) =>
     api.post<CapabilityProbeResult>(`/admin/api/models/${id}/probe`, {
       capability,
       ...(value === undefined ? {} : { value }),
       ...(max_cost_usd === undefined ? {} : { max_cost_usd }),
       ...(account_id === undefined ? {} : { account_id }),
+      ...(transport === undefined ? {} : { transport }),
     }),
   deleteModel: (id: string) => api.del(`/admin/api/models/${id}`),
 
