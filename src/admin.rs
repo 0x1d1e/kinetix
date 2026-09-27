@@ -3164,7 +3164,10 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                         "capabilities": discovered_capabilities(observation),
                         "reasoning_capability": &observation.reasoning,
                         "thinking_map": &observation.thinking_map,
-                        "transport": observation.transport.as_ref().map(|format| json!({ "format": format })),
+                        "transport": observation
+                            .transport
+                            .as_ref()
+                            .map(|format| json!({ "format": format })),
                         "transport_source": &observation.transport_source,
                         "capability_sources": &observation.capability_sources,
                         "modalities": &observation.modalities,
@@ -6339,7 +6342,9 @@ pub async fn create_model(
             &id,
             &json!({
                 "operator_capability_overrides": caps.clone(),
-                "operator_parameter_overrides": operator_parameter_support_overrides(&body.parameters),
+                "operator_parameter_overrides": operator_parameter_support_overrides(
+                    &body.parameters
+                ),
             }),
         )
         .await
