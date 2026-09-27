@@ -4367,6 +4367,30 @@ fn probe_thinking_level(value: Option<&Value>) -> Result<crate::types::ThinkingL
     }
 }
 
+fn normalize_capability_probe_value(
+    capability: &str,
+    value: Option<&Value>,
+) -> Result<Option<Value>, ApiError> {
+    if capability != "reasoning_disable" {
+        return Ok(value.cloned());
+    }
+
+    match value {
+        None => Ok(Some(json!("off"))),
+        Some(Value::String(level))
+            if matches!(
+                level.trim().to_ascii_lowercase().as_str(),
+                "off" | "none"
+            ) =>
+        {
+            Ok(Some(json!("off")))
+        }
+        Some(_) => Err(ApiError::bad(
+            "reasoning_disable probe only accepts value 'off'/'none' or an omitted value",
+        )),
+    }
+}
+
 fn numeric_probe_budget(value: &Value) -> Option<u64> {
     match value {
         Value::Number(value) => value.as_u64(),
@@ -5113,6 +5137,40 @@ mod model_lifecycle_regression_tests {
         );
     }
 
+
+    #[test]
+    fn reasoning_disable_probe_defaults_to_off_and_rejects_non_off_values() {
+        let omitted: CapabilityProbeBody =
+            serde_json::from_value(json!({"capability": "reasoning_disable"})).unwrap();
+        let omitted_value =
+            normalize_capability_probe_value(&omitted.capability, omitted.value.as_ref()).unwrap();
+        assert_eq!(omitted_value, Some(json!("off")));
+        assert_eq!(
+            probe_thinking_level(omitted_value.as_ref()).unwrap(),
+            crate::types::ThinkingLevel::Off
+        );
+
+        let none: CapabilityProbeBody = serde_json::from_value(json!({
+            "capability": "reasoning_disable",
+            "value": "none"
+        }))
+        .unwrap();
+        assert_eq!(
+            normalize_capability_probe_value(&none.capability, none.value.as_ref()).unwrap(),
+            Some(json!("off"))
+        );
+
+        let invalid: CapabilityProbeBody = serde_json::from_value(json!({
+            "capability": "reasoning_disable",
+            "value": "low"
+        }))
+        .unwrap();
+        let error =
+            normalize_capability_probe_value(&invalid.capability, invalid.value.as_ref())
+                .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
 }
 
 #[cfg(test)]
@@ -5440,6 +5498,9 @@ pub async fn probe_model_capability(
     Path(id): Path<String>,
     Json(body): Json<CapabilityProbeBody>,
 ) -> ApiResult {
+    let probe_value =
+        normalize_capability_probe_value(&body.capability, body.value.as_ref())?;
+
     let model = db::get_model(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?
@@ -5521,7 +5582,7 @@ pub async fn probe_model_capability(
     match body.capability.as_str() {
         "transport" => {}
         "reasoning" | "reasoning_disable" => {
-            let level = probe_thinking_level(body.value.as_ref())?;
+            let level = probe_thinking_level(probe_value.as_ref())?;
             if !probe_thinking_map.level_is_executable(level.as_key()) {
                 return Ok(Json(json!({
                     "status": "inconclusive",
@@ -5779,7 +5840,7 @@ pub async fn probe_model_capability(
                 let redacted = crypto::redact(&text);
                 let status = if deterministic_probe_rejection(
                     &body.capability,
-                    body.value.as_ref(),
+                    probe_value.as_ref(),
                     status_code,
                     &redacted,
                 ) {
@@ -5800,7 +5861,7 @@ pub async fn probe_model_capability(
     let evidence_value = json!({
         "status": status,
         "source": "probe",
-        "value": body.value,
+        "value": probe_value.as_ref(),
         "verified_at": verified_at.to_rfc3339(),
         "fresh_until": fresh_until.to_rfc3339(),
         "scope": {
@@ -5818,7 +5879,7 @@ pub async fn probe_model_capability(
         &state.pool,
         &provider.id,
         &model.id,
-        probe_evidence_key(&body.capability, body.value.as_ref()),
+        probe_evidence_key(&body.capability, probe_value.as_ref()),
         evidence_value.clone(),
     )
     .await
