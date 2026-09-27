@@ -218,7 +218,10 @@ pub fn resolve_execution_profile(
     // "reasoning" false. Fresh unsupported evidence filters discovered
     // mappings, while an explicit operator thinking map remains authoritative.
     let mut verified_reasoning_supported = false;
-    if let Some(evidence) = discovery.get("probe_evidence").and_then(serde_json::Value::as_object) {
+    if let Some(evidence) = discovery
+        .get("probe_evidence")
+        .and_then(serde_json::Value::as_object)
+    {
         for (key, item) in evidence {
             if let Some(level) = key.strip_prefix("reasoning_effort_") {
                 match fresh_probe_status(item) {
