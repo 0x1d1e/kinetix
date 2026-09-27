@@ -203,8 +203,33 @@ pub fn resolve_execution_profile(
     };
     let configured_capabilities = serde_json::from_str::<serde_json::Value>(&model.capabilities)
         .unwrap_or_else(|_| serde_json::json!({}));
+    let operator_overrides = discovery.get("operator_capability_overrides");
     let discovered_capabilities = discovery.get("capabilities");
+    let probe_capability = |name: &str| {
+        let evidence = discovery
+            .get("probe_evidence")
+            .and_then(|value| value.get(name))?;
+        let fresh_until = evidence.get("fresh_until").and_then(serde_json::Value::as_str)?;
+        let fresh_until = chrono::DateTime::parse_from_rfc3339(fresh_until).ok()?;
+        if fresh_until.with_timezone(&chrono::Utc) <= chrono::Utc::now() {
+            return None;
+        }
+        match evidence.get("status").and_then(serde_json::Value::as_str) {
+            Some("supported") => Some(true),
+            Some("unsupported") => Some(false),
+            _ => None,
+        }
+    };
     let capability = |name: &str| {
+        if let Some(value) = operator_overrides
+            .and_then(|value| value.get(name))
+            .and_then(serde_json::Value::as_bool)
+        {
+            return Some(value);
+        }
+        if let Some(value) = probe_capability(name) {
+            return Some(value);
+        }
         if let Some(value) = discovered_capabilities.and_then(|value| value.get(name)) {
             // A present null is an explicit unknown observation and must not be
             // collapsed into a legacy false value from the configured model.
