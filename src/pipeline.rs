@@ -173,7 +173,11 @@ fn token_count_exact_target(
 
     let eligible = |target: &ResolvedTarget| {
         let capabilities_match = !target.provider.strict()
-            || crate::adapters::resolve_execution_profile(&target.provider, &target.model)
+            || crate::adapters::resolve_execution_profile_for_target(
+                &target.provider,
+                &target.model,
+                Some(target.account.id.as_str()),
+            )
                 .map(|profile| profile_satisfies_needs(&profile.capabilities, &needs))
                 .unwrap_or(false);
         (allowed_providers.is_empty() || allowed_providers.contains(&target.provider.id))
@@ -201,13 +205,6 @@ fn token_count_exact_target(
                     "this key is not allowed to use the resolved provider",
                 ));
             }
-            let profile = crate::adapters::resolve_execution_profile(&provider, &model)?;
-            if provider.strict() && !profile_satisfies_needs(&profile.capabilities, &needs) {
-                return Err(ProxyError::unsupported(
-                    "resolved model cannot satisfy this token-count request",
-                ));
-            }
-
             let account = select_accounts(&snap, &provider_id, None)?
                 .into_iter()
                 .find(|account| {
@@ -216,7 +213,21 @@ fn token_count_exact_target(
                         pool::AccountStatus::Healthy
                     )
                 });
-            Ok(account.map(|account| ResolvedTarget {
+            let Some(account) = account else {
+                return Ok(None);
+            };
+            let profile = crate::adapters::resolve_execution_profile_for_target(
+                &provider,
+                &model,
+                Some(account.id.as_str()),
+            )?;
+            if provider.strict() && !profile_satisfies_needs(&profile.capabilities, &needs) {
+                return Err(ProxyError::unsupported(
+                    "resolved model cannot satisfy this token-count request",
+                ));
+            }
+
+            Ok(Some(ResolvedTarget {
                 account,
                 model,
                 provider,
@@ -273,7 +284,11 @@ pub async fn count_tokens(
     let Some(target) = token_count_exact_target(state, key, req)? else {
         return Ok(estimate());
     };
-    let profile = crate::adapters::resolve_execution_profile(&target.provider, &target.model)?;
+    let profile = crate::adapters::resolve_execution_profile_for_target(
+                &target.provider,
+                &target.model,
+                Some(target.account.id.as_str()),
+            )?;
     let adapter = state.adapters.for_transport(&profile.transport)?;
     if !adapter.supports_count_tokens() {
         return Ok(estimate());
@@ -892,7 +907,11 @@ pub async fn run(
         // Resolve target transport and its execution metadata before any
         // target-specific credential lookup or network dispatch.
         let profile =
-            match crate::adapters::resolve_execution_profile(&target.provider, &target.model) {
+            match crate::adapters::resolve_execution_profile_for_target(
+                &target.provider,
+                &target.model,
+                Some(target.account.id.as_str()),
+            ) {
                 Ok(profile) => profile,
                 Err(error) => {
                     trace.step(
@@ -3551,7 +3570,11 @@ fn target_profile_supports_request(
     target: &ResolvedTarget,
     needs: &crate::types::CapabilityNeeds,
 ) -> bool {
-    crate::adapters::resolve_execution_profile(&target.provider, &target.model)
+    crate::adapters::resolve_execution_profile_for_target(
+                &target.provider,
+                &target.model,
+                Some(target.account.id.as_str()),
+            )
         .map(|profile| {
             !target.provider.strict() || profile_satisfies_needs(&profile.capabilities, needs)
         })
