@@ -2901,7 +2901,11 @@ pub async fn update_model_reconciliation(
             object.insert("diff".into(), Value::Array(remaining.clone()));
             object.insert(
                 "status".into(),
-                json!(if remaining.is_empty() { "unchanged" } else { "changed" }),
+                json!(if remaining.is_empty() {
+                    "unchanged"
+                } else {
+                    "changed"
+                }),
             );
             object.insert("decision_at".into(), json!(db::now_iso()));
         }
@@ -3076,7 +3080,11 @@ pub async fn update_model_reconciliation(
                 .ok_or_else(|| ApiError::internal("invalid reconciliation metadata"))?;
             object.insert(
                 "status".into(),
-                json!(if remaining.is_empty() { "accepted" } else { "changed" }),
+                json!(if remaining.is_empty() {
+                    "accepted"
+                } else {
+                    "changed"
+                }),
             );
             object.insert("diff".into(), Value::Array(remaining));
             object.remove("ignored_diff");
@@ -3990,7 +3998,9 @@ pub async fn probe_model_capability(
                                 .collect::<String>()
                         })
                         .and_then(|text| serde_json::from_str::<Value>(text.trim()).ok())
-                        .and_then(|value| value.get("ok").and_then(Value::as_str).map(str::to_string))
+                        .and_then(|value| {
+                            value.get("ok").and_then(Value::as_str).map(str::to_string)
+                        })
                         .is_some(),
                     _ => true,
                 };
