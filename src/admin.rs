@@ -3240,14 +3240,6 @@ fn reconciliation_fields(reconciliation: &Value) -> Vec<String> {
         .collect()
 }
 
-fn prices_equal(a: &Prices, b: &Prices) -> bool {
-    a.input_per_1m == b.input_per_1m
-        && a.output_per_1m == b.output_per_1m
-        && a.cached_per_1m == b.cached_per_1m
-        && a.cache_write_per_1m == b.cache_write_per_1m
-        && a.thinking_per_1m == b.thinking_per_1m
-}
-
 const PRICE_FIELDS: [&str; 5] = [
     "input_per_1m",
     "output_per_1m",
@@ -3920,28 +3912,12 @@ pub(crate) async fn sync_provider_pricing_id(
             "fields": fields,
             "catalog_source_state": catalog_source_state,
         });
-        let version_id =
-            db::ensure_price_version(&state.pool, &row.id, &effective, &source, &metadata)
-                .await
-                .map_err(ApiError::internal)?;
-
-        if !prices_equal(&current, &effective) {
-            db::update_model_prices(&state.pool, &row.id, &effective)
-                .await
-                .map_err(ApiError::internal)?;
-        }
-        db::merge_model_discovery(
+        db::commit_effective_model_pricing(
             &state.pool,
             &row.id,
-            &json!({
-                "effective_pricing": {
-                    "source": source,
-                    "fields": fields,
-                    "metadata": metadata,
-                    "price_version_id": version_id,
-                    "updated_at": db::now_iso(),
-                }
-            }),
+            &effective,
+            &source,
+            &metadata,
         )
         .await
         .map_err(ApiError::internal)?;
