@@ -2368,6 +2368,13 @@ fn discovery_object(row: &db::ModelRow) -> Value {
     serde_json::from_str::<Value>(&row.discovery).unwrap_or_else(|_| json!({}))
 }
 
+fn latest_reconciliation_observation(discovery: &Value) -> &Value {
+    discovery
+        .get("latest_observation")
+        .filter(|value| value.is_object())
+        .unwrap_or(discovery)
+}
+
 fn provenance_mentions_models_dev(value: Option<&Value>) -> bool {
     value
         .and_then(Value::as_str)
@@ -2411,7 +2418,8 @@ fn preserve_last_known_catalog_observation(
     row: &db::ModelRow,
     observation: &mut DiscoveredObservation,
 ) {
-    let previous = discovery_object(row);
+    let discovery = discovery_object(row);
+    let previous = latest_reconciliation_observation(&discovery);
     let previous_sources = previous
         .get("capability_sources")
         .cloned()
@@ -2551,30 +2559,100 @@ fn preserve_last_known_catalog_observation(
     }
 }
 
-fn explicit_deprecation(observation: &DiscoveredObservation) -> bool {
-    fn marked(value: &Value) -> bool {
-        value.get("deprecated").and_then(Value::as_bool) == Some(true)
-            || value
-                .get("status")
-                .and_then(Value::as_str)
-                .is_some_and(|status| status.eq_ignore_ascii_case("deprecated"))
-            || value
-                .pointer("/lifecycle/status")
-                .and_then(Value::as_str)
-                .is_some_and(|status| status.eq_ignore_ascii_case("deprecated"))
+fn metadata_marks_deprecated(value: &Value) -> bool {
+    value.get("deprecated").and_then(Value::as_bool) == Some(true)
+        || value
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status.eq_ignore_ascii_case("deprecated"))
+        || value
+            .pointer("/lifecycle/status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status.eq_ignore_ascii_case("deprecated"))
+}
+
+fn first_metadata_value(value: &Value, pointers: &[&str]) -> Option<Value> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).filter(|value| !value.is_null()).cloned())
+}
+
+fn deprecation_details(observation: &DiscoveredObservation) -> Option<Value> {
+    let candidates = [
+        ("provider_metadata", observation.raw_metadata.as_ref()),
+        (
+            "catalog_provider",
+            observation
+                .catalog
+                .as_ref()
+                .and_then(|catalog| catalog.pointer("/provider/metadata")),
+        ),
+        (
+            "catalog_canonical",
+            observation
+                .catalog
+                .as_ref()
+                .and_then(|catalog| catalog.pointer("/canonical/metadata")),
+        ),
+    ];
+
+    for (source, metadata) in candidates {
+        let Some(metadata) = metadata else {
+            continue;
+        };
+        if !metadata_marks_deprecated(metadata) {
+            continue;
+        }
+
+        let mut details = serde_json::Map::new();
+        details.insert("source".into(), json!(source));
+        if let Some(value) = first_metadata_value(
+            metadata,
+            &[
+                "/end_date",
+                "/endDate",
+                "/sunset_at",
+                "/sunsetAt",
+                "/lifecycle/end_date",
+                "/lifecycle/endDate",
+            ],
+        ) {
+            details.insert("end_date".into(), value);
+        }
+        if let Some(value) = first_metadata_value(
+            metadata,
+            &[
+                "/effective_date",
+                "/effectiveDate",
+                "/deprecated_at",
+                "/deprecatedAt",
+                "/lifecycle/effective_date",
+                "/lifecycle/effectiveDate",
+            ],
+        ) {
+            details.insert("effective_date".into(), value);
+        }
+        if let Some(value) = first_metadata_value(
+            metadata,
+            &[
+                "/replacement",
+                "/replacement_model",
+                "/replacementModel",
+                "/replacement_model_id",
+                "/replacementModelId",
+                "/lifecycle/replacement",
+            ],
+        ) {
+            details.insert("replacement".into(), value);
+        }
+        return Some(Value::Object(details));
     }
 
-    observation.raw_metadata.as_ref().is_some_and(marked)
-        || observation
-            .catalog
-            .as_ref()
-            .and_then(|catalog| catalog.pointer("/provider/metadata"))
-            .is_some_and(marked)
-        || observation
-            .catalog
-            .as_ref()
-            .and_then(|catalog| catalog.pointer("/canonical/metadata"))
-            .is_some_and(marked)
+    None
+}
+
+fn explicit_deprecation(observation: &DiscoveredObservation) -> bool {
+    deprecation_details(observation).is_some()
 }
 
 fn reconciliation_diff(row: &db::ModelRow, observation: &DiscoveredObservation) -> Vec<Value> {
@@ -2656,6 +2734,37 @@ fn reconciliation_diff(row: &db::ModelRow, observation: &DiscoveredObservation) 
         }
     }
 
+    if let Some(reasoning) = observation.reasoning.as_ref() {
+        push_diff(
+            &mut diff,
+            "reasoning_capability",
+            discovery
+                .get("reasoning_capability")
+                .cloned()
+                .unwrap_or(Value::Null),
+            serde_json::to_value(reasoning).unwrap_or(Value::Null),
+            observation
+                .capability_sources
+                .get("reasoning")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+
+    if let Some(modalities) = observation.modalities.as_ref() {
+        push_diff(
+            &mut diff,
+            "modalities",
+            discovery.get("modalities").cloned().unwrap_or(Value::Null),
+            modalities.clone(),
+            observation
+                .capability_sources
+                .get("modalities")
+                .cloned()
+                .unwrap_or_else(|| json!("discovery")),
+        );
+    }
+
     if let Some(thinking_map) = observation.thinking_map.as_ref() {
         let configured =
             serde_json::from_str::<Value>(&row.thinking_map).unwrap_or_else(|_| json!({}));
@@ -2718,18 +2827,17 @@ fn reconciliation_diff(row: &db::ModelRow, observation: &DiscoveredObservation) 
     }
 
     if let Some(observed) = observation.transport.as_ref() {
-        if let Some(configured) = discovery
+        let configured = discovery
             .get("configured_transport")
             .and_then(Value::as_str)
-        {
-            push_diff(
-                &mut diff,
-                "transport",
-                json!(configured),
-                json!(observed),
-                json!(observation.transport_source),
-            );
-        }
+            .or_else(|| discovery.pointer("/transport/format").and_then(Value::as_str));
+        push_diff(
+            &mut diff,
+            "transport",
+            configured.map(Value::from).unwrap_or(Value::Null),
+            json!(observed),
+            json!(observation.transport_source),
+        );
     }
 
     let pinned: std::collections::HashSet<String> = discovery
@@ -2762,7 +2870,8 @@ fn reconciliation_state(
     let ignored = previous
         .get("ignored_diff")
         .is_some_and(|value| value == &diff);
-    let deprecated = explicit_deprecation(observation);
+    let deprecation = deprecation_details(observation);
+    let deprecated = deprecation.is_some();
     let status = if deprecated {
         "deprecated"
     } else if diff.as_array().is_none_or(Vec::is_empty) {
@@ -2783,6 +2892,7 @@ fn reconciliation_state(
             .get("pinned_fields")
             .cloned()
             .unwrap_or_else(|| json!([])),
+        "deprecation": deprecation,
         "provenance": {
             "capabilities": observation.capability_sources,
             "prices": observation.price_sources,
@@ -3046,28 +3156,35 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                 row,
                 json!({
                     "last_seen": now,
-                    "context_window": m.context_window,
-                    "max_output_tokens": m.max_output_tokens,
-                    "display_name": m.display_name,
-                    "capabilities": discovered_capabilities(observation),
-                    "reasoning_capability": &observation.reasoning,
-                    "thinking_map": &observation.thinking_map,
-                    "transport": observation.transport.as_ref().map(|format| json!({ "format": format })),
-                    "transport_source": &observation.transport_source,
-                    "capability_sources": &observation.capability_sources,
-                    "modalities": &observation.modalities,
-                    "prices": &observation.prices,
-                    "price_sources": &observation.price_sources,
-                    "raw_metadata": &observation.raw_metadata,
-                    "raw_metadata_truncated": observation.raw_metadata_truncated,
-                    "canonical_identity": &observation.canonical_identity,
-                    "canonical_model_id": &observation.canonical_model_id,
-                    "canonical_match": &observation.canonical_match,
-                    "provider_variant": &observation.provider_variant,
+                    "latest_observation": {
+                        "observed_at": now,
+                        "context_window": m.context_window,
+                        "max_output_tokens": m.max_output_tokens,
+                        "display_name": m.display_name,
+                        "capabilities": discovered_capabilities(observation),
+                        "reasoning_capability": &observation.reasoning,
+                        "thinking_map": &observation.thinking_map,
+                        "transport": observation.transport.as_ref().map(|format| json!({ "format": format })),
+                        "transport_source": &observation.transport_source,
+                        "capability_sources": &observation.capability_sources,
+                        "modalities": &observation.modalities,
+                        "prices": &observation.prices,
+                        "price_sources": &observation.price_sources,
+                        "raw_metadata": &observation.raw_metadata,
+                        "raw_metadata_truncated": observation.raw_metadata_truncated,
+                        "canonical_identity": &observation.canonical_identity,
+                        "canonical_model_id": &observation.canonical_model_id,
+                        "canonical_match": &observation.canonical_match,
+                        "provider_variant": &observation.provider_variant,
+                        "opaque_state": &observation.opaque_state,
+                        "model_type": &observation.model_type,
+                        "execution_supported": observation.execution_supported,
+                        "catalog": &observation.catalog,
+                    },
+                    // Opaque-state capability is host-owned protocol metadata,
+                    // not an operator model-semantic override. Keep it live so
+                    // plugin continuation handling remains correct.
                     "opaque_state": &observation.opaque_state,
-                    "model_type": &observation.model_type,
-                    "execution_supported": observation.execution_supported,
-                    "catalog": &observation.catalog,
                     "reconciliation": &reconciliation,
                     "disappeared": false,
                 }),
@@ -11827,13 +11944,16 @@ mod reasoning_discovery_control_plane_tests {
         assert_eq!(discovery["disappeared"], false);
         assert!(discovery.get("last_seen").is_some());
         assert_eq!(
-            discovery["raw_metadata"],
+            discovery["latest_observation"]["raw_metadata"],
             json!({
                 "id": "reasoner",
                 "supportedThinkingEfforts": ["low", "high"]
             })
         );
-        assert_eq!(discovery["raw_metadata_truncated"], false);
+        assert_eq!(
+            discovery["latest_observation"]["raw_metadata_truncated"],
+            false
+        );
 
         assert_eq!(rediscovered.context_window, Some(4096));
         assert_eq!(rediscovered.max_output_tokens, Some(1024));
