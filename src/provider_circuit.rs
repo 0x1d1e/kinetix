@@ -195,13 +195,19 @@ impl Circuit {
         changed
     }
 
-    fn release_probe_without_verdict(&mut self, generation: u64, now: DateTime<Utc>) {
+    fn release_probe_slot(&mut self, generation: u64) -> bool {
         if generation != self.generation || self.state != ProviderCircuitState::HalfOpen {
-            return;
+            return false;
         }
         self.half_open_inflight = 0;
-        self.state = ProviderCircuitState::Open;
-        self.retry_at = Some(now + ChronoDuration::seconds(ABANDONED_PROBE_RETRY_SECS));
+        true
+    }
+
+    fn reopen_abandoned_probe(&mut self, generation: u64, now: DateTime<Utc>) {
+        if self.release_probe_slot(generation) {
+            self.state = ProviderCircuitState::Open;
+            self.retry_at = Some(now + ChronoDuration::seconds(ABANDONED_PROBE_RETRY_SECS));
+        }
     }
 }
 
@@ -414,7 +420,7 @@ impl ProviderAttempt {
 
         if !qualifies(kind, status) {
             if self.half_open_probe {
-                state.release_probe_without_verdict(self.generation, now);
+                state.release_probe_slot(self.generation);
             }
             return ProviderCircuitTransition {
                 half_open_probe: self.half_open_probe,
@@ -453,7 +459,9 @@ impl ProviderAttempt {
                 distinct_targets >= MIN_DISTINCT_TARGETS
             }
         };
-        let opened = if self.half_open_probe || correlated {
+        let validated_success = self.validated_success.load(Ordering::Acquire);
+        let unvalidated_probe_failure = self.half_open_probe && !validated_success;
+        let opened = if unvalidated_probe_failure || correlated {
             let changed = state.open(now);
             if changed {
                 state.generation = state.generation.wrapping_add(1);
@@ -477,7 +485,7 @@ impl ProviderAttempt {
         if self.half_open_probe {
             self.circuit
                 .lock()
-                .release_probe_without_verdict(self.generation, Utc::now());
+                .reopen_abandoned_probe(self.generation, Utc::now());
         }
         ProviderCircuitTransition {
             half_open_probe: self.half_open_probe,
@@ -494,7 +502,7 @@ impl Drop for ProviderAttempt {
         if self.half_open_probe {
             self.circuit
                 .lock()
-                .release_probe_without_verdict(self.generation, Utc::now());
+                .reopen_abandoned_probe(self.generation, Utc::now());
         }
     }
 }
@@ -641,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn validated_probe_stream_failure_reopens_provider_and_records_evidence() {
+    fn validated_probe_stream_failure_obeys_closed_correlation_threshold() {
         let circuits = ProviderCircuits::default();
         circuits
             .begin_attempt("p", "a", "route-a")
@@ -663,15 +671,29 @@ mod tests {
         assert!(validation.recovered);
         assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Closed);
 
+        for account in ["c", "d", "e"] {
+            circuits
+                .begin_attempt("p", account, "route-normal")
+                .unwrap()
+                .finish_success();
+        }
+
         let terminal = probe.finish_failure(FailureKind::Timeout, None);
-        assert!(terminal.opened);
+        assert!(!terminal.opened);
         let snapshot = circuits.snapshot("p");
-        assert_eq!(snapshot.state, ProviderCircuitState::Open);
+        assert_eq!(snapshot.state, ProviderCircuitState::Closed);
         assert_eq!(snapshot.recent_qualifying_failures, 1);
         assert_eq!(snapshot.recent_failures[0].account_id, "a");
+
+        let second = circuits
+            .begin_attempt("p", "b", "route-b")
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+        assert!(second.opened);
+        assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Open);
         let combined = validation.merge(terminal);
         assert!(combined.recovered);
-        assert!(combined.opened);
+        assert!(!combined.opened);
     }
 
     #[test]
@@ -694,6 +716,73 @@ mod tests {
         assert_eq!(snapshot.state, ProviderCircuitState::Closed);
         assert_eq!(snapshot.recent_qualifying_failures, 1);
         assert_eq!(snapshot.distinct_failing_accounts, 1);
+    }
+
+    #[test]
+    fn non_provider_half_open_failures_release_the_probe_slot_for_retry() {
+        for (kind, status) in [
+            (FailureKind::AuthError, Some(401)),
+            (FailureKind::QuotaExhausted, Some(429)),
+            (FailureKind::RateLimit, Some(429)),
+            (FailureKind::BadRequest, Some(400)),
+            (FailureKind::TargetError, None),
+        ] {
+            let circuits = ProviderCircuits::default();
+            circuits
+                .begin_attempt("p", "a", "route-a")
+                .unwrap()
+                .finish_failure(FailureKind::ServerError, Some(503));
+            circuits
+                .begin_attempt("p", "b", "route-b")
+                .unwrap()
+                .finish_failure(FailureKind::ServerError, Some(503));
+            {
+                let circuit = circuits.circuit("p");
+                let mut state = circuit.lock();
+                state.retry_at = Some(Utc::now() - ChronoDuration::seconds(1));
+            }
+
+            let probe = circuits.begin_attempt("p", "a", "route-a").unwrap();
+            let transition = probe.finish_failure(kind, status);
+            assert!(!transition.opened, "kind={kind:?}");
+            assert_eq!(
+                circuits.snapshot("p").state,
+                ProviderCircuitState::HalfOpen,
+                "kind={kind:?}"
+            );
+
+            let retry = circuits.begin_attempt("p", "b", "route-b").unwrap();
+            assert!(retry.is_half_open_probe(), "kind={kind:?}");
+            assert!(retry.finish_success().recovered, "kind={kind:?}");
+            assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Closed);
+        }
+    }
+
+    #[test]
+    fn dropping_an_abandoned_half_open_probe_reopens_briefly() {
+        let circuits = ProviderCircuits::default();
+        circuits
+            .begin_attempt("p", "a", "route-a")
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+        circuits
+            .begin_attempt("p", "b", "route-b")
+            .unwrap()
+            .finish_failure(FailureKind::ServerError, Some(503));
+        {
+            let circuit = circuits.circuit("p");
+            let mut state = circuit.lock();
+            state.retry_at = Some(Utc::now() - ChronoDuration::seconds(1));
+        }
+
+        let probe = circuits.begin_attempt("p", "a", "route-a").unwrap();
+        let before_drop = Utc::now();
+        drop(probe);
+        let snapshot = circuits.snapshot("p");
+        assert_eq!(snapshot.state, ProviderCircuitState::Open);
+        assert!(snapshot
+            .retry_at
+            .is_some_and(|retry_at| retry_at > before_drop));
     }
 
     #[test]

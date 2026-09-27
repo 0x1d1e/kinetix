@@ -76,7 +76,10 @@ fallback causes, the commit point, and the final result.
 - Retrieve by the client's opaque id: `GET /admin/api/route-traces/{krt_…}`.
 
 Trace steps look like `resolve → candidate → skip → attempt → commit → result`
-with per-step timings and warnings. Each target attempt includes its structured
+with per-step timings and warnings. When Kinetix opens its provider circuit, the
+trace records a `provider_circuit` step at the transition, including transitions
+recorded while finalizing a committed stream; it does not require a later target to
+be rejected by that circuit. Each target attempt includes its structured
 `resolved_transport` value (for example, `openai-responses`) so transport and
 endpoint decisions can be diagnosed without exposing credentials.
 

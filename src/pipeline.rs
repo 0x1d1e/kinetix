@@ -1414,6 +1414,7 @@ pub async fn run(
                                 attempts_done > 1,
                                 can_fallback,
                                 circuit_transition,
+                                &mut trace,
                             );
                             if !can_fallback {
                                 trace.step(
@@ -1578,6 +1579,7 @@ pub async fn run(
                                 attempts_done > 1,
                                 false,
                                 circuit_transition,
+                                &mut trace,
                             );
                             auth_retried_accounts.insert(target.account.id.clone());
                             // Credential renewal is part of this logical target
@@ -1654,6 +1656,7 @@ pub async fn run(
                                 attempts_done > 1,
                                 can_fallback,
                                 circuit_transition,
+                                &mut trace,
                             );
                             if !can_fallback {
                                 trace.finish("failed");
@@ -1694,6 +1697,7 @@ pub async fn run(
                     attempts_done > 1,
                     can_fallback,
                     circuit_transition,
+                    &mut trace,
                 );
                 if !can_fallback {
                     trace.step(
@@ -1750,6 +1754,7 @@ pub async fn run(
                     attempts_done > 1,
                     can_fallback,
                     circuit_transition,
+                    &mut trace,
                 );
                 if !can_fallback {
                     trace.step(
@@ -2010,6 +2015,20 @@ fn telemetry_outcome_for_failure(kind: FailureKind) -> crate::target_telemetry::
     }
 }
 
+fn trace_provider_circuit_transition(
+    trace: &mut RouteTrace,
+    provider_name: &str,
+    transition: crate::provider_circuit::ProviderCircuitTransition,
+) {
+    if transition.opened {
+        trace.step(
+            "provider_circuit",
+            Some(provider_name.to_string()),
+            "provider circuit opened after a qualifying failure",
+        );
+    }
+}
+
 fn record_target_telemetry(
     state: &AppState,
     target: &ResolvedTarget,
@@ -2019,7 +2038,9 @@ fn record_target_telemetry(
     fallback_attempt: bool,
     caused_fallback: bool,
     circuit: crate::provider_circuit::ProviderCircuitTransition,
+    trace: &mut RouteTrace,
 ) {
+    trace_provider_circuit_transition(trace, &target.provider.name, circuit);
     let mut event = crate::target_telemetry::TelemetryEvent::attempt(
         traffic_key(target),
         outcome,
@@ -4826,6 +4847,7 @@ async fn finalize_log(
         meta.fallback_hops > 0,
         false,
         circuit_transition,
+        &mut trace,
     );
 
     let prices = attempt.target.model.prices();
@@ -5260,6 +5282,30 @@ pub async fn dry_run(
 #[cfg(test)]
 mod route_policy_tests {
     use super::*;
+
+    #[test]
+    fn provider_circuit_open_transition_is_added_to_route_trace() {
+        let mut trace = RouteTrace::new("req_test".into(), "model".into());
+        trace_provider_circuit_transition(
+            &mut trace,
+            "provider-a",
+            crate::provider_circuit::ProviderCircuitTransition::default(),
+        );
+        assert!(trace.steps.is_empty());
+
+        trace_provider_circuit_transition(
+            &mut trace,
+            "provider-a",
+            crate::provider_circuit::ProviderCircuitTransition {
+                opened: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(trace.steps.len(), 1);
+        assert_eq!(trace.steps[0].stage, "provider_circuit");
+        assert_eq!(trace.steps[0].target.as_deref(), Some("provider-a"));
+        assert!(trace.steps[0].detail.contains("opened"));
+    }
 
     #[test]
     fn cache_status_comes_from_provider_usage() {
