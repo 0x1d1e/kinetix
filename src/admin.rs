@@ -2457,9 +2457,25 @@ fn raw_discovery_metadata<'a>(payload: &'a Value, model_id: &str) -> Option<&'a 
         .and_then(|values| values.iter().find(|value| matches_model(value, model_id)))
 }
 
+fn model_reconciliation_locks(
+) -> &'static dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>> {
+    static LOCKS: std::sync::OnceLock<
+        dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS.get_or_init(dashmap::DashMap::new)
+}
+
 /// `POST /admin/api/providers/:id/discover` — fetch the upstream model list
 /// using the provider's credentials (FR-10.4).
 pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<Value, ApiError> {
+    // Manual discovery, scheduled reconciliation, and pricing sync all reuse
+    // this path. Serialize work per provider so overlapping refreshes cannot
+    // race observation/ignore/pin state or duplicate upstream/catalog traffic.
+    let lock = model_reconciliation_locks()
+        .entry(id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _guard = lock.lock().await;
     let provider = db::get_provider(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?
@@ -3618,7 +3634,19 @@ fn deterministic_probe_rejection(
     feature_terms.iter().any(|term| body.contains(term))
 }
 
-fn probe_evidence_key(capability: &str) -> String {
+fn probe_evidence_key(capability: &str, value: Option<&Value>) -> String {
+    if capability == "reasoning" {
+        if let Some(level) = value.and_then(Value::as_str) {
+            let level = level.trim().to_ascii_lowercase();
+            if !level.is_empty()
+                && level
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            {
+                return format!("reasoning_effort_{}", level.replace('-', "_"));
+            }
+        }
+    }
     capability.replace('.', "_")
 }
 
@@ -3751,7 +3779,10 @@ pub async fn probe_model_capability(
                 }),
                 defer_loading: None,
             });
-            internal.tool_choice = Some(crate::types::ToolChoice::None);
+            // Require the inert synthetic tool so a successful probe proves
+            // actual tool-call generation rather than merely accepting a tool schema.
+            // The returned call is inspected only; it is never executed.
+            internal.tool_choice = Some(crate::types::ToolChoice::Required);
         }
         "structured_output" => {
             let schema = json!({
@@ -3886,10 +3917,51 @@ pub async fn probe_model_capability(
     let (status, status_code, detail) = match response {
         Ok(response) => {
             let status_code = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
             if (200..300).contains(&status_code) {
-                ("supported", status_code, None)
+                let contract_verified = match body.capability.as_str() {
+                    "tool_calling" => serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|payload| adapter.parse_full_response(&payload).ok())
+                        .is_some_and(|events| {
+                            events.iter().any(|event| {
+                                matches!(
+                                    event,
+                                    crate::types::StreamEvent::ToolCallStart { name, .. }
+                                        if name == "kinetix_probe_noop"
+                                )
+                            })
+                        }),
+                    "structured_output" => serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|payload| adapter.parse_full_response(&payload).ok())
+                        .map(|events| {
+                            events
+                                .into_iter()
+                                .filter_map(|event| match event {
+                                    crate::types::StreamEvent::TextDelta(text) => Some(text),
+                                    _ => None,
+                                })
+                                .collect::<String>()
+                        })
+                        .and_then(|text| serde_json::from_str::<Value>(text.trim()).ok())
+                        .and_then(|value| value.get("ok").and_then(Value::as_str).map(str::to_string))
+                        .is_some(),
+                    _ => true,
+                };
+                if contract_verified {
+                    ("supported", status_code, None)
+                } else {
+                    (
+                        "inconclusive",
+                        status_code,
+                        Some(format!(
+                            "upstream returned success but did not satisfy the {} probe contract",
+                            body.capability
+                        )),
+                    )
+                }
             } else {
-                let text = response.text().await.unwrap_or_default();
                 let redacted = crypto::redact(&text);
                 let status = if deterministic_probe_rejection(
                     &body.capability,
@@ -3934,7 +4006,10 @@ pub async fn probe_model_capability(
         "estimated_max_cost_usd": estimated_cost,
         "detail": detail,
     });
-    evidence.insert(probe_evidence_key(&body.capability), evidence_value.clone());
+    evidence.insert(
+        probe_evidence_key(&body.capability, body.value.as_ref()),
+        evidence_value.clone(),
+    );
     db::merge_model_discovery(
         &state.pool,
         &model.id,
