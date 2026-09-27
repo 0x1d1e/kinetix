@@ -2708,7 +2708,9 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                 .await
                 .map_err(ApiError::internal)?;
             if accounts.is_empty() {
-                return Err(ApiError::bad("provider has no credentials to discover with"));
+                return Err(ApiError::bad(
+                    "provider has no credentials to discover with",
+                ));
             }
 
             let mut combined = Vec::new();
@@ -3762,7 +3764,9 @@ async fn discover_models_native(
         .await
         .map_err(ApiError::internal)?;
     if accounts.is_empty() {
-        return Err(ApiError::bad("provider has no credentials to discover with"));
+        return Err(ApiError::bad(
+            "provider has no credentials to discover with",
+        ));
     }
 
     let adapter = state.adapters.for_provider(provider);
@@ -3827,7 +3831,7 @@ async fn discover_models_native(
                 request_id: None,
                 headers: Vec::new(),
                 total_timeout: Some(std::time::Duration::from_millis(
-                    provider.timeout_ms.max(1) as u64,
+                    provider.timeout_ms.max(1) as u64
                 )),
             },
         )
@@ -3856,8 +3860,11 @@ async fn discover_models_native(
             .into_iter()
             .map(|model| {
                 let provider_metadata = raw_discovery_metadata(&parsed, &model.id).cloned();
-                let catalog =
-                    crate::model_catalog::resolve(&provider.base_url, &model.id, models_dev.as_ref());
+                let catalog = crate::model_catalog::resolve(
+                    &provider.base_url,
+                    &model.id,
+                    models_dev.as_ref(),
+                );
                 discovered_observation_with_catalog(
                     model,
                     provider_metadata,
@@ -4650,20 +4657,25 @@ mod model_lifecycle_regression_tests {
         let mut union = Vec::new();
         extend_unique_by_id(
             &mut union,
-            vec![Item { id: "model-1".into() }],
+            vec![Item {
+                id: "model-1".into(),
+            }],
             |item| item.id.clone(),
         );
         extend_unique_by_id(
             &mut union,
             vec![
-                Item { id: "model-1".into() },
-                Item { id: "model-2".into() },
+                Item {
+                    id: "model-1".into(),
+                },
+                Item {
+                    id: "model-2".into(),
+                },
             ],
             |item| item.id.clone(),
         );
 
-        let ids: std::collections::HashSet<_> =
-            union.into_iter().map(|item| item.id).collect();
+        let ids: std::collections::HashSet<_> = union.into_iter().map(|item| item.id).collect();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains("model-1"));
         assert!(ids.contains("model-2"));
@@ -5013,11 +5025,7 @@ fn deterministic_probe_rejection(
     }
 
     parameter_terms.iter().any(|term| {
-        let value_forms = [
-            value.clone(),
-            format!("'{value}'"),
-            format!("\"{value}\""),
-        ];
+        let value_forms = [value.clone(), format!("'{value}'"), format!("\"{value}\"")];
         value_forms.iter().any(|value| {
             [
                 format!("invalid value {value} for {term}"),
