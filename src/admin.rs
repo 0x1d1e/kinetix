@@ -581,26 +581,11 @@ pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
         )
         .await;
 
-        if pricing_due {
+        if reconcile_due {
             let now = db::now_iso();
-            if let Err(error) = db::set_setting(&state.pool, &pricing_key, &now).await {
-                tracing::warn!(provider = %provider.id, %error, "failed to persist pricing-sync attempt state");
-                continue;
-            }
-            if reconcile_due {
-                if let Err(error) = db::set_setting(&state.pool, &reconcile_key, &now).await {
-                    tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation attempt state");
-                    continue;
-                }
-            }
-            match sync_provider_pricing_id(state, &provider.id).await {
-                Ok(_) => {
-                    if let Err(error) =
-                        record_lifecycle_success(&state.pool, "pricing_sync", &provider.id).await
-                    {
-                        tracing::warn!(provider = %provider.id, %error, "failed to persist pricing-sync success state");
-                    }
-                    if reconcile_due {
+            match db::set_setting(&state.pool, &reconcile_key, &now).await {
+                Ok(()) => match reconcile_provider_id(state, &provider.id).await {
+                    Ok(_) => {
                         if let Err(error) =
                             record_lifecycle_success(&state.pool, "reconciliation", &provider.id)
                                 .await
@@ -608,63 +593,63 @@ pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
                             tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation success state");
                         }
                     }
-                }
-                Err(error) => {
-                    let message = error.1.clone();
-                    let _ = record_lifecycle_failure(
-                        &state.pool,
-                        "pricing_sync",
-                        &provider.id,
-                        &message,
-                    )
-                    .await;
-                    if reconcile_due {
-                        let _ = record_lifecycle_failure(
+                    Err(error) => {
+                        let message = error.1.clone();
+                        if let Err(record_error) = record_lifecycle_failure(
                             &state.pool,
                             "reconciliation",
                             &provider.id,
                             &message,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(provider = %provider.id, %record_error, "failed to persist reconciliation failure state");
+                        }
+                        tracing::warn!(
+                            provider = %provider.id,
+                            error = ?error,
+                            "scheduled model reconciliation failed; existing state left intact"
+                        );
                     }
-                    tracing::warn!(
-                        provider = %provider.id,
-                        error = ?error,
-                        "scheduled pricing sync failed; preserving last-known metadata and prices"
-                    );
+                },
+                Err(error) => {
+                    tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation attempt state");
                 }
             }
-            continue;
         }
 
-        if reconcile_due {
+        if pricing_due {
             let now = db::now_iso();
-            if let Err(error) = db::set_setting(&state.pool, &reconcile_key, &now).await {
-                tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation attempt state");
-                continue;
-            }
-            match reconcile_provider_id(state, &provider.id).await {
-                Ok(_) => {
-                    if let Err(error) =
-                        record_lifecycle_success(&state.pool, "reconciliation", &provider.id).await
-                    {
-                        tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation success state");
+            match db::set_setting(&state.pool, &pricing_key, &now).await {
+                Ok(()) => match sync_provider_pricing_id(state, &provider.id).await {
+                    Ok(_) => {
+                        if let Err(error) =
+                            record_lifecycle_success(&state.pool, "pricing_sync", &provider.id).await
+                        {
+                            tracing::warn!(provider = %provider.id, %error, "failed to persist pricing-sync success state");
+                        }
                     }
-                }
+                    Err(error) => {
+                        let message = error.1.clone();
+                        if let Err(record_error) = record_lifecycle_failure(
+                            &state.pool,
+                            "pricing_sync",
+                            &provider.id,
+                            &message,
+                        )
+                        .await
+                        {
+                            tracing::warn!(provider = %provider.id, %record_error, "failed to persist pricing-sync failure state");
+                        }
+                        tracing::warn!(
+                            provider = %provider.id,
+                            error = ?error,
+                            "scheduled pricing sync failed; preserving last-known metadata and prices"
+                        );
+                    }
+                },
                 Err(error) => {
-                    let message = error.1.clone();
-                    let _ = record_lifecycle_failure(
-                        &state.pool,
-                        "reconciliation",
-                        &provider.id,
-                        &message,
-                    )
-                    .await;
-                    tracing::warn!(
-                        provider = %provider.id,
-                        error = ?error,
-                        "scheduled model reconciliation failed; existing state left intact"
-                    );
+                    tracing::warn!(provider = %provider.id, %error, "failed to persist pricing-sync attempt state");
                 }
             }
         }
@@ -2621,9 +2606,10 @@ fn model_reconciliation_locks(
 /// `POST /admin/api/providers/:id/discover` — fetch the upstream model list
 /// using the provider's credentials (FR-10.4).
 pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<Value, ApiError> {
-    // Manual discovery, scheduled reconciliation, and pricing sync all reuse
-    // this path. Serialize work per provider so overlapping refreshes cannot
-    // race observation/ignore/pin state or duplicate upstream/catalog traffic.
+    // Manual discovery and scheduled reconciliation reuse this path. Serialize
+    // work per provider so overlapping refreshes cannot race observation,
+    // ignore, or pin state. Pricing sync shares the same provider lock but has
+    // an independent state machine and never invokes reconciliation implicitly.
     let lock = model_reconciliation_locks()
         .entry(id.to_string())
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
@@ -3074,9 +3060,13 @@ fn merge_automatic_price_observation(
     let mut effective = current.clone();
     let mut fields = effective_price_fields(discovery, current);
     let mut preserved_manual = false;
-    let observed_at = discovery.get("last_seen").cloned().unwrap_or(Value::Null);
+    let provider_observed_at = discovery.get("last_seen").cloned().unwrap_or(Value::Null);
     let catalog_source_state = discovery
         .pointer("/catalog/source_state")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let catalog_observed_at = catalog_source_state
+        .get("retrieved_at")
         .cloned()
         .unwrap_or(Value::Null);
 
@@ -3094,10 +3084,10 @@ fn merge_automatic_price_observation(
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| automatic_price_source(discovery));
-        let source_state = if source.starts_with("models.dev") {
-            catalog_source_state.clone()
+        let (observed_at, source_state) = if source.starts_with("models.dev") {
+            (catalog_observed_at.clone(), catalog_source_state.clone())
         } else {
-            Value::Null
+            (provider_observed_at.clone(), Value::Null)
         };
         set_price_field_provenance(
             &mut fields,
@@ -3142,6 +3132,30 @@ fn is_automatic_price_source(source: &str) -> bool {
             | "discovery"
     ) || source.starts_with("models.dev:")
         || source.starts_with("bundled_catalog:")
+}
+
+fn merge_selected_capability_overrides(
+    discovery: &Value,
+    capabilities: &Value,
+    selected: &[String],
+) -> serde_json::Map<String, Value> {
+    let mut overrides = discovery
+        .get("operator_capability_overrides")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let Some(configured) = capabilities.as_object() else {
+        return overrides;
+    };
+    for field in selected {
+        let Some(key) = field.strip_prefix("capabilities.") else {
+            continue;
+        };
+        if let Some(value) = configured.get(key) {
+            overrides.insert(key.to_string(), value.clone());
+        }
+    }
+    overrides
 }
 
 /// Apply an explicit reconciliation decision. Observations never reach this
@@ -3355,10 +3369,14 @@ pub async fn update_model_reconciliation(
                 .iter()
                 .any(|field| field.starts_with("capabilities."))
             {
+                let capability_overrides =
+                    merge_selected_capability_overrides(&discovery, &capabilities, &selected);
                 db::merge_model_discovery(
                     &state.pool,
                     &id,
-                    &json!({ "operator_capability_overrides": capabilities.clone() }),
+                    &json!({
+                        "operator_capability_overrides": Value::Object(capability_overrides)
+                    }),
                 )
                 .await
                 .map_err(ApiError::internal)?;
@@ -3442,15 +3460,95 @@ pub async fn update_model_reconciliation(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// Explicit pricing synchronization. Manual/operator-owned prices always win;
-/// auto-managed prices are refreshed from the latest successful observation.
+fn models_dev_pricing_patch(
+    discovery: &Value,
+    resolution: &crate::model_catalog::CatalogResolution,
+) -> Value {
+    let mut observed: Prices = discovery
+        .get("prices")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    let mut sources = discovery
+        .get("price_sources")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let provider_prices = resolution
+        .provider
+        .as_ref()
+        .filter(|provider| provider.source == crate::model_catalog::CatalogSource::ModelsDev);
+
+    for field in PRICE_FIELDS {
+        let existing_source = sources.get(field).and_then(Value::as_str);
+        if matches!(
+            existing_source,
+            Some("provider_metadata" | "plugin_capabilities_json")
+        ) {
+            continue;
+        }
+
+        let value = provider_prices.and_then(|provider| price_field(&provider.prices, field));
+        if let Some(value) = value {
+            set_price_field(&mut observed, field, Some(value));
+            sources.insert(
+                field.to_string(),
+                Value::String("models.dev:provider".to_string()),
+            );
+        } else if existing_source.is_some_and(|source| source.starts_with("models.dev")) {
+            set_price_field(&mut observed, field, None);
+            sources.insert(field.to_string(), Value::Null);
+        }
+    }
+
+    json!({
+        "prices": observed,
+        "price_sources": Value::Object(sources),
+        "catalog": resolution.catalog_json(),
+    })
+}
+
+fn apply_top_level_discovery_patch(discovery: &mut Value, patch: &Value) {
+    let Some(target) = discovery.as_object_mut() else {
+        *discovery = patch.clone();
+        return;
+    };
+    let Some(fields) = patch.as_object() else {
+        return;
+    };
+    for (key, value) in fields {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+/// Explicit pricing synchronization. This lane refreshes models.dev pricing
+/// independently of provider/plugin discovery and never runs reconciliation.
+/// Existing provider/plugin observations retain precedence; manual/operator-owned
+/// effective fields always win.
 pub(crate) async fn sync_provider_pricing_id(
     state: &AppState,
     id: &str,
 ) -> Result<Value, ApiError> {
-    // Refresh observations first. If discovery/catalog resolution fails, this
-    // returns before touching any effective prices, preserving last-known rates.
-    let _ = reconcile_provider_id(state, id).await?;
+    let lock = model_reconciliation_locks()
+        .entry(id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _guard = lock.lock().await;
+
+    let provider = db::get_provider(&state.pool, id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let models_dev =
+        crate::model_catalog::ModelsDevCatalog::fetch(&state.http, &provider.base_url)
+            .await
+            .ok_or_else(|| {
+                ApiError::bad(
+                    "models.dev pricing refresh unavailable; preserving last-known observations and effective prices",
+                )
+            })?;
+
     let models = db::models_for_provider(&state.pool, id)
         .await
         .map_err(ApiError::internal)?;
@@ -3458,7 +3556,15 @@ pub(crate) async fn sync_provider_pricing_id(
     let mut skipped_manual = Vec::new();
 
     for row in models {
-        let discovery = discovery_object(&row);
+        let mut discovery = discovery_object(&row);
+        let resolution =
+            crate::model_catalog::resolve(&provider.base_url, &row.upstream_id, Some(&models_dev));
+        let pricing_patch = models_dev_pricing_patch(&discovery, &resolution);
+        apply_top_level_discovery_patch(&mut discovery, &pricing_patch);
+        db::merge_model_discovery(&state.pool, &row.id, &pricing_patch)
+            .await
+            .map_err(ApiError::internal)?;
+
         let observed: Prices = discovery
             .get("prices")
             .cloned()
@@ -3471,7 +3577,6 @@ pub(crate) async fn sync_provider_pricing_id(
         let current = row.prices();
         let (effective, fields, preserved_manual) =
             merge_automatic_price_observation(&current, &observed, &discovery);
-        let observed_at = discovery.get("last_seen").cloned().unwrap_or(Value::Null);
         let catalog_source_state = discovery
             .pointer("/catalog/source_state")
             .cloned()
@@ -3483,7 +3588,6 @@ pub(crate) async fn sync_provider_pricing_id(
         let source = effective_price_source(&fields, &effective);
         let metadata = json!({
             "fields": fields,
-            "observed_at": observed_at,
             "catalog_source_state": catalog_source_state,
         });
         let version_id =
@@ -3977,10 +4081,11 @@ fn numeric_probe_budget(value: &Value) -> Option<u64> {
     }
 }
 
+const PROBE_RESPONSE_ALLOWANCE_TOKENS: u64 = 16;
+
 fn probe_reasoning_token_bound(
     thinking_map: &ThinkingMap,
     thinking: Option<crate::types::ThinkingLevel>,
-    model_max_output_tokens: Option<i64>,
 ) -> Option<u64> {
     let Some(level) = thinking else {
         return Some(0);
@@ -3989,12 +4094,32 @@ fn probe_reasoning_token_bound(
         return Some(0);
     }
     let mapping = thinking_map.levels.get(level.as_key())?;
-    if let Some(bound) = numeric_probe_budget(mapping) {
-        return Some(bound);
+    Some(numeric_probe_budget(mapping).unwrap_or(0))
+}
+
+fn probe_max_tokens_for_thinking(
+    thinking_map: &ThinkingMap,
+    thinking: Option<crate::types::ThinkingLevel>,
+    model_max_output_tokens: Option<i64>,
+) -> Result<u32, String> {
+    let reasoning_tokens = probe_reasoning_token_bound(thinking_map, thinking)
+        .ok_or_else(|| "requested reasoning level has no executable mapping".to_string())?;
+    if reasoning_tokens == 0 {
+        return Ok(PROBE_RESPONSE_ALLOWANCE_TOKENS as u32);
     }
-    model_max_output_tokens
-        .filter(|value| *value >= 0)
-        .map(|value| value as u64)
+
+    let required = reasoning_tokens
+        .checked_add(PROBE_RESPONSE_ALLOWANCE_TOKENS)
+        .ok_or_else(|| "reasoning budget is too large to construct a bounded probe".to_string())?;
+    if let Some(ceiling) = model_max_output_tokens {
+        if ceiling <= 0 || required > ceiling as u64 {
+            return Err(format!(
+                "reasoning budget requires max_tokens > {reasoning_tokens}, but model output ceiling is {ceiling}"
+            ));
+        }
+    }
+    u32::try_from(required)
+        .map_err(|_| "reasoning budget exceeds the supported probe token range".to_string())
 }
 
 fn probe_cost_upper_bound(
@@ -4003,14 +4128,16 @@ fn probe_cost_upper_bound(
     max_tokens: u32,
     thinking_map: &ThinkingMap,
     thinking: Option<crate::types::ThinkingLevel>,
-    model_max_output_tokens: Option<i64>,
 ) -> Option<f64> {
     let input_rate = prices.input_per_1m?;
     let output_rate = prices.output_per_1m?;
+    // Serialized bytes intentionally overestimate token count; this is a
+    // ceiling, not billing estimation.
     let input_tokens = serde_json::to_vec(outbound).ok()?.len() as u64;
-    let reasoning_tokens =
-        probe_reasoning_token_bound(thinking_map, thinking, model_max_output_tokens)?;
-    let generated_tokens = (max_tokens as u64).saturating_add(reasoning_tokens);
+    let reasoning_tokens = probe_reasoning_token_bound(thinking_map, thinking)?;
+    let generated_tokens = (max_tokens as u64).max(
+        reasoning_tokens.saturating_add(PROBE_RESPONSE_ALLOWANCE_TOKENS),
+    );
     let generated_rate = if reasoning_tokens > 0 {
         output_rate.max(prices.thinking_per_1m.unwrap_or(output_rate))
     } else {
@@ -4068,6 +4195,84 @@ mod model_lifecycle_regression_tests {
     }
 
     #[test]
+    fn partial_capability_accept_only_promotes_selected_keys() {
+        let discovery = json!({
+            "operator_capability_overrides": {
+                "reasoning": true
+            }
+        });
+        let configured = json!({
+            "tool_calling": true,
+            "vision": false,
+            "reasoning": true
+        });
+        let selected = vec!["capabilities.tool_calling".to_string()];
+        let overrides =
+            merge_selected_capability_overrides(&discovery, &configured, &selected);
+        assert_eq!(overrides.get("tool_calling"), Some(&json!(true)));
+        assert_eq!(overrides.get("reasoning"), Some(&json!(true)));
+        assert!(!overrides.contains_key("vision"));
+    }
+
+    #[test]
+    fn models_dev_pricing_patch_does_not_touch_reconciliation_state() {
+        let discovery = json!({
+            "reconciliation": {
+                "status": "missing",
+                "checked_at": "2026-09-27T00:00:00Z"
+            },
+            "prices": {},
+            "price_sources": {}
+        });
+        let resolution = crate::model_catalog::CatalogResolution {
+            identity: crate::model_catalog::CanonicalIdentity {
+                status: crate::model_catalog::CanonicalIdentityStatus::Unresolved,
+                upstream_model_id: "model".into(),
+                canonical_model_id: None,
+                match_kind: None,
+                candidates: vec![],
+                source: None,
+            },
+            canonical: None,
+            provider: Some(crate::model_catalog::ProviderModelMatch {
+                source: crate::model_catalog::CatalogSource::ModelsDev,
+                provider_id: "provider".into(),
+                host: "example.test".into(),
+                model_id: "model".into(),
+                context_window: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                capabilities_json: json!({}),
+                modalities: None,
+                prices: Prices {
+                    input_per_1m: Some(1.0),
+                    output_per_1m: Some(2.0),
+                    ..Default::default()
+                },
+                model_type: None,
+                metadata: json!({}),
+                source_url: None,
+            }),
+            fallback_canonical: None,
+            fallback_provider: None,
+            catalog_provenance: Some(json!({
+                "source": "models.dev",
+                "retrieved_at": "2026-09-27T01:00:00Z",
+                "freshness": "fresh"
+            })),
+        };
+        let patch = models_dev_pricing_patch(&discovery, &resolution);
+        assert_eq!(patch["prices"]["input_per_1m"], json!(1.0));
+        assert_eq!(
+            patch["price_sources"]["input_per_1m"],
+            json!("models.dev:provider")
+        );
+        assert!(patch.get("reconciliation").is_none());
+        assert!(patch.get("disappeared").is_none());
+        assert!(patch.get("last_seen").is_none());
+    }
+
+    #[test]
     fn partial_reconciliation_selection_keeps_unselected_drift() {
         let reconciliation = json!({
             "diff": [
@@ -4109,6 +4314,54 @@ mod model_lifecycle_regression_tests {
         assert_eq!(loaded, payload);
         drop(pool);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scoped_probe_evidence_retains_multiple_accounts_and_replaces_same_scope() {
+        let mut evidence = serde_json::Map::new();
+        let key = "tool_calling".to_string();
+        let account_a = json!({
+            "status": "supported",
+            "scope": {
+                "provider_id": "provider",
+                "account_id": "account-a",
+                "model_id": "model",
+                "transport": "openai"
+            }
+        });
+        let account_b = json!({
+            "status": "unsupported",
+            "scope": {
+                "provider_id": "provider",
+                "account_id": "account-b",
+                "model_id": "model",
+                "transport": "openai"
+            }
+        });
+        upsert_probe_evidence(&mut evidence, key.clone(), account_a);
+        upsert_probe_evidence(&mut evidence, key.clone(), account_b);
+        assert_eq!(evidence[&key].as_array().unwrap().len(), 2);
+
+        let account_a_new = json!({
+            "status": "unsupported",
+            "scope": {
+                "provider_id": "provider",
+                "account_id": "account-a",
+                "model_id": "model",
+                "transport": "openai"
+            }
+        });
+        upsert_probe_evidence(&mut evidence, key.clone(), account_a_new);
+        let entries = evidence[&key].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|item| {
+            item.pointer("/scope/account_id").and_then(Value::as_str) == Some("account-a")
+                && item.get("status").and_then(Value::as_str) == Some("unsupported")
+        }));
+        assert!(entries.iter().any(|item| {
+            item.pointer("/scope/account_id").and_then(Value::as_str) == Some("account-b")
+                && item.get("status").and_then(Value::as_str) == Some("unsupported")
+        }));
     }
 
     #[tokio::test]
@@ -4158,10 +4411,54 @@ mod probe_cost_regression_tests {
             16,
             &thinking_map,
             Some(crate::types::ThinkingLevel::High),
-            Some(8192),
         )
         .unwrap();
         assert!(cost >= (4112.0 * 3.0) / 1_000_000.0);
+    }
+
+    #[test]
+    fn numeric_reasoning_budget_builds_valid_probe_output_limit() {
+        let thinking_map = ThinkingMap {
+            levels: [("high".to_string(), json!(4096))].into_iter().collect(),
+            mode: Some(crate::types::ThinkingMode::ManualBudget),
+            budget_field: Some("thinking.budget_tokens".into()),
+            level_field: None,
+        };
+        let max_tokens = probe_max_tokens_for_thinking(
+            &thinking_map,
+            Some(crate::types::ThinkingLevel::High),
+            Some(8192),
+        )
+        .unwrap();
+        assert_eq!(max_tokens, 4112);
+        assert!(max_tokens > 4096);
+
+        let error = probe_max_tokens_for_thinking(
+            &thinking_map,
+            Some(crate::types::ThinkingLevel::High),
+            Some(4096),
+        )
+        .unwrap_err();
+        assert!(error.contains("output ceiling"));
+    }
+
+    #[test]
+    fn effort_reasoning_keeps_probe_tiny_without_numeric_budget() {
+        let thinking_map = ThinkingMap {
+            levels: [("high".to_string(), json!("high"))].into_iter().collect(),
+            mode: Some(crate::types::ThinkingMode::Level),
+            budget_field: None,
+            level_field: Some("reasoning_effort".into()),
+        };
+        assert_eq!(
+            probe_max_tokens_for_thinking(
+                &thinking_map,
+                Some(crate::types::ThinkingLevel::High),
+                Some(65536),
+            )
+            .unwrap(),
+            16
+        );
     }
 
     #[test]
@@ -4177,7 +4474,6 @@ mod probe_cost_regression_tests {
             16,
             &ThinkingMap::default(),
             None,
-            None,
         )
         .unwrap();
         let large = probe_cost_upper_bound(
@@ -4185,7 +4481,6 @@ mod probe_cost_regression_tests {
             &json!({"tools":[{"parameters":{"schema":"x".repeat(2048)}}]}),
             16,
             &ThinkingMap::default(),
-            None,
             None,
         )
         .unwrap();
@@ -4257,6 +4552,25 @@ fn probe_evidence_key(capability: &str, value: Option<&Value>) -> String {
         }
     }
     capability.replace('.', "_")
+}
+
+fn same_probe_scope(a: &Value, b: &Value) -> bool {
+    a.get("scope") == b.get("scope")
+}
+
+fn upsert_probe_evidence(
+    evidence: &mut serde_json::Map<String, Value>,
+    key: String,
+    evidence_value: Value,
+) {
+    let mut entries = match evidence.remove(&key) {
+        Some(Value::Array(entries)) => entries,
+        Some(existing @ Value::Object(_)) => vec![existing],
+        _ => Vec::new(),
+    };
+    entries.retain(|existing| !same_probe_scope(existing, &evidence_value));
+    entries.push(evidence_value);
+    evidence.insert(key, Value::Array(entries));
 }
 
 /// Run one explicit, bounded upstream capability probe against the selected
@@ -4458,6 +4772,30 @@ pub async fn probe_model_capability(
         }
     }
 
+    if internal.thinking.is_some() {
+        let max_tokens = match probe_max_tokens_for_thinking(
+            &probe_thinking_map,
+            internal.thinking,
+            model.max_output_tokens,
+        ) {
+            Ok(max_tokens) => max_tokens,
+            Err(reason) => {
+                return Ok(Json(json!({
+                    "status": "inconclusive",
+                    "reason": reason,
+                    "transport": profile.transport.as_str(),
+                    "scope": {
+                        "provider_id": provider.id,
+                        "account_id": account.id,
+                        "model_id": model.id,
+                        "transport": profile.transport.as_str(),
+                    }
+                })))
+            }
+        };
+        internal.params.max_tokens = Some(max_tokens);
+    }
+
     execution_model.thinking_map =
         serde_json::to_string(&probe_thinking_map).map_err(ApiError::internal)?;
     execution_model.parameters =
@@ -4488,7 +4826,6 @@ pub async fn probe_model_capability(
         internal.params.max_tokens.unwrap_or(16),
         &probe_thinking_map,
         internal.thinking,
-        model.max_output_tokens,
     )
     .ok_or_else(|| {
         ApiError::bad(
@@ -4625,7 +4962,8 @@ pub async fn probe_model_capability(
         "estimated_max_cost_usd": estimated_cost,
         "detail": detail,
     });
-    evidence.insert(
+    upsert_probe_evidence(
+        &mut evidence,
         probe_evidence_key(&body.capability, body.value.as_ref()),
         evidence_value.clone(),
     );
