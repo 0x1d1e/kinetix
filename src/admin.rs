@@ -3708,8 +3708,12 @@ pub async fn test_provider(
             opaque_state_plugin: String::new(),
         });
 
-    let profile = crate::adapters::resolve_execution_profile(&provider, &model)
-        .map_err(|error| ApiError::bad(error.message))?;
+    let profile = crate::adapters::resolve_execution_profile_for_target(
+        &provider,
+        &model,
+        Some(account.id.as_str()),
+    )
+    .map_err(|error| ApiError::bad(error.message))?;
     let adapter = state
         .adapters
         .for_transport(&profile.transport)
