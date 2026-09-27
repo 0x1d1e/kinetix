@@ -545,14 +545,39 @@ impl ModelsDevCatalog {
             .get(reqwest::header::LAST_MODIFIED)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let bytes = match response.bytes().await {
-            Ok(bytes) if bytes.len() <= MAX_MODELS_DEV_BYTES => bytes,
-            _ => {
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_MODELS_DEV_BYTES as u64)
+        {
+            return cached
+                .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
+                .map(|entry| entry.catalog.with_freshness("stale"));
+        }
+
+        let mut response = response;
+        let mut bytes = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or_default()
+                .min(MAX_MODELS_DEV_BYTES as u64) as usize,
+        );
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(_) => {
+                    return cached
+                        .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
+                        .map(|entry| entry.catalog.with_freshness("stale"));
+                }
+            };
+            if bytes.len().saturating_add(chunk.len()) > MAX_MODELS_DEV_BYTES {
                 return cached
                     .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
                     .map(|entry| entry.catalog.with_freshness("stale"));
             }
-        };
+            bytes.extend_from_slice(&chunk);
+        }
         let catalog = match Self::from_slice(&bytes) {
             Some(catalog) => catalog,
             None => {

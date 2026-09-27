@@ -1142,8 +1142,9 @@ fn price_snapshot_matches(
 
 /// Resolve the immutable snapshot backing an effective price.
 ///
-/// Identical consecutive prices reuse their latest snapshot, so ordinary model
-/// saves and repeated catalog syncs cannot create unbounded duplicate versions.
+/// Snapshot identity is global within a model's price history, not merely
+/// consecutive. A request that finishes after pricing changed can therefore
+/// reuse the immutable version it started with instead of re-inserting it.
 pub async fn ensure_price_version(
     pool: &Pool,
     model_id: &str,
@@ -1155,19 +1156,30 @@ pub async fn ensure_price_version(
         return Ok(None);
     }
 
-    let latest = sqlx::query(
+    let candidates = sqlx::query(
         "SELECT id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m,
                 thinking_per_1m, source, source_metadata
          FROM price_versions
          WHERE model_id = ?
-         ORDER BY created_at DESC, rowid DESC
-         LIMIT 1",
+           AND input_per_1m IS ?
+           AND output_per_1m IS ?
+           AND cached_per_1m IS ?
+           AND cache_write_per_1m IS ?
+           AND thinking_per_1m IS ?
+           AND source = ?
+         ORDER BY created_at DESC, rowid DESC",
     )
     .bind(model_id)
-    .fetch_optional(pool)
+    .bind(p.input_per_1m)
+    .bind(p.output_per_1m)
+    .bind(p.cached_per_1m)
+    .bind(p.cache_write_per_1m)
+    .bind(p.thinking_per_1m)
+    .bind(source)
+    .fetch_all(pool)
     .await?;
 
-    if let Some(row) = latest {
+    for row in candidates {
         if price_snapshot_matches(&row, p, source, source_metadata)? {
             return Ok(Some(row.try_get::<String, _>("id")?));
         }
@@ -2180,6 +2192,106 @@ mod price_version_identity_tests {
                 .unwrap();
 
         assert_eq!(first, second);
+        drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn in_flight_price_versions_reuse_historical_snapshots() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-price-version-race-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("test.db").display());
+        let pool = connect(&url).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        let provider_id = insert_provider(
+            &pool,
+            &NewProvider {
+                name: "Provider",
+                base_url: "https://example.test",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 120_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "example.test",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let model_id = insert_model(
+            &pool,
+            &NewModel {
+                provider_id: &provider_id,
+                upstream_id: "model",
+                display_name: "Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let v1 = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(2.0),
+            ..Default::default()
+        };
+        let v2 = Prices {
+            input_per_1m: Some(3.0),
+            output_per_1m: Some(4.0),
+            ..Default::default()
+        };
+        let metadata = json!({"reference": "operator"});
+
+        let v1_id = ensure_price_version(&pool, &model_id, &v1, "operator", &metadata)
+            .await
+            .unwrap()
+            .unwrap();
+        let v2_id = ensure_price_version(&pool, &model_id, &v2, "operator", &metadata)
+            .await
+            .unwrap()
+            .unwrap();
+        let late_v1_id = ensure_price_version(&pool, &model_id, &v1, "operator", &metadata)
+            .await
+            .unwrap()
+            .unwrap();
+        let current_v2_id = ensure_price_version(&pool, &model_id, &v2, "operator", &metadata)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(late_v1_id, v1_id);
+        assert_eq!(current_v2_id, v2_id);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id = ?")
+                .bind(&model_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 2);
+
         drop(pool);
         let _ = std::fs::remove_dir_all(root);
     }

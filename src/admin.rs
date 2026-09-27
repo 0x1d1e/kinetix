@@ -2641,6 +2641,20 @@ fn raw_discovery_metadata<'a>(payload: &'a Value, model_id: &str) -> Option<&'a 
         .and_then(|values| values.iter().find(|value| matches_model(value, model_id)))
 }
 
+fn extend_unique_by_id<T>(
+    target: &mut Vec<T>,
+    incoming: Vec<T>,
+    id: impl Fn(&T) -> String,
+) {
+    let mut seen: std::collections::HashSet<String> =
+        target.iter().map(&id).collect();
+    for item in incoming {
+        if seen.insert(id(&item)) {
+            target.push(item);
+        }
+    }
+}
+
 fn model_reconciliation_locks(
 ) -> &'static dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>> {
     static LOCKS: std::sync::OnceLock<
@@ -2698,19 +2712,33 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
             let accounts = db::accounts_for_provider(&state.pool, &provider.id)
                 .await
                 .map_err(ApiError::internal)?;
-            let account = accounts
-                .into_iter()
-                .next()
-                .ok_or_else(|| ApiError::bad("provider has no credentials to discover with"))?;
-            manager
-                .account_model_discover(
-                    &pref.plugin_id,
-                    &provider.id,
-                    &account.id,
-                    &provider.base_url,
-                    &models_path,
-                )
-                .await
+            if accounts.is_empty() {
+                return Err(ApiError::bad(
+                    "provider has no credentials to discover with",
+                ));
+            }
+
+            let mut combined = Vec::new();
+            for account in accounts {
+                let account_models = manager
+                    .account_model_discover(
+                        &pref.plugin_id,
+                        &provider.id,
+                        &account.id,
+                        &provider.base_url,
+                        &models_path,
+                    )
+                    .await
+                    .map_err(|fault| {
+                        ApiError::bad(format!(
+                            "plugin model discovery failed for account '{}': {}",
+                            account.label,
+                            crate::crypto::redact(&fault.message())
+                        ))
+                    })?;
+                extend_unique_by_id(&mut combined, account_models, |model| model.id.clone());
+            }
+            combined
         } else {
             manager
                 .model_discover(
@@ -2720,13 +2748,13 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                     &models_path,
                 )
                 .await
-        }
-        .map_err(|f| {
-            ApiError::bad(format!(
-                "plugin model discovery failed: {}",
-                crate::crypto::redact(&f.message())
-            ))
-        })?;
+                .map_err(|fault| {
+                    ApiError::bad(format!(
+                        "plugin model discovery failed: {}",
+                        crate::crypto::redact(&fault.message())
+                    ))
+                })?
+        };
 
         let models_dev =
             crate::model_catalog::ModelsDevCatalog::fetch(&state.http, &provider.base_url).await;
@@ -3740,19 +3768,12 @@ async fn discover_models_native(
     let accounts = db::accounts_for_provider(&state.pool, &provider.id)
         .await
         .map_err(ApiError::internal)?;
-    let account = accounts
-        .into_iter()
-        .next()
-        .ok_or_else(|| ApiError::bad("provider has no credentials to discover with"))?;
-    let credential = credential_for_admin_action(
-        state,
-        provider,
-        &account,
-        "native model discovery credential resolution",
-    )
-    .await?;
+    if accounts.is_empty() {
+        return Err(ApiError::bad(
+            "provider has no credentials to discover with",
+        ));
+    }
 
-    let wire = provider.wire();
     let adapter = state.adapters.for_provider(provider);
     let path = provider
         .models_path
@@ -3764,8 +3785,10 @@ async fn discover_models_native(
     } else {
         format!("{base}/{path}")
     };
-    let _ = wire;
-
+    let parsed_url =
+        url::Url::parse(&url).map_err(|e| ApiError::bad(format!("invalid discovery URL: {e}")))?;
+    let models_dev =
+        crate::model_catalog::ModelsDevCatalog::fetch(&state.http, &provider.base_url).await;
     let dummy_model = db::ModelRow {
         id: "discovery".into(),
         provider_id: provider.id.clone(),
@@ -3783,63 +3806,83 @@ async fn discover_models_native(
         created_at: db::now_iso(),
         opaque_state_plugin: String::new(),
     };
-    let ctx = UpstreamContext {
-        provider,
-        model: &dummy_model,
-        account_id: Some(account.id.as_str()),
-        credential,
-    };
-    let parsed_url =
-        url::Url::parse(&url).map_err(|e| ApiError::bad(format!("invalid discovery URL: {e}")))?;
-    let resp = crate::outbound::send_provider_request(
-        &state.outbound_clients,
-        state.config.allow_private_upstreams,
-        state.config.allow_insecure_tls,
-        &adapter,
-        &ctx,
-        crate::outbound::ProviderRequest {
-            method: reqwest::Method::GET,
-            url: parsed_url,
-            json_body: None,
-            accept_event_stream: false,
-            request_id: None,
-            headers: Vec::new(),
-            total_timeout: Some(std::time::Duration::from_millis(
-                provider.timeout_ms.max(1) as u64
-            )),
-        },
-    )
-    .await
-    .map_err(|e| ApiError::bad(format!("discovery request failed: {}", e.message)))?;
-    let status = resp.status();
-    let body_text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(ApiError::bad(format!(
-            "upstream returned HTTP {}: {}",
-            status.as_u16(),
-            crate::crypto::redact(&truncate(&body_text, 400))
-        )));
+
+    let mut discovered = Vec::new();
+    for account in accounts {
+        let credential = credential_for_admin_action(
+            state,
+            provider,
+            &account,
+            "native model discovery credential resolution",
+        )
+        .await?;
+        let ctx = UpstreamContext {
+            provider,
+            model: &dummy_model,
+            account_id: Some(account.id.as_str()),
+            credential,
+        };
+        let resp = crate::outbound::send_provider_request(
+            &state.outbound_clients,
+            state.config.allow_private_upstreams,
+            state.config.allow_insecure_tls,
+            &adapter,
+            &ctx,
+            crate::outbound::ProviderRequest {
+                method: reqwest::Method::GET,
+                url: parsed_url.clone(),
+                json_body: None,
+                accept_event_stream: false,
+                request_id: None,
+                headers: Vec::new(),
+                total_timeout: Some(std::time::Duration::from_millis(
+                    provider.timeout_ms.max(1) as u64,
+                )),
+            },
+        )
+        .await
+        .map_err(|e| {
+            ApiError::bad(format!(
+                "discovery request failed for account '{}': {}",
+                account.label, e.message
+            ))
+        })?;
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(ApiError::bad(format!(
+                "upstream returned HTTP {} for account '{}': {}",
+                status.as_u16(),
+                account.label,
+                crate::crypto::redact(&truncate(&body_text, 400))
+            )));
+        }
+        let parsed: Value = serde_json::from_str(&body_text)
+            .map_err(|e| ApiError::bad(format!("invalid discovery response: {e}")))?;
+        let account_observations = adapter
+            .parse_model_list(&parsed)
+            .into_iter()
+            .map(|model| {
+                let provider_metadata = raw_discovery_metadata(&parsed, &model.id).cloned();
+                let catalog =
+                    crate::model_catalog::resolve(&provider.base_url, &model.id, models_dev.as_ref());
+                discovered_observation_with_catalog(
+                    model,
+                    provider_metadata,
+                    None,
+                    reasoning_wire_context(provider),
+                    Some(catalog),
+                )
+            })
+            .collect();
+        extend_unique_by_id(
+            &mut discovered,
+            account_observations,
+            |observation: &DiscoveredObservation| observation.model.id.clone(),
+        );
     }
-    let parsed: Value = serde_json::from_str(&body_text)
-        .map_err(|e| ApiError::bad(format!("invalid discovery response: {e}")))?;
-    let models_dev =
-        crate::model_catalog::ModelsDevCatalog::fetch(&state.http, &provider.base_url).await;
-    Ok(adapter
-        .parse_model_list(&parsed)
-        .into_iter()
-        .map(|model| {
-            let provider_metadata = raw_discovery_metadata(&parsed, &model.id).cloned();
-            let catalog =
-                crate::model_catalog::resolve(&provider.base_url, &model.id, models_dev.as_ref());
-            discovered_observation_with_catalog(
-                model,
-                provider_metadata,
-                None,
-                reasoning_wire_context(provider),
-                Some(catalog),
-            )
-        })
-        .collect())
+
+    Ok(discovered)
 }
 
 /// `POST /admin/api/providers/:id/test` — send a minimal probe (FR-10.11).
@@ -4605,6 +4648,135 @@ mod model_lifecycle_regression_tests {
         assert_eq!(entries[1]["reason"], "timeout");
     }
 
+    #[test]
+    fn account_scoped_discovery_union_keeps_models_from_either_account() {
+        #[derive(Debug)]
+        struct Item {
+            id: String,
+        }
+
+        let mut union = Vec::new();
+        extend_unique_by_id(
+            &mut union,
+            vec![Item { id: "model-1".into() }],
+            |item| item.id.clone(),
+        );
+        extend_unique_by_id(
+            &mut union,
+            vec![
+                Item { id: "model-1".into() },
+                Item { id: "model-2".into() },
+            ],
+            |item| item.id.clone(),
+        );
+
+        let ids: std::collections::HashSet<_> =
+            union.into_iter().map(|item| item.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("model-1"));
+        assert!(ids.contains("model-2"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_probe_persistence_keeps_both_capability_keys() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-probe-evidence-race-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("test.db").display());
+        let pool = db::connect(&url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+
+        let provider_id = db::insert_provider(
+            &pool,
+            &db::NewProvider {
+                name: "Provider",
+                base_url: "https://example.test",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 120_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "example.test",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let model_id = db::insert_model(
+            &pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "model",
+                display_name: "Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let scope = json!({
+            "provider_id": provider_id,
+            "account_id": "account-a",
+            "model_id": model_id,
+            "transport": "openai",
+        });
+        let first = persist_probe_evidence_observation(
+            &pool,
+            &provider_id,
+            &model_id,
+            "tool_calling".into(),
+            json!({
+                "status": "supported",
+                "fresh_until": "2999-01-01T00:00:00Z",
+                "scope": scope.clone(),
+            }),
+        );
+        let second = persist_probe_evidence_observation(
+            &pool,
+            &provider_id,
+            &model_id,
+            "structured_output".into(),
+            json!({
+                "status": "supported",
+                "fresh_until": "2999-01-01T00:00:00Z",
+                "scope": scope,
+            }),
+        );
+        let (first, second) = tokio::join!(first, second);
+        first.unwrap();
+        second.unwrap();
+
+        let row = db::get_model(&pool, &model_id).await.unwrap().unwrap();
+        let discovery = discovery_object(&row);
+        let evidence = discovery["probe_evidence"].as_object().unwrap();
+        assert!(evidence.contains_key("tool_calling"));
+        assert!(evidence.contains_key("structured_output"));
+
+        model_reconciliation_locks().remove(&provider_id);
+        drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn discovery_persistence_failure_is_not_silently_successful() {
         let root = std::env::temp_dir().join(format!(
@@ -4729,6 +4901,31 @@ mod probe_cost_regression_tests {
     }
 }
 
+#[cfg(test)]
+mod probe_rejection_regression_tests {
+    use super::*;
+
+    #[test]
+    fn coupled_parameter_invalid_value_is_not_deterministic_rejection() {
+        assert!(!deterministic_probe_rejection(
+            "reasoning",
+            Some(&json!("high")),
+            400,
+            "invalid value for max_tokens when reasoning is enabled",
+        ));
+    }
+
+    #[test]
+    fn explicit_reasoning_parameter_rejection_is_deterministic() {
+        assert!(deterministic_probe_rejection(
+            "reasoning",
+            Some(&json!("high")),
+            400,
+            "unsupported value 'high' for reasoning_effort",
+        ));
+    }
+}
+
 fn deterministic_probe_rejection(
     capability: &str,
     value: Option<&Value>,
@@ -4738,45 +4935,73 @@ fn deterministic_probe_rejection(
     if !matches!(status, 400 | 422) {
         return false;
     }
+
     let body = body.to_ascii_lowercase();
-    let rejection = [
+    let parameter_terms: Vec<String> = match capability {
+        "reasoning" | "reasoning_disable" => vec![
+            "reasoning_effort".into(),
+            "reasoning.effort".into(),
+            "reasoning effort".into(),
+            "thinking_level".into(),
+            "thinking level".into(),
+            "thinkingconfig.thinkinglevel".into(),
+            "thinking effort".into(),
+        ],
+        "tool_calling" => vec![
+            "tool_choice".into(),
+            "tool choice".into(),
+            "tool calling".into(),
+            "function_call".into(),
+            "function call".into(),
+            "tools".into(),
+        ],
+        "structured_output" => vec![
+            "response_format".into(),
+            "response format".into(),
+            "json_schema".into(),
+            "json schema".into(),
+            "structured output".into(),
+        ],
+        capability if capability.starts_with("parameter.") => {
+            let parameter = capability
+                .trim_start_matches("parameter.")
+                .to_ascii_lowercase();
+            vec![parameter.clone(), parameter.replace('_', " ")]
+        }
+        _ => Vec::new(),
+    };
+    if !parameter_terms.iter().any(|term| body.contains(term)) {
+        return false;
+    }
+
+    let explicit_parameter_rejection = [
         "unsupported",
         "not supported",
         "not allowed",
         "unknown parameter",
-        "unrecognized",
+        "unrecognized parameter",
         "invalid parameter",
-        "invalid value",
     ]
     .iter()
     .any(|needle| body.contains(needle));
-    if !rejection {
-        return false;
+    if explicit_parameter_rejection {
+        return true;
     }
 
-    let mut feature_terms: Vec<String> = match capability {
-        "reasoning" | "reasoning_disable" => {
-            vec!["reasoning".into(), "thinking".into(), "effort".into()]
-        }
-        "tool_calling" => vec!["tool".into(), "function".into()],
-        "structured_output" => {
-            vec![
-                "response_format".into(),
-                "json_schema".into(),
-                "schema".into(),
-            ]
-        }
-        capability if capability.starts_with("parameter.") => {
-            vec![capability
-                .trim_start_matches("parameter.")
-                .to_ascii_lowercase()]
-        }
-        _ => Vec::new(),
-    };
-    if let Some(value) = value.and_then(Value::as_str) {
-        feature_terms.push(value.to_ascii_lowercase());
+    if !body.contains("invalid value") {
+        return false;
     }
-    feature_terms.iter().any(|term| body.contains(term))
+    let Some(value) = value else {
+        return false;
+    };
+    let value = match value {
+        Value::String(value) => value.to_ascii_lowercase(),
+        Value::Number(value) => value.to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Null => "null".to_string(),
+        _ => return false,
+    };
+    !value.is_empty() && body.contains(&value)
 }
 
 fn probe_evidence_key(capability: &str, value: Option<&Value>) -> String {
@@ -4823,6 +5048,33 @@ fn upsert_probe_evidence(
     }
     entries.push(evidence_value);
     evidence.insert(key, Value::Array(entries));
+}
+
+async fn persist_probe_evidence_observation(
+    pool: &Pool,
+    provider_id: &str,
+    model_id: &str,
+    key: String,
+    evidence_value: Value,
+) -> anyhow::Result<()> {
+    let lock = model_reconciliation_lock(provider_id);
+    let _guard = lock.lock().await;
+    let latest = db::get_model(pool, model_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("model disappeared while persisting probe evidence"))?;
+    let discovery = discovery_object(&latest);
+    let mut evidence = discovery
+        .get("probe_evidence")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    upsert_probe_evidence(&mut evidence, key, evidence_value);
+    db::merge_model_discovery(
+        pool,
+        model_id,
+        &json!({ "probe_evidence": Value::Object(evidence) }),
+    )
+    .await
 }
 
 /// Run one explicit, bounded upstream capability probe against the selected
@@ -4876,328 +5128,7 @@ pub async fn probe_model_capability(
 
     let mut effective_prices = model.prices();
     if !effective_prices.is_configured() {
-        let discovery = discovery_object(&model);
-        if let Some(prices) = discovery
-            .get("prices")
-            .cloned()
-            .and_then(|value| serde_json::from_value::<Prices>(value).ok())
-        {
-            effective_prices = prices;
-        }
-    }
-    let mut execution_model = model.clone();
-    let probe_thinking_map = profile.thinking_map.clone();
-    let mut probe_parameters = profile.parameters.clone();
-
-    let mut internal = crate::types::InternalRequest {
-        requested_model: model.upstream_id.clone(),
-        system: vec![],
-        messages: vec![crate::types::Message {
-            role: crate::types::Role::User,
-            parts: vec![crate::types::Part::Text(
-                "Reply with the single word: ok".into(),
-            )],
-        }],
-        tools: vec![],
-        tool_choice: None,
-        tool_choice_name: None,
-        params: crate::types::SamplingParams {
-            max_tokens: Some(16),
-            ..Default::default()
-        },
-        stream: false,
-        include_usage: false,
-        thinking: None,
-        extra: Default::default(),
-        raw_body: None,
-    };
-
-    match body.capability.as_str() {
-        "transport" => {}
-        "reasoning" | "reasoning_disable" => {
-            let level = probe_thinking_level(body.value.as_ref())?;
-            if !probe_thinking_map.level_is_executable(level.as_key()) {
-                return Ok(Json(json!({
-                    "status": "inconclusive",
-                    "reason": "resolved target has no executable mapping for the requested canonical reasoning level",
-                    "transport": profile.transport.as_str(),
-                    "level": level.as_key(),
-                })));
-            }
-            internal.thinking = Some(level);
-        }
-        "tool_calling" => {
-            internal.tools.push(crate::types::ToolDef {
-                name: "kinetix_probe_noop".into(),
-                description: Some("Capability probe only; never executed.".into()),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false,
-                }),
-                defer_loading: None,
-            });
-            // Require the inert synthetic tool so a successful probe proves
-            // actual tool-call generation rather than merely accepting a tool schema.
-            // The returned call is inspected only; it is never executed.
-            internal.tool_choice = Some(crate::types::ToolChoice::Required);
-        }
-        "structured_output" => {
-            let schema = json!({
-                "type": "object",
-                "properties": { "ok": { "type": "string" } },
-                "required": ["ok"],
-                "additionalProperties": false,
-            });
-            let extra = match &profile.transport {
-                crate::adapters::TargetTransport::OpenAiChat => json!({
-                    "response_format": {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "kinetix_probe",
-                            "strict": true,
-                            "schema": schema,
-                        }
-                    }
-                }),
-                crate::adapters::TargetTransport::OpenAiResponses => json!({
-                    "text": {
-                        "format": {
-                            "type": "json_schema",
-                            "name": "kinetix_probe",
-                            "strict": true,
-                            "schema": schema,
-                        }
-                    }
-                }),
-                crate::adapters::TargetTransport::Gemini => json!({
-                    "generationConfig": {
-                        "responseMimeType": "application/json",
-                        "responseJsonSchema": schema,
-                    }
-                }),
-                _ => {
-                    return Ok(Json(json!({
-                        "status": "inconclusive",
-                        "reason": "no conservative structured-output probe mapping for this transport",
-                        "transport": profile.transport.as_str(),
-                    })))
-                }
-            };
-            execution_model.extra_request = extra.to_string();
-        }
-        capability if capability.starts_with("parameter.") => {
-            let parameter = capability.trim_start_matches("parameter.");
-            let value = body
-                .value
-                .as_ref()
-                .and_then(Value::as_f64)
-                .ok_or_else(|| ApiError::bad("parameter probe requires a numeric value"))?;
-            match parameter {
-                "temperature" => internal.params.temperature = Some(value),
-                "top_p" => internal.params.top_p = Some(value),
-                "top_k" => internal.params.top_k = Some(value),
-                "seed" => internal.params.seed = Some(value as i64),
-                "presence_penalty" => internal.params.presence_penalty = Some(value),
-                "frequency_penalty" => internal.params.frequency_penalty = Some(value),
-                other => {
-                    return Err(ApiError::bad(format!(
-                        "unsupported safe parameter probe '{other}'"
-                    )))
-                }
-            }
-            probe_parameters.insert(
-                parameter.to_string(),
-                crate::types::ParamSpec {
-                    supported: true,
-                    min: None,
-                    max: None,
-                    default: None,
-                    policy: crate::types::ParamPolicy::Forward,
-                },
-            );
-        }
-        other => {
-            return Err(ApiError::bad(format!(
-                "unsupported capability probe '{other}'"
-            )))
-        }
-    }
-
-    if internal.thinking.is_some() {
-        let max_tokens = match probe_max_tokens_for_thinking(
-            &probe_thinking_map,
-            internal.thinking,
-            model.max_output_tokens,
-        ) {
-            Ok(max_tokens) => max_tokens,
-            Err(reason) => {
-                return Ok(Json(json!({
-                    "status": "inconclusive",
-                    "reason": reason,
-                    "transport": profile.transport.as_str(),
-                    "scope": {
-                        "provider_id": provider.id,
-                        "account_id": account.id,
-                        "model_id": model.id,
-                        "transport": profile.transport.as_str(),
-                    }
-                })))
-            }
-        };
-        internal.params.max_tokens = Some(max_tokens);
-    }
-
-    execution_model.thinking_map =
-        serde_json::to_string(&probe_thinking_map).map_err(ApiError::internal)?;
-    execution_model.parameters =
-        serde_json::to_string(&probe_parameters).map_err(ApiError::internal)?;
-
-    let ctx = UpstreamContext {
-        provider: &provider,
-        model: &execution_model,
-        account_id: Some(account.id.as_str()),
-        credential,
-    };
-    let url = adapter
-        .build_url(&ctx)
-        .map_err(|error| ApiError::bad(error.message))?;
-    let outbound = adapter
-        .build_body(&ctx, &internal)
-        .map_err(|failure| ApiError::bad(failure.message))?;
-
-    let max_cost = body.max_cost_usd.unwrap_or(0.05);
-    if !max_cost.is_finite() || max_cost < 0.0 {
-        return Err(ApiError::bad(
-            "max_cost_usd must be a finite non-negative number",
-        ));
-    }
-    let estimated_cost = probe_cost_upper_bound(
-        &effective_prices,
-        &outbound,
-        internal.params.max_tokens.unwrap_or(16),
-        &probe_thinking_map,
-        internal.thinking,
-    )
-    .ok_or_else(|| {
-        ApiError::bad(
-            "cannot conservatively bound probe cost from pricing and reasoning limits; configure/sync pricing and an output ceiling first",
-        )
-    })?;
-    if estimated_cost > max_cost {
-        return Err(ApiError::bad(format!(
-            "probe upper-bound cost ${estimated_cost:.6} exceeds max_cost_usd ${max_cost:.6}"
-        )));
-    }
-    let parsed_url = url::Url::parse(&url)
-        .map_err(|error| ApiError::bad(format!("invalid probe URL: {error}")))?;
-
-    let started = std::time::Instant::now();
-    let response = crate::outbound::send_provider_request(
-        &state.outbound_clients,
-        state.config.allow_private_upstreams,
-        state.config.allow_insecure_tls,
-        &adapter,
-        &ctx,
-        crate::outbound::ProviderRequest {
-            method: reqwest::Method::POST,
-            url: parsed_url,
-            json_body: Some(outbound),
-            accept_event_stream: false,
-            request_id: None,
-            headers: Vec::new(),
-            total_timeout: Some(std::time::Duration::from_secs(10)),
-        },
-    )
-    .await;
-
-    let verified_at = chrono::Utc::now();
-    let freshness_secs = db::get_setting(&state.pool, "model_probe_freshness_secs")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(30 * 24 * 3600);
-    let fresh_until = verified_at + chrono::Duration::seconds(freshness_secs);
-    let (status, status_code, detail) = match response {
-        Ok(response) => {
-            let status_code = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
-            if (200..300).contains(&status_code) {
-                let contract_verified = match body.capability.as_str() {
-                    "tool_calling" => serde_json::from_str::<Value>(&text)
-                        .ok()
-                        .and_then(|payload| adapter.parse_full_response(&payload).ok())
-                        .is_some_and(|events| {
-                            events.iter().any(|event| {
-                                matches!(
-                                    event,
-                                    crate::types::StreamEvent::ToolCallStart { name, .. }
-                                        if name == "kinetix_probe_noop"
-                                )
-                            })
-                        }),
-                    "structured_output" => serde_json::from_str::<Value>(&text)
-                        .ok()
-                        .and_then(|payload| adapter.parse_full_response(&payload).ok())
-                        .map(|events| {
-                            events
-                                .into_iter()
-                                .filter_map(|event| match event {
-                                    crate::types::StreamEvent::TextDelta(text) => Some(text),
-                                    _ => None,
-                                })
-                                .collect::<String>()
-                        })
-                        .and_then(|text| serde_json::from_str::<Value>(text.trim()).ok())
-                        .and_then(|value| {
-                            value.get("ok").and_then(Value::as_str).map(str::to_string)
-                        })
-                        .is_some(),
-                    _ => true,
-                };
-                if contract_verified {
-                    ("supported", status_code, None)
-                } else {
-                    (
-                        "inconclusive",
-                        status_code,
-                        Some(format!(
-                            "upstream returned success but did not satisfy the {} probe contract",
-                            body.capability
-                        )),
-                    )
-                }
-            } else {
-                let redacted = crypto::redact(&text);
-                let status = if deterministic_probe_rejection(
-                    &body.capability,
-                    body.value.as_ref(),
-                    status_code,
-                    &redacted,
-                ) {
-                    "unsupported"
-                } else {
-                    "inconclusive"
-                };
-                (status, status_code, Some(truncate(&redacted, 400)))
-            }
-        }
-        Err(error) => (
-            "inconclusive",
-            0,
-            Some(truncate(&crypto::redact(&error.message), 400)),
-        ),
-    };
-
-    let discovery = discovery_object(&model);
-    let mut evidence = discovery
-        .get("probe_evidence")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let evidence_value = json!({
+        let evidence_value = json!({
         "status": status,
         "source": "probe",
         "value": body.value,
@@ -5219,10 +5150,12 @@ pub async fn probe_model_capability(
         probe_evidence_key(&body.capability, body.value.as_ref()),
         evidence_value.clone(),
     );
-    db::merge_model_discovery(
+    persist_probe_evidence_observation(
         &state.pool,
+        &provider.id,
         &model.id,
-        &json!({ "probe_evidence": Value::Object(evidence) }),
+        probe_evidence_key(&body.capability, body.value.as_ref()),
+        evidence_value.clone(),
     )
     .await
     .map_err(ApiError::internal)?;
