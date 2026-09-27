@@ -2570,6 +2570,51 @@ fn reconciliation_state(
     })
 }
 
+fn missing_reconciliation_state(row: &db::ModelRow, checked_at: &str) -> Value {
+    let discovery = discovery_object(row);
+    let previous = discovery
+        .get("reconciliation")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let pinned_fields = previous
+        .get("pinned_fields")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let pinned: std::collections::HashSet<String> = pinned_fields
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+
+    let mut diff = vec![json!({
+        "field": "availability",
+        "configured": "present",
+        "observed": "missing",
+        "source": "upstream_discovery",
+    })];
+    diff.retain(|item| {
+        item.get("field")
+            .and_then(Value::as_str)
+            .is_none_or(|field| !pinned.contains(field))
+    });
+    let diff = Value::Array(diff);
+    let ignored = !diff.as_array().is_none_or(Vec::is_empty)
+        && previous
+            .get("ignored_diff")
+            .is_some_and(|value| value == &diff);
+
+    json!({
+        "status": if ignored { "ignored" } else { "missing" },
+        "checked_at": checked_at,
+        "last_success_at": checked_at,
+        "diff": diff,
+        "ignored_diff": previous.get("ignored_diff").cloned(),
+        "pinned_fields": pinned_fields,
+    })
+}
+
 fn raw_discovery_metadata<'a>(payload: &'a Value, model_id: &str) -> Option<&'a Value> {
     fn matches_model(value: &Value, model_id: &str) -> bool {
         value
@@ -2833,21 +2878,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
             json!({
                 "disappeared": true,
                 "flagged_at": now,
-                "reconciliation": {
-                    "status": "missing",
-                    "checked_at": now,
-                    "last_success_at": now,
-                    "diff": [{
-                        "field": "availability",
-                        "configured": "present",
-                        "observed": "missing",
-                        "source": "upstream_discovery",
-                    }],
-                    "pinned_fields": discovery_object(row)
-                        .pointer("/reconciliation/pinned_fields")
-                        .cloned()
-                        .unwrap_or_else(|| json!([])),
-                },
+                "reconciliation": missing_reconciliation_state(row, &now),
             }),
         )
         .await
@@ -4283,6 +4314,58 @@ mod model_lifecycle_regression_tests {
         let remaining = remaining_reconciliation_diff(&reconciliation, &selected);
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0]["field"], "capabilities.reasoning");
+    }
+
+    fn model_row_with_reconciliation(reconciliation: Value) -> db::ModelRow {
+        db::ModelRow {
+            id: "model".into(),
+            provider_id: "provider".into(),
+            upstream_id: "model".into(),
+            display_name: "Model".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: json!({ "reconciliation": reconciliation }).to_string(),
+            created_at: db::now_iso(),
+            opaque_state_plugin: String::new(),
+        }
+    }
+
+    #[test]
+    fn missing_reconciliation_keeps_identical_ignored_diff_ignored() {
+        let missing_diff = json!([{
+            "field": "availability",
+            "configured": "present",
+            "observed": "missing",
+            "source": "upstream_discovery",
+        }]);
+        let row = model_row_with_reconciliation(json!({
+            "status": "ignored",
+            "ignored_diff": missing_diff,
+            "pinned_fields": [],
+        }));
+
+        let state = missing_reconciliation_state(&row, "2026-09-27T00:00:00Z");
+        assert_eq!(state["status"], "ignored");
+        assert_eq!(state["diff"], state["ignored_diff"]);
+    }
+
+    #[test]
+    fn missing_reconciliation_filters_pinned_availability() {
+        let row = model_row_with_reconciliation(json!({
+            "status": "unchanged",
+            "pinned_fields": ["availability"],
+        }));
+
+        let state = missing_reconciliation_state(&row, "2026-09-27T00:00:00Z");
+        assert_eq!(state["status"], "missing");
+        assert_eq!(state["diff"], json!([]));
+        assert_eq!(state["pinned_fields"], json!(["availability"]));
     }
 
     #[tokio::test]

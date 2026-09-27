@@ -415,6 +415,14 @@ struct ModelsDevCacheEntry {
     fetched_at: Instant,
 }
 
+impl ModelsDevCacheEntry {
+    fn mark_validated(mut self) -> Self {
+        self.fetched_at = Instant::now();
+        self.catalog = self.catalog.with_freshness("fresh");
+        self
+    }
+}
+
 const MODELS_DEV_FRESH_TTL: Duration = Duration::from_secs(15 * 60);
 const MODELS_DEV_STALE_IF_ERROR_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -512,15 +520,8 @@ impl ModelsDevCatalog {
         };
 
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(mut entry) = cached {
-                entry.fetched_at = Instant::now();
-                let retrieved_at = chrono::Utc::now().to_rfc3339();
-                entry.catalog = entry.catalog.with_source_state(
-                    retrieved_at,
-                    "fresh",
-                    entry.etag.clone(),
-                    entry.last_modified.clone(),
-                );
+            if let Some(entry) = cached {
+                let entry = entry.mark_validated();
                 let catalog = entry.catalog.clone();
                 *models_dev_cache().write().await = Some(entry);
                 return Some(catalog);
@@ -1980,6 +1981,29 @@ mod tests {
         assert_eq!(state["retrieved_at"], "2026-09-20T00:00:00Z");
         assert_eq!(state["freshness"], "stale");
         assert_eq!(state["etag"], "etag-1");
+    }
+
+    #[test]
+    fn not_modified_validation_keeps_price_provenance_stable() {
+        let catalog = models_dev_fixture().with_source_state(
+            "2026-09-20T00:00:00Z".into(),
+            "fresh",
+            Some("etag-1".into()),
+            Some("Sun, 20 Sep 2026 00:00:00 GMT".into()),
+        );
+        let expected_provenance = catalog.provenance.clone();
+        let entry = ModelsDevCacheEntry {
+            catalog,
+            etag: Some("etag-1".into()),
+            last_modified: Some("Sun, 20 Sep 2026 00:00:00 GMT".into()),
+            fetched_at: Instant::now(),
+        }
+        .mark_validated();
+
+        assert_eq!(entry.catalog.provenance, expected_provenance);
+        let state = entry.catalog.provenance.as_ref().unwrap();
+        assert_eq!(state["retrieved_at"], "2026-09-20T00:00:00Z");
+        assert_eq!(state["freshness"], "fresh");
     }
 
     #[test]
