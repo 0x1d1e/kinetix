@@ -3916,15 +3916,127 @@ fn probe_thinking_level(value: Option<&Value>) -> Result<crate::types::ThinkingL
     }
 }
 
-fn probe_cost_upper_bound(prices: &Prices, reasoning: bool) -> Option<f64> {
-    let input = prices.input_per_1m?;
-    let output = prices.output_per_1m?;
-    let output = if reasoning {
-        output.max(prices.thinking_per_1m.unwrap_or(output))
-    } else {
-        output
+fn numeric_probe_budget(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(value) => value.as_u64(),
+        Value::Object(fields) => {
+            let mut found = false;
+            let mut total = 0_u64;
+            for value in fields.values() {
+                if let Some(bound) = numeric_probe_budget(value) {
+                    found = true;
+                    total = total.saturating_add(bound);
+                }
+            }
+            found.then_some(total)
+        }
+        _ => None,
+    }
+}
+
+fn probe_reasoning_token_bound(
+    thinking_map: &ThinkingMap,
+    thinking: Option<crate::types::ThinkingLevel>,
+    model_max_output_tokens: Option<i64>,
+) -> Option<u64> {
+    let Some(level) = thinking else {
+        return Some(0);
     };
-    Some((32.0 * input + 16.0 * output) / 1_000_000.0)
+    if level == crate::types::ThinkingLevel::Off {
+        return Some(0);
+    }
+    let mapping = thinking_map.levels.get(level.as_key())?;
+    if let Some(bound) = numeric_probe_budget(mapping) {
+        return Some(bound);
+    }
+    model_max_output_tokens
+        .filter(|value| *value >= 0)
+        .map(|value| value as u64)
+}
+
+fn probe_cost_upper_bound(
+    prices: &Prices,
+    outbound: &Value,
+    max_tokens: u32,
+    thinking_map: &ThinkingMap,
+    thinking: Option<crate::types::ThinkingLevel>,
+    model_max_output_tokens: Option<i64>,
+) -> Option<f64> {
+    let input_rate = prices.input_per_1m?;
+    let output_rate = prices.output_per_1m?;
+    let input_tokens = serde_json::to_vec(outbound).ok()?.len() as u64;
+    let reasoning_tokens =
+        probe_reasoning_token_bound(thinking_map, thinking, model_max_output_tokens)?;
+    let generated_tokens = (max_tokens as u64).saturating_add(reasoning_tokens);
+    let generated_rate = if reasoning_tokens > 0 {
+        output_rate.max(prices.thinking_per_1m.unwrap_or(output_rate))
+    } else {
+        output_rate
+    };
+    Some(
+        (input_tokens as f64 * input_rate + generated_tokens as f64 * generated_rate)
+            / 1_000_000.0,
+    )
+}
+
+#[cfg(test)]
+mod probe_cost_regression_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_reasoning_budget_is_included_in_cost_ceiling() {
+        let prices = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(2.0),
+            thinking_per_1m: Some(3.0),
+            ..Default::default()
+        };
+        let thinking_map = ThinkingMap {
+            levels: [("high".to_string(), json!(4096))].into_iter().collect(),
+            mode: Some(crate::types::ThinkingMode::ManualBudget),
+            budget_field: Some("thinking.budget_tokens".into()),
+            level_field: None,
+        };
+        let outbound = json!({"messages":[{"role":"user","content":"ok"}]});
+        let cost = probe_cost_upper_bound(
+            &prices,
+            &outbound,
+            16,
+            &thinking_map,
+            Some(crate::types::ThinkingLevel::High),
+            Some(8192),
+        )
+        .unwrap();
+        assert!(cost >= (4112.0 * 3.0) / 1_000_000.0);
+    }
+
+    #[test]
+    fn outbound_schema_bytes_contribute_to_input_bound() {
+        let prices = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(1.0),
+            ..Default::default()
+        };
+        let small = probe_cost_upper_bound(
+            &prices,
+            &json!({"messages":[]}),
+            16,
+            &ThinkingMap::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let large = probe_cost_upper_bound(
+            &prices,
+            &json!({"tools":[{"parameters":{"schema":"x".repeat(2048)}}]}),
+            16,
+            &ThinkingMap::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(large > small);
+    }
 }
 
 fn deterministic_probe_rejection(
@@ -4053,23 +4165,6 @@ pub async fn probe_model_capability(
             effective_prices = prices;
         }
     }
-    let reasoning_probe = matches!(body.capability.as_str(), "reasoning" | "reasoning_disable");
-    let max_cost = body.max_cost_usd.unwrap_or(0.05);
-    if !max_cost.is_finite() || max_cost < 0.0 {
-        return Err(ApiError::bad(
-            "max_cost_usd must be a finite non-negative number",
-        ));
-    }
-    let estimated_cost = probe_cost_upper_bound(&effective_prices, reasoning_probe)
-        .ok_or_else(|| ApiError::bad(
-            "cannot bound probe cost because input/output pricing is unknown; configure or sync pricing first",
-        ))?;
-    if estimated_cost > max_cost {
-        return Err(ApiError::bad(format!(
-            "probe upper-bound cost ${estimated_cost:.6} exceeds max_cost_usd ${max_cost:.6}"
-        )));
-    }
-
     let mut execution_model = model.clone();
     let probe_thinking_map = profile.thinking_map.clone();
     let mut probe_parameters = profile.parameters.clone();
@@ -4226,6 +4321,31 @@ pub async fn probe_model_capability(
     let outbound = adapter
         .build_body(&ctx, &internal)
         .map_err(|failure| ApiError::bad(failure.message))?;
+
+    let max_cost = body.max_cost_usd.unwrap_or(0.05);
+    if !max_cost.is_finite() || max_cost < 0.0 {
+        return Err(ApiError::bad(
+            "max_cost_usd must be a finite non-negative number",
+        ));
+    }
+    let estimated_cost = probe_cost_upper_bound(
+        &effective_prices,
+        &outbound,
+        internal.params.max_tokens.unwrap_or(16),
+        &probe_thinking_map,
+        internal.thinking,
+        model.max_output_tokens,
+    )
+    .ok_or_else(|| {
+        ApiError::bad(
+            "cannot conservatively bound probe cost from pricing and reasoning limits; configure/sync pricing and an output ceiling first",
+        )
+    })?;
+    if estimated_cost > max_cost {
+        return Err(ApiError::bad(format!(
+            "probe upper-bound cost ${estimated_cost:.6} exceeds max_cost_usd ${max_cost:.6}"
+        )));
+    }
     let parsed_url = url::Url::parse(&url)
         .map_err(|error| ApiError::bad(format!("invalid probe URL: {error}")))?;
 
