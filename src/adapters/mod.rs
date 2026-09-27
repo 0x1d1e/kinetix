@@ -118,7 +118,7 @@ fn discovered_transport(discovery: &serde_json::Value) -> Result<Option<&str>, P
         .transpose()
 }
 
-fn fresh_probe_status<'a>(
+fn fresh_probe_status_entry<'a>(
     evidence: &'a serde_json::Value,
     provider_id: &str,
     model_id: &str,
@@ -142,6 +142,24 @@ fn fresh_probe_status<'a>(
         return None;
     }
     evidence.get("status").and_then(serde_json::Value::as_str)
+}
+
+fn fresh_probe_status<'a>(
+    evidence: &'a serde_json::Value,
+    provider_id: &str,
+    model_id: &str,
+    account_id: Option<&str>,
+    transport: &TargetTransport,
+) -> Option<&'a str> {
+    match evidence {
+        // New storage keeps one entry per execution scope under the capability
+        // key. Search newest-first so re-probing the same scope wins.
+        serde_json::Value::Array(entries) => entries.iter().rev().find_map(|entry| {
+            fresh_probe_status_entry(entry, provider_id, model_id, account_id, transport)
+        }),
+        // Legacy single-entry storage remains readable.
+        _ => fresh_probe_status_entry(evidence, provider_id, model_id, account_id, transport),
+    }
 }
 
 /// Resolve model transport, reasoning, parameters, and capabilities without an
@@ -2004,6 +2022,72 @@ mod execution_profile_tests {
             resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
         assert_eq!(responses.transport, TargetTransport::OpenAiResponses);
         assert_eq!(responses.capabilities.tool_calling, None);
+    }
+
+    #[test]
+    fn scoped_probe_evidence_can_coexist_across_accounts_and_transports() {
+        let provider = provider();
+        let mut model = model();
+        let entries = serde_json::json!([
+            {
+                "status": "supported",
+                "fresh_until": "2999-01-01T00:00:00Z",
+                "scope": {
+                    "provider_id": "provider",
+                    "account_id": "account-a",
+                    "model_id": "model",
+                    "transport": "openai"
+                }
+            },
+            {
+                "status": "unsupported",
+                "fresh_until": "2999-01-01T00:00:00Z",
+                "scope": {
+                    "provider_id": "provider",
+                    "account_id": "account-b",
+                    "model_id": "model",
+                    "transport": "openai"
+                }
+            },
+            {
+                "status": "unsupported",
+                "fresh_until": "2999-01-01T00:00:00Z",
+                "scope": {
+                    "provider_id": "provider",
+                    "account_id": "account-a",
+                    "model_id": "model",
+                    "transport": "openai-responses"
+                }
+            }
+        ]);
+
+        model.discovery = serde_json::json!({
+            "probe_evidence": {
+                "tool_calling": entries.clone()
+            }
+        })
+        .to_string();
+        let account_a_chat =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        let account_b_chat =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-b")).unwrap();
+        assert_eq!(account_a_chat.capabilities.tool_calling, Some(true));
+        assert_eq!(account_b_chat.capabilities.tool_calling, Some(false));
+
+        model.discovery = serde_json::json!({
+            "configured_transport": "openai-responses",
+            "probe_evidence": {
+                "tool_calling": entries
+            }
+        })
+        .to_string();
+        let account_a_responses =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        assert_eq!(
+            account_a_responses.transport,
+            TargetTransport::OpenAiResponses
+        );
+        assert_eq!(account_a_responses.capabilities.tool_calling, Some(false));
     }
 
     #[test]
