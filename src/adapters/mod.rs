@@ -274,7 +274,8 @@ pub fn resolve_execution_profile_for_target(
                 }
             } else if key == "reasoning_disable" && !admin_thinking_configured {
                 if let Some(capability) = reasoning.as_mut() {
-                    match fresh_probe_status(item, &provider.id, &model.id, account_id, &transport) {
+                    match fresh_probe_status(item, &provider.id, &model.id, account_id, &transport)
+                    {
                         Some("supported") => capability.can_disable = true,
                         Some("unsupported") => capability.can_disable = false,
                         _ => {}
