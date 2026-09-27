@@ -2913,21 +2913,113 @@ fn prices_equal(a: &Prices, b: &Prices) -> bool {
         && a.thinking_per_1m == b.thinking_per_1m
 }
 
-fn overlay_known_prices(base: &mut Prices, observed: &Prices) {
-    if observed.input_per_1m.is_some() {
-        base.input_per_1m = observed.input_per_1m;
+const PRICE_FIELDS: [&str; 5] = [
+    "input_per_1m",
+    "output_per_1m",
+    "cached_per_1m",
+    "cache_write_per_1m",
+    "thinking_per_1m",
+];
+
+fn price_field(prices: &Prices, field: &str) -> Option<f64> {
+    match field {
+        "input_per_1m" => prices.input_per_1m,
+        "output_per_1m" => prices.output_per_1m,
+        "cached_per_1m" => prices.cached_per_1m,
+        "cache_write_per_1m" => prices.cache_write_per_1m,
+        "thinking_per_1m" => prices.thinking_per_1m,
+        _ => None,
     }
-    if observed.output_per_1m.is_some() {
-        base.output_per_1m = observed.output_per_1m;
+}
+
+fn set_price_field(prices: &mut Prices, field: &str, value: Option<f64>) {
+    match field {
+        "input_per_1m" => prices.input_per_1m = value,
+        "output_per_1m" => prices.output_per_1m = value,
+        "cached_per_1m" => prices.cached_per_1m = value,
+        "cache_write_per_1m" => prices.cache_write_per_1m = value,
+        "thinking_per_1m" => prices.thinking_per_1m = value,
+        _ => {}
     }
-    if observed.cached_per_1m.is_some() {
-        base.cached_per_1m = observed.cached_per_1m;
+}
+
+fn effective_price_fields(
+    discovery: &Value,
+    current: &Prices,
+) -> serde_json::Map<String, Value> {
+    let mut fields = discovery
+        .pointer("/effective_pricing/fields")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let legacy_source = discovery
+        .pointer("/effective_pricing/source")
+        .and_then(Value::as_str)
+        .unwrap_or("operator");
+    let legacy_metadata = discovery
+        .pointer("/effective_pricing/metadata")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    for field in PRICE_FIELDS {
+        if price_field(current, field).is_some() && !fields.contains_key(field) {
+            fields.insert(
+                field.to_string(),
+                json!({
+                    "source": legacy_source,
+                    "metadata": legacy_metadata,
+                }),
+            );
+        }
     }
-    if observed.cache_write_per_1m.is_some() {
-        base.cache_write_per_1m = observed.cache_write_per_1m;
+    fields
+}
+
+fn set_price_field_provenance(
+    fields: &mut serde_json::Map<String, Value>,
+    field: &str,
+    source: &str,
+    metadata: Value,
+) {
+    fields.insert(
+        field.to_string(),
+        json!({
+            "source": source,
+            "metadata": metadata,
+        }),
+    );
+}
+
+fn price_field_operator_owned(
+    fields: &serde_json::Map<String, Value>,
+    current: &Prices,
+    field: &str,
+) -> bool {
+    if price_field(current, field).is_none() {
+        return false;
     }
-    if observed.thinking_per_1m.is_some() {
-        base.thinking_per_1m = observed.thinking_per_1m;
+    fields
+        .get(field)
+        .and_then(|value| value.get("source"))
+        .and_then(Value::as_str)
+        .is_none_or(|source| !is_automatic_price_source(source))
+}
+
+fn effective_price_source(fields: &serde_json::Map<String, Value>, prices: &Prices) -> String {
+    let sources: std::collections::BTreeSet<&str> = PRICE_FIELDS
+        .iter()
+        .filter(|field| price_field(prices, field).is_some())
+        .filter_map(|field| {
+            fields
+                .get(*field)
+                .and_then(|value| value.get("source"))
+                .and_then(Value::as_str)
+        })
+        .collect();
+    match sources.len() {
+        0 => "untracked".into(),
+        1 => sources.into_iter().next().unwrap_or("untracked").to_string(),
+        _ => "mixed".into(),
     }
 }
 
@@ -2959,7 +3051,8 @@ fn is_automatic_price_source(source: &str) -> bool {
             | "bundled_catalog"
             | "mixed"
             | "discovery"
-    )
+    ) || source.starts_with("models.dev:")
+        || source.starts_with("bundled_catalog:")
 }
 
 /// Apply an explicit reconciliation decision. Observations never reach this
@@ -3291,24 +3384,53 @@ pub(crate) async fn sync_provider_pricing_id(
         }
 
         let current = row.prices();
-        let current_source = discovery
-            .pointer("/effective_pricing/source")
-            .and_then(Value::as_str);
-        let operator_owned = current.is_configured()
-            && current_source
-                .map(|source| !is_automatic_price_source(source))
-                .unwrap_or(true);
-        if operator_owned {
-            skipped_manual.push(row.id.clone());
-            continue;
+        let mut effective = current.clone();
+        let mut fields = effective_price_fields(&discovery, &current);
+        let mut preserved_manual = false;
+        let observed_at = discovery.get("last_seen").cloned().unwrap_or(Value::Null);
+        let catalog_source_state = discovery
+            .pointer("/catalog/source_state")
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        for field in PRICE_FIELDS {
+            let Some(value) = price_field(&observed, field) else {
+                continue;
+            };
+            if price_field_operator_owned(&fields, &current, field) {
+                preserved_manual = true;
+                continue;
+            }
+            set_price_field(&mut effective, field, Some(value));
+            let source = discovery
+                .pointer(&format!("/price_sources/{field}"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| automatic_price_source(&discovery));
+            let source_state = if source.starts_with("models.dev") {
+                catalog_source_state.clone()
+            } else {
+                Value::Null
+            };
+            set_price_field_provenance(
+                &mut fields,
+                field,
+                &source,
+                json!({
+                    "observed_at": observed_at,
+                    "catalog_source_state": source_state,
+                }),
+            );
         }
 
-        let mut effective = current.clone();
-        overlay_known_prices(&mut effective, &observed);
-        let source = automatic_price_source(&discovery);
+        if preserved_manual {
+            skipped_manual.push(row.id.clone());
+        }
+        let source = effective_price_source(&fields, &effective);
         let metadata = json!({
-            "price_sources": discovery.get("price_sources").cloned().unwrap_or(Value::Null),
-            "observed_at": discovery.get("last_seen").cloned().unwrap_or(Value::Null),
+            "fields": fields,
+            "observed_at": observed_at,
+            "catalog_source_state": catalog_source_state,
         });
         let version_id =
             db::ensure_price_version(&state.pool, &row.id, &effective, &source, &metadata)
@@ -3326,6 +3448,7 @@ pub(crate) async fn sync_provider_pricing_id(
             &json!({
                 "effective_pricing": {
                     "source": source,
+                    "fields": fields,
                     "metadata": metadata,
                     "price_version_id": version_id,
                     "updated_at": db::now_iso(),
