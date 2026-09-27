@@ -181,6 +181,7 @@ pub struct CatalogResolution {
     pub provider: Option<ProviderModelMatch>,
     pub fallback_canonical: Option<CanonicalModelMatch>,
     pub fallback_provider: Option<ProviderModelMatch>,
+    pub catalog_provenance: Option<Value>,
 }
 
 pub struct CatalogLayer<'a> {
@@ -209,6 +210,7 @@ impl CatalogResolution {
             provider: None,
             fallback_canonical: None,
             fallback_provider: None,
+            catalog_provenance: None,
         }
     }
 
@@ -352,6 +354,7 @@ impl CatalogResolution {
                 "canonical": self.fallback_canonical.as_ref().map(canonical_json),
                 "provider": self.fallback_provider.as_ref().map(provider_json),
             },
+            "source_state": self.catalog_provenance,
         })
     }
 }
@@ -401,6 +404,7 @@ pub struct ModelsDevCatalog {
     models: Value,
     providers: Value,
     canonical_index: CanonicalModelIndex,
+    provenance: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +438,7 @@ impl ModelsDevCatalog {
             canonical_index: CanonicalModelIndex::from_models(models_object),
             models,
             providers,
+            provenance: None,
         })
     }
 
@@ -443,6 +448,30 @@ impl ModelsDevCatalog {
             "models": models,
             "providers": providers,
         }))
+    }
+
+    fn with_source_state(
+        mut self,
+        retrieved_at: String,
+        freshness: &str,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    ) -> Self {
+        self.provenance = Some(json!({
+            "source": "models.dev",
+            "retrieved_at": retrieved_at,
+            "freshness": freshness,
+            "etag": etag,
+            "last_modified": last_modified,
+        }));
+        self
+    }
+
+    fn with_freshness(mut self, freshness: &str) -> Self {
+        if let Some(state) = self.provenance.as_mut().and_then(Value::as_object_mut) {
+            state.insert("freshness".into(), Value::String(freshness.to_string()));
+        }
+        self
     }
 
     pub async fn fetch(client: &reqwest::Client, _base_url: &str) -> Option<Self> {
@@ -456,7 +485,7 @@ impl ModelsDevCatalog {
         let cached = models_dev_cache().read().await.clone();
         if let Some(entry) = cached.as_ref() {
             if entry.fetched_at.elapsed() <= MODELS_DEV_FRESH_TTL {
-                return Some(entry.catalog.clone());
+                return Some(entry.catalog.clone().with_freshness("fresh"));
             }
         }
 
@@ -478,13 +507,20 @@ impl ModelsDevCatalog {
             Err(_) => {
                 return cached
                     .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
-                    .map(|entry| entry.catalog);
+                    .map(|entry| entry.catalog.with_freshness("stale"));
             }
         };
 
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             if let Some(mut entry) = cached {
                 entry.fetched_at = Instant::now();
+                let retrieved_at = chrono::Utc::now().to_rfc3339();
+                entry.catalog = entry.catalog.with_source_state(
+                    retrieved_at,
+                    "fresh",
+                    entry.etag.clone(),
+                    entry.last_modified.clone(),
+                );
                 let catalog = entry.catalog.clone();
                 *models_dev_cache().write().await = Some(entry);
                 return Some(catalog);
@@ -495,7 +531,7 @@ impl ModelsDevCatalog {
         if !response.status().is_success() {
             return cached
                 .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
-                .map(|entry| entry.catalog);
+                .map(|entry| entry.catalog.with_freshness("stale"));
         }
 
         let etag = response
@@ -513,7 +549,7 @@ impl ModelsDevCatalog {
             _ => {
                 return cached
                     .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
-                    .map(|entry| entry.catalog);
+                    .map(|entry| entry.catalog.with_freshness("stale"));
             }
         };
         let catalog = match Self::from_slice(&bytes) {
@@ -521,9 +557,15 @@ impl ModelsDevCatalog {
             None => {
                 return cached
                     .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
-                    .map(|entry| entry.catalog);
+                    .map(|entry| entry.catalog.with_freshness("stale"));
             }
         };
+        let catalog = catalog.with_source_state(
+            chrono::Utc::now().to_rfc3339(),
+            "fresh",
+            etag.clone(),
+            last_modified.clone(),
+        );
         *models_dev_cache().write().await = Some(ModelsDevCacheEntry {
             catalog: catalog.clone(),
             etag,
@@ -1316,6 +1358,7 @@ fn resolve_with_bundled(
         provider,
         fallback_canonical,
         fallback_provider,
+        catalog_provenance: models_dev.and_then(|catalog| catalog.provenance.clone()),
     }
 }
 
@@ -1922,6 +1965,21 @@ mod tests {
             canonical.capabilities_json["structured_output"]["supported"],
             true
         );
+    }
+
+    #[test]
+    fn stale_catalog_keeps_original_retrieval_provenance() {
+        let catalog = models_dev_fixture().with_source_state(
+            "2026-09-20T00:00:00Z".into(),
+            "fresh",
+            Some("etag-1".into()),
+            Some("Sun, 20 Sep 2026 00:00:00 GMT".into()),
+        );
+        let stale = catalog.with_freshness("stale");
+        let state = stale.provenance.as_ref().unwrap();
+        assert_eq!(state["retrieved_at"], "2026-09-20T00:00:00Z");
+        assert_eq!(state["freshness"], "stale");
+        assert_eq!(state["etag"], "etag-1");
     }
 
     #[test]
