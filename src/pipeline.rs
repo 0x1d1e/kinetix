@@ -4917,7 +4917,35 @@ async fn finalize_log(
     );
 
     let prices = attempt.target.model.prices();
-    let cost = cost::compute_cost(&prices, &usage);
+    let computed_cost = cost::compute_cost(&prices, &usage);
+    let (cost, price_version_id) = if let Some(computed_cost) = computed_cost {
+        let (source, source_metadata) = attempt.target.model.price_provenance();
+        match db::ensure_price_version(
+            &state.pool,
+            &attempt.target.model.id,
+            &prices,
+            &source,
+            &source_metadata,
+        )
+        .await
+        {
+            Ok(Some(version_id)) => (Some(computed_cost), Some(version_id)),
+            Ok(None) => (None, None),
+            Err(error) => {
+                // A known cost without the exact immutable rate snapshot is not
+                // auditable. Prefer unknown cost over silently mis-attributing
+                // historical usage to a later price.
+                tracing::warn!(
+                    model = %attempt.target.model.id,
+                    %error,
+                    "failed to resolve price version; persisting usage with unknown cost"
+                );
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
     let cost_known = cost.is_some();
 
     // Reconcile only when both canonical token totals are complete. The
@@ -4993,7 +5021,7 @@ async fn finalize_log(
         thinking_tokens: usage.thinking.map(|v| v as i64),
         cost_usd: cost,
         cost_known: cost_known as i64,
-        price_version_id: None,
+        price_version_id,
         cache_status: meta.cache_status.to_string(),
         serving_account_id: Some(attempt.target.account.id.clone()),
         serving_account: Some(attempt.target.account.label.clone()),
