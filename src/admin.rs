@@ -4173,17 +4173,29 @@ pub async fn create_model(
         }
     }
     if prices.is_configured() {
-        let metadata = json!({ "configured_by": "admin" });
-        db::ensure_price_version(&state.pool, &id, &prices, "operator", &metadata)
-            .await
-            .map_err(ApiError::internal)?;
+        let (source, metadata) = if imported_from_discovery {
+            (
+                automatic_price_source(&body.discovery),
+                json!({
+                    "price_sources": body.discovery.get("price_sources").cloned().unwrap_or(Value::Null),
+                    "imported_from_discovery": true,
+                }),
+            )
+        } else {
+            ("operator".to_string(), json!({ "configured_by": "admin" }))
+        };
+        let version_id =
+            db::ensure_price_version(&state.pool, &id, &prices, &source, &metadata)
+                .await
+                .map_err(ApiError::internal)?;
         db::merge_model_discovery(
             &state.pool,
             &id,
             &json!({
                 "effective_pricing": {
-                    "source": "operator",
+                    "source": source,
                     "metadata": metadata,
+                    "price_version_id": version_id,
                     "updated_at": db::now_iso(),
                 }
             }),
@@ -4262,17 +4274,36 @@ pub async fn update_model(
     .await
     .map_err(ApiError::internal)?;
     if prices.is_configured() {
-        let metadata = json!({ "configured_by": "admin" });
-        db::ensure_price_version(&state.pool, &id, &prices, "operator", &metadata)
-            .await
-            .map_err(ApiError::internal)?;
+        let existing_discovery = discovery_object(&model);
+        let existing_source = existing_discovery
+            .pointer("/effective_pricing/source")
+            .and_then(Value::as_str);
+        let price_changed = !prices_equal(&model.prices(), &prices);
+        let (source, metadata) = if price_changed {
+            ("operator".to_string(), json!({ "configured_by": "admin" }))
+        } else if let Some(source) = existing_source {
+            (
+                source.to_string(),
+                existing_discovery
+                    .pointer("/effective_pricing/metadata")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            )
+        } else {
+            ("operator".to_string(), json!({ "configured_by": "admin" }))
+        };
+        let version_id =
+            db::ensure_price_version(&state.pool, &id, &prices, &source, &metadata)
+                .await
+                .map_err(ApiError::internal)?;
         db::merge_model_discovery(
             &state.pool,
             &id,
             &json!({
                 "effective_pricing": {
-                    "source": "operator",
+                    "source": source,
                     "metadata": metadata,
+                    "price_version_id": version_id,
                     "updated_at": db::now_iso(),
                 }
             }),
