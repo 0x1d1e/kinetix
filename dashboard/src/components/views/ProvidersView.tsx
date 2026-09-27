@@ -1400,7 +1400,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs font-mono">
                           <div className="bg-[var(--paper)] p-2 border border-[var(--ink)] rounded">
                             <strong className="font-heading text-sm text-[var(--ink)] block mb-1">
-                              💵 Token Pricing · ${modelPricingSource(m)}
+                              💵 Token Pricing · {modelPricingSource(m)}
                             </strong>
                             <div>Input: {m.prices.inputPer1M == null ? 'unknown' : `${m.prices.inputPer1M} / 1M`}</div>
                             <div>Output: {m.prices.outputPer1M == null ? 'unknown' : `${m.prices.outputPer1M} / 1M`}</div>
