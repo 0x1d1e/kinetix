@@ -624,7 +624,8 @@ pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
                 Ok(()) => match sync_provider_pricing_id(state, &provider.id).await {
                     Ok(_) => {
                         if let Err(error) =
-                            record_lifecycle_success(&state.pool, "pricing_sync", &provider.id).await
+                            record_lifecycle_success(&state.pool, "pricing_sync", &provider.id)
+                                .await
                         {
                             tracing::warn!(provider = %provider.id, %error, "failed to persist pricing-sync success state");
                         }
@@ -4135,9 +4136,8 @@ fn probe_cost_upper_bound(
     // ceiling, not billing estimation.
     let input_tokens = serde_json::to_vec(outbound).ok()?.len() as u64;
     let reasoning_tokens = probe_reasoning_token_bound(thinking_map, thinking)?;
-    let generated_tokens = (max_tokens as u64).max(
-        reasoning_tokens.saturating_add(PROBE_RESPONSE_ALLOWANCE_TOKENS),
-    );
+    let generated_tokens =
+        (max_tokens as u64).max(reasoning_tokens.saturating_add(PROBE_RESPONSE_ALLOWANCE_TOKENS));
     let generated_rate = if reasoning_tokens > 0 {
         output_rate.max(prices.thinking_per_1m.unwrap_or(output_rate))
     } else {
@@ -4207,8 +4207,7 @@ mod model_lifecycle_regression_tests {
             "reasoning": true
         });
         let selected = vec!["capabilities.tool_calling".to_string()];
-        let overrides =
-            merge_selected_capability_overrides(&discovery, &configured, &selected);
+        let overrides = merge_selected_capability_overrides(&discovery, &configured, &selected);
         assert_eq!(overrides.get("tool_calling"), Some(&json!(true)));
         assert_eq!(overrides.get("reasoning"), Some(&json!(true)));
         assert!(!overrides.contains_key("vision"));
