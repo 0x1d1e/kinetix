@@ -118,6 +118,17 @@ fn discovered_transport(discovery: &serde_json::Value) -> Result<Option<&str>, P
         .transpose()
 }
 
+fn fresh_probe_status(evidence: &serde_json::Value) -> Option<&str> {
+    let fresh_until = evidence
+        .get("fresh_until")
+        .and_then(serde_json::Value::as_str)?;
+    let fresh_until = chrono::DateTime::parse_from_rfc3339(fresh_until).ok()?;
+    if fresh_until.with_timezone(&chrono::Utc) <= chrono::Utc::now() {
+        return None;
+    }
+    evidence.get("status").and_then(serde_json::Value::as_str)
+}
+
 /// Resolve model transport, reasoning, parameters, and capabilities in one
 /// place. Explicit invalid metadata is an error, never a signal to fall back.
 pub fn resolve_execution_profile(
@@ -176,13 +187,13 @@ pub fn resolve_execution_profile(
         ));
     }
 
-    let reasoning = crate::adapters::normalize_reasoning_capability(&discovery);
+    let mut reasoning = crate::adapters::normalize_reasoning_capability(&discovery);
     let admin_thinking = model.thinking();
-    let thinking_map = if !admin_thinking.levels.is_empty()
+    let admin_thinking_configured = !admin_thinking.levels.is_empty()
         || admin_thinking.mode.is_some()
         || admin_thinking.budget_field.is_some()
-        || admin_thinking.level_field.is_some()
-    {
+        || admin_thinking.level_field.is_some();
+    let mut thinking_map = if admin_thinking_configured {
         admin_thinking
     } else {
         discovery
@@ -201,6 +212,49 @@ pub fn resolve_execution_profile(
             })
             .unwrap_or_default()
     };
+
+    // Effort probes are evidence about one canonical level, not about the
+    // model's entire reasoning capability. A rejected "max" must never turn
+    // "reasoning" false. Fresh unsupported evidence filters discovered
+    // mappings, while an explicit operator thinking map remains authoritative.
+    let mut verified_reasoning_supported = false;
+    if let Some(evidence) = discovery.get("probe_evidence").and_then(serde_json::Value::as_object) {
+        for (key, item) in evidence {
+            if let Some(level) = key.strip_prefix("reasoning_effort_") {
+                match fresh_probe_status(item) {
+                    Some("supported") => {
+                        verified_reasoning_supported = true;
+                        if thinking_map.level_is_executable(level) {
+                            if let Some(capability) = reasoning.as_mut() {
+                                if !capability.levels.iter().any(|candidate| candidate == level) {
+                                    capability.levels.push(level.to_string());
+                                }
+                            }
+                        }
+                    }
+                    Some("unsupported") if !admin_thinking_configured => {
+                        thinking_map.levels.remove(level);
+                        if let Some(capability) = reasoning.as_mut() {
+                            capability.levels.retain(|candidate| candidate != level);
+                            if capability.default.as_deref() == Some(level) {
+                                capability.default = None;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else if key == "reasoning_disable" && !admin_thinking_configured {
+                if let Some(capability) = reasoning.as_mut() {
+                    match fresh_probe_status(item) {
+                        Some("supported") => capability.can_disable = true,
+                        Some("unsupported") => capability.can_disable = false,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     let configured_capabilities = serde_json::from_str::<serde_json::Value>(&model.capabilities)
         .unwrap_or_else(|_| serde_json::json!({}));
     let operator_overrides = discovery.get("operator_capability_overrides");
@@ -209,14 +263,7 @@ pub fn resolve_execution_profile(
         let evidence = discovery
             .get("probe_evidence")
             .and_then(|value| value.get(name))?;
-        let fresh_until = evidence
-            .get("fresh_until")
-            .and_then(serde_json::Value::as_str)?;
-        let fresh_until = chrono::DateTime::parse_from_rfc3339(fresh_until).ok()?;
-        if fresh_until.with_timezone(&chrono::Utc) <= chrono::Utc::now() {
-            return None;
-        }
-        match evidence.get("status").and_then(serde_json::Value::as_str) {
+        match fresh_probe_status(evidence) {
             Some("supported") => Some(true),
             Some("unsupported") => Some(false),
             _ => None,
@@ -231,6 +278,9 @@ pub fn resolve_execution_profile(
         }
         if let Some(value) = probe_capability(name) {
             return Some(value);
+        }
+        if name == "reasoning" && verified_reasoning_supported {
+            return Some(true);
         }
         if let Some(value) = discovered_capabilities.and_then(|value| value.get(name)) {
             // A present null is an explicit unknown observation and must not be
