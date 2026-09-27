@@ -1079,13 +1079,37 @@ pub async fn insert_price_version(pool: &Pool, model_id: &str, p: &Prices) -> Re
     insert_price_version_with_source(pool, model_id, p, "operator", &serde_json::json!({})).await
 }
 
-fn price_snapshot_matches(row: &sqlx::sqlite::SqliteRow, p: &Prices) -> Result<bool> {
+fn price_provenance_matches(
+    stored_source: &str,
+    stored_metadata: &str,
+    source: &str,
+    source_metadata: &Value,
+) -> bool {
+    if stored_source != source {
+        return false;
+    }
+    serde_json::from_str::<Value>(stored_metadata)
+        .is_ok_and(|stored| stored == *source_metadata)
+}
+
+fn price_snapshot_matches(
+    row: &sqlx::sqlite::SqliteRow,
+    p: &Prices,
+    source: &str,
+    source_metadata: &Value,
+) -> Result<bool> {
     Ok(
         row.try_get::<Option<f64>, _>("input_per_1m")? == p.input_per_1m
             && row.try_get::<Option<f64>, _>("output_per_1m")? == p.output_per_1m
             && row.try_get::<Option<f64>, _>("cached_per_1m")? == p.cached_per_1m
             && row.try_get::<Option<f64>, _>("cache_write_per_1m")? == p.cache_write_per_1m
-            && row.try_get::<Option<f64>, _>("thinking_per_1m")? == p.thinking_per_1m,
+            && row.try_get::<Option<f64>, _>("thinking_per_1m")? == p.thinking_per_1m
+            && price_provenance_matches(
+                &row.try_get::<String, _>("source")?,
+                &row.try_get::<String, _>("source_metadata")?,
+                source,
+                source_metadata,
+            ),
     )
 }
 
@@ -1106,7 +1130,7 @@ pub async fn ensure_price_version(
 
     let latest = sqlx::query(
         "SELECT id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m,
-                thinking_per_1m
+                thinking_per_1m, source, source_metadata
          FROM price_versions
          WHERE model_id = ?
          ORDER BY created_at DESC, rowid DESC
@@ -1117,7 +1141,7 @@ pub async fn ensure_price_version(
     .await?;
 
     if let Some(row) = latest {
-        if price_snapshot_matches(&row, p)? {
+        if price_snapshot_matches(&row, p, source, source_metadata)? {
             return Ok(Some(row.try_get::<String, _>("id")?));
         }
     }
@@ -1933,4 +1957,33 @@ pub async fn purge_old_route_traces(pool: &Pool, retain_days: i64) -> Result<u64
         .execute(pool)
         .await?;
     Ok(res.rows_affected())
+}
+
+
+#[cfg(test)]
+mod price_version_identity_tests {
+    use super::price_provenance_matches;
+    use serde_json::json;
+
+    #[test]
+    fn equal_numeric_prices_do_not_dedupe_across_provenance_changes() {
+        assert!(price_provenance_matches(
+            "models.dev",
+            r#"{"reference":"models.dev:provider/openai/gpt"}"#,
+            "models.dev",
+            &json!({"reference":"models.dev:provider/openai/gpt"}),
+        ));
+        assert!(!price_provenance_matches(
+            "models.dev",
+            r#"{"reference":"models.dev:provider/openai/gpt"}"#,
+            "operator_accept",
+            &json!({"accepted_from":"models.dev"}),
+        ));
+        assert!(!price_provenance_matches(
+            "models.dev",
+            r#"{"reference":"old"}"#,
+            "models.dev",
+            &json!({"reference":"new"}),
+        ));
+    }
 }
