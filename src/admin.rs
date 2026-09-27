@@ -3868,7 +3868,7 @@ pub async fn create_model(
             enabled: body.enabled,
             context_window: body.context_window,
             max_output_tokens: body.max_output_tokens,
-            capabilities: caps,
+            capabilities: caps.clone(),
             prices: serde_json::to_value(&prices).unwrap(),
             parameters: body.parameters.clone(),
             thinking_map: serde_json::to_value(&body.thinking_map)
@@ -3887,6 +3887,15 @@ pub async fn create_model(
         .get("imported_from_discovery")
         .and_then(Value::as_bool)
         == Some(true);
+    if !imported_from_discovery {
+        db::merge_model_discovery(
+            &state.pool,
+            &id,
+            &json!({ "operator_capability_overrides": caps.clone() }),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    }
     let valid_opaque_state = body
         .discovery
         .get("opaque_state")
@@ -3968,7 +3977,7 @@ pub async fn update_model(
         body.enabled,
         body.context_window,
         body.max_output_tokens,
-        caps,
+        caps.clone(),
         serde_json::to_value(&prices).unwrap(),
         body.parameters.clone(),
         serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible"),
@@ -3979,6 +3988,13 @@ pub async fn update_model(
     db::set_model_transport_override(&state.pool, &id, transport_override.as_deref())
         .await
         .map_err(ApiError::internal)?;
+    db::merge_model_discovery(
+        &state.pool,
+        &id,
+        &json!({ "operator_capability_overrides": caps }),
+    )
+    .await
+    .map_err(ApiError::internal)?;
     if prices.is_configured() {
         let metadata = json!({ "configured_by": "admin" });
         db::ensure_price_version(&state.pool, &id, &prices, "operator", &metadata)
