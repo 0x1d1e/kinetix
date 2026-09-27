@@ -2952,6 +2952,16 @@ pub async fn update_model_reconciliation(
                     .map_err(ApiError::internal)?;
             }
 
+            if selected.iter().any(|field| field.starts_with("capabilities.")) {
+                db::merge_model_discovery(
+                    &state.pool,
+                    &id,
+                    &json!({ "operator_capability_overrides": capabilities.clone() }),
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            }
+
             if accepted_prices && prices.is_configured() {
                 let metadata = json!({
                     "accepted_from": discovery.get("price_sources").cloned().unwrap_or(Value::Null),
@@ -4288,13 +4298,18 @@ pub async fn update_model(
     db::set_model_transport_override(&state.pool, &id, transport_override.as_deref())
         .await
         .map_err(ApiError::internal)?;
-    db::merge_model_discovery(
-        &state.pool,
-        &id,
-        &json!({ "operator_capability_overrides": caps }),
-    )
-    .await
-    .map_err(ApiError::internal)?;
+    let existing_caps = normalize_model_capabilities(
+        &serde_json::from_str::<Value>(&model.capabilities).unwrap_or_else(|_| json!({})),
+    );
+    if existing_caps != caps {
+        db::merge_model_discovery(
+            &state.pool,
+            &id,
+            &json!({ "operator_capability_overrides": caps.clone() }),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    }
     if prices.is_configured() {
         let existing_discovery = discovery_object(&model);
         let existing_source = existing_discovery
