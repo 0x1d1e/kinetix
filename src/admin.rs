@@ -281,7 +281,11 @@ fn lifecycle_setting_key(lane: &str, field: &str, provider_id: &str) -> String {
     format!("model_{lane}_{field}:{provider_id}")
 }
 
-async fn lifecycle_lane_status(pool: &Pool, lane: &str, provider_id: &str) -> Result<Value, ApiError> {
+async fn lifecycle_lane_status(
+    pool: &Pool,
+    lane: &str,
+    provider_id: &str,
+) -> Result<Value, ApiError> {
     let last_attempt = db::get_setting(
         pool,
         &lifecycle_setting_key(lane, "last_attempt", provider_id),
@@ -322,7 +326,11 @@ async fn provider_lifecycle_status(pool: &Pool, provider_id: &str) -> Result<Val
     }))
 }
 
-async fn record_lifecycle_success(pool: &Pool, lane: &str, provider_id: &str) -> anyhow::Result<()> {
+async fn record_lifecycle_success(
+    pool: &Pool,
+    lane: &str,
+    provider_id: &str,
+) -> anyhow::Result<()> {
     db::set_setting(
         pool,
         &lifecycle_setting_key(lane, "last_success", provider_id),
@@ -594,7 +602,8 @@ pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
                     }
                     if reconcile_due {
                         if let Err(error) =
-                            record_lifecycle_success(&state.pool, "reconciliation", &provider.id).await
+                            record_lifecycle_success(&state.pool, "reconciliation", &provider.id)
+                                .await
                         {
                             tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation success state");
                         }
@@ -2976,10 +2985,7 @@ fn set_price_field(prices: &mut Prices, field: &str, value: Option<f64>) {
     }
 }
 
-fn effective_price_fields(
-    discovery: &Value,
-    current: &Prices,
-) -> serde_json::Map<String, Value> {
+fn effective_price_fields(discovery: &Value, current: &Prices) -> serde_json::Map<String, Value> {
     let mut fields = discovery
         .pointer("/effective_pricing/fields")
         .and_then(Value::as_object)
@@ -3051,7 +3057,11 @@ fn effective_price_source(fields: &serde_json::Map<String, Value>, prices: &Pric
         .collect();
     match sources.len() {
         0 => "untracked".into(),
-        1 => sources.into_iter().next().unwrap_or("untracked").to_string(),
+        1 => sources
+            .into_iter()
+            .next()
+            .unwrap_or("untracked")
+            .to_string(),
         _ => "mixed".into(),
     }
 }
@@ -3356,7 +3366,10 @@ pub async fn update_model_reconciliation(
 
             if accepted_prices && prices.is_configured() {
                 let mut fields = effective_price_fields(&discovery, &row.prices());
-                for selected_field in selected.iter().filter_map(|field| field.strip_prefix("prices.")) {
+                for selected_field in selected
+                    .iter()
+                    .filter_map(|field| field.strip_prefix("prices."))
+                {
                     let accepted_from = discovery
                         .pointer(&format!("/price_sources/{selected_field}"))
                         .cloned()
@@ -4004,8 +4017,7 @@ fn probe_cost_upper_bound(
         output_rate
     };
     Some(
-        (input_tokens as f64 * input_rate + generated_tokens as f64 * generated_rate)
-            / 1_000_000.0,
+        (input_tokens as f64 * input_rate + generated_tokens as f64 * generated_rate) / 1_000_000.0,
     )
 }
 
@@ -4110,15 +4122,13 @@ mod model_lifecycle_regression_tests {
         let pool = db::connect(&url).await.unwrap();
         db::migrate(&pool).await.unwrap();
         pool.close().await;
-        assert!(
-            persist_provider_discovery_observations(
-                &pool,
-                "provider-a",
-                &json!({"models":[],"disappeared":[]}),
-            )
-            .await
-            .is_err()
-        );
+        assert!(persist_provider_discovery_observations(
+            &pool,
+            "provider-a",
+            &json!({"models":[],"disappeared":[]}),
+        )
+        .await
+        .is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 }
