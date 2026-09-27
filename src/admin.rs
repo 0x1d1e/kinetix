@@ -2431,6 +2431,408 @@ pub async fn reconcile_models(
     reconcile_provider_id(&state, &id).await.map(Json)
 }
 
+
+#[derive(Deserialize)]
+pub struct ReconciliationActionBody {
+    pub action: String,
+    #[serde(default)]
+    pub fields: Vec<String>,
+}
+
+fn reconciliation_fields(reconciliation: &Value) -> Vec<String> {
+    reconciliation
+        .get("diff")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("field").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn prices_equal(a: &Prices, b: &Prices) -> bool {
+    a.input_per_1m == b.input_per_1m
+        && a.output_per_1m == b.output_per_1m
+        && a.cached_per_1m == b.cached_per_1m
+        && a.cache_write_per_1m == b.cache_write_per_1m
+        && a.thinking_per_1m == b.thinking_per_1m
+}
+
+fn overlay_known_prices(base: &mut Prices, observed: &Prices) {
+    if observed.input_per_1m.is_some() {
+        base.input_per_1m = observed.input_per_1m;
+    }
+    if observed.output_per_1m.is_some() {
+        base.output_per_1m = observed.output_per_1m;
+    }
+    if observed.cached_per_1m.is_some() {
+        base.cached_per_1m = observed.cached_per_1m;
+    }
+    if observed.cache_write_per_1m.is_some() {
+        base.cache_write_per_1m = observed.cache_write_per_1m;
+    }
+    if observed.thinking_per_1m.is_some() {
+        base.thinking_per_1m = observed.thinking_per_1m;
+    }
+}
+
+fn automatic_price_source(discovery: &Value) -> String {
+    let mut sources = std::collections::BTreeSet::new();
+    if let Some(values) = discovery.get("price_sources").and_then(Value::as_object) {
+        for source in values.values().filter_map(Value::as_str) {
+            sources.insert(source.to_string());
+        }
+    }
+    if sources.len() == 1 {
+        sources.into_iter().next().unwrap_or_else(|| "discovery".into())
+    } else if sources.is_empty() {
+        "discovery".into()
+    } else {
+        "mixed".into()
+    }
+}
+
+fn is_automatic_price_source(source: &str) -> bool {
+    matches!(
+        source,
+        "provider_metadata"
+            | "plugin_capabilities_json"
+            | "models.dev"
+            | "bundled_catalog"
+            | "mixed"
+            | "discovery"
+    )
+}
+
+/// Apply an explicit reconciliation decision. Observations never reach this
+/// path on their own; every mutation here represents an operator action.
+pub async fn update_model_reconciliation(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+    Json(body): Json<ReconciliationActionBody>,
+) -> ApiResult {
+    let row = db::get_model(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("model not found"))?;
+    let discovery = discovery_object(&row);
+    let mut reconciliation = discovery
+        .get("reconciliation")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let available = reconciliation_fields(&reconciliation);
+    let selected = if body.fields.is_empty() {
+        available.clone()
+    } else {
+        body.fields.clone()
+    };
+
+    match body.action.as_str() {
+        "ignore" => {
+            let current = reconciliation
+                .get("diff")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let object = reconciliation
+                .as_object_mut()
+                .ok_or_else(|| ApiError::internal("invalid reconciliation metadata"))?;
+            object.insert("ignored_diff".into(), current);
+            object.insert("status".into(), json!("ignored"));
+            object.insert("decision_at".into(), json!(db::now_iso()));
+        }
+        "pin" => {
+            let pins = if selected.is_empty() {
+                return Err(ApiError::bad("pin requires at least one observed field"));
+            } else {
+                selected
+            };
+            let mut merged: std::collections::BTreeSet<String> = reconciliation
+                .get("pinned_fields")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            for field in pins {
+                if available.iter().any(|candidate| candidate == &field) {
+                    merged.insert(field);
+                }
+            }
+            let object = reconciliation
+                .as_object_mut()
+                .ok_or_else(|| ApiError::internal("invalid reconciliation metadata"))?;
+            object.insert(
+                "pinned_fields".into(),
+                Value::Array(merged.into_iter().map(Value::String).collect()),
+            );
+            object.insert("decision_at".into(), json!(db::now_iso()));
+        }
+        "accept" => {
+            let safe_default: Vec<String> = available
+                .iter()
+                .filter(|field| field.as_str() != "transport")
+                .cloned()
+                .collect();
+            let selected = if body.fields.is_empty() {
+                safe_default
+            } else {
+                selected
+            };
+
+            let mut display_name = row.display_name.clone();
+            let mut context_window = row.context_window;
+            let mut max_output_tokens = row.max_output_tokens;
+            let mut capabilities =
+                serde_json::from_str::<Value>(&row.capabilities).unwrap_or_else(|_| json!({}));
+            if !capabilities.is_object() {
+                capabilities = json!({});
+            }
+            let mut thinking_map = row.thinking();
+            let mut prices = row.prices();
+            let mut accepted_prices = false;
+            let mut accepted_transport: Option<String> = None;
+
+            for field in &selected {
+                match field.as_str() {
+                    "display_name" => {
+                        if let Some(value) = discovery.get("display_name").and_then(Value::as_str) {
+                            display_name = value.to_string();
+                        }
+                    }
+                    "context_window" => {
+                        if let Some(value) = discovery.get("context_window").and_then(Value::as_i64) {
+                            context_window = Some(value);
+                        }
+                    }
+                    "max_output_tokens" => {
+                        if let Some(value) =
+                            discovery.get("max_output_tokens").and_then(Value::as_i64)
+                        {
+                            max_output_tokens = Some(value);
+                        }
+                    }
+                    "thinking_map" => {
+                        if let Some(value) = discovery.get("thinking_map") {
+                            if let Ok(parsed) = serde_json::from_value::<ThinkingMap>(value.clone()) {
+                                validate_thinking_map(&parsed)?;
+                                thinking_map = parsed;
+                            }
+                        }
+                    }
+                    "transport" => {
+                        accepted_transport = discovery
+                            .pointer("/transport/format")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                    }
+                    field if field.starts_with("capabilities.") => {
+                        let key = field.trim_start_matches("capabilities.");
+                        if let Some(value) = discovery
+                            .pointer(&format!("/capabilities/{key}"))
+                            .and_then(Value::as_bool)
+                        {
+                            capabilities
+                                .as_object_mut()
+                                .expect("capabilities normalized to object")
+                                .insert(key.to_string(), Value::Bool(value));
+                        }
+                    }
+                    field if field.starts_with("prices.") => {
+                        let key = field.trim_start_matches("prices.");
+                        let value = discovery
+                            .pointer(&format!("/prices/{key}"))
+                            .and_then(Value::as_f64);
+                        match key {
+                            "input_per_1m" => prices.input_per_1m = value,
+                            "output_per_1m" => prices.output_per_1m = value,
+                            "cached_per_1m" => prices.cached_per_1m = value,
+                            "cache_write_per_1m" => prices.cache_write_per_1m = value,
+                            "thinking_per_1m" => prices.thinking_per_1m = value,
+                            _ => {}
+                        }
+                        accepted_prices = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            db::update_model(
+                &state.pool,
+                &id,
+                &display_name,
+                row.enabled != 0,
+                context_window,
+                max_output_tokens,
+                normalize_model_capabilities(&capabilities),
+                serde_json::to_value(&prices).map_err(ApiError::internal)?,
+                serde_json::to_value(row.params()).unwrap_or_else(|_| json!({})),
+                serde_json::to_value(&thinking_map).map_err(ApiError::internal)?,
+                row.extra_request_value(),
+            )
+            .await
+            .map_err(ApiError::internal)?;
+
+            if let Some(transport) = accepted_transport {
+                let provider = db::get_provider(&state.pool, &row.provider_id)
+                    .await
+                    .map_err(ApiError::internal)?
+                    .ok_or_else(|| ApiError::not_found("provider not found"))?;
+                let transport =
+                    validate_model_transport_override(&provider, Some(transport.as_str()))?;
+                db::set_model_transport_override(&state.pool, &id, transport.as_deref())
+                    .await
+                    .map_err(ApiError::internal)?;
+            }
+
+            if accepted_prices && prices.is_configured() {
+                let metadata = json!({
+                    "accepted_from": discovery.get("price_sources").cloned().unwrap_or(Value::Null),
+                });
+                db::ensure_price_version(&state.pool, &id, &prices, "operator_accept", &metadata)
+                    .await
+                    .map_err(ApiError::internal)?;
+                db::merge_model_discovery(
+                    &state.pool,
+                    &id,
+                    &json!({
+                        "effective_pricing": {
+                            "source": "operator_accept",
+                            "metadata": metadata,
+                            "updated_at": db::now_iso(),
+                        }
+                    }),
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            }
+
+            let object = reconciliation
+                .as_object_mut()
+                .ok_or_else(|| ApiError::internal("invalid reconciliation metadata"))?;
+            object.insert("status".into(), json!("accepted"));
+            object.insert("diff".into(), json!([]));
+            object.remove("ignored_diff");
+            object.insert("decision_at".into(), json!(db::now_iso()));
+            state
+                .registry
+                .reload(&state.pool)
+                .await
+                .map_err(ApiError::internal)?;
+        }
+        other => {
+            return Err(ApiError::bad(format!(
+                "unsupported reconciliation action '{other}'"
+            )))
+        }
+    }
+
+    db::merge_model_discovery(
+        &state.pool,
+        &id,
+        &json!({ "reconciliation": reconciliation }),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Explicit pricing synchronization. Manual/operator-owned prices always win;
+/// auto-managed prices are refreshed from the latest successful observation.
+pub(crate) async fn sync_provider_pricing_id(
+    state: &AppState,
+    id: &str,
+) -> Result<Value, ApiError> {
+    // Refresh observations first. If discovery/catalog resolution fails, this
+    // returns before touching any effective prices, preserving last-known rates.
+    let _ = reconcile_provider_id(state, id).await?;
+    let models = db::models_for_provider(&state.pool, id)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut updated = Vec::new();
+    let mut skipped_manual = Vec::new();
+
+    for row in models {
+        let discovery = discovery_object(&row);
+        let observed: Prices = discovery
+            .get("prices")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        if !observed.is_configured() {
+            continue;
+        }
+
+        let current = row.prices();
+        let current_source = discovery
+            .pointer("/effective_pricing/source")
+            .and_then(Value::as_str);
+        let operator_owned = current.is_configured()
+            && current_source
+                .map(|source| !is_automatic_price_source(source))
+                .unwrap_or(true);
+        if operator_owned {
+            skipped_manual.push(row.id.clone());
+            continue;
+        }
+
+        let mut effective = current.clone();
+        overlay_known_prices(&mut effective, &observed);
+        let source = automatic_price_source(&discovery);
+        let metadata = json!({
+            "price_sources": discovery.get("price_sources").cloned().unwrap_or(Value::Null),
+            "observed_at": discovery.get("last_seen").cloned().unwrap_or(Value::Null),
+        });
+        let version_id =
+            db::ensure_price_version(&state.pool, &row.id, &effective, &source, &metadata)
+                .await
+                .map_err(ApiError::internal)?;
+
+        if !prices_equal(&current, &effective) {
+            db::update_model_prices(&state.pool, &row.id, &effective)
+                .await
+                .map_err(ApiError::internal)?;
+        }
+        db::merge_model_discovery(
+            &state.pool,
+            &row.id,
+            &json!({
+                "effective_pricing": {
+                    "source": source,
+                    "metadata": metadata,
+                    "price_version_id": version_id,
+                    "updated_at": db::now_iso(),
+                }
+            }),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        updated.push(row.id);
+    }
+
+    if !updated.is_empty() {
+        state
+            .registry
+            .reload(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    Ok(json!({
+        "ok": true,
+        "updated": updated,
+        "skipped_manual": skipped_manual,
+    }))
+}
+
+pub async fn sync_provider_pricing(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+) -> ApiResult {
+    sync_provider_pricing_id(&state, &id).await.map(Json)
+}
+
 async fn credential_for_admin_action(
     state: &AppState,
     provider: &db::ProviderRow,
