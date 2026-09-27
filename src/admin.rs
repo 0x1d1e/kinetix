@@ -1913,6 +1913,233 @@ async fn persist_model_discovery_update(
     db::merge_model_discovery(pool, &row.id, &fresh).await
 }
 
+fn discovery_object(row: &db::ModelRow) -> Value {
+    serde_json::from_str::<Value>(&row.discovery).unwrap_or_else(|_| json!({}))
+}
+
+fn explicit_deprecation(observation: &DiscoveredObservation) -> bool {
+    fn marked(value: &Value) -> bool {
+        value.get("deprecated").and_then(Value::as_bool) == Some(true)
+            || value
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status.eq_ignore_ascii_case("deprecated"))
+            || value
+                .pointer("/lifecycle/status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status.eq_ignore_ascii_case("deprecated"))
+    }
+
+    observation.raw_metadata.as_ref().is_some_and(marked)
+        || observation
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.pointer("/provider/metadata"))
+            .is_some_and(marked)
+        || observation
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.pointer("/canonical/metadata"))
+            .is_some_and(marked)
+}
+
+fn reconciliation_diff(row: &db::ModelRow, observation: &DiscoveredObservation) -> Vec<Value> {
+    fn push_diff(out: &mut Vec<Value>, field: &str, configured: Value, observed: Value, source: Value) {
+        if configured != observed && !observed.is_null() {
+            out.push(json!({
+                "field": field,
+                "configured": configured,
+                "observed": observed,
+                "source": source,
+            }));
+        }
+    }
+
+    let mut diff = Vec::new();
+    let discovery = discovery_object(row);
+    push_diff(
+        &mut diff,
+        "display_name",
+        json!(row.display_name),
+        json!(observation.model.display_name),
+        json!("upstream_discovery"),
+    );
+    if let Some(value) = observation.model.context_window {
+        push_diff(
+            &mut diff,
+            "context_window",
+            json!(row.context_window),
+            json!(value),
+            observation
+                .capability_sources
+                .get("context_window")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+    if let Some(value) = observation.model.max_output_tokens {
+        push_diff(
+            &mut diff,
+            "max_output_tokens",
+            json!(row.max_output_tokens),
+            json!(value),
+            observation
+                .capability_sources
+                .get("max_output_tokens")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+
+    let configured_caps =
+        serde_json::from_str::<Value>(&row.capabilities).unwrap_or_else(|_| json!({}));
+    let observed_caps = discovered_capabilities(observation);
+    for field in ["text", "reasoning", "vision", "tool_calling", "structured_output"] {
+        if let Some(observed) = observed_caps.get(field).filter(|value| !value.is_null()) {
+            push_diff(
+                &mut diff,
+                &format!("capabilities.{field}"),
+                configured_caps.get(field).cloned().unwrap_or(Value::Null),
+                observed.clone(),
+                observation
+                    .capability_sources
+                    .get(field)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
+    }
+
+    if let Some(thinking_map) = observation.thinking_map.as_ref() {
+        let configured =
+            serde_json::from_str::<Value>(&row.thinking_map).unwrap_or_else(|_| json!({}));
+        let observed = serde_json::to_value(thinking_map).unwrap_or_else(|_| json!({}));
+        push_diff(
+            &mut diff,
+            "thinking_map",
+            configured,
+            observed,
+            observation
+                .capability_sources
+                .get("reasoning")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+
+    let configured_prices = row.prices();
+    for (field, configured, observed) in [
+        (
+            "prices.input_per_1m",
+            configured_prices.input_per_1m,
+            observation.prices.input_per_1m,
+        ),
+        (
+            "prices.output_per_1m",
+            configured_prices.output_per_1m,
+            observation.prices.output_per_1m,
+        ),
+        (
+            "prices.cached_per_1m",
+            configured_prices.cached_per_1m,
+            observation.prices.cached_per_1m,
+        ),
+        (
+            "prices.cache_write_per_1m",
+            configured_prices.cache_write_per_1m,
+            observation.prices.cache_write_per_1m,
+        ),
+        (
+            "prices.thinking_per_1m",
+            configured_prices.thinking_per_1m,
+            observation.prices.thinking_per_1m,
+        ),
+    ] {
+        if let Some(observed) = observed {
+            let source_key = field.trim_start_matches("prices.");
+            push_diff(
+                &mut diff,
+                field,
+                configured.map(Value::from).unwrap_or(Value::Null),
+                Value::from(observed),
+                observation
+                    .price_sources
+                    .get(source_key)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
+    }
+
+    if let Some(observed) = observation.transport.as_ref() {
+        if let Some(configured) = discovery
+            .get("configured_transport")
+            .and_then(Value::as_str)
+        {
+            push_diff(
+                &mut diff,
+                "transport",
+                json!(configured),
+                json!(observed),
+                json!(observation.transport_source),
+            );
+        }
+    }
+
+    let pinned: std::collections::HashSet<String> = discovery
+        .pointer("/reconciliation/pinned_fields")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    diff.retain(|item| {
+        item.get("field")
+            .and_then(Value::as_str)
+            .is_none_or(|field| !pinned.contains(field))
+    });
+    diff
+}
+
+fn reconciliation_state(
+    row: &db::ModelRow,
+    observation: &DiscoveredObservation,
+    checked_at: &str,
+) -> Value {
+    let discovery = discovery_object(row);
+    let previous = discovery.get("reconciliation").cloned().unwrap_or_else(|| json!({}));
+    let diff = Value::Array(reconciliation_diff(row, observation));
+    let ignored = previous.get("ignored_diff").is_some_and(|value| value == &diff);
+    let deprecated = explicit_deprecation(observation);
+    let status = if deprecated {
+        "deprecated"
+    } else if diff.as_array().is_none_or(Vec::is_empty) {
+        "unchanged"
+    } else if ignored {
+        "ignored"
+    } else {
+        "changed"
+    };
+
+    json!({
+        "status": status,
+        "checked_at": checked_at,
+        "last_success_at": checked_at,
+        "diff": diff,
+        "ignored_diff": previous.get("ignored_diff").cloned(),
+        "pinned_fields": previous
+            .get("pinned_fields")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+        "provenance": {
+            "capabilities": observation.capability_sources,
+            "prices": observation.price_sources,
+            "transport": observation.transport_source,
+        },
+    })
+}
+
 fn raw_discovery_metadata<'a>(payload: &'a Value, model_id: &str) -> Option<&'a Value> {
     fn matches_model(value: &Value, model_id: &str) -> bool {
         value
@@ -2063,6 +2290,7 @@ pub(crate) async fn reconcile_provider_id(
     for observation in &discovered {
         let m = &observation.model;
         if let Some(row) = existing.iter().find(|e| e.upstream_id == m.id) {
+            let reconciliation = reconciliation_state(row, observation, &now);
             let _ = persist_model_discovery_update(
                 &state.pool,
                 row,
@@ -2090,6 +2318,7 @@ pub(crate) async fn reconcile_provider_id(
                     "model_type": &observation.model_type,
                     "execution_supported": observation.execution_supported,
                     "catalog": &observation.catalog,
+                    "reconciliation": &reconciliation,
                     "disappeared": false,
                 }),
             )
@@ -2127,6 +2356,21 @@ pub(crate) async fn reconcile_provider_id(
             "model_type": &observation.model_type,
             "execution_supported": observation.execution_supported,
             "catalog": &observation.catalog,
+            "reconciliation": existing
+                .iter()
+                .find(|row| row.upstream_id == m.id)
+                .map(|row| reconciliation_state(row, observation, &now))
+                .unwrap_or_else(|| json!({
+                    "status": if explicit_deprecation(observation) { "deprecated" } else { "new" },
+                    "checked_at": now,
+                    "last_success_at": now,
+                    "diff": [],
+                    "provenance": {
+                        "capabilities": observation.capability_sources,
+                        "prices": observation.price_sources,
+                        "transport": observation.transport_source,
+                    },
+                })),
             "already_imported": existing.iter().any(|e| e.upstream_id == m.id),
         }));
     }
@@ -2142,6 +2386,21 @@ pub(crate) async fn reconcile_provider_id(
             json!({
                 "disappeared": true,
                 "flagged_at": now,
+                "reconciliation": {
+                    "status": "missing",
+                    "checked_at": now,
+                    "last_success_at": now,
+                    "diff": [{
+                        "field": "availability",
+                        "configured": "present",
+                        "observed": "missing",
+                        "source": "upstream_discovery",
+                    }],
+                    "pinned_fields": discovery_object(row)
+                        .pointer("/reconciliation/pinned_fields")
+                        .cloned()
+                        .unwrap_or_else(|| json!([])),
+                },
             }),
         )
         .await;
