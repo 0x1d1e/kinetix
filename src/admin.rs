@@ -4582,6 +4582,17 @@ mod model_lifecycle_regression_tests {
             key.clone(),
             json!({
                 "status": "inconclusive",
+                "reason": "503",
+                "fresh_until": "2999-01-01T00:00:00Z",
+                "scope": scope.clone()
+            }),
+        );
+        upsert_probe_evidence(
+            &mut evidence,
+            key.clone(),
+            json!({
+                "status": "inconclusive",
+                "reason": "timeout",
                 "fresh_until": "2999-01-01T00:00:00Z",
                 "scope": scope
             }),
@@ -4591,6 +4602,7 @@ mod model_lifecycle_regression_tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["status"], "supported");
         assert_eq!(entries[1]["status"], "inconclusive");
+        assert_eq!(entries[1]["reason"], "timeout");
     }
 
     #[tokio::test]
@@ -4797,12 +4809,17 @@ fn upsert_probe_evidence(
         Some(existing @ Value::Object(_)) => vec![existing],
         _ => Vec::new(),
     };
-    let conclusive = matches!(
-        evidence_value.get("status").and_then(Value::as_str),
-        Some("supported" | "unsupported")
-    );
-    if conclusive {
-        entries.retain(|existing| !same_probe_scope(existing, &evidence_value));
+    match evidence_value.get("status").and_then(Value::as_str) {
+        Some("supported" | "unsupported") => {
+            entries.retain(|existing| !same_probe_scope(existing, &evidence_value));
+        }
+        Some("inconclusive") => {
+            entries.retain(|existing| {
+                !same_probe_scope(existing, &evidence_value)
+                    || existing.get("status").and_then(Value::as_str) != Some("inconclusive")
+            });
+        }
+        _ => {}
     }
     entries.push(evidence_value);
     evidence.insert(key, Value::Array(entries));
