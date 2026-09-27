@@ -3482,13 +3482,20 @@ fn effective_price_source(fields: &serde_json::Map<String, Value>, prices: &Pric
 fn merge_automatic_price_observation(
     current: &Prices,
     observed: &Prices,
-    discovery: &Value,
+    observation: &Value,
+    ownership: &Value,
 ) -> (Prices, serde_json::Map<String, Value>, bool) {
     let mut effective = current.clone();
-    let mut fields = effective_price_fields(discovery, current);
+    // Ownership is stored on the model's top-level discovery envelope, while
+    // fresh automatic values live under latest_observation. Keep those two
+    // concerns separate so reconciliation snapshots cannot hide operator pins.
+    let mut fields = effective_price_fields(ownership, current);
     let mut preserved_manual = false;
-    let provider_observed_at = discovery.get("last_seen").cloned().unwrap_or(Value::Null);
-    let catalog_source_state = discovery
+    let provider_observed_at = observation
+        .get("last_seen")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let catalog_source_state = observation
         .pointer("/catalog/source_state")
         .cloned()
         .unwrap_or(Value::Null);
@@ -3500,7 +3507,7 @@ fn merge_automatic_price_observation(
     for field in PRICE_FIELDS {
         let observed_value = price_field(observed, field);
         let authoritative_absence = observed_value.is_none()
-            && discovery
+            && observation
                 .pointer(&format!("/price_sources/{field}"))
                 .is_some_and(Value::is_null);
         if observed_value.is_none() && !authoritative_absence {
@@ -3516,11 +3523,11 @@ fn merge_automatic_price_observation(
             continue;
         };
         set_price_field(&mut effective, field, Some(value));
-        let source = discovery
+        let source = observation
             .pointer(&format!("/price_sources/{field}"))
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| automatic_price_source(discovery));
+            .unwrap_or_else(|| automatic_price_source(observation));
         let (observed_at, source_state) = if source.starts_with("models.dev") {
             (catalog_observed_at.clone(), catalog_source_state.clone())
         } else {
@@ -4158,7 +4165,7 @@ pub(crate) async fn sync_provider_pricing_id(
 
         let current = row.prices();
         let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &observation);
+            merge_automatic_price_observation(&current, &observed, &observation, &discovery);
         let catalog_source_state = observation
             .pointer("/catalog/source_state")
             .cloned()
@@ -4870,7 +4877,7 @@ mod model_lifecycle_regression_tests {
         });
 
         let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &discovery);
+            merge_automatic_price_observation(&current, &observed, &discovery, &discovery);
         assert_eq!(effective.output_per_1m, Some(5.0));
         assert!(!preserved_manual);
         assert_eq!(fields["output_per_1m"]["source"], "models.dev:provider");
@@ -4915,7 +4922,7 @@ mod model_lifecycle_regression_tests {
         };
 
         let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &discovery);
+            merge_automatic_price_observation(&current, &observed, &discovery, &discovery);
         assert_eq!(effective.output_per_1m, Some(5.0));
         assert!(preserved_manual);
         assert_eq!(fields["output_per_1m"]["source"], "operator_pin");
@@ -4955,7 +4962,7 @@ mod model_lifecycle_regression_tests {
             }
         });
         let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &discovery);
+            merge_automatic_price_observation(&current, &observed, &discovery, &discovery);
         assert_eq!(effective.input_per_1m, Some(1.0));
         assert_eq!(effective.output_per_1m, Some(5.0));
         assert!(preserved_manual);
@@ -4991,7 +4998,7 @@ mod model_lifecycle_regression_tests {
 
         assert!(has_automatic_price_observation(&observed, &discovery));
         let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &discovery);
+            merge_automatic_price_observation(&current, &observed, &discovery, &discovery);
 
         assert_eq!(effective.output_per_1m, None);
         assert!(!preserved_manual);
@@ -5021,7 +5028,7 @@ mod model_lifecycle_regression_tests {
         });
 
         let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &discovery);
+            merge_automatic_price_observation(&current, &observed, &discovery, &discovery);
 
         assert_eq!(effective.output_per_1m, Some(7.0));
         assert!(preserved_manual);
@@ -13344,10 +13351,10 @@ mod credential_enrollment_regression_tests {
             Path(model_id.clone()),
             Json(ModelBody {
                 upstream_id: "priced-model".into(),
-                display_name: Some("Priced Model".into()),
+                display_name: Some("Changed Model Name".into()),
                 enabled: true,
-                context_window: None,
-                max_output_tokens: None,
+                context_window: Some(200_000),
+                max_output_tokens: Some(16_384),
                 capabilities: json!({}),
                 prices: json!({
                     "input_per_1m": 9.0,
@@ -13367,6 +13374,9 @@ mod credential_enrollment_regression_tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(row.display_name, "Priced Model");
+        assert_eq!(row.context_window, None);
+        assert_eq!(row.max_output_tokens, None);
         assert_eq!(row.prices().input_per_1m, Some(1.0));
         assert_eq!(row.prices().output_per_1m, Some(2.0));
         let discovery: Value = serde_json::from_str(&row.discovery).unwrap();
@@ -13375,6 +13385,354 @@ mod credential_enrollment_regression_tests {
                 .pointer("/effective_pricing/price_version_id")
                 .and_then(Value::as_str),
             Some(old_version.as_str())
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+
+    #[tokio::test]
+    async fn pin_action_promotes_capability_and_price_ownership() {
+        let (state, root) = test_state("pin-ownership").await;
+        let provider_id = insert_provider(
+            &state,
+            "pin-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let prices = Prices {
+            output_per_1m: Some(5.0),
+            ..Prices::default()
+        };
+        let reconciliation = json!({
+            "status": "changed",
+            "diff": [
+                {
+                    "field": "capabilities.tool_calling",
+                    "configured": false,
+                    "observed": true
+                },
+                {
+                    "field": "prices.output_per_1m",
+                    "configured": 5.0,
+                    "observed": 6.0
+                }
+            ]
+        });
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "pinned-model",
+                display_name: "Pinned Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({"tool_calling": false}),
+                prices: serde_json::to_value(&prices).unwrap(),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({
+                    "operator_capability_overrides": {},
+                    "latest_observation": {
+                        "capabilities": {"tool_calling": true},
+                        "prices": {"output_per_1m": 6.0},
+                        "price_sources": {"output_per_1m": "models.dev:provider"}
+                    },
+                    "reconciliation": reconciliation,
+                    "effective_pricing": {
+                        "source": "models.dev:provider",
+                        "fields": {
+                            "output_per_1m": {
+                                "source": "models.dev:provider",
+                                "metadata": {}
+                            }
+                        }
+                    }
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        update_model_reconciliation(
+            State(state.clone()),
+            auth(),
+            Path(model_id.clone()),
+            Json(ReconciliationActionBody {
+                action: "pin".into(),
+                fields: vec![
+                    "capabilities.tool_calling".into(),
+                    "prices.output_per_1m".into(),
+                ],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let pinned = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pinned_discovery = discovery_object(&pinned);
+        assert_eq!(
+            pinned_discovery
+                .pointer("/operator_capability_overrides/tool_calling")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            pinned_discovery
+                .pointer("/effective_pricing/fields/output_per_1m/source")
+                .and_then(Value::as_str),
+            Some("operator_pin")
+        );
+
+        db::merge_model_discovery(
+            &state.pool,
+            &model_id,
+            &json!({
+                "probe_evidence": {
+                    "tool_calling": {
+                        "status": "supported",
+                        "fresh_until": "2999-01-01T00:00:00Z",
+                        "scope": {
+                            "provider_id": provider_id.clone(),
+                            "account_id": "account-a",
+                            "model_id": model_id.clone(),
+                            "transport": "openai"
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let pinned = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let profile = crate::adapters::resolve_execution_profile_for_target(
+            &provider,
+            &pinned,
+            Some("account-a"),
+        )
+        .unwrap();
+        assert_eq!(profile.capabilities.tool_calling, Some(false));
+
+        let pinned_discovery = discovery_object(&pinned);
+        let observation = latest_reconciliation_observation(&pinned_discovery);
+        let observed = Prices {
+            output_per_1m: Some(6.0),
+            ..Prices::default()
+        };
+        let (effective, fields, preserved_manual) = merge_automatic_price_observation(
+            &pinned.prices(),
+            &observed,
+            observation,
+            &pinned_discovery,
+        );
+        assert_eq!(effective.output_per_1m, Some(5.0));
+        assert!(preserved_manual);
+        assert_eq!(fields["output_per_1m"]["source"], "operator_pin");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_accept_rolls_back_context_price_and_decision_on_price_failure() {
+        let (state, root) = test_state("accept-rollback").await;
+        let provider_id = insert_provider(
+            &state,
+            "accept-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let old_prices = Prices {
+            output_per_1m: Some(5.0),
+            ..Prices::default()
+        };
+        let original_reconciliation = json!({
+            "status": "changed",
+            "diff": [
+                {
+                    "field": "context_window",
+                    "configured": 100000,
+                    "observed": 200000
+                },
+                {
+                    "field": "prices.output_per_1m",
+                    "configured": 5.0,
+                    "observed": 6.0
+                }
+            ]
+        });
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "accept-model",
+                display_name: "Accept Model",
+                enabled: true,
+                context_window: Some(100_000),
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: serde_json::to_value(&old_prices).unwrap(),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({
+                    "latest_observation": {
+                        "context_window": 200000,
+                        "prices": {"output_per_1m": 6.0},
+                        "price_sources": {"output_per_1m": "models.dev:provider"}
+                    },
+                    "reconciliation": original_reconciliation.clone()
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let old_version = db::commit_effective_model_pricing(
+            &state.pool,
+            &model_id,
+            &old_prices,
+            "operator",
+            &json!({
+                "fields": {
+                    "output_per_1m": {
+                        "source": "operator",
+                        "metadata": {}
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        sqlx::query(
+            "CREATE TRIGGER reject_accept_price_version_insert
+             BEFORE INSERT ON price_versions
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected accept price version failure');
+             END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let result = update_model_reconciliation(
+            State(state.clone()),
+            auth(),
+            Path(model_id.clone()),
+            Json(ReconciliationActionBody {
+                action: "accept".into(),
+                fields: vec![
+                    "context_window".into(),
+                    "prices.output_per_1m".into(),
+                ],
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+
+        let row = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.context_window, Some(100_000));
+        assert_eq!(row.prices().output_per_1m, Some(5.0));
+        let discovery = discovery_object(&row);
+        assert_eq!(
+            discovery.get("reconciliation"),
+            Some(&original_reconciliation)
+        );
+        assert_eq!(
+            discovery
+                .pointer("/effective_pricing/price_version_id")
+                .and_then(Value::as_str),
+            Some(old_version.as_str())
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn candidate_transport_probe_model_is_ephemeral() {
+        let (state, root) = test_state("candidate-transport").await;
+        let provider_id = insert_provider(
+            &state,
+            "transport-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "transport-model",
+                display_name: "Transport Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let candidate =
+            probe_execution_model(&provider, &stored, Some("openai-responses")).unwrap();
+        assert!(discovery_object(&stored).get("configured_transport").is_none());
+        assert_eq!(
+            discovery_object(&candidate)
+                .get("configured_transport")
+                .and_then(Value::as_str),
+            Some("openai-responses")
+        );
+        assert_eq!(
+            crate::adapters::resolve_execution_profile(&provider, &candidate)
+                .unwrap()
+                .transport,
+            crate::adapters::TargetTransport::OpenAiResponses
+        );
+        assert!(
+            discovery_object(
+                &db::get_model(&state.pool, &model_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .get("configured_transport")
+            .is_none()
         );
 
         drop(state);
