@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -401,6 +403,22 @@ pub struct ModelsDevCatalog {
     canonical_index: CanonicalModelIndex,
 }
 
+#[derive(Debug, Clone)]
+struct ModelsDevCacheEntry {
+    catalog: ModelsDevCatalog,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    fetched_at: Instant,
+}
+
+const MODELS_DEV_FRESH_TTL: Duration = Duration::from_secs(15 * 60);
+const MODELS_DEV_STALE_IF_ERROR_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+fn models_dev_cache() -> &'static tokio::sync::RwLock<Option<ModelsDevCacheEntry>> {
+    static CACHE: OnceLock<tokio::sync::RwLock<Option<ModelsDevCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::RwLock::new(None))
+}
+
 impl ModelsDevCatalog {
     fn from_slice(bytes: &[u8]) -> Option<Self> {
         let root: Value = serde_json::from_slice(bytes).ok()?;
@@ -434,21 +452,85 @@ impl ModelsDevCatalog {
         if should_skip_external_lookup(MODELS_DEV_CATALOG_URL) {
             return None;
         }
-        let response = client
+
+        let cached = models_dev_cache().read().await.clone();
+        if let Some(entry) = cached.as_ref() {
+            if entry.fetched_at.elapsed() <= MODELS_DEV_FRESH_TTL {
+                return Some(entry.catalog.clone());
+            }
+        }
+
+        let mut request = client
             .get(MODELS_DEV_CATALOG_URL)
             .header(reqwest::header::ACCEPT, "application/json")
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
-            .await
-            .ok()?;
+            .timeout(Duration::from_secs(3));
+        if let Some(entry) = cached.as_ref() {
+            if let Some(etag) = entry.etag.as_deref() {
+                request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+            }
+            if let Some(last_modified) = entry.last_modified.as_deref() {
+                request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+            }
+        }
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_) => {
+                return cached
+                    .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
+                    .map(|entry| entry.catalog);
+            }
+        };
+
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if let Some(mut entry) = cached {
+                entry.fetched_at = Instant::now();
+                let catalog = entry.catalog.clone();
+                *models_dev_cache().write().await = Some(entry);
+                return Some(catalog);
+            }
+            return None;
+        }
+
         if !response.status().is_success() {
-            return None;
+            return cached
+                .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
+                .map(|entry| entry.catalog);
         }
-        let bytes = response.bytes().await.ok()?;
-        if bytes.len() > MAX_MODELS_DEV_BYTES {
-            return None;
-        }
-        Self::from_slice(&bytes)
+
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let last_modified = response
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = match response.bytes().await {
+            Ok(bytes) if bytes.len() <= MAX_MODELS_DEV_BYTES => bytes,
+            _ => {
+                return cached
+                    .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
+                    .map(|entry| entry.catalog);
+            }
+        };
+        let catalog = match Self::from_slice(&bytes) {
+            Some(catalog) => catalog,
+            None => {
+                return cached
+                    .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
+                    .map(|entry| entry.catalog);
+            }
+        };
+        *models_dev_cache().write().await = Some(ModelsDevCacheEntry {
+            catalog: catalog.clone(),
+            etag,
+            last_modified,
+            fetched_at: Instant::now(),
+        });
+        Some(catalog)
     }
 
     fn provider_id_for_base(&self, base_url: &str) -> Option<String> {
