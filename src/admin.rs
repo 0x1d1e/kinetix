@@ -669,12 +669,9 @@ pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
         .await;
 
         if reconcile_due {
-            if let Err(error) = run_model_lifecycle_lane(
-                state,
-                &provider.id,
-                ModelLifecycleLane::Reconciliation,
-            )
-            .await
+            if let Err(error) =
+                run_model_lifecycle_lane(state, &provider.id, ModelLifecycleLane::Reconciliation)
+                    .await
             {
                 tracing::warn!(
                     provider = %provider.id,
@@ -2430,12 +2427,10 @@ fn preserve_last_known_catalog_observation(
         }
         match field {
             "context_window" => {
-                observation.model.context_window =
-                    previous.get(field).and_then(Value::as_i64);
+                observation.model.context_window = previous.get(field).and_then(Value::as_i64);
             }
             "max_output_tokens" => {
-                observation.model.max_output_tokens =
-                    previous.get(field).and_then(Value::as_i64);
+                observation.model.max_output_tokens = previous.get(field).and_then(Value::as_i64);
             }
             _ => {}
         }
@@ -2532,19 +2527,14 @@ fn preserve_last_known_catalog_observation(
                 .get("model_type")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            observation.execution_supported =
-                previous
-                    .get("execution_supported")
-                    .and_then(Value::as_bool)
-                    .unwrap_or_else(|| {
-                        execution_supported_for_model_type(observation.model_type.as_deref())
-                    });
+            observation.execution_supported = previous
+                .get("execution_supported")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| {
+                    execution_supported_for_model_type(observation.model_type.as_deref())
+                });
             if let Some(source) = previous_model_type_source {
-                set_provenance_field(
-                    &mut observation.capability_sources,
-                    "model_type",
-                    source,
-                );
+                set_provenance_field(&mut observation.capability_sources, "model_type", source);
             }
         }
 
@@ -3912,15 +3902,9 @@ pub(crate) async fn sync_provider_pricing_id(
             "fields": fields,
             "catalog_source_state": catalog_source_state,
         });
-        db::commit_effective_model_pricing(
-            &state.pool,
-            &row.id,
-            &effective,
-            &source,
-            &metadata,
-        )
-        .await
-        .map_err(ApiError::internal)?;
+        db::commit_effective_model_pricing(&state.pool, &row.id, &effective, &source, &metadata)
+            .await
+            .map_err(ApiError::internal)?;
         updated.push(row.id);
     }
 
@@ -5159,7 +5143,6 @@ mod model_lifecycle_regression_tests {
         );
     }
 
-
     #[test]
     fn reasoning_disable_probe_defaults_to_off_and_rejects_non_off_values() {
         let omitted: CapabilityProbeBody =
@@ -5187,9 +5170,8 @@ mod model_lifecycle_regression_tests {
             "value": "low"
         }))
         .unwrap();
-        let error =
-            normalize_capability_probe_value(&invalid.capability, invalid.value.as_ref())
-                .unwrap_err();
+        let error = normalize_capability_probe_value(&invalid.capability, invalid.value.as_ref())
+            .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
@@ -5547,8 +5529,7 @@ pub async fn probe_model_capability(
     Path(id): Path<String>,
     Json(body): Json<CapabilityProbeBody>,
 ) -> ApiResult {
-    let probe_value =
-        normalize_capability_probe_value(&body.capability, body.value.as_ref())?;
+    let probe_value = normalize_capability_probe_value(&body.capability, body.value.as_ref())?;
 
     let model = db::get_model(&state.pool, &id)
         .await
