@@ -6,7 +6,7 @@ name: ci
 on:
   push:
     branches:
-      - feat/model-lifecycle-reconciliation
+      - feat/model-maintenance-reconciliation-probes-pricing
   workflow_dispatch:
 
 env:
