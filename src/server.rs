@@ -239,6 +239,21 @@ pub fn spawn_background_tasks(state: AppState) {
         });
     }
 
+    // Optional model reconciliation / pricing synchronization. The scheduler
+    // only wakes once per minute; per-provider due times and deterministic
+    // jitter are persisted in settings by the lifecycle runner.
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                crate::admin::run_scheduled_model_lifecycle(&st).await;
+            }
+        });
+    }
+
     // Frequent registry reload (NFR-2.8: health-state changes visible within 1s;
     // NFR-2.10: reload only swaps an immutable snapshot).
     let st = state.clone();
