@@ -443,11 +443,36 @@ pub async fn runtime_health(
     let mut provider_circuits = state.provider_circuits.snapshots();
     provider_circuits.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
 
+    let routing_quota = state
+        .quota
+        .routing_observations()
+        .into_iter()
+        .map(|(provider_id, account_id, snapshot, fresh)| {
+            (
+                (provider_id, account_id),
+                json!({
+                    "scope": "account-global",
+                    "remaining_fraction": snapshot.remaining_fraction,
+                    "reset_at": snapshot.reset_at,
+                    "observed_at": snapshot.observed_at,
+                    "source": snapshot.source,
+                    "max_age_secs": snapshot.max_age_secs,
+                    "freshness": if fresh { "fresh" } else { "stale" },
+                    "routing_eligible": fresh,
+                }),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
     let mut quota = state
         .quota
         .observations()
         .into_iter()
         .map(|(provider_id, account_id, snapshot, fresh)| {
+            let routing = routing_quota
+                .get(&(provider_id.clone(), account_id.clone()))
+                .cloned()
+                .unwrap_or(Value::Null);
             json!({
                 "provider_id": provider_id,
                 "account_id": account_id,
@@ -457,6 +482,7 @@ pub async fn runtime_health(
                 "source": snapshot.source,
                 "max_age_secs": snapshot.max_age_secs,
                 "freshness": if fresh { "fresh" } else { "stale" },
+                "routing": routing,
             })
         })
         .collect::<Vec<_>>();
@@ -9767,5 +9793,48 @@ mod credential_enrollment_regression_tests {
 
         let _ = std::fs::remove_dir_all(source_root);
         let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn runtime_health_separates_diagnostic_and_routing_quota_evidence() {
+        let (state, root) = test_state("runtime-quota-evidence").await;
+        state.quota.observe_account_global(
+            "provider-test",
+            "account-test",
+            Some(0.75),
+            None,
+            "plugin_health_probe",
+            std::time::Duration::from_secs(60),
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining-requests", "0".parse().unwrap());
+        state
+            .quota
+            .observe_headers("provider-test", "account-test", &headers)
+            .unwrap();
+
+        let response = runtime_health(
+            State(state.clone()),
+            auth(),
+            Query(RuntimeHealthQuery {
+                window: Some("1h".into()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let quota = &response["quota"][0];
+        assert_eq!(quota["remaining_fraction"], 0.0);
+        assert_eq!(
+            quota["source"],
+            "response_header:x-ratelimit-remaining-requests"
+        );
+        assert_eq!(quota["routing"]["scope"], "account-global");
+        assert_eq!(quota["routing"]["remaining_fraction"], 0.75);
+        assert_eq!(quota["routing"]["source"], "plugin_health_probe");
+        assert_eq!(quota["routing"]["routing_eligible"], true);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

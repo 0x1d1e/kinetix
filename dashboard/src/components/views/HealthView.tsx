@@ -17,14 +17,19 @@ interface Circuit {
   last_successful_probe?: string | null;
 }
 
-interface Quota {
-  provider_id: string;
-  account_id: string;
+interface QuotaEvidence {
   remaining_fraction?: number | null;
   reset_at?: string | null;
   observed_at: string;
   source: string;
   freshness: 'fresh' | 'stale';
+  routing_eligible?: boolean;
+}
+
+interface Quota extends QuotaEvidence {
+  provider_id: string;
+  account_id: string;
+  routing: (QuotaEvidence & { scope: 'account-global'; routing_eligible: boolean }) | null;
 }
 
 interface Telemetry {
@@ -110,7 +115,7 @@ export function HealthView() {
         <div>
           <h2 className="font-heading text-3xl font-bold text-[var(--ink)]">Runtime Health</h2>
           <p className="font-body text-sm text-[var(--ink)]/65 mt-1">
-            Live provider circuits and quota evidence plus persisted target telemetry.
+            Live provider circuits, diagnostic quota buckets, account-global routing evidence, and persisted target telemetry.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -147,12 +152,12 @@ export function HealthView() {
         </div>
         <div className="border-2 border-[var(--ink)] p-4 bg-[var(--surface)] sketch-shadow-sm">
           <div className="flex items-center gap-2 text-sm font-heading font-bold">
-            <TimerReset className="w-4 h-4" /> Fresh quota observations
+            <TimerReset className="w-4 h-4" /> Fresh diagnostic observations
           </div>
           <div className="text-3xl font-heading font-bold mt-2">
             {data?.quota.filter((quota) => quota.freshness === 'fresh').length ?? 0}
           </div>
-          <div className="font-body text-xs text-[var(--ink)]/60">stale/unknown stay neutral</div>
+          <div className="font-body text-xs text-[var(--ink)]/60">routing eligibility is shown below</div>
         </div>
         <div className="border-2 border-[var(--ink)] p-4 bg-[var(--surface)] sketch-shadow-sm">
           <div className="flex items-center gap-2 text-sm font-heading font-bold">
@@ -213,17 +218,19 @@ export function HealthView() {
       <section className="border-2 border-[var(--ink)] bg-[var(--surface)] overflow-x-auto">
         <div className="p-4 border-b-2 border-[var(--ink)]">
           <h3 className="font-heading text-xl font-bold">Quota evidence</h3>
+          <p className="font-body text-sm text-[var(--ink)]/60 mt-1">
+            Diagnostic observations are separate from account-global evidence eligible for adaptive routing.
+          </p>
         </div>
         <table className="w-full min-w-[760px] text-sm">
           <thead>
             <tr className="text-left border-b border-[var(--ink)]/30">
               <th className="p-3">Provider</th>
               <th className="p-3">Account</th>
-              <th className="p-3">Remaining</th>
-              <th className="p-3">Reset</th>
-              <th className="p-3">Source</th>
-              <th className="p-3">Freshness</th>
-              <th className="p-3">Observed</th>
+              <th className="p-3">Diagnostic remaining / reset</th>
+              <th className="p-3">Diagnostic source</th>
+              <th className="p-3">Account-global remaining / reset</th>
+              <th className="p-3">Adaptive routing source</th>
             </tr>
           </thead>
           <tbody>
@@ -231,19 +238,42 @@ export function HealthView() {
               <tr key={`${quota.provider_id}:${quota.account_id}`} className="border-b border-[var(--ink)]/10">
                 <td className="p-3 font-mono">{quota.provider_id}</td>
                 <td className="p-3 font-mono">{quota.account_id}</td>
-                <td className="p-3">{pct(quota.remaining_fraction)}</td>
-                <td className="p-3">{when(quota.reset_at)}</td>
-                <td className="p-3 font-mono text-xs">{quota.source}</td>
                 <td className="p-3">
-                  <SketchBadge variant={quota.freshness === 'fresh' ? 'green' : 'yellow'}>
-                    {quota.freshness}
-                  </SketchBadge>
+                  {pct(quota.remaining_fraction)}
+                  <div className="text-xs text-[var(--ink)]/60">reset: {when(quota.reset_at)}</div>
                 </td>
-                <td className="p-3">{when(quota.observed_at)}</td>
+                <td className="p-3 font-mono text-xs">
+                  <div>{quota.source}</div>
+                  <SketchBadge variant={quota.freshness === 'fresh' ? 'green' : 'yellow'}>
+                    {quota.freshness} diagnostic
+                  </SketchBadge>
+                  <div className="font-sans text-[var(--ink)]/60">observed: {when(quota.observed_at)}</div>
+                </td>
+                <td className="p-3">
+                  {quota.routing ? (
+                    <>
+                      {pct(quota.routing.remaining_fraction)}
+                      <div className="text-xs text-[var(--ink)]/60">reset: {when(quota.routing.reset_at)}</div>
+                    </>
+                  ) : (
+                    <span className="text-[var(--ink)]/60">unknown — no account-global evidence</span>
+                  )}
+                </td>
+                <td className="p-3 font-mono text-xs">
+                  {quota.routing ? (
+                    <>
+                      <div>{quota.routing.source}</div>
+                      <SketchBadge variant={quota.routing.routing_eligible ? 'green' : 'yellow'}>
+                        {quota.routing.routing_eligible ? 'eligible' : 'stale / neutral'}
+                      </SketchBadge>
+                      <div className="font-sans text-[var(--ink)]/60">observed: {when(quota.routing.observed_at)}</div>
+                    </>
+                  ) : '—'}
+                </td>
               </tr>
             ))}
             {data && data.quota.length === 0 && (
-              <tr><td className="p-4 text-[var(--ink)]/60" colSpan={7}>No quota observations yet.</td></tr>
+              <tr><td className="p-4 text-[var(--ink)]/60" colSpan={6}>No quota observations yet.</td></tr>
             )}
           </tbody>
         </table>

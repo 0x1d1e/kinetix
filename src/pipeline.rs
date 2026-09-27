@@ -585,7 +585,7 @@ pub async fn run(
             let ordered = if route.strategy == "adaptive" {
                 targets
             } else {
-                order_route_targets(state, &route, targets).await
+                order_route_targets(state, &route, targets).await.targets
             };
             // Read-only target hook (§6.6): observe each candidate target before
             // eligibility filtering. Fire-and-forget; never blocks routing.
@@ -704,37 +704,10 @@ pub async fn run(
     // Ineligible candidates must not affect route-wide neutral telemetry.
     if let Some(route) = &route {
         if route.strategy == "adaptive" {
-            targets = order_route_targets(state, route, targets).await;
+            let ordering = order_route_targets(state, route, targets).await;
+            targets = ordering.targets;
             for target in &targets {
-                match state
-                    .quota
-                    .snapshot(&target.provider.id, &target.account.id)
-                {
-                    Some(quota) => {
-                        let remaining = quota
-                            .remaining_fraction
-                            .map(|value| format!("{:.1}%", value * 100.0))
-                            .unwrap_or_else(|| "unknown".into());
-                        trace.step(
-                            "candidate",
-                            Some(target.account.label.clone()),
-                            format!(
-                                "quota-evidence: remaining={remaining} reset={} source={} observed={} freshness=fresh",
-                                quota
-                                    .reset_at
-                                    .map(|value| value.to_rfc3339())
-                                    .unwrap_or_else(|| "unknown".into()),
-                                quota.source,
-                                quota.observed_at.to_rfc3339(),
-                            ),
-                        );
-                    }
-                    None => trace.step(
-                        "candidate",
-                        Some(target.account.label.clone()),
-                        "quota-evidence: unknown (no fresh observation)",
-                    ),
-                }
+                trace_adaptive_quota_evidence(&mut trace, target, &ordering.quota_evidence);
             }
         }
     }
@@ -1822,6 +1795,37 @@ fn provider_correlation_target_id(target: &ResolvedTarget) -> &str {
     target.model.id.as_str()
 }
 
+fn trace_adaptive_quota_evidence(
+    trace: &mut RouteTrace,
+    target: &ResolvedTarget,
+    evidence: &std::collections::HashMap<String, Option<crate::quota::QuotaSnapshot>>,
+) {
+    let detail = match evidence.get(&adaptive_candidate_key(target)) {
+        Some(Some(quota)) => {
+            let remaining = quota
+                .remaining_fraction
+                .map(|value| format!("{:.1}%", value * 100.0))
+                .unwrap_or_else(|| "unknown".into());
+            format!(
+                "quota-evidence: remaining={remaining} reset={} source={} observed={} freshness=fresh scope=account-global",
+                quota
+                    .reset_at
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_else(|| "unknown".into()),
+                quota.source,
+                quota.observed_at.to_rfc3339(),
+            )
+        }
+        Some(None) => {
+            "quota-evidence: unknown (no fresh account-global observation at ordering time)".into()
+        }
+        None => {
+            "quota-evidence: not used (target was not dispatchable during adaptive ordering)".into()
+        }
+    };
+    trace.step("candidate", None, detail);
+}
+
 fn adaptive_candidate_key(t: &ResolvedTarget) -> String {
     format!(
         "{}|{}|{}|{}",
@@ -1847,6 +1851,13 @@ fn snapshot_traffic_targets(
             .or_insert_with(|| state.upstream_traffic.snapshot(&key));
     }
     snapshots
+}
+
+#[derive(Debug, Clone)]
+struct OrderedRouteTargets {
+    targets: Vec<ResolvedTarget>,
+    /// Frozen account-global snapshots and unknowns used to score dispatchable candidates.
+    quota_evidence: std::collections::HashMap<String, Option<crate::quota::QuotaSnapshot>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2998,7 +3009,7 @@ async fn order_route_targets(
     state: &AppState,
     route: &db::RouteRow,
     targets: Vec<ResolvedTarget>,
-) -> Vec<ResolvedTarget> {
+) -> OrderedRouteTargets {
     // Freeze adaptive telemetry for this ordering pass. acquire() still
     // performs the authoritative live capacity check immediately before
     // dispatch, but one sort must never observe a moving comparator.
@@ -3009,18 +3020,27 @@ async fn order_route_targets(
             .map(adaptive_candidate_key)
             .collect::<std::collections::HashSet<_>>()
     });
-    let adaptive_quota = adaptive_dispatchable.as_ref().map(|dispatchable_keys| {
-        targets
-            .iter()
-            .filter(|target| dispatchable_keys.contains(&adaptive_candidate_key(target)))
-            .filter_map(|target| {
-                state
-                    .quota
-                    .adaptive_snapshot(&target.provider.id, &target.account.id)
-                    .map(|snapshot| (adaptive_candidate_key(target), snapshot))
-            })
-            .collect::<std::collections::HashMap<_, _>>()
-    });
+    let quota_evidence = adaptive_dispatchable
+        .as_ref()
+        .map(|dispatchable_keys| {
+            targets
+                .iter()
+                .filter(|target| dispatchable_keys.contains(&adaptive_candidate_key(target)))
+                .map(|target| {
+                    (
+                        adaptive_candidate_key(target),
+                        state
+                            .quota
+                            .adaptive_snapshot(&target.provider.id, &target.account.id),
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let adaptive_quota = quota_evidence
+        .iter()
+        .filter_map(|(key, snapshot)| snapshot.clone().map(|snapshot| (key.clone(), snapshot)))
+        .collect::<std::collections::HashMap<_, _>>();
     let adaptive_scores = adaptive_dispatchable.as_ref().map(|dispatchable_keys| {
         let dispatchable: Vec<_> = targets
             .iter()
@@ -3028,11 +3048,7 @@ async fn order_route_targets(
             .cloned()
             .collect();
         let snapshots = snapshot_traffic_targets(state, &dispatchable);
-        build_adaptive_scores_with_quota(
-            &dispatchable,
-            &snapshots,
-            adaptive_quota.as_ref().expect("adaptive quota snapshot"),
-        )
+        build_adaptive_scores_with_quota(&dispatchable, &snapshots, &adaptive_quota)
     });
 
     let mut groups: Vec<Vec<ResolvedTarget>> = Vec::new();
@@ -3146,7 +3162,10 @@ async fn order_route_targets(
         }
     }
 
-    groups.into_iter().flatten().collect()
+    OrderedRouteTargets {
+        targets: groups.into_iter().flatten().collect(),
+        quota_evidence,
+    }
 }
 
 /// Apply a route's continuity/portability policy when falling back across
@@ -5155,7 +5174,7 @@ pub async fn dry_run(
             let ordered = if route.strategy == "adaptive" {
                 targets
             } else {
-                order_route_targets(state, &route, targets).await
+                order_route_targets(state, &route, targets).await.targets
             };
             (ordered, Some(route))
         }
@@ -5210,6 +5229,7 @@ pub async fn dry_run(
         let ordered = order_route_targets(state, route, hard_eligible).await;
         Some(
             ordered
+                .targets
                 .iter()
                 .enumerate()
                 .map(|(rank, target)| (adaptive_candidate_key(target), rank))
@@ -6044,6 +6064,80 @@ mod route_policy_tests {
     }
 
     #[tokio::test]
+    async fn adaptive_order_and_trace_share_frozen_account_global_quota_evidence() {
+        let (state, root, _, _, _) = adaptive_dry_run_state().await;
+        let mut route_row = route(serde_json::json!({}));
+        route_row.strategy = "adaptive".into();
+
+        let mut preferred = target();
+        preferred.route_target_id = Some("rt_preferred".into());
+        preferred.account.id = "acc_preferred".into();
+        let mut fallback = target();
+        fallback.route_target_id = Some("rt_fallback".into());
+        fallback.account.id = "acc_fallback".into();
+
+        state.quota.observe_account_global(
+            "prov_test",
+            "acc_preferred",
+            Some(0.75),
+            None,
+            "plugin_health_probe",
+            Duration::from_secs(60),
+        );
+        state.quota.observe_account_global(
+            "prov_test",
+            "acc_fallback",
+            Some(0.25),
+            None,
+            "plugin_health_probe",
+            Duration::from_secs(60),
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining-requests", "0".parse().unwrap());
+        state
+            .quota
+            .observe_headers("prov_test", "acc_preferred", &headers)
+            .unwrap();
+
+        let ordering =
+            order_route_targets(&state, &route_row, vec![preferred.clone(), fallback]).await;
+        assert_eq!(ordering.targets[0].account.id, "acc_preferred");
+        assert_eq!(
+            state
+                .quota
+                .snapshot("prov_test", "acc_preferred")
+                .unwrap()
+                .remaining_fraction,
+            Some(0.0),
+            "the latest generic bucket remains diagnostic"
+        );
+        let frozen = ordering.quota_evidence[&adaptive_candidate_key(&preferred)]
+            .as_ref()
+            .unwrap();
+        assert_eq!(frozen.remaining_fraction, Some(0.75));
+        assert_eq!(frozen.source, "plugin_health_probe");
+
+        // A later observation must not change the evidence attached to this ordering pass.
+        state.quota.observe_account_global(
+            "prov_test",
+            "acc_preferred",
+            Some(0.10),
+            None,
+            "later_health_probe",
+            Duration::from_secs(60),
+        );
+        let mut trace = RouteTrace::new("request".into(), "model".into());
+        trace_adaptive_quota_evidence(&mut trace, &preferred, &ordering.quota_evidence);
+        let detail = &trace.steps[0].detail;
+        assert!(detail.contains("remaining=75.0%"), "{detail}");
+        assert!(detail.contains("source=plugin_health_probe"), "{detail}");
+        assert!(detail.contains("scope=account-global"), "{detail}");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn adaptive_ordering_ignores_unavailable_fast_sibling_telemetry() {
         let (state, root, _, _, _) = adaptive_dry_run_state().await;
 
@@ -6087,6 +6181,7 @@ mod route_policy_tests {
         )
         .await;
         let account_ids: Vec<_> = ordered
+            .targets
             .iter()
             .map(|candidate| candidate.account.id.as_str())
             .collect();

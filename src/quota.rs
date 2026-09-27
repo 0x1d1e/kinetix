@@ -281,6 +281,24 @@ impl QuotaRegistry {
             })
             .collect()
     }
+
+    /// Operator-facing account-global evidence; freshness determines whether
+    /// adaptive routing is currently allowed to use each observation.
+    pub fn routing_observations(&self) -> Vec<(String, String, QuotaSnapshot, bool)> {
+        let now = Utc::now();
+        self.account_global
+            .iter()
+            .map(|entry| {
+                let value = entry.value().clone();
+                (
+                    entry.key().0.clone(),
+                    entry.key().1.clone(),
+                    value.clone(),
+                    value.is_fresh(now),
+                )
+            })
+            .collect()
+    }
 }
 
 fn parse_quota_state(value: &str) -> Option<f64> {
@@ -544,6 +562,9 @@ mod tests {
         let routing = registry.adaptive_snapshot("p", "a").unwrap();
         assert_eq!(routing.source, "account_quota");
         assert_eq!(routing.remaining_fraction, Some(0.75));
+        let (_, _, routing_observation, fresh) = registry.routing_observations().pop().unwrap();
+        assert!(fresh);
+        assert_eq!(routing_observation.remaining_fraction, Some(0.75));
     }
 
     #[test]

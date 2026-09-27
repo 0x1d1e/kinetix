@@ -34,6 +34,12 @@ Kinetix parses countdown reset values with `ms`, `s`, `m`, and `h` units, as
 well as numeric seconds, Unix timestamps, and RFC3339 timestamps. Expired
 observations are neutral to routing.
 
+Runtime Health quota rows keep the latest diagnostic observation in their
+existing top-level fields. The nested `routing` object reports the separate
+account-global snapshot (`scope`, source, headroom, reset, and freshness)
+eligible to influence adaptive ordering; `routing_eligible` is false for stale
+evidence, and `null` means no account-global observation has been reported.
+
 The Runtime Health provider-circuit rejection count is a target-candidate count,
 not a unique-request count. A logical request may contribute multiple rejects
 when it skips multiple targets behind an open provider circuit.
@@ -85,7 +91,9 @@ fallback causes, the commit point, and the final result.
 - Retrieve by the client's opaque id: `GET /admin/api/route-traces/{krt_…}`.
 
 Trace steps look like `resolve → candidate → skip → attempt → commit → result`
-with per-step timings and warnings. When Kinetix opens its provider circuit, the
+with per-step timings and warnings. Adaptive quota-evidence steps use the exact
+frozen account-global snapshots captured for that ordering pass, rather than a
+later registry read. When Kinetix opens its provider circuit, the
 trace records a `provider_circuit` step at the transition, including transitions
 recorded while finalizing a committed stream; it does not require a later target to
 be rejected by that circuit. Each target attempt includes its structured
