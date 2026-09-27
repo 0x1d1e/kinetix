@@ -1823,11 +1823,7 @@ fn trace_adaptive_quota_evidence(
             "quota-evidence: not used (target was not dispatchable during adaptive ordering)".into()
         }
     };
-    trace.step(
-        "candidate",
-        Some(target.account.label.clone()),
-        detail,
-    );
+    trace.step("candidate", Some(target.account.label.clone()), detail);
 }
 
 fn adaptive_candidate_key(t: &ResolvedTarget) -> String {
