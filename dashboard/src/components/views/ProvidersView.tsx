@@ -61,6 +61,12 @@ const modelReconciliation = (model: ModelConfig) =>
       last_success_at?: string | null;
       diff?: Array<{ field?: string; configured?: unknown; observed?: unknown; source?: unknown }>;
       pinned_fields?: string[];
+      deprecation?: {
+        source?: string;
+        end_date?: unknown;
+        effective_date?: unknown;
+        replacement?: unknown;
+      } | null;
     } | null;
   } | undefined)?.reconciliation || null;
 
@@ -106,17 +112,25 @@ const modelProbeTransport = (model: ModelConfig, provider: Provider) => {
   const discovery = model.discovery as {
     transport?: { format?: string } | null;
   } | undefined;
+  // Plugin binding is the actual runtime target transport. Discovered transport
+  // is descriptive metadata and must not make the probe target label lie.
+  if (provider.wireFormat === 'plugin') return provider.wirePlugin || 'plugin';
   if (model.transportOverride) return model.transportOverride;
   if (discovery?.transport?.format) return discovery.transport.format;
-  if (provider.wireFormat === 'plugin') return provider.wirePlugin || 'plugin';
   return provider.wireFormat;
 };
 
 const modelReasoningLevels = (model: ModelConfig) => {
   const discovery = model.discovery as {
     reasoning_capability?: { levels?: string[]; can_disable?: boolean } | null;
+    latest_observation?: {
+      reasoning_capability?: { levels?: string[]; can_disable?: boolean } | null;
+    } | null;
   } | undefined;
-  const discovered = discovery?.reasoning_capability?.levels || [];
+  const discovered =
+    discovery?.latest_observation?.reasoning_capability?.levels
+    || discovery?.reasoning_capability?.levels
+    || [];
   const mapped = Object.keys(model.thinkingMap?.levels || {});
   return Array.from(new Set([...discovered, ...mapped])).filter((level) => level && level !== 'off' && level !== 'default');
 };
@@ -130,8 +144,12 @@ const formatDriftValue = (value: unknown) => {
 const modelCanProbeReasoningDisable = (model: ModelConfig) => {
   const discovery = model.discovery as {
     reasoning_capability?: { can_disable?: boolean } | null;
+    latest_observation?: {
+      reasoning_capability?: { can_disable?: boolean } | null;
+    } | null;
   } | undefined;
-  return discovery?.reasoning_capability?.can_disable === true
+  return discovery?.latest_observation?.reasoning_capability?.can_disable === true
+    || discovery?.reasoning_capability?.can_disable === true
     || Object.prototype.hasOwnProperty.call(model.thinkingMap?.levels || {}, 'off');
 };
 
@@ -1516,6 +1534,20 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                 </div>
                               )}
                             </div>
+                            {modelReconciliation(m)?.deprecation && (
+                              <div className="mt-2 text-[var(--marker-red)]">
+                                deprecated via {modelReconciliation(m)?.deprecation?.source || 'unknown source'}
+                                {modelReconciliation(m)?.deprecation?.effective_date !== undefined
+                                  ? ` · effective ${formatDriftValue(modelReconciliation(m)?.deprecation?.effective_date)}`
+                                  : ''}
+                                {modelReconciliation(m)?.deprecation?.end_date !== undefined
+                                  ? ` · end ${formatDriftValue(modelReconciliation(m)?.deprecation?.end_date)}`
+                                  : ''}
+                                {modelReconciliation(m)?.deprecation?.replacement !== undefined
+                                  ? ` · replacement ${formatDriftValue(modelReconciliation(m)?.deprecation?.replacement)}`
+                                  : ''}
+                              </div>
+                            )}
                             {!!modelReconciliation(m)?.diff?.length && (
                               <div className="mt-3 space-y-2">
                                 {modelReconciliation(m)?.diff?.map((diff) => {
