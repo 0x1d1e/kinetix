@@ -2874,9 +2874,9 @@ pub async fn update_model_reconciliation(
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect();
-            for field in pins {
-                if available.iter().any(|candidate| candidate == &field) {
-                    merged.insert(field);
+            for field in &pins {
+                if available.iter().any(|candidate| candidate == field) {
+                    merged.insert(field.clone());
                 }
             }
             let object = reconciliation
