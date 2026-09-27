@@ -73,7 +73,10 @@ pub fn build(state: AppState) -> Router {
                 .put(admin::update_provider)
                 .delete(admin::delete_provider),
         )
-        .route("/providers/{id}/discover", post(admin::discover_models))
+        .route(
+            "/providers/{id}/discover",
+            get(admin::cached_model_discovery).post(admin::discover_models),
+        )
         .route("/providers/{id}/reconcile", post(admin::reconcile_models))
         .route(
             "/providers/{id}/pricing/sync",
