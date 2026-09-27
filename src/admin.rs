@@ -3224,6 +3224,410 @@ pub struct TestBody {
     pub account_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct CapabilityProbeBody {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub capability: String,
+    #[serde(default)]
+    pub value: Option<Value>,
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
+}
+
+fn probe_thinking_level(value: Option<&Value>) -> Result<crate::types::ThinkingLevel, ApiError> {
+    let level = value.and_then(Value::as_str).unwrap_or("low");
+    match level {
+        "off" | "none" => Ok(crate::types::ThinkingLevel::Off),
+        "default" => Ok(crate::types::ThinkingLevel::Default),
+        "minimal" => Ok(crate::types::ThinkingLevel::Minimal),
+        "low" => Ok(crate::types::ThinkingLevel::Low),
+        "medium" => Ok(crate::types::ThinkingLevel::Medium),
+        "high" => Ok(crate::types::ThinkingLevel::High),
+        "xhigh" => Ok(crate::types::ThinkingLevel::XHigh),
+        "max" => Ok(crate::types::ThinkingLevel::Max),
+        other => Err(ApiError::bad(format!(
+            "unsupported canonical reasoning level '{other}'"
+        ))),
+    }
+}
+
+fn probe_cost_upper_bound(prices: &Prices, reasoning: bool) -> Option<f64> {
+    let input = prices.input_per_1m?;
+    let output = prices.output_per_1m?;
+    let output = if reasoning {
+        output.max(prices.thinking_per_1m.unwrap_or(output))
+    } else {
+        output
+    };
+    Some((32.0 * input + 16.0 * output) / 1_000_000.0)
+}
+
+fn deterministic_probe_rejection(
+    capability: &str,
+    value: Option<&Value>,
+    status: u16,
+    body: &str,
+) -> bool {
+    if !matches!(status, 400 | 422) {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    let rejection = [
+        "unsupported",
+        "not supported",
+        "not allowed",
+        "unknown parameter",
+        "unrecognized",
+        "invalid parameter",
+        "invalid value",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle));
+    if !rejection {
+        return false;
+    }
+
+    let mut feature_terms: Vec<String> = match capability {
+        "reasoning" | "reasoning_disable" => {
+            vec!["reasoning".into(), "thinking".into(), "effort".into()]
+        }
+        "tool_calling" => vec!["tool".into(), "function".into()],
+        "structured_output" => {
+            vec!["response_format".into(), "json_schema".into(), "schema".into()]
+        }
+        capability if capability.starts_with("parameter.") => {
+            vec![capability.trim_start_matches("parameter.").to_ascii_lowercase()]
+        }
+        _ => Vec::new(),
+    };
+    if let Some(value) = value.and_then(Value::as_str) {
+        feature_terms.push(value.to_ascii_lowercase());
+    }
+    feature_terms.iter().any(|term| body.contains(term))
+}
+
+fn probe_evidence_key(capability: &str) -> String {
+    capability.replace('.', "_")
+}
+
+/// Run one explicit, bounded upstream capability probe against the selected
+/// provider/account/model/transport execution profile. No automatic path calls
+/// this handler.
+pub async fn probe_model_capability(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+    Json(body): Json<CapabilityProbeBody>,
+) -> ApiResult {
+    let model = db::get_model(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("model not found"))?;
+    let provider = db::get_provider(&state.pool, &model.provider_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let account = if let Some(account_id) = body.account_id.as_deref() {
+        let account = db::get_account(&state.pool, account_id)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("account not found"))?;
+        if account.provider_id != provider.id {
+            return Err(ApiError::bad("account does not belong to model provider"));
+        }
+        account
+    } else {
+        db::accounts_for_provider(&state.pool, &provider.id)
+            .await
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| ApiError::bad("provider has no credentials to probe with"))?
+    };
+
+    let profile = crate::adapters::resolve_execution_profile(&provider, &model)
+        .map_err(|error| ApiError::bad(error.message))?;
+    let adapter = state
+        .adapters
+        .for_transport(&profile.transport)
+        .map_err(|error| ApiError::bad(error.message))?;
+    let credential = credential_for_admin_action(
+        &state,
+        &provider,
+        &account,
+        "capability probe credential resolution",
+    )
+    .await?;
+
+    let mut effective_prices = model.prices();
+    if !effective_prices.is_configured() {
+        let discovery = discovery_object(&model);
+        if let Some(prices) = discovery
+            .get("prices")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Prices>(value).ok())
+        {
+            effective_prices = prices;
+        }
+    }
+    let reasoning_probe = matches!(body.capability.as_str(), "reasoning" | "reasoning_disable");
+    let max_cost = body.max_cost_usd.unwrap_or(0.05);
+    if !max_cost.is_finite() || max_cost < 0.0 {
+        return Err(ApiError::bad("max_cost_usd must be a finite non-negative number"));
+    }
+    let estimated_cost = probe_cost_upper_bound(&effective_prices, reasoning_probe)
+        .ok_or_else(|| ApiError::bad(
+            "cannot bound probe cost because input/output pricing is unknown; configure or sync pricing first",
+        ))?;
+    if estimated_cost > max_cost {
+        return Err(ApiError::bad(format!(
+            "probe upper-bound cost ${estimated_cost:.6} exceeds max_cost_usd ${max_cost:.6}"
+        )));
+    }
+
+    let mut execution_model = model.clone();
+    execution_model.thinking_map = serde_json::to_string(&profile.thinking_map)
+        .map_err(ApiError::internal)?;
+    execution_model.parameters =
+        serde_json::to_string(&profile.parameters).map_err(ApiError::internal)?;
+
+    let mut internal = crate::types::InternalRequest {
+        requested_model: model.upstream_id.clone(),
+        system: vec![],
+        messages: vec![crate::types::Message {
+            role: crate::types::Role::User,
+            parts: vec![crate::types::Part::Text(
+                "Reply with the single word: ok".into(),
+            )],
+        }],
+        tools: vec![],
+        tool_choice: None,
+        tool_choice_name: None,
+        params: crate::types::SamplingParams {
+            max_tokens: Some(16),
+            ..Default::default()
+        },
+        stream: false,
+        include_usage: false,
+        thinking: None,
+        extra: Default::default(),
+        raw_body: None,
+    };
+
+    match body.capability.as_str() {
+        "transport" => {}
+        "reasoning" | "reasoning_disable" => {
+            internal.thinking = Some(probe_thinking_level(body.value.as_ref())?);
+        }
+        "tool_calling" => {
+            internal.tools.push(crate::types::ToolDef {
+                name: "kinetix_probe_noop".into(),
+                description: Some("Capability probe only; never executed.".into()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                defer_loading: None,
+            });
+            internal.tool_choice = Some(crate::types::ToolChoice::None);
+        }
+        "structured_output" => {
+            let schema = json!({
+                "type": "object",
+                "properties": { "ok": { "type": "string" } },
+                "required": ["ok"],
+                "additionalProperties": false,
+            });
+            let extra = match &profile.transport {
+                crate::adapters::TargetTransport::OpenAiChat => json!({
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "kinetix_probe",
+                            "strict": true,
+                            "schema": schema,
+                        }
+                    }
+                }),
+                crate::adapters::TargetTransport::OpenAiResponses => json!({
+                    "text": {
+                        "format": {
+                            "type": "json_schema",
+                            "name": "kinetix_probe",
+                            "strict": true,
+                            "schema": schema,
+                        }
+                    }
+                }),
+                crate::adapters::TargetTransport::Gemini => json!({
+                    "generationConfig": {
+                        "responseMimeType": "application/json",
+                        "responseJsonSchema": schema,
+                    }
+                }),
+                _ => {
+                    return Ok(Json(json!({
+                        "status": "inconclusive",
+                        "reason": "no conservative structured-output probe mapping for this transport",
+                        "transport": profile.transport.as_str(),
+                    })))
+                }
+            };
+            execution_model.extra_request = extra.to_string();
+        }
+        capability if capability.starts_with("parameter.") => {
+            let parameter = capability.trim_start_matches("parameter.");
+            let value = body
+                .value
+                .as_ref()
+                .and_then(Value::as_f64)
+                .ok_or_else(|| ApiError::bad("parameter probe requires a numeric value"))?;
+            match parameter {
+                "temperature" => internal.params.temperature = Some(value),
+                "top_p" => internal.params.top_p = Some(value),
+                "top_k" => internal.params.top_k = Some(value),
+                "seed" => internal.params.seed = Some(value as i64),
+                "presence_penalty" => internal.params.presence_penalty = Some(value),
+                "frequency_penalty" => internal.params.frequency_penalty = Some(value),
+                other => {
+                    return Err(ApiError::bad(format!(
+                        "unsupported safe parameter probe '{other}'"
+                    )))
+                }
+            }
+        }
+        other => {
+            return Err(ApiError::bad(format!(
+                "unsupported capability probe '{other}'"
+            )))
+        }
+    }
+
+    let ctx = UpstreamContext {
+        provider: &provider,
+        model: &execution_model,
+        account_id: Some(account.id.as_str()),
+        credential,
+    };
+    let url = adapter
+        .build_url(&ctx)
+        .map_err(|error| ApiError::bad(error.message))?;
+    let outbound = adapter
+        .build_body(&ctx, &internal)
+        .map_err(|failure| ApiError::bad(failure.message))?;
+    let parsed_url =
+        url::Url::parse(&url).map_err(|error| ApiError::bad(format!("invalid probe URL: {error}")))?;
+
+    let started = std::time::Instant::now();
+    let response = crate::outbound::send_provider_request(
+        &state.outbound_clients,
+        state.config.allow_private_upstreams,
+        state.config.allow_insecure_tls,
+        &adapter,
+        &ctx,
+        crate::outbound::ProviderRequest {
+            method: reqwest::Method::POST,
+            url: parsed_url,
+            json_body: Some(outbound),
+            accept_event_stream: false,
+            request_id: None,
+            headers: Vec::new(),
+            total_timeout: Some(std::time::Duration::from_secs(10)),
+        },
+    )
+    .await;
+
+    let verified_at = chrono::Utc::now();
+    let freshness_secs = db::get_setting(&state.pool, "model_probe_freshness_secs")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30 * 24 * 3600);
+    let fresh_until = verified_at + chrono::Duration::seconds(freshness_secs);
+    let (status, status_code, detail) = match response {
+        Ok(response) => {
+            let status_code = response.status().as_u16();
+            if (200..300).contains(&status_code) {
+                ("supported", status_code, None)
+            } else {
+                let text = response.text().await.unwrap_or_default();
+                let redacted = crypto::redact(&text);
+                let status = if deterministic_probe_rejection(
+                    &body.capability,
+                    body.value.as_ref(),
+                    status_code,
+                    &redacted,
+                ) {
+                    "unsupported"
+                } else {
+                    "inconclusive"
+                };
+                (status, status_code, Some(truncate(&redacted, 400)))
+            }
+        }
+        Err(error) => (
+            "inconclusive",
+            0,
+            Some(truncate(&crypto::redact(&error.message), 400)),
+        ),
+    };
+
+    let discovery = discovery_object(&model);
+    let mut evidence = discovery
+        .get("probe_evidence")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let evidence_value = json!({
+        "status": status,
+        "source": "probe",
+        "value": body.value,
+        "verified_at": verified_at.to_rfc3339(),
+        "fresh_until": fresh_until.to_rfc3339(),
+        "scope": {
+            "provider_id": provider.id,
+            "account_id": account.id,
+            "model_id": model.id,
+            "transport": profile.transport.as_str(),
+        },
+        "status_code": status_code,
+        "latency_ms": started.elapsed().as_millis() as i64,
+        "estimated_max_cost_usd": estimated_cost,
+        "detail": detail,
+    });
+    evidence.insert(probe_evidence_key(&body.capability), evidence_value.clone());
+    db::merge_model_discovery(
+        &state.pool,
+        &model.id,
+        &json!({ "probe_evidence": Value::Object(evidence) }),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+
+    let _ = db::insert_audit(
+        &state.pool,
+        "admin",
+        "model_capability_probe",
+        "model",
+        &model.id,
+        &model.display_name,
+        &format!(
+            "Capability probe '{}' completed as {status} with status {status_code}.",
+            body.capability
+        ),
+    )
+    .await;
+
+    Ok(Json(json!({
+        "status": status,
+        "evidence": evidence_value,
+    })))
+}
+
 /// `POST /admin/api/accounts/:id/test` — run a minimal real proxy-style probe
 /// through one specific credential instead of the provider pool default.
 pub async fn test_account(
