@@ -268,6 +268,272 @@ pub async fn update_public_base_url(
     })))
 }
 
+const MODEL_RECONCILIATION_INTERVAL_SETTING: &str = "model_reconciliation_interval_secs";
+const MODEL_PRICING_SYNC_INTERVAL_SETTING: &str = "model_pricing_sync_interval_secs";
+const MODEL_LIFECYCLE_JITTER_SETTING: &str = "model_lifecycle_jitter_secs";
+const MODEL_PROBE_FRESHNESS_SETTING: &str = "model_probe_freshness_secs";
+
+#[derive(Debug, Clone, Copy)]
+struct ModelLifecycleSettings {
+    reconciliation_interval_secs: u64,
+    pricing_sync_interval_secs: u64,
+    jitter_secs: u64,
+    probe_freshness_secs: u64,
+}
+
+async fn read_u64_setting(pool: &Pool, key: &str, default: u64) -> Result<u64, ApiError> {
+    Ok(db::get_setting(pool, key)
+        .await
+        .map_err(ApiError::internal)?
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default))
+}
+
+async fn model_lifecycle_settings(state: &AppState) -> Result<ModelLifecycleSettings, ApiError> {
+    Ok(ModelLifecycleSettings {
+        reconciliation_interval_secs: read_u64_setting(
+            &state.pool,
+            MODEL_RECONCILIATION_INTERVAL_SETTING,
+            0,
+        )
+        .await?,
+        pricing_sync_interval_secs: read_u64_setting(
+            &state.pool,
+            MODEL_PRICING_SYNC_INTERVAL_SETTING,
+            0,
+        )
+        .await?,
+        jitter_secs: read_u64_setting(&state.pool, MODEL_LIFECYCLE_JITTER_SETTING, 300).await?,
+        probe_freshness_secs: read_u64_setting(
+            &state.pool,
+            MODEL_PROBE_FRESHNESS_SETTING,
+            30 * 24 * 3600,
+        )
+        .await?,
+    })
+}
+
+#[derive(Deserialize)]
+pub struct ModelLifecycleSettingsBody {
+    #[serde(default)]
+    pub reconciliation_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub pricing_sync_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub jitter_secs: Option<u64>,
+    #[serde(default)]
+    pub probe_freshness_secs: Option<u64>,
+}
+
+fn validate_lifecycle_interval(name: &str, value: u64) -> Result<(), ApiError> {
+    if value != 0 && !(300..=365 * 24 * 3600).contains(&value) {
+        return Err(ApiError::bad(format!(
+            "{name} must be 0 (disabled) or between 300 and 31536000 seconds"
+        )));
+    }
+    Ok(())
+}
+
+pub async fn get_model_lifecycle_settings(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+) -> ApiResult {
+    let settings = model_lifecycle_settings(&state).await?;
+    Ok(Json(json!({
+        "reconciliation_interval_secs": settings.reconciliation_interval_secs,
+        "pricing_sync_interval_secs": settings.pricing_sync_interval_secs,
+        "jitter_secs": settings.jitter_secs,
+        "probe_freshness_secs": settings.probe_freshness_secs,
+    })))
+}
+
+pub async fn update_model_lifecycle_settings(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Json(body): Json<ModelLifecycleSettingsBody>,
+) -> ApiResult {
+    if let Some(value) = body.reconciliation_interval_secs {
+        validate_lifecycle_interval("reconciliation_interval_secs", value)?;
+        db::set_setting(
+            &state.pool,
+            MODEL_RECONCILIATION_INTERVAL_SETTING,
+            &value.to_string(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    }
+    if let Some(value) = body.pricing_sync_interval_secs {
+        validate_lifecycle_interval("pricing_sync_interval_secs", value)?;
+        db::set_setting(
+            &state.pool,
+            MODEL_PRICING_SYNC_INTERVAL_SETTING,
+            &value.to_string(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    }
+    if let Some(value) = body.jitter_secs {
+        if value > 3600 {
+            return Err(ApiError::bad("jitter_secs must be <= 3600"));
+        }
+        db::set_setting(&state.pool, MODEL_LIFECYCLE_JITTER_SETTING, &value.to_string())
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    if let Some(value) = body.probe_freshness_secs {
+        if !(60..=365 * 24 * 3600).contains(&value) {
+            return Err(ApiError::bad(
+                "probe_freshness_secs must be between 60 and 31536000",
+            ));
+        }
+        db::set_setting(&state.pool, MODEL_PROBE_FRESHNESS_SETTING, &value.to_string())
+            .await
+            .map_err(ApiError::internal)?;
+    }
+
+    let settings = model_lifecycle_settings(&state).await?;
+    let _ = db::insert_audit(
+        &state.pool,
+        "admin",
+        "model_lifecycle_settings_changed",
+        "system",
+        "",
+        "Model Lifecycle",
+        "Updated model reconciliation, pricing-sync, or probe-freshness scheduling.",
+    )
+    .await;
+    Ok(Json(json!({
+        "ok": true,
+        "reconciliation_interval_secs": settings.reconciliation_interval_secs,
+        "pricing_sync_interval_secs": settings.pricing_sync_interval_secs,
+        "jitter_secs": settings.jitter_secs,
+        "probe_freshness_secs": settings.probe_freshness_secs,
+    })))
+}
+
+fn stable_schedule_jitter(key: &str, max_secs: u64) -> u64 {
+    if max_secs == 0 {
+        return 0;
+    }
+    let hash = key.bytes().fold(1469598103934665603_u64, |hash, byte| {
+        hash.wrapping_mul(1099511628211).wrapping_add(byte as u64)
+    });
+    hash % (max_secs + 1)
+}
+
+async fn scheduled_due(pool: &Pool, key: &str, interval_secs: u64, jitter_secs: u64) -> bool {
+    if interval_secs == 0 {
+        return false;
+    }
+    let Some(last) = db::get_setting(pool, key).await.ok().flatten() else {
+        return true;
+    };
+    let Ok(last) = chrono::DateTime::parse_from_rfc3339(&last) else {
+        return true;
+    };
+    let elapsed = chrono::Utc::now()
+        .signed_duration_since(last.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .max(0) as u64;
+    elapsed >= interval_secs.saturating_add(stable_schedule_jitter(key, jitter_secs))
+}
+
+/// Best-effort scheduled lifecycle pass. Each provider has an independent last
+/// attempt timestamp and deterministic jitter, avoiding synchronized catalog or
+/// provider discovery bursts across a large installation.
+pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
+    let settings = match model_lifecycle_settings(state).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(error = ?error, "failed to read model lifecycle settings");
+            return;
+        }
+    };
+    if settings.reconciliation_interval_secs == 0 && settings.pricing_sync_interval_secs == 0 {
+        return;
+    }
+
+    let providers = match db::list_providers(&state.pool).await {
+        Ok(providers) => providers,
+        Err(error) => {
+            tracing::warn!(%error, "failed to list providers for model lifecycle scheduler");
+            return;
+        }
+    };
+
+    for provider in providers {
+        let reconcile_key = format!("model_reconciliation_last_attempt:{}", provider.id);
+        let pricing_key = format!("model_pricing_sync_last_attempt:{}", provider.id);
+        let reconcile_due = scheduled_due(
+            &state.pool,
+            &reconcile_key,
+            settings.reconciliation_interval_secs,
+            settings.jitter_secs,
+        )
+        .await;
+        let pricing_due = scheduled_due(
+            &state.pool,
+            &pricing_key,
+            settings.pricing_sync_interval_secs,
+            settings.jitter_secs,
+        )
+        .await;
+
+        if pricing_due {
+            let now = db::now_iso();
+            let _ = db::set_setting(&state.pool, &pricing_key, &now).await;
+            if reconcile_due {
+                let _ = db::set_setting(&state.pool, &reconcile_key, &now).await;
+            }
+            match sync_provider_pricing_id(state, &provider.id).await {
+                Ok(_) => {
+                    let success = db::now_iso();
+                    let _ = db::set_setting(
+                        &state.pool,
+                        &format!("model_pricing_sync_last_success:{}", provider.id),
+                        &success,
+                    )
+                    .await;
+                    if reconcile_due {
+                        let _ = db::set_setting(
+                            &state.pool,
+                            &format!("model_reconciliation_last_success:{}", provider.id),
+                            &success,
+                        )
+                        .await;
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    provider = %provider.id,
+                    error = ?error,
+                    "scheduled pricing sync failed; preserving last-known metadata and prices"
+                ),
+            }
+            continue;
+        }
+
+        if reconcile_due {
+            let now = db::now_iso();
+            let _ = db::set_setting(&state.pool, &reconcile_key, &now).await;
+            match reconcile_provider_id(state, &provider.id).await {
+                Ok(_) => {
+                    let _ = db::set_setting(
+                        &state.pool,
+                        &format!("model_reconciliation_last_success:{}", provider.id),
+                        &db::now_iso(),
+                    )
+                    .await;
+                }
+                Err(error) => tracing::warn!(
+                    provider = %provider.id,
+                    error = ?error,
+                    "scheduled model reconciliation failed; existing state left intact"
+                ),
+            }
+        }
+    }
+}
+
 /// `POST /admin/api/test-stream` — run a real request through the pipeline for a
 /// chosen virtual key + model and stream the encoded result back to the
 /// browser. The raw virtual key never leaves the server (it is stored hashed).
