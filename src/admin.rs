@@ -5824,6 +5824,17 @@ fn structured_output_probe_contract(value: &Value) -> bool {
     object.len() == 1 && object.get("ok").and_then(Value::as_str).is_some()
 }
 
+fn reasoning_disable_probe_contract(
+    events: &[crate::types::StreamEvent],
+) -> Option<bool> {
+    events.iter().find_map(|event| match event {
+        crate::types::StreamEvent::Usage(usage) => {
+            usage.thinking.map(|reasoning_tokens| reasoning_tokens == 0)
+        }
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod probe_rejection_regression_tests {
     use super::*;
@@ -5894,6 +5905,26 @@ mod probe_rejection_regression_tests {
         ));
         assert!(!structured_output_probe_contract(&json!({"ok": 1})));
         assert!(!structured_output_probe_contract(&json!(["ok"])));
+    }
+
+    #[test]
+    fn reasoning_disable_probe_requires_explicit_zero_reasoning_usage() {
+        let zero = vec![crate::types::StreamEvent::Usage(crate::types::TokenUsage {
+            thinking: Some(0),
+            ..Default::default()
+        })];
+        assert_eq!(reasoning_disable_probe_contract(&zero), Some(true));
+
+        let nonzero = vec![crate::types::StreamEvent::Usage(crate::types::TokenUsage {
+            thinking: Some(7),
+            ..Default::default()
+        })];
+        assert_eq!(reasoning_disable_probe_contract(&nonzero), Some(false));
+
+        let missing = vec![crate::types::StreamEvent::Usage(
+            crate::types::TokenUsage::default(),
+        )];
+        assert_eq!(reasoning_disable_probe_contract(&missing), None);
     }
 }
 
@@ -6396,46 +6427,72 @@ pub async fn probe_model_capability(
             let status_code = response.status().as_u16();
             let text = response.text().await.unwrap_or_default();
             if (200..300).contains(&status_code) {
-                let contract_verified = match body.capability.as_str() {
-                    "tool_calling" => serde_json::from_str::<Value>(&text)
+                if body.capability == "reasoning_disable" {
+                    let verified = serde_json::from_str::<Value>(&text)
                         .ok()
                         .and_then(|payload| adapter.parse_full_response(&payload).ok())
-                        .is_some_and(|events| {
-                            events.iter().any(|event| {
-                                matches!(
-                                    event,
-                                    crate::types::StreamEvent::ToolCallStart { name, .. }
-                                        if name == "kinetix_probe_noop"
-                                )
-                            })
-                        }),
-                    "structured_output" => serde_json::from_str::<Value>(&text)
-                        .ok()
-                        .and_then(|payload| adapter.parse_full_response(&payload).ok())
-                        .map(|events| {
-                            events
-                                .into_iter()
-                                .filter_map(|event| match event {
-                                    crate::types::StreamEvent::TextDelta(text) => Some(text),
-                                    _ => None,
-                                })
-                                .collect::<String>()
-                        })
-                        .and_then(|text| serde_json::from_str::<Value>(text.trim()).ok())
-                        .is_some_and(|value| structured_output_probe_contract(&value)),
-                    _ => true,
-                };
-                if contract_verified {
-                    ("supported", status_code, None)
+                        .and_then(|events| reasoning_disable_probe_contract(&events));
+                    match verified {
+                        Some(true) => ("supported", status_code, None),
+                        Some(false) => (
+                            "unsupported",
+                            status_code,
+                            Some(
+                                "upstream accepted the disable request but reported non-zero reasoning tokens"
+                                    .to_string(),
+                            ),
+                        ),
+                        None => (
+                            "inconclusive",
+                            status_code,
+                            Some(
+                                "upstream accepted the disable request but did not report reasoning-token usage"
+                                    .to_string(),
+                            ),
+                        ),
+                    }
                 } else {
-                    (
-                        "inconclusive",
-                        status_code,
-                        Some(format!(
-                            "upstream returned success but did not satisfy the {} probe contract",
-                            body.capability
-                        )),
-                    )
+                    let contract_verified = match body.capability.as_str() {
+                        "tool_calling" => serde_json::from_str::<Value>(&text)
+                            .ok()
+                            .and_then(|payload| adapter.parse_full_response(&payload).ok())
+                            .is_some_and(|events| {
+                                events.iter().any(|event| {
+                                    matches!(
+                                        event,
+                                        crate::types::StreamEvent::ToolCallStart { name, .. }
+                                            if name == "kinetix_probe_noop"
+                                    )
+                                })
+                            }),
+                        "structured_output" => serde_json::from_str::<Value>(&text)
+                            .ok()
+                            .and_then(|payload| adapter.parse_full_response(&payload).ok())
+                            .map(|events| {
+                                events
+                                    .into_iter()
+                                    .filter_map(|event| match event {
+                                        crate::types::StreamEvent::TextDelta(text) => Some(text),
+                                        _ => None,
+                                    })
+                                    .collect::<String>()
+                            })
+                            .and_then(|text| serde_json::from_str::<Value>(text.trim()).ok())
+                            .is_some_and(|value| structured_output_probe_contract(&value)),
+                        _ => true,
+                    };
+                    if contract_verified {
+                        ("supported", status_code, None)
+                    } else {
+                        (
+                            "inconclusive",
+                            status_code,
+                            Some(format!(
+                                "upstream returned success but did not satisfy the {} probe contract",
+                                body.capability
+                            )),
+                        )
+                    }
                 }
             } else {
                 let redacted = crypto::redact(&text);
