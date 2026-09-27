@@ -1049,7 +1049,6 @@ pub async fn update_model(
     Ok(())
 }
 
-
 async fn update_model_configuration_in_transaction(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     mutation: &ModelOperatorMutation<'_>,
@@ -1436,9 +1435,7 @@ async fn apply_effective_model_pricing_transaction(
         .get("fields")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let has_owned_fields = fields
-        .as_object()
-        .is_some_and(|fields| !fields.is_empty());
+    let has_owned_fields = fields.as_object().is_some_and(|fields| !fields.is_empty());
     let effective_pricing = if prices.is_configured() || has_owned_fields {
         serde_json::json!({
             "source": source,
@@ -2438,7 +2435,6 @@ mod price_version_identity_tests {
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);
     }
-
 
     #[tokio::test]
     async fn operator_mutation_rolls_back_model_reconciliation_and_pricing_together() {

@@ -3491,10 +3491,7 @@ fn merge_automatic_price_observation(
     // concerns separate so reconciliation snapshots cannot hide operator pins.
     let mut fields = effective_price_fields(ownership, current);
     let mut preserved_manual = false;
-    let provider_observed_at = observation
-        .get("last_seen")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let provider_observed_at = observation.get("last_seen").cloned().unwrap_or(Value::Null);
     let catalog_source_state = observation
         .pointer("/catalog/source_state")
         .cloned()
@@ -3604,7 +3601,6 @@ fn merge_selected_capability_overrides(
     }
     overrides
 }
-
 
 fn pin_selected_price_fields(
     discovery: &Value,
@@ -3748,12 +3744,10 @@ pub async fn update_model_reconciliation(
                 serde_json::from_str::<Value>(&row.capabilities).unwrap_or_else(|_| json!({}));
             let parameters =
                 serde_json::from_str::<Value>(&row.parameters).unwrap_or_else(|_| json!({}));
-            let thinking_map =
-                serde_json::to_value(row.thinking()).map_err(ApiError::internal)?;
+            let thinking_map = serde_json::to_value(row.thinking()).map_err(ApiError::internal)?;
             let extra_request = row.extra_request_value();
             let current_prices = row.prices();
-            let has_capability_pins =
-                pins.iter().any(|field| field.starts_with("capabilities."));
+            let has_capability_pins = pins.iter().any(|field| field.starts_with("capabilities."));
             let has_price_pins = pins.iter().any(|field| field.starts_with("prices."));
 
             let mut discovery_patch = serde_json::Map::new();
@@ -3923,7 +3917,10 @@ pub async fn update_model_reconciliation(
                     .await
                     .map_err(ApiError::internal)?
                     .ok_or_else(|| ApiError::not_found("provider not found"))?;
-                Some(validate_model_transport_override(&provider, Some(transport))?)
+                Some(validate_model_transport_override(
+                    &provider,
+                    Some(transport),
+                )?)
             } else {
                 None
             };
@@ -3993,8 +3990,7 @@ pub async fn update_model_reconciliation(
                 None
             };
             let capabilities = normalize_model_capabilities(&capabilities);
-            let thinking_map =
-                serde_json::to_value(&thinking_map).map_err(ApiError::internal)?;
+            let thinking_map = serde_json::to_value(&thinking_map).map_err(ApiError::internal)?;
             let discovery_patch = Value::Object(accepted_discovery);
             db::commit_model_operator_mutation(
                 &state.pool,
@@ -4647,9 +4643,7 @@ fn probe_execution_model(
     model: &db::ModelRow,
     candidate_transport: Option<&str>,
 ) -> Result<db::ModelRow, ApiError> {
-    let Some(transport) =
-        validate_model_transport_override(provider, candidate_transport)?
-    else {
+    let Some(transport) = validate_model_transport_override(provider, candidate_transport)? else {
         return Ok(model.clone());
     };
     let mut execution_model = model.clone();
@@ -4883,7 +4877,6 @@ mod model_lifecycle_regression_tests {
         assert_eq!(fields["output_per_1m"]["source"], "models.dev:provider");
     }
 
-
     #[test]
     fn pinned_price_field_survives_later_automatic_observation() {
         let current = Prices {
@@ -4906,16 +4899,13 @@ mod model_lifecycle_regression_tests {
         });
         let selected = vec!["prices.output_per_1m".to_string()];
         let pinned = pin_selected_price_fields(&discovery, &current, &selected);
-        discovery
-            .as_object_mut()
-            .unwrap()
-            .insert(
-                "effective_pricing".into(),
-                json!({
-                    "source": "operator_pin",
-                    "fields": pinned
-                }),
-            );
+        discovery.as_object_mut().unwrap().insert(
+            "effective_pricing".into(),
+            json!({
+                "source": "operator_pin",
+                "fields": pinned
+            }),
+        );
         let observed = Prices {
             output_per_1m: Some(6.0),
             ..Default::default()
@@ -6050,8 +6040,7 @@ pub async fn probe_model_capability(
             .ok_or_else(|| ApiError::bad("provider has no credentials to probe with"))?
     };
 
-    let mut execution_model =
-        probe_execution_model(&provider, &model, body.transport.as_deref())?;
+    let mut execution_model = probe_execution_model(&provider, &model, body.transport.as_deref())?;
     let profile = crate::adapters::resolve_execution_profile(&provider, &execution_model)
         .map_err(|error| ApiError::bad(error.message))?;
     let adapter = state
@@ -13391,7 +13380,6 @@ mod credential_enrollment_regression_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-
     #[tokio::test]
     async fn pin_action_promotes_capability_and_price_ownership() {
         let (state, root) = test_state("pin-ownership").await;
@@ -13639,10 +13627,7 @@ mod credential_enrollment_regression_tests {
             Path(model_id.clone()),
             Json(ReconciliationActionBody {
                 action: "accept".into(),
-                fields: vec![
-                    "context_window".into(),
-                    "prices.output_per_1m".into(),
-                ],
+                fields: vec!["context_window".into(), "prices.output_per_1m".into()],
             }),
         )
         .await;
@@ -13711,7 +13696,9 @@ mod credential_enrollment_regression_tests {
 
         let candidate =
             probe_execution_model(&provider, &stored, Some("openai-responses")).unwrap();
-        assert!(discovery_object(&stored).get("configured_transport").is_none());
+        assert!(discovery_object(&stored)
+            .get("configured_transport")
+            .is_none());
         assert_eq!(
             discovery_object(&candidate)
                 .get("configured_transport")
@@ -13724,16 +13711,14 @@ mod credential_enrollment_regression_tests {
                 .transport,
             crate::adapters::TargetTransport::OpenAiResponses
         );
-        assert!(
-            discovery_object(
-                &db::get_model(&state.pool, &model_id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-            )
-            .get("configured_transport")
-            .is_none()
-        );
+        assert!(discovery_object(
+            &db::get_model(&state.pool, &model_id)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .get("configured_transport")
+        .is_none());
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);

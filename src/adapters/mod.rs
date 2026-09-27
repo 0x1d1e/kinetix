@@ -2072,7 +2072,6 @@ mod execution_profile_tests {
         assert_eq!(profile.capabilities.text, None);
     }
 
-
     #[test]
     fn legacy_configured_capability_remains_operator_owned_against_probe() {
         let provider = provider();
