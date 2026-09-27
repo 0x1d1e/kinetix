@@ -74,6 +74,23 @@ const modelProbeEvidence = (model: ModelConfig) =>
     probe_evidence?: Record<string, { status?: string; verified_at?: string; fresh_until?: string }> | null;
   } | undefined)?.probe_evidence || {};
 
+const modelReasoningLevels = (model: ModelConfig) => {
+  const discovery = model.discovery as {
+    reasoning_capability?: { levels?: string[]; can_disable?: boolean } | null;
+  } | undefined;
+  const discovered = discovery?.reasoning_capability?.levels || [];
+  const mapped = Object.keys(model.thinkingMap?.levels || {});
+  return Array.from(new Set([...discovered, ...mapped])).filter((level) => level && level !== 'off' && level !== 'default');
+};
+
+const modelCanProbeReasoningDisable = (model: ModelConfig) => {
+  const discovery = model.discovery as {
+    reasoning_capability?: { can_disable?: boolean } | null;
+  } | undefined;
+  return discovery?.reasoning_capability?.can_disable === true
+    || Object.prototype.hasOwnProperty.call(model.thinkingMap?.levels || {}, 'off');
+};
+
 
 interface ProvidersViewProps {
   providers: Provider[];
@@ -295,16 +312,13 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
 
   const handleProbeModel = async (
     modelId: string,
-    capability: 'transport' | 'reasoning' | 'tool_calling' | 'structured_output',
+    capability: 'transport' | 'reasoning' | 'reasoning_disable' | 'tool_calling' | 'structured_output',
+    value?: string,
   ) => {
-    const key = `${modelId}:${capability}`;
+    const key = `${modelId}:${capability}${value ? `:${value}` : ''}`;
     setLifecycleBusy(`probe:${key}`);
     try {
-      const result = await Kinetix.probeModel(
-        modelId,
-        capability,
-        capability === 'reasoning' ? 'low' : undefined,
-      );
+      const result = await Kinetix.probeModel(modelId, capability, value);
       setProbeStatus((prev) => ({ ...prev, [key]: result.status }));
       onRefresh?.();
     } catch (error) {
@@ -1372,13 +1386,18 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                               <strong className="font-heading text-sm">Verified capability probes</strong>
                               <span className="ml-2 text-[var(--ink)]/60">
                                 transport {modelProbeEvidence(m).transport?.status || '—'} ·
-                                reasoning {modelProbeEvidence(m).reasoning?.status || '—'} ·
+                                reasoning efforts {
+                                  Object.entries(modelProbeEvidence(m))
+                                    .filter(([key]) => key.startsWith('reasoning_effort_'))
+                                    .map(([key, evidence]) => `${key.replace('reasoning_effort_', '')}:${evidence.status || '—'}`)
+                                    .join(', ') || '—'
+                                } ·
                                 tools {modelProbeEvidence(m).tool_calling?.status || '—'} ·
                                 structured {modelProbeEvidence(m).structured_output?.status || '—'}
                               </span>
                             </div>
                             <div className="flex flex-wrap gap-1">
-                              {(['transport', 'reasoning', 'tool_calling', 'structured_output'] as const).map((capability) => (
+                              {(['transport', 'tool_calling', 'structured_output'] as const).map((capability) => (
                                 <button
                                   key={capability}
                                   type="button"
@@ -1392,6 +1411,34 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                     : ''}
                                 </button>
                               ))}
+                              {modelReasoningLevels(m).map((level) => {
+                                const key = `${m.id}:reasoning:${level}`;
+                                return (
+                                  <button
+                                    key={key}
+                                    type="button"
+                                    disabled={lifecycleBusy === `probe:${key}`}
+                                    onClick={() => handleProbeModel(m.id, 'reasoning', level)}
+                                    className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
+                                  >
+                                    Probe reasoning {level}
+                                    {probeStatus[key] ? ` · ${probeStatus[key]}` : ''}
+                                  </button>
+                                );
+                              })}
+                              {modelCanProbeReasoningDisable(m) && (
+                                <button
+                                  type="button"
+                                  disabled={lifecycleBusy === `probe:${m.id}:reasoning_disable:off`}
+                                  onClick={() => handleProbeModel(m.id, 'reasoning_disable', 'off')}
+                                  className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
+                                >
+                                  Probe reasoning off
+                                  {probeStatus[`${m.id}:reasoning_disable:off`]
+                                    ? ` · ${probeStatus[`${m.id}:reasoning_disable:off`]}`
+                                    : ''}
+                                </button>
+                              )}
                             </div>
                           </div>
                         </div>
