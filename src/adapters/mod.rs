@@ -118,7 +118,22 @@ fn discovered_transport(discovery: &serde_json::Value) -> Result<Option<&str>, P
         .transpose()
 }
 
-fn fresh_probe_status(evidence: &serde_json::Value) -> Option<&str> {
+fn fresh_probe_status<'a>(
+    evidence: &'a serde_json::Value,
+    provider_id: &str,
+    model_id: &str,
+    account_id: Option<&str>,
+    transport: &TargetTransport,
+) -> Option<&'a str> {
+    let account_id = account_id?;
+    let scope = evidence.get("scope")?;
+    if scope.get("provider_id").and_then(serde_json::Value::as_str) != Some(provider_id)
+        || scope.get("model_id").and_then(serde_json::Value::as_str) != Some(model_id)
+        || scope.get("account_id").and_then(serde_json::Value::as_str) != Some(account_id)
+        || scope.get("transport").and_then(serde_json::Value::as_str) != Some(transport.as_str())
+    {
+        return None;
+    }
     let fresh_until = evidence
         .get("fresh_until")
         .and_then(serde_json::Value::as_str)?;
@@ -129,11 +144,22 @@ fn fresh_probe_status(evidence: &serde_json::Value) -> Option<&str> {
     evidence.get("status").and_then(serde_json::Value::as_str)
 }
 
-/// Resolve model transport, reasoning, parameters, and capabilities in one
-/// place. Explicit invalid metadata is an error, never a signal to fall back.
+/// Resolve model transport, reasoning, parameters, and capabilities without an
+/// account-bound probe scope. Scoped probe evidence is intentionally ignored.
 pub fn resolve_execution_profile(
     provider: &crate::db::ProviderRow,
     model: &crate::db::ModelRow,
+) -> Result<ResolvedExecutionProfile, ProxyError> {
+    resolve_execution_profile_for_target(provider, model, None)
+}
+
+/// Resolve the execution profile for one concrete account target. Fresh probe
+/// evidence is consumed only when provider, account, model, and transport all
+/// match the active execution target.
+pub fn resolve_execution_profile_for_target(
+    provider: &crate::db::ProviderRow,
+    model: &crate::db::ModelRow,
+    account_id: Option<&str>,
 ) -> Result<ResolvedExecutionProfile, ProxyError> {
     let discovery = serde_json::from_str::<serde_json::Value>(&model.discovery)
         .unwrap_or_else(|_| serde_json::json!({}));
@@ -224,7 +250,7 @@ pub fn resolve_execution_profile(
     {
         for (key, item) in evidence {
             if let Some(level) = key.strip_prefix("reasoning_effort_") {
-                match fresh_probe_status(item) {
+                match fresh_probe_status(item, &provider.id, &model.id, account_id, &transport) {
                     Some("supported") => {
                         verified_reasoning_supported = true;
                         if thinking_map.level_is_executable(level) {
@@ -248,7 +274,7 @@ pub fn resolve_execution_profile(
                 }
             } else if key == "reasoning_disable" && !admin_thinking_configured {
                 if let Some(capability) = reasoning.as_mut() {
-                    match fresh_probe_status(item) {
+                    match fresh_probe_status(item, &provider.id, &model.id, account_id, &transport) {
                         Some("supported") => capability.can_disable = true,
                         Some("unsupported") => capability.can_disable = false,
                         _ => {}
@@ -266,7 +292,7 @@ pub fn resolve_execution_profile(
         let evidence = discovery
             .get("probe_evidence")
             .and_then(|value| value.get(name))?;
-        match fresh_probe_status(evidence) {
+        match fresh_probe_status(evidence, &provider.id, &model.id, account_id, &transport) {
             Some("supported") => Some(true),
             Some("unsupported") => Some(false),
             _ => None,
@@ -302,10 +328,30 @@ pub fn resolve_execution_profile(
         structured_output: capability("structured_output"),
     };
 
+    let mut parameters = model.params();
+    if let Some(evidence) = discovery
+        .get("probe_evidence")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, item) in evidence {
+            let Some(parameter) = key.strip_prefix("parameter_") else {
+                continue;
+            };
+            let Some(spec) = parameters.get_mut(parameter) else {
+                continue;
+            };
+            match fresh_probe_status(item, &provider.id, &model.id, account_id, &transport) {
+                Some("supported") => spec.supported = true,
+                Some("unsupported") => spec.supported = false,
+                _ => {}
+            }
+        }
+    }
+
     Ok(ResolvedExecutionProfile {
         transport,
         reasoning,
-        parameters: model.params(),
+        parameters,
         capabilities,
         thinking_map,
     })
@@ -1907,6 +1953,92 @@ mod execution_profile_tests {
         .to_string();
         let profile = resolve_execution_profile(&provider, &model).unwrap();
         assert_eq!(profile.capabilities.text, None);
+    }
+
+    #[test]
+    fn scoped_probe_evidence_isolated_by_account_and_transport() {
+        let provider = provider();
+        let mut model = model();
+        model.discovery = serde_json::json!({
+            "probe_evidence": {
+                "tool_calling": {
+                    "status": "unsupported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai-chat"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let account_a =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        assert_eq!(account_a.capabilities.tool_calling, Some(false));
+
+        let account_b =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-b")).unwrap();
+        assert_eq!(account_b.capabilities.tool_calling, None);
+
+        model.discovery = serde_json::json!({
+            "configured_transport": "openai-responses",
+            "probe_evidence": {
+                "tool_calling": {
+                    "status": "unsupported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai-chat"
+                    }
+                }
+            }
+        })
+        .to_string();
+        let responses =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        assert_eq!(responses.transport, TargetTransport::OpenAiResponses);
+        assert_eq!(responses.capabilities.tool_calling, None);
+    }
+
+    #[test]
+    fn scoped_parameter_probe_updates_only_matching_target() {
+        let provider = provider();
+        let mut model = model();
+        model.parameters = serde_json::json!({
+            "temperature": {
+                "supported": true,
+                "policy": "reject"
+            }
+        })
+        .to_string();
+        model.discovery = serde_json::json!({
+            "probe_evidence": {
+                "parameter_temperature": {
+                    "status": "unsupported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai-chat"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let matching =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        assert!(!matching.parameters["temperature"].supported);
+
+        let other =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-b")).unwrap();
+        assert!(other.parameters["temperature"].supported);
     }
 
     #[test]
