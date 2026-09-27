@@ -1140,9 +1140,7 @@ fn price_snapshot_matches(
     )
 }
 
-fn price_version_lock(
-    model_id: &str,
-) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+fn price_version_lock(model_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::OnceLock<
         dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
     > = std::sync::OnceLock::new();
@@ -2232,13 +2230,12 @@ mod price_version_identity_tests {
         let right = right.unwrap().unwrap();
         assert_eq!(left, right);
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM price_versions WHERE model_id = ?",
-        )
-        .bind(&model_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id = ?")
+                .bind(&model_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 1);
 
         pool.close().await;
