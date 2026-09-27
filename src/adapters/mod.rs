@@ -167,13 +167,7 @@ fn fresh_probe_status<'a>(
         // newest-first for fresh conclusive evidence; inconclusive attempts do
         // not supersede a still-fresh supported/unsupported result.
         serde_json::Value::Array(entries) => entries.iter().rev().find_map(|entry| {
-            fresh_conclusive_probe_status_entry(
-                entry,
-                provider_id,
-                model_id,
-                account_id,
-                transport,
-            )
+            fresh_conclusive_probe_status_entry(entry, provider_id, model_id, account_id, transport)
         }),
         // Legacy single-entry storage remains readable.
         _ => fresh_conclusive_probe_status_entry(

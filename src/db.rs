@@ -2169,26 +2169,15 @@ mod price_version_identity_tests {
             }
         });
 
-        let first = ensure_price_version(
-            &pool,
-            &model_id,
-            &prices,
-            "models.dev",
-            &first_metadata,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let second = ensure_price_version(
-            &pool,
-            &model_id,
-            &prices,
-            "models.dev",
-            &second_metadata,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let first = ensure_price_version(&pool, &model_id, &prices, "models.dev", &first_metadata)
+            .await
+            .unwrap()
+            .unwrap();
+        let second =
+            ensure_price_version(&pool, &model_id, &prices, "models.dev", &second_metadata)
+                .await
+                .unwrap()
+                .unwrap();
 
         assert_eq!(first, second);
         drop(pool);
