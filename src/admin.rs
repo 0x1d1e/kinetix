@@ -3213,6 +3213,7 @@ pub async fn update_model_reconciliation(
                     merged.insert(field.clone());
                 }
             }
+            let remaining = remaining_reconciliation_diff(&reconciliation, &pins);
             let object = reconciliation
                 .as_object_mut()
                 .ok_or_else(|| ApiError::internal("invalid reconciliation metadata"))?;
@@ -3220,7 +3221,6 @@ pub async fn update_model_reconciliation(
                 "pinned_fields".into(),
                 Value::Array(merged.into_iter().map(Value::String).collect()),
             );
-            let remaining = remaining_reconciliation_diff(&reconciliation, &pins);
             object.insert("diff".into(), Value::Array(remaining.clone()));
             object.insert(
                 "status".into(),
