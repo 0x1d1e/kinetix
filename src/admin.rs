@@ -368,6 +368,73 @@ async fn record_lifecycle_failure(
 }
 
 #[derive(Debug, Clone, Copy)]
+enum ModelLifecycleLane {
+    Reconciliation,
+    PricingSync,
+}
+
+impl ModelLifecycleLane {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Reconciliation => "reconciliation",
+            Self::PricingSync => "pricing_sync",
+        }
+    }
+}
+
+async fn run_model_lifecycle_lane(
+    state: &AppState,
+    provider_id: &str,
+    lane: ModelLifecycleLane,
+) -> Result<Value, ApiError> {
+    let lane_name = lane.name();
+    db::set_setting(
+        &state.pool,
+        &lifecycle_setting_key(lane_name, "last_attempt", provider_id),
+        &db::now_iso(),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+
+    let result = match lane {
+        ModelLifecycleLane::Reconciliation => reconcile_provider_id(state, provider_id).await,
+        ModelLifecycleLane::PricingSync => sync_provider_pricing_id(state, provider_id).await,
+    };
+
+    match result {
+        Ok(mut payload) => {
+            record_lifecycle_success(&state.pool, lane_name, provider_id)
+                .await
+                .map_err(ApiError::internal)?;
+            let lifecycle = provider_lifecycle_status(&state.pool, provider_id).await?;
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("lifecycle".to_string(), lifecycle);
+                Ok(payload)
+            } else {
+                Ok(json!({
+                    "result": payload,
+                    "lifecycle": lifecycle,
+                }))
+            }
+        }
+        Err(error) => {
+            if let Err(record_error) =
+                record_lifecycle_failure(&state.pool, lane_name, provider_id, &error.1).await
+            {
+                tracing::warn!(
+                    provider = %provider_id,
+                    lane = lane_name,
+                    %record_error,
+                    "failed to persist model lifecycle failure state"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+
+#[derive(Debug, Clone, Copy)]
 struct ModelLifecycleSettings {
     reconciliation_interval_secs: u64,
     pricing_sync_interval_secs: u64,
@@ -527,17 +594,38 @@ async fn scheduled_due(pool: &Pool, key: &str, interval_secs: u64, jitter_secs: 
     if interval_secs == 0 {
         return false;
     }
-    let Some(last) = db::get_setting(pool, key).await.ok().flatten() else {
-        return true;
-    };
-    let Ok(last) = chrono::DateTime::parse_from_rfc3339(&last) else {
-        return true;
-    };
-    let elapsed = chrono::Utc::now()
-        .signed_duration_since(last.with_timezone(&chrono::Utc))
-        .num_seconds()
-        .max(0) as u64;
-    elapsed >= interval_secs.saturating_add(stable_schedule_jitter(key, jitter_secs))
+
+    let jitter = stable_schedule_jitter(key, jitter_secs);
+    let now = chrono::Utc::now();
+    if let Some(last) = db::get_setting(pool, key).await.ok().flatten() {
+        if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&last) {
+            let elapsed = now
+                .signed_duration_since(last.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0) as u64;
+            return elapsed >= interval_secs.saturating_add(jitter);
+        }
+    }
+
+    // Keep first-run jitter durable without pretending an attempt already ran.
+    let anchor_key = format!("{key}:schedule_anchor");
+    if let Some(anchor) = db::get_setting(pool, &anchor_key).await.ok().flatten() {
+        if let Ok(anchor) = chrono::DateTime::parse_from_rfc3339(&anchor) {
+            let elapsed = now
+                .signed_duration_since(anchor.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0) as u64;
+            return elapsed >= jitter;
+        }
+    }
+
+    if db::set_setting(pool, &anchor_key, &now.to_rfc3339())
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    jitter == 0
 }
 
 /// Best-effort scheduled lifecycle pass. Each provider has an independent last
@@ -582,76 +670,30 @@ pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
         .await;
 
         if reconcile_due {
-            let now = db::now_iso();
-            match db::set_setting(&state.pool, &reconcile_key, &now).await {
-                Ok(()) => match reconcile_provider_id(state, &provider.id).await {
-                    Ok(_) => {
-                        if let Err(error) =
-                            record_lifecycle_success(&state.pool, "reconciliation", &provider.id)
-                                .await
-                        {
-                            tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation success state");
-                        }
-                    }
-                    Err(error) => {
-                        let message = error.1.clone();
-                        if let Err(record_error) = record_lifecycle_failure(
-                            &state.pool,
-                            "reconciliation",
-                            &provider.id,
-                            &message,
-                        )
-                        .await
-                        {
-                            tracing::warn!(provider = %provider.id, %record_error, "failed to persist reconciliation failure state");
-                        }
-                        tracing::warn!(
-                            provider = %provider.id,
-                            error = ?error,
-                            "scheduled model reconciliation failed; existing state left intact"
-                        );
-                    }
-                },
-                Err(error) => {
-                    tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation attempt state");
-                }
+            if let Err(error) = run_model_lifecycle_lane(
+                state,
+                &provider.id,
+                ModelLifecycleLane::Reconciliation,
+            )
+            .await
+            {
+                tracing::warn!(
+                    provider = %provider.id,
+                    error = ?error,
+                    "scheduled model reconciliation failed; existing state left intact"
+                );
             }
         }
 
         if pricing_due {
-            let now = db::now_iso();
-            match db::set_setting(&state.pool, &pricing_key, &now).await {
-                Ok(()) => match sync_provider_pricing_id(state, &provider.id).await {
-                    Ok(_) => {
-                        if let Err(error) =
-                            record_lifecycle_success(&state.pool, "pricing_sync", &provider.id)
-                                .await
-                        {
-                            tracing::warn!(provider = %provider.id, %error, "failed to persist pricing-sync success state");
-                        }
-                    }
-                    Err(error) => {
-                        let message = error.1.clone();
-                        if let Err(record_error) = record_lifecycle_failure(
-                            &state.pool,
-                            "pricing_sync",
-                            &provider.id,
-                            &message,
-                        )
-                        .await
-                        {
-                            tracing::warn!(provider = %provider.id, %record_error, "failed to persist pricing-sync failure state");
-                        }
-                        tracing::warn!(
-                            provider = %provider.id,
-                            error = ?error,
-                            "scheduled pricing sync failed; preserving last-known metadata and prices"
-                        );
-                    }
-                },
-                Err(error) => {
-                    tracing::warn!(provider = %provider.id, %error, "failed to persist pricing-sync attempt state");
-                }
+            if let Err(error) =
+                run_model_lifecycle_lane(state, &provider.id, ModelLifecycleLane::PricingSync).await
+            {
+                tracing::warn!(
+                    provider = %provider.id,
+                    error = ?error,
+                    "scheduled pricing sync failed; preserving last-known metadata and prices"
+                );
             }
         }
     }
@@ -3150,7 +3192,9 @@ pub async fn discover_models(
     _auth: AdminAuth,
     Path(id): Path<String>,
 ) -> ApiResult {
-    reconcile_provider_id(&state, &id).await.map(Json)
+    run_model_lifecycle_lane(&state, &id, ModelLifecycleLane::Reconciliation)
+        .await
+        .map(Json)
 }
 
 pub async fn reconcile_models(
@@ -3158,7 +3202,9 @@ pub async fn reconcile_models(
     _auth: AdminAuth,
     Path(id): Path<String>,
 ) -> ApiResult {
-    reconcile_provider_id(&state, &id).await.map(Json)
+    run_model_lifecycle_lane(&state, &id, ModelLifecycleLane::Reconciliation)
+        .await
+        .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -3921,7 +3967,9 @@ pub async fn sync_provider_pricing(
     _auth: AdminAuth,
     Path(id): Path<String>,
 ) -> ApiResult {
-    sync_provider_pricing_id(&state, &id).await.map(Json)
+    run_model_lifecycle_lane(&state, &id, ModelLifecycleLane::PricingSync)
+        .await
+        .map(Json)
 }
 
 async fn credential_for_admin_action(
@@ -5169,6 +5217,35 @@ mod model_lifecycle_regression_tests {
             normalize_capability_probe_value(&invalid.capability, invalid.value.as_ref())
                 .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+
+    #[tokio::test]
+    async fn initial_scheduled_pass_waits_for_stable_jitter_without_fake_attempt() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-lifecycle-jitter-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("test.db").display());
+        let pool = db::connect(&url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+
+        let mut key = "model_reconciliation_last_attempt:provider-jitter".to_string();
+        while stable_schedule_jitter(&key, 300) == 0 {
+            key.push('x');
+        }
+
+        assert!(!scheduled_due(&pool, &key, 3600, 300).await);
+        assert!(db::get_setting(&pool, &key).await.unwrap().is_none());
+        assert!(db::get_setting(&pool, &format!("{key}:schedule_anchor"))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(!scheduled_due(&pool, &key, 3600, 300).await);
+
+        drop(pool);
+        let _ = std::fs::remove_dir_all(root);
     }
 
 }
