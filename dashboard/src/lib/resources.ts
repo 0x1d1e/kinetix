@@ -144,6 +144,24 @@ export interface ModelLifecycleSettings {
   probe_freshness_secs: number;
 }
 
+export interface LifecycleLaneStatus {
+  last_attempt?: string | null;
+  last_success?: string | null;
+  last_failure?: string | null;
+  last_error?: string | null;
+}
+
+export interface ProviderLifecycleStatus {
+  reconciliation: LifecycleLaneStatus;
+  pricing_sync: LifecycleLaneStatus;
+}
+
+export interface CachedDiscoveryResponse {
+  models: DiscoveredModel[];
+  disappeared: unknown[];
+  lifecycle: ProviderLifecycleStatus;
+}
+
 export interface CapabilityProbeResult {
   status: 'supported' | 'unsupported' | 'inconclusive';
   reason?: string;
@@ -455,6 +473,8 @@ export const Kinetix = {
       '/admin/api/validate/provider',
       body,
     ),
+  cachedDiscovery: (providerId: string) =>
+    api.get<CachedDiscoveryResponse>(`/admin/api/providers/${providerId}/discover`),
   async discover(providerId: string): Promise<DiscoveredModel[]> {
     const r = await api.post<{ models: DiscoveredModel[] }>(`/admin/api/providers/${providerId}/discover`);
     return r.models;
