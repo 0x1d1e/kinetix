@@ -3222,11 +3222,6 @@ async fn discover_models_native(
         created_at: db::now_iso(),
         opaque_state_plugin: String::new(),
     };
-    execution_model.thinking_map =
-        serde_json::to_string(&probe_thinking_map).map_err(ApiError::internal)?;
-    execution_model.parameters =
-        serde_json::to_string(&probe_parameters).map_err(ApiError::internal)?;
-
     let ctx = UpstreamContext {
         provider,
         model: &dummy_model,
@@ -3839,6 +3834,11 @@ pub async fn probe_model_capability(
             )))
         }
     }
+
+    execution_model.thinking_map =
+        serde_json::to_string(&probe_thinking_map).map_err(ApiError::internal)?;
+    execution_model.parameters =
+        serde_json::to_string(&probe_parameters).map_err(ApiError::internal)?;
 
     let ctx = UpstreamContext {
         provider: &provider,
