@@ -2146,6 +2146,36 @@ mod execution_profile_tests {
     }
 
     #[test]
+    fn inconclusive_reasoning_probe_keeps_discovered_level_executable() {
+        let provider = provider();
+        let mut model = model();
+        model.discovery = serde_json::json!({
+            "thinking_map": {
+                "levels": {"high": "high"},
+                "mode": "level",
+                "level_field": "reasoning_effort"
+            },
+            "probe_evidence": {
+                "reasoning_effort_high": {
+                    "status": "inconclusive",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        assert!(profile.thinking_map.level_is_executable("high"));
+    }
+
+    #[test]
     fn scoped_parameter_probe_updates_only_matching_target() {
         let provider = provider();
         let mut model = model();

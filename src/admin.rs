@@ -2641,13 +2641,9 @@ fn raw_discovery_metadata<'a>(payload: &'a Value, model_id: &str) -> Option<&'a 
         .and_then(|values| values.iter().find(|value| matches_model(value, model_id)))
 }
 
-fn extend_unique_by_id<T>(
-    target: &mut Vec<T>,
-    incoming: Vec<T>,
-    id: impl Fn(&T) -> String,
-) {
+fn extend_unique_by_id<T>(target: &mut Vec<T>, incoming: Vec<T>, id: impl Fn(&T) -> String) {
     let mut seen: std::collections::HashSet<String> =
-        target.iter().map(&id).collect();
+        target.iter().map(|item| id(item)).collect();
     for item in incoming {
         if seen.insert(id(&item)) {
             target.push(item);
@@ -2713,9 +2709,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                 .await
                 .map_err(ApiError::internal)?;
             if accounts.is_empty() {
-                return Err(ApiError::bad(
-                    "provider has no credentials to discover with",
-                ));
+                return Err(ApiError::bad("provider has no credentials to discover with"));
             }
 
             let mut combined = Vec::new();
@@ -3769,9 +3763,7 @@ async fn discover_models_native(
         .await
         .map_err(ApiError::internal)?;
     if accounts.is_empty() {
-        return Err(ApiError::bad(
-            "provider has no credentials to discover with",
-        ));
+        return Err(ApiError::bad("provider has no credentials to discover with"));
     }
 
     let adapter = state.adapters.for_provider(provider);
@@ -3844,7 +3836,8 @@ async fn discover_models_native(
         .map_err(|e| {
             ApiError::bad(format!(
                 "discovery request failed for account '{}': {}",
-                account.label, e.message
+                account.label,
+                crate::crypto::redact(&e.message)
             ))
         })?;
         let status = resp.status();
@@ -4970,27 +4963,45 @@ fn deterministic_probe_rejection(
         }
         _ => Vec::new(),
     };
-    if !parameter_terms.iter().any(|term| body.contains(term)) {
+    if parameter_terms.is_empty() {
         return false;
     }
 
-    let explicit_parameter_rejection = [
-        "unsupported",
-        "not supported",
-        "not allowed",
-        "unknown parameter",
-        "unrecognized parameter",
-        "invalid parameter",
-    ]
-    .iter()
-    .any(|needle| body.contains(needle));
-    if explicit_parameter_rejection {
+    let explicitly_rejects_parameter = parameter_terms.iter().any(|term| {
+        [
+            format!("{term} is unsupported"),
+            format!("{term} are unsupported"),
+            format!("{term} unsupported"),
+            format!("{term}: unsupported"),
+            format!("{term} is not supported"),
+            format!("{term} are not supported"),
+            format!("{term} not supported"),
+            format!("{term} is not allowed"),
+            format!("{term} not allowed"),
+            format!("unsupported parameter {term}"),
+            format!("unsupported parameter: {term}"),
+            format!("unknown parameter {term}"),
+            format!("unknown parameter: {term}"),
+            format!("unrecognized parameter {term}"),
+            format!("unrecognized parameter: {term}"),
+            format!("invalid parameter {term}"),
+            format!("invalid parameter: {term}"),
+        ]
+        .iter()
+        .any(|pattern| body.contains(pattern))
+    });
+    if explicitly_rejects_parameter {
         return true;
     }
 
-    if !body.contains("invalid value") {
+    let rejects_value = body.contains("invalid value")
+        || body.contains("unsupported value")
+        || body.contains("value is not supported")
+        || body.contains("value not supported");
+    if !rejects_value || !parameter_terms.iter().any(|term| body.contains(term)) {
         return false;
     }
+
     let Some(value) = value else {
         return false;
     };
