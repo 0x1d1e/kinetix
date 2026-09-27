@@ -3183,6 +3183,11 @@ async fn discover_models_native(
         created_at: db::now_iso(),
         opaque_state_plugin: String::new(),
     };
+    execution_model.thinking_map =
+        serde_json::to_string(&probe_thinking_map).map_err(ApiError::internal)?;
+    execution_model.parameters =
+        serde_json::to_string(&probe_parameters).map_err(ApiError::internal)?;
+
     let ctx = UpstreamContext {
         provider,
         model: &dummy_model,
@@ -3653,10 +3658,8 @@ pub async fn probe_model_capability(
     }
 
     let mut execution_model = model.clone();
-    execution_model.thinking_map = serde_json::to_string(&profile.thinking_map)
-        .map_err(ApiError::internal)?;
-    execution_model.parameters =
-        serde_json::to_string(&profile.parameters).map_err(ApiError::internal)?;
+    let probe_thinking_map = profile.thinking_map.clone();
+    let mut probe_parameters = profile.parameters.clone();
 
     let mut internal = crate::types::InternalRequest {
         requested_model: model.upstream_id.clone(),
@@ -3684,7 +3687,16 @@ pub async fn probe_model_capability(
     match body.capability.as_str() {
         "transport" => {}
         "reasoning" | "reasoning_disable" => {
-            internal.thinking = Some(probe_thinking_level(body.value.as_ref())?);
+            let level = probe_thinking_level(body.value.as_ref())?;
+            if !probe_thinking_map.level_is_executable(level.as_key()) {
+                return Ok(Json(json!({
+                    "status": "inconclusive",
+                    "reason": "resolved target has no executable mapping for the requested canonical reasoning level",
+                    "transport": profile.transport.as_str(),
+                    "level": level.as_key(),
+                })));
+            }
+            internal.thinking = Some(level);
         }
         "tool_calling" => {
             internal.tools.push(crate::types::ToolDef {
@@ -3763,6 +3775,16 @@ pub async fn probe_model_capability(
                     )))
                 }
             }
+            probe_parameters.insert(
+                parameter.to_string(),
+                crate::types::ParamSpec {
+                    supported: true,
+                    min: None,
+                    max: None,
+                    default: None,
+                    policy: crate::types::ParamPolicy::Forward,
+                },
+            );
         }
         other => {
             return Err(ApiError::bad(format!(
