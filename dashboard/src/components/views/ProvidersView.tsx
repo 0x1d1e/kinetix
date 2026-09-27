@@ -162,16 +162,9 @@ const formatDriftValue = (value: unknown) => {
   return serialized === undefined ? String(value) : serialized;
 };
 
-const modelCanProbeReasoningDisable = (model: ModelConfig) => {
-  const discovery = model.discovery as {
-    reasoning_capability?: { can_disable?: boolean } | null;
-    latest_observation?: {
-      reasoning_capability?: { can_disable?: boolean } | null;
-    } | null;
-  } | undefined;
-  return discovery?.latest_observation?.reasoning_capability?.can_disable === true
-    || discovery?.reasoning_capability?.can_disable === true
-    || Object.prototype.hasOwnProperty.call(model.thinkingMap?.levels || {}, 'off');
+const modelCanProbeReasoningDisable = (model: ModelConfig, provider: Provider) => {
+  const transport = modelProbeTransport(model, provider);
+  return transport === 'openai' || transport === 'openai-responses';
 };
 
 
@@ -1745,7 +1738,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                   </button>
                                 );
                               })}
-                              {modelCanProbeReasoningDisable(m) && (() => {
+                              {modelCanProbeReasoningDisable(m, activeProvider) && (() => {
                                 const key = probeStatusKey(m, 'reasoning_disable', 'off');
                                 return (
                                   <button
