@@ -3787,8 +3787,7 @@ pub async fn update_model_reconciliation(
                 );
             }
             if has_reasoning_pins {
-                let overrides =
-                    merge_selected_reasoning_overrides(&discovery, &discovery, &pins);
+                let overrides = merge_selected_reasoning_overrides(&discovery, &discovery, &pins);
                 discovery_patch.insert(
                     "operator_reasoning_overrides".into(),
                     Value::Object(overrides),
@@ -5665,13 +5664,11 @@ mod model_lifecycle_regression_tests {
 
     #[test]
     fn reasoning_disable_probe_uses_transport_specific_candidate_mapping() {
-        let responses =
-            reasoning_disable_probe_thinking_map(&crate::adapters::TargetTransport::OpenAiResponses)
-                .unwrap();
-        assert_eq!(
-            responses.level_field.as_deref(),
-            Some("reasoning.effort")
-        );
+        let responses = reasoning_disable_probe_thinking_map(
+            &crate::adapters::TargetTransport::OpenAiResponses,
+        )
+        .unwrap();
+        assert_eq!(responses.level_field.as_deref(), Some("reasoning.effort"));
         assert_eq!(responses.levels.get("off"), Some(&json!("none")));
 
         let chat =
@@ -5824,9 +5821,7 @@ fn structured_output_probe_contract(value: &Value) -> bool {
     object.len() == 1 && object.get("ok").and_then(Value::as_str).is_some()
 }
 
-fn reasoning_disable_probe_contract(
-    events: &[crate::types::StreamEvent],
-) -> Option<bool> {
+fn reasoning_disable_probe_contract(events: &[crate::types::StreamEvent]) -> Option<bool> {
     events.iter().find_map(|event| match event {
         crate::types::StreamEvent::Usage(usage) => {
             usage.thinking.map(|reasoning_tokens| reasoning_tokens == 0)
