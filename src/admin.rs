@@ -11941,7 +11941,7 @@ mod reasoning_discovery_control_plane_tests {
                 actor: "admin".into(),
                 token: "test".into(),
             },
-            Path(provider_id),
+            Path(provider_id.clone()),
         )
         .await
         .unwrap();
@@ -11977,6 +11977,10 @@ mod reasoning_discovery_control_plane_tests {
         assert_eq!(
             discovery["latest_observation"]["raw_metadata_truncated"],
             false
+        );
+        assert!(
+            discovery.get("reasoning_capability").is_none(),
+            "fresh reasoning metadata must remain observational until accepted"
         );
 
         assert_eq!(rediscovered.context_window, Some(4096));
