@@ -33,7 +33,7 @@ providers and wire formats.
 | `round-robin` | Rotate the starting target per request. |
 | `weighted` | Choose proportionally to target weight. |
 | `least-used` | Prefer the target with the fewest lifetime requests. |
-| `adaptive` | Prefer available target-local concurrency, then overload/error/TTFT telemetry. Cold TTFT uses the route-wide median observed TTFT as a neutral score. |
+| `adaptive` | Prefer available target-local concurrency, account-global quota headroom, then lower overload/error EWMAs and TTFT. Unknown quota is neutral; cold TTFT uses the route-wide median observed TTFT. |
 
 For `adaptive` routes, Kinetix holds a target-local concurrency permit for the
 full upstream stream and records dispatch-to-first-semantic-event TTFT immediately.
@@ -49,7 +49,11 @@ failures do not permanently sideline recovered targets. TTFT observations also
 become cold after five minutes without a new sample, allowing a previously slow
 target to return to the route's neutral TTFT baseline. Adaptive ordering runs only
 after hard eligibility (predicate, provider restriction, capability, and context
-checks). Within the remaining candidates, only currently dispatchable accounts
+checks). Account-global quota headroom is the next sort key after capacity;
+only fresh explicit account-global observations contribute, while generic
+response-header buckets remain diagnostic. The Route Trace records the frozen
+quota evidence from that ordering pass. Within the remaining candidates, only
+currently dispatchable accounts
 (healthy accounts plus legitimate circuit half-open probes) contribute adaptive
 telemetry or represent a logical route target; unavailable siblings remain in the
 fallback list but cannot shift its ranking. One immutable score is computed per

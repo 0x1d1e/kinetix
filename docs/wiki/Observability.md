@@ -16,6 +16,34 @@ It stays **HTTP 200** while the data plane is serviceable. `control_plane:
 degraded` means the store is unavailable but inference still works from the
 in-memory snapshot, so the instance is not dropped from a load balancer.
 
+## Runtime health
+
+`GET /admin/api/health/runtime` requires admin auth. Its `window` query accepts
+`5m`, `1h`, or `24h` (default `1h`). The response combines persisted telemetry
+at provider, account, and model scope with live provider circuit states and
+quota observations.
+
+Telemetry keeps separate counters for rate limits, quota exhaustion, server
+errors, connection errors, timeouts, authentication errors, target errors, and
+bad requests. Rate-limit headers remain visible as bucket headroom and reset
+diagnostics, and may set a 429 cooldown. Their scope can be request- or
+model-specific, so they do not affect account-wide adaptive ordering or exhaust
+an account. Adaptive quota preference and hard exhaustion use explicit
+account-global evidence, such as account quota status or a plugin health probe.
+Kinetix parses countdown reset values with `ms`, `s`, `m`, and `h` units, as
+well as numeric seconds, Unix timestamps, and RFC3339 timestamps. Expired
+observations are neutral to routing.
+
+Runtime Health quota rows keep the latest diagnostic observation in their
+existing top-level fields. The nested `routing` object reports the separate
+account-global snapshot (`scope`, source, headroom, reset, and freshness)
+eligible to influence adaptive ordering; `routing_eligible` is false for stale
+evidence, and `null` means no account-global observation has been reported.
+
+The Runtime Health provider-circuit rejection count is a target-candidate count,
+not a unique-request count. A logical request may contribute multiple rejects
+when it skips multiple targets behind an open provider circuit.
+
 ## Metrics
 
 `GET /admin/api/metrics` emits Prometheus text (requires admin auth):
@@ -63,7 +91,12 @@ fallback causes, the commit point, and the final result.
 - Retrieve by the client's opaque id: `GET /admin/api/route-traces/{krt_…}`.
 
 Trace steps look like `resolve → candidate → skip → attempt → commit → result`
-with per-step timings and warnings. Each target attempt includes its structured
+with per-step timings and warnings. Adaptive quota-evidence steps use the exact
+frozen account-global snapshots captured for that ordering pass, rather than a
+later registry read. When Kinetix opens its provider circuit, the
+trace records a `provider_circuit` step at the transition, including transitions
+recorded while finalizing a committed stream; it does not require a later target to
+be rejected by that circuit. Each target attempt includes its structured
 `resolved_transport` value (for example, `openai-responses`) so transport and
 endpoint decisions can be diagnosed without exposing credentials.
 

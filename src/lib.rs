@@ -49,11 +49,14 @@ pub mod pipeline;
 pub mod plugins;
 pub mod pool;
 pub mod predicate;
+pub mod provider_circuit;
+pub mod quota;
 pub mod ratelimit;
 pub mod registry;
 pub mod router;
 pub mod server;
 pub mod sse;
+pub mod target_telemetry;
 #[cfg(test)]
 mod torture;
 pub mod trace;

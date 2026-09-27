@@ -71,6 +71,12 @@ pub struct AppState {
     /// Target-local adaptive upstream concurrency. This is deliberately
     /// independent from virtual-key admission limits.
     pub upstream_traffic: crate::upstream_traffic::UpstreamTraffic,
+    /// Fresh provider/account quota evidence used only by adaptive routing.
+    pub quota: crate::quota::QuotaRegistry,
+    /// Provider-wide correlated transient-failure breaker.
+    pub provider_circuits: crate::provider_circuit::ProviderCircuits,
+    /// Durable per-target telemetry; request-path recording is non-blocking.
+    pub target_telemetry: crate::target_telemetry::TargetTelemetry,
     /// Per-IP abuse limiter (NFR-3.6), applied before virtual-key auth.
     pub ip_limiter: crate::ratelimit::IpLimiter,
     /// In-memory admin sessions (dropped on restart; TTL-bounded).
@@ -145,6 +151,7 @@ impl AppState {
         let credentials = Arc::new(StaticKeyStrategy::new(crypto.clone()));
         let sessions = Arc::new(crate::auth::Sessions::new(config.session_ttl_minutes));
         let plugin_auth_sessions = Arc::new(crate::auth::PluginAuthSessions::new());
+        let target_telemetry = crate::target_telemetry::TargetTelemetry::new(pool.clone());
         let (hook_tx, hook_rx) = tokio::sync::mpsc::channel::<HookJob>(HOOK_QUEUE_CAPACITY);
         spawn_hook_worker(hook_rx);
         AppState {
@@ -176,6 +183,9 @@ impl AppState {
             last_backup_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             admission: crate::admission::AdmissionController::default(),
             upstream_traffic: crate::upstream_traffic::UpstreamTraffic::default(),
+            quota: crate::quota::QuotaRegistry::default(),
+            provider_circuits: crate::provider_circuit::ProviderCircuits::default(),
+            target_telemetry,
             ip_limiter: crate::ratelimit::IpLimiter::new(config_ip_limit),
             sessions,
             plugin_auth_sessions,

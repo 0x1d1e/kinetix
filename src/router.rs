@@ -137,6 +137,7 @@ pub fn build(state: AppState) -> Router {
         )
         .route("/exports/{name}", delete(admin::delete_export))
         .route("/metrics", get(admin::metrics))
+        .route("/health/runtime", get(admin::runtime_health))
         // Plugins
         .route("/plugins", get(admin::list_plugins))
         .route("/plugins/catalog", get(admin::plugin_catalog))

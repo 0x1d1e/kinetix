@@ -17,6 +17,7 @@ import { ProvidersView } from './components/views/ProvidersView';
 import { AccountsView } from './components/views/AccountsView';
 import { UsageView } from './components/views/UsageView';
 import { RequestsView } from './components/views/RequestsView';
+import { HealthView } from './components/views/HealthView';
 import { LiveRequest } from './types';
 import { AliasesView } from './components/views/AliasesView';
 import { AuditView } from './components/views/AuditView';
@@ -569,6 +570,8 @@ export default function App() {
         {activeTab === 'requests' && (
           <RequestsView requests={requests} liveRequests={liveRequests} />
         )}
+
+        {activeTab === 'health' && <HealthView />}
 
         {activeTab === 'aliases' && (
           <AliasesView

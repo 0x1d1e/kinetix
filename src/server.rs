@@ -15,7 +15,7 @@ use crate::logqueue::UsageLogQueue;
 use crate::opaque_state::OpaqueStateStore;
 use crate::plugins::{HostPolicy, PluginManager};
 use crate::registry::Registry;
-use crate::{alerts, bootstrap, db, export, router};
+use crate::{alerts, bootstrap, db, export, pool, router};
 
 pub fn init_tracing(json: bool) {
     let filter = EnvFilter::try_from_default_env()
@@ -444,6 +444,17 @@ pub fn spawn_background_tasks(state: AppState) {
 /// plugin knows is cooling down or out of quota. The core still owns the policy
 /// decision (cooldown windows, circuit breakers); the plugin only supplies
 /// evidence.
+fn plugin_quota_reset_at(
+    reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    retry_after_secs: Option<u64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    reset_at.or_else(|| {
+        let seconds = i64::try_from(retry_after_secs?).ok()?;
+        now.checked_add_signed(chrono::Duration::try_seconds(seconds)?)
+    })
+}
+
 async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>) {
     let providers = match db::list_providers(&state.pool).await {
         Ok(p) => p,
@@ -483,6 +494,29 @@ async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>
                     continue;
                 }
             };
+            let quota_observation = state.quota.observe_plugin(
+                &provider.id,
+                &account.id,
+                obs.quota_state.as_deref(),
+                obs.reset_at.as_deref(),
+            );
+            if let Some(observation) = quota_observation.filter(|observation| observation.exhausted)
+            {
+                let _ = pool::mark_exhausted(
+                    &state.pool,
+                    &account.id,
+                    plugin_quota_reset_at(
+                        observation.reset_at,
+                        obs.retry_after,
+                        chrono::Utc::now(),
+                    ),
+                    3600,
+                    "plugin health probe: quota exhausted",
+                )
+                .await;
+                let _ = state.registry.reload(&state.pool).await;
+                continue;
+            }
             match obs.state.as_str() {
                 "healthy" => {
                     if account.status != "healthy" {
@@ -581,6 +615,21 @@ mod tests {
     use axum::{routing::get, Router};
     use std::sync::{Arc, Mutex};
     use tokio::sync::oneshot;
+
+    #[test]
+    fn plugin_quota_retry_hint_supplies_missing_reset_safely() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            plugin_quota_reset_at(None, Some(90), now),
+            Some(now + chrono::Duration::seconds(90))
+        );
+        let explicit = now + chrono::Duration::seconds(300);
+        assert_eq!(
+            plugin_quota_reset_at(Some(explicit), Some(90), now),
+            Some(explicit)
+        );
+        assert_eq!(plugin_quota_reset_at(None, Some(u64::MAX), now), None);
+    }
 
     /// A real temp-file-backed opaque-state store, so the shutdown-flush
     /// regression can prove SQLite durability rather than only RAM.

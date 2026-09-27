@@ -414,6 +414,97 @@ pub async fn overview(State(state): State<AppState>, _auth: AdminAuth) -> ApiRes
     })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RuntimeHealthQuery {
+    pub window: Option<String>,
+}
+
+pub async fn runtime_health(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Query(query): Query<RuntimeHealthQuery>,
+) -> ApiResult {
+    let window_secs = match query.window.as_deref().unwrap_or("1h") {
+        "5m" => 5 * 60,
+        "1h" => 60 * 60,
+        "24h" => 24 * 60 * 60,
+        other => {
+            return Err(ApiError::bad(format!(
+                "unsupported health window '{other}'"
+            )))
+        }
+    };
+    let telemetry = state
+        .target_telemetry
+        .summaries(&state.pool, window_secs)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let mut provider_circuits = state.provider_circuits.snapshots();
+    provider_circuits.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+
+    let routing_quota = state
+        .quota
+        .routing_observations()
+        .into_iter()
+        .map(|(provider_id, account_id, snapshot, fresh)| {
+            (
+                (provider_id, account_id),
+                json!({
+                    "scope": "account-global",
+                    "remaining_fraction": snapshot.remaining_fraction,
+                    "reset_at": snapshot.reset_at,
+                    "observed_at": snapshot.observed_at,
+                    "source": snapshot.source,
+                    "max_age_secs": snapshot.max_age_secs,
+                    "freshness": if fresh { "fresh" } else { "stale" },
+                    "routing_eligible": fresh,
+                }),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut quota = state
+        .quota
+        .observations()
+        .into_iter()
+        .map(|(provider_id, account_id, snapshot, fresh)| {
+            let routing = routing_quota
+                .get(&(provider_id.clone(), account_id.clone()))
+                .cloned()
+                .unwrap_or(Value::Null);
+            json!({
+                "provider_id": provider_id,
+                "account_id": account_id,
+                "remaining_fraction": snapshot.remaining_fraction,
+                "reset_at": snapshot.reset_at,
+                "observed_at": snapshot.observed_at,
+                "source": snapshot.source,
+                "max_age_secs": snapshot.max_age_secs,
+                "freshness": if fresh { "fresh" } else { "stale" },
+                "routing": routing,
+            })
+        })
+        .collect::<Vec<_>>();
+    quota.sort_by(|a, b| {
+        a["provider_id"]
+            .as_str()
+            .cmp(&b["provider_id"].as_str())
+            .then_with(|| a["account_id"].as_str().cmp(&b["account_id"].as_str()))
+    });
+
+    Ok(Json(json!({
+        "window": query.window.unwrap_or_else(|| "1h".into()),
+        "telemetry": telemetry,
+        "provider_circuits": provider_circuits,
+        "quota": quota,
+        "dropped": {
+            "queue": state.target_telemetry.dropped_queue(),
+            "persistence": state.target_telemetry.dropped_persistence(),
+        },
+    })))
+}
+
 // ===========================================================================
 // Virtual keys
 // ===========================================================================
@@ -4184,6 +4275,74 @@ pub async fn metrics(State(state): State<AppState>, _auth: AdminAuth) -> Respons
         "kinetix_route_skip_total {}\n",
         state.route_skips.load(std::sync::atomic::Ordering::Relaxed)
     ));
+    body.push_str(
+        "# HELP kinetix_provider_circuit_open 1 when a provider circuit is open or half-open\n",
+    );
+    body.push_str("# TYPE kinetix_provider_circuit_open gauge\n");
+    body.push_str(
+        "# HELP kinetix_provider_circuit_opens_total Provider circuit open transitions\n",
+    );
+    body.push_str("# TYPE kinetix_provider_circuit_opens_total counter\n");
+    body.push_str(
+        "# HELP kinetix_provider_circuit_recoveries_total Successful half-open recoveries\n",
+    );
+    body.push_str("# TYPE kinetix_provider_circuit_recoveries_total counter\n");
+    body.push_str(
+        "# HELP kinetix_provider_circuit_rejects_total Target candidates rejected by an open provider circuit; one request may count more than once\n",
+    );
+    body.push_str("# TYPE kinetix_provider_circuit_rejects_total counter\n");
+    body.push_str(
+        "# HELP kinetix_provider_circuit_half_open_probes_total Half-open provider probes started\n",
+    );
+    body.push_str("# TYPE kinetix_provider_circuit_half_open_probes_total counter\n");
+    for circuit in state.provider_circuits.snapshots() {
+        let provider_id = circuit
+            .provider_id
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        let open = if circuit.state == crate::provider_circuit::ProviderCircuitState::Closed {
+            0
+        } else {
+            1
+        };
+        body.push_str(&format!(
+            "kinetix_provider_circuit_open{{provider_id=\"{provider_id}\"}} {open}\n"
+        ));
+        body.push_str(&format!(
+            "kinetix_provider_circuit_opens_total{{provider_id=\"{provider_id}\"}} {}\n",
+            circuit.opens
+        ));
+        body.push_str(&format!(
+            "kinetix_provider_circuit_recoveries_total{{provider_id=\"{provider_id}\"}} {}\n",
+            circuit.recoveries
+        ));
+        body.push_str(&format!(
+            "kinetix_provider_circuit_rejects_total{{provider_id=\"{provider_id}\"}} {}\n",
+            circuit.rejects
+        ));
+        body.push_str(&format!(
+            "kinetix_provider_circuit_half_open_probes_total{{provider_id=\"{provider_id}\"}} {}\n",
+            circuit.half_open_probes
+        ));
+    }
+    body.push_str(
+        "# HELP kinetix_target_telemetry_queue_dropped_total Target telemetry events dropped because the queue was full\n",
+    );
+    body.push_str("# TYPE kinetix_target_telemetry_queue_dropped_total counter\n");
+    body.push_str(&format!(
+        "kinetix_target_telemetry_queue_dropped_total {}\n",
+        state.target_telemetry.dropped_queue()
+    ));
+    body.push_str(
+        "# HELP kinetix_target_telemetry_persistence_dropped_total Target telemetry events lost on persistence failure\n",
+    );
+    body.push_str("# TYPE kinetix_target_telemetry_persistence_dropped_total counter\n");
+    body.push_str(&format!(
+        "kinetix_target_telemetry_persistence_dropped_total {}\n",
+        state.target_telemetry.dropped_persistence()
+    ));
+
     body.push_str(
         "# HELP kinetix_flight_recorder_requests Requests tracked by the flight recorder\n",
     );
@@ -9634,5 +9793,48 @@ mod credential_enrollment_regression_tests {
 
         let _ = std::fs::remove_dir_all(source_root);
         let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn runtime_health_separates_diagnostic_and_routing_quota_evidence() {
+        let (state, root) = test_state("runtime-quota-evidence").await;
+        state.quota.observe_account_global(
+            "provider-test",
+            "account-test",
+            Some(0.75),
+            None,
+            "plugin_health_probe",
+            std::time::Duration::from_secs(60),
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining-requests", "0".parse().unwrap());
+        state
+            .quota
+            .observe_headers("provider-test", "account-test", &headers)
+            .unwrap();
+
+        let response = runtime_health(
+            State(state.clone()),
+            auth(),
+            Query(RuntimeHealthQuery {
+                window: Some("1h".into()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let quota = &response["quota"][0];
+        assert_eq!(quota["remaining_fraction"], 0.0);
+        assert_eq!(
+            quota["source"],
+            "response_header:x-ratelimit-remaining-requests"
+        );
+        assert_eq!(quota["routing"]["scope"], "account-global");
+        assert_eq!(quota["routing"]["remaining_fraction"], 0.75);
+        assert_eq!(quota["routing"]["source"], "plugin_health_probe");
+        assert_eq!(quota["routing"]["routing_eligible"], true);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

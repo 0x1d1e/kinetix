@@ -18,6 +18,7 @@ expose it behind Cloudflare Access plus the in-Kinetix password/session check.
 | Method & path | Purpose |
 | --- | --- |
 | `GET /admin/api/overview` | Active streams, totals, spend, fallback rate, latency, key/account counts, queue depth, uptime, usage-confidence counts. |
+| `GET /admin/api/health/runtime` | Persisted telemetry for `window` (`5m`, `1h`, or `24h`; defaults to `1h`), live provider circuit states, and quota evidence. See [Observability](Observability). |
 | `GET /admin/api/metrics` | Prometheus text (`kinetix_*`). See [Observability](Observability). |
 
 ## Virtual keys

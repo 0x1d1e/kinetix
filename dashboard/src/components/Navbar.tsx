@@ -27,7 +27,7 @@ import { formatCurrency } from '../lib/designSystem';
 import { SketchButton, SketchBadge } from './HandDrawnElements';
 import type { ThemeMode } from '../lib/theme';
 
-export type NavTab = 'keys' | 'routes' | 'providers' | 'accounts' | 'plugins' | 'usage' | 'requests' | 'aliases' | 'audit' | 'settings';
+export type NavTab = 'keys' | 'routes' | 'providers' | 'accounts' | 'plugins' | 'usage' | 'requests' | 'health' | 'aliases' | 'audit' | 'settings';
 
 export const TAB_ROUTES: Record<NavTab, string> = {
   keys: '/admin/keys',
@@ -37,6 +37,7 @@ export const TAB_ROUTES: Record<NavTab, string> = {
   plugins: '/admin/plugins',
   usage: '/admin/usage',
   requests: '/admin/requests',
+  health: '/admin/health',
   aliases: '/admin/aliases',
   audit: '/admin/audit',
   settings: '/admin/settings',
@@ -77,6 +78,7 @@ export const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
     items: [
       { id: 'usage', label: 'Usage & Spend', icon: <BarChart3 className="w-5 h-5" /> },
       { id: 'requests', label: 'Request Inspector', icon: <Radio className="w-5 h-5" />, badge: 'Live' },
+      { id: 'health', label: 'Runtime Health', icon: <Activity className="w-5 h-5" /> },
       { id: 'audit', label: 'Audit Log', icon: <History className="w-5 h-5" /> },
     ],
   },
