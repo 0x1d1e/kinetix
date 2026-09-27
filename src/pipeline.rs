@@ -1823,7 +1823,11 @@ fn trace_adaptive_quota_evidence(
             "quota-evidence: not used (target was not dispatchable during adaptive ordering)".into()
         }
     };
-    trace.step("candidate", None, detail);
+    trace.step(
+        "candidate",
+        Some(target.account.label.clone()),
+        detail,
+    );
 }
 
 fn adaptive_candidate_key(t: &ResolvedTarget) -> String {
@@ -6128,6 +6132,10 @@ mod route_policy_tests {
         );
         let mut trace = RouteTrace::new("request".into(), "model".into());
         trace_adaptive_quota_evidence(&mut trace, &preferred, &ordering.quota_evidence);
+        assert_eq!(
+            trace.steps[0].target.as_deref(),
+            Some(preferred.account.label.as_str())
+        );
         let detail = &trace.steps[0].detail;
         assert!(detail.contains("remaining=75.0%"), "{detail}");
         assert!(detail.contains("source=plugin_health_probe"), "{detail}");
