@@ -1088,8 +1088,7 @@ fn price_provenance_matches(
     if stored_source != source {
         return false;
     }
-    serde_json::from_str::<Value>(stored_metadata)
-        .is_ok_and(|stored| stored == *source_metadata)
+    serde_json::from_str::<Value>(stored_metadata).is_ok_and(|stored| stored == *source_metadata)
 }
 
 fn price_snapshot_matches(
@@ -1958,7 +1957,6 @@ pub async fn purge_old_route_traces(pool: &Pool, retain_days: i64) -> Result<u64
         .await?;
     Ok(res.rows_affected())
 }
-
 
 #[cfg(test)]
 mod price_version_identity_tests {
