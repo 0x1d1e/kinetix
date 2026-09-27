@@ -1969,7 +1969,7 @@ mod execution_profile_tests {
                         "provider_id": "provider",
                         "account_id": "account-a",
                         "model_id": "model",
-                        "transport": "openai-chat"
+                        "transport": "openai"
                     }
                 }
             }
@@ -1994,7 +1994,7 @@ mod execution_profile_tests {
                         "provider_id": "provider",
                         "account_id": "account-a",
                         "model_id": "model",
-                        "transport": "openai-chat"
+                        "transport": "openai"
                     }
                 }
             }
@@ -2026,7 +2026,7 @@ mod execution_profile_tests {
                         "provider_id": "provider",
                         "account_id": "account-a",
                         "model_id": "model",
-                        "transport": "openai-chat"
+                        "transport": "openai"
                     }
                 }
             }
