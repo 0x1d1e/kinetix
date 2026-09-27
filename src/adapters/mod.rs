@@ -408,8 +408,7 @@ pub fn resolve_execution_profile_for_target(
 
     let mut parameters = model.params();
     let parameter_ownership = discovery.get("operator_parameter_overrides");
-    let operator_parameter_overrides =
-        parameter_ownership.and_then(serde_json::Value::as_object);
+    let operator_parameter_overrides = parameter_ownership.and_then(serde_json::Value::as_object);
     if let Some(evidence) = discovery
         .get("probe_evidence")
         .and_then(serde_json::Value::as_object)

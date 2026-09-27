@@ -2572,9 +2572,12 @@ fn metadata_marks_deprecated(value: &Value) -> bool {
 }
 
 fn first_metadata_value(value: &Value, pointers: &[&str]) -> Option<Value> {
-    pointers
-        .iter()
-        .find_map(|pointer| value.pointer(pointer).filter(|value| !value.is_null()).cloned())
+    pointers.iter().find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .filter(|value| !value.is_null())
+            .cloned()
+    })
 }
 
 fn deprecation_details(observation: &DiscoveredObservation) -> Option<Value> {
@@ -2830,7 +2833,11 @@ fn reconciliation_diff(row: &db::ModelRow, observation: &DiscoveredObservation) 
         let configured = discovery
             .get("configured_transport")
             .and_then(Value::as_str)
-            .or_else(|| discovery.pointer("/transport/format").and_then(Value::as_str));
+            .or_else(|| {
+                discovery
+                    .pointer("/transport/format")
+                    .and_then(Value::as_str)
+            });
         push_diff(
             &mut diff,
             "transport",
@@ -3831,13 +3838,9 @@ pub async fn update_model_reconciliation(
                 );
             }
             if !accepted_discovery.is_empty() {
-                db::merge_model_discovery(
-                    &state.pool,
-                    &id,
-                    &Value::Object(accepted_discovery),
-                )
-                .await
-                .map_err(ApiError::internal)?;
+                db::merge_model_discovery(&state.pool, &id, &Value::Object(accepted_discovery))
+                    .await
+                    .map_err(ApiError::internal)?;
             }
 
             if accepted_prices {
@@ -3863,15 +3866,9 @@ pub async fn update_model_reconciliation(
                     "operator_accept".to_string()
                 };
                 let metadata = json!({ "fields": fields });
-                db::commit_effective_model_pricing(
-                    &state.pool,
-                    &id,
-                    &prices,
-                    &source,
-                    &metadata,
-                )
-                .await
-                .map_err(ApiError::internal)?;
+                db::commit_effective_model_pricing(&state.pool, &id, &prices, &source, &metadata)
+                    .await
+                    .map_err(ApiError::internal)?;
             }
 
             let remaining = remaining_reconciliation_diff(&reconciliation, &selected);
@@ -6521,15 +6518,9 @@ pub async fn update_model(
         .await
         .map_err(ApiError::internal)?;
     }
-    db::commit_effective_model_pricing(
-        &state.pool,
-        &id,
-        &prices,
-        &price_source,
-        &price_metadata,
-    )
-    .await
-    .map_err(ApiError::internal)?;
+    db::commit_effective_model_pricing(&state.pool, &id, &prices, &price_source, &price_metadata)
+        .await
+        .map_err(ApiError::internal)?;
     let _ = db::insert_audit(
         &state.pool,
         "admin",
