@@ -2385,5 +2385,4 @@ mod execution_profile_tests {
         assert!(!profile.thinking_map.level_is_executable("off"));
         assert!(!profile.thinking_map.levels.contains_key("off"));
     }
-
 }

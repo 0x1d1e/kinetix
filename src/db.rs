@@ -1190,7 +1190,6 @@ pub async fn ensure_price_version(
     ))
 }
 
-
 async fn ensure_price_version_in_transaction(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     model_id: &str,
@@ -2541,5 +2540,4 @@ mod price_version_identity_tests {
         drop(pool);
         let _ = std::fs::remove_dir_all(root);
     }
-
 }

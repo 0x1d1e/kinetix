@@ -433,7 +433,6 @@ async fn run_model_lifecycle_lane(
     }
 }
 
-
 #[derive(Debug, Clone, Copy)]
 struct ModelLifecycleSettings {
     reconciliation_interval_secs: u64,
@@ -2916,8 +2915,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
     // fails closed rather than silently falling back to native discovery
     // (§6.0).
     let (mut discovered, models_dev_available): (Vec<DiscoveredObservation>, bool) =
-        if let Some(pref) = provider.model_source_plugin_ref()
-    {
+        if let Some(pref) = provider.model_source_plugin_ref() {
         let manager = plugin_manager(&state)?;
         let reference = format!("plugin:{}/{}", pref.plugin_id, pref.capability);
         let account_aware = manager
@@ -2986,7 +2984,8 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
         let models_dev =
             crate::model_catalog::ModelsDevCatalog::fetch(&state.http, &provider.base_url).await;
         let models_dev_available = models_dev.is_some();
-        let discovered = list.into_iter()
+        let discovered = list
+            .into_iter()
             .map(|m| {
                 let provider_metadata = m.raw_metadata.as_deref().map(|value| {
                     serde_json::from_str::<Value>(value)
@@ -4401,14 +4400,12 @@ fn normalize_capability_probe_value(
 
     match value {
         None => Ok(Some(json!("off"))),
-        Some(Value::String(level))
-            if matches!(
-                level.trim().to_ascii_lowercase().as_str(),
-                "off" | "none"
-            ) =>
-        {
-            Ok(Some(json!("off")))
-        }
+        Some(Value::String(level)) => match level.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" => Ok(Some(json!("off"))),
+            _ => Err(ApiError::bad(
+                "reasoning_disable probe only accepts value 'off'/'none' or an omitted value",
+            )),
+        },
         Some(_) => Err(ApiError::bad(
             "reasoning_disable probe only accepts value 'off'/'none' or an omitted value",
         )),
@@ -5195,7 +5192,6 @@ mod model_lifecycle_regression_tests {
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
-
     #[tokio::test]
     async fn initial_scheduled_pass_waits_for_stable_jitter_without_fake_attempt() {
         let root = std::env::temp_dir().join(format!(
@@ -5207,7 +5203,8 @@ mod model_lifecycle_regression_tests {
         let pool = db::connect(&url).await.unwrap();
         db::migrate(&pool).await.unwrap();
 
-        let mut key = "model_reconciliation_last_attempt:provider-jitter".to_string();
+        let mut key =
+            lifecycle_setting_key("reconciliation", "last_attempt", "provider-jitter");
         while stable_schedule_jitter(&key, 300) == 0 {
             key.push('x');
         }
@@ -5223,7 +5220,6 @@ mod model_lifecycle_regression_tests {
         drop(pool);
         let _ = std::fs::remove_dir_all(root);
     }
-
 }
 
 #[cfg(test)]
@@ -12647,6 +12643,44 @@ mod credential_enrollment_regression_tests {
             actor: "test".into(),
             token: "test-admin".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn reasoning_disable_api_validates_value_before_model_lookup() {
+        let (state, root) = test_state("reasoning-disable-probe").await;
+
+        let invalid = probe_model_capability(
+            State(state.clone()),
+            auth(),
+            Path("missing-model".into()),
+            Json(CapabilityProbeBody {
+                account_id: None,
+                capability: "reasoning_disable".into(),
+                value: Some(json!("low")),
+                max_cost_usd: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid.0, StatusCode::BAD_REQUEST);
+
+        let omitted = probe_model_capability(
+            State(state.clone()),
+            auth(),
+            Path("missing-model".into()),
+            Json(CapabilityProbeBody {
+                account_id: None,
+                capability: "reasoning_disable".into(),
+                value: None,
+                max_cost_usd: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(omitted.0, StatusCode::NOT_FOUND);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     async fn insert_provider(
