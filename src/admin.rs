@@ -2833,6 +2833,19 @@ pub async fn update_model_reconciliation(
     } else {
         body.fields.clone()
     };
+    if !body.fields.is_empty() {
+        let unknown: Vec<&str> = selected
+            .iter()
+            .filter(|field| !available.iter().any(|candidate| candidate == *field))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            return Err(ApiError::bad(format!(
+                "reconciliation fields are not currently actionable: {}",
+                unknown.join(", ")
+            )));
+        }
+    }
 
     match body.action.as_str() {
         "ignore" => {
@@ -2872,6 +2885,23 @@ pub async fn update_model_reconciliation(
             object.insert(
                 "pinned_fields".into(),
                 Value::Array(merged.into_iter().map(Value::String).collect()),
+            );
+            let remaining: Vec<Value> = object
+                .get("diff")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|item| {
+                    item.get("field")
+                        .and_then(Value::as_str)
+                        .is_none_or(|field| !pins.iter().any(|pinned| pinned == field))
+                })
+                .cloned()
+                .collect();
+            object.insert("diff".into(), Value::Array(remaining.clone()));
+            object.insert(
+                "status".into(),
+                json!(if remaining.is_empty() { "unchanged" } else { "changed" }),
             );
             object.insert("decision_at".into(), json!(db::now_iso()));
         }
@@ -3029,11 +3059,26 @@ pub async fn update_model_reconciliation(
                 .map_err(ApiError::internal)?;
             }
 
+            let remaining: Vec<Value> = reconciliation
+                .get("diff")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|item| {
+                    item.get("field")
+                        .and_then(Value::as_str)
+                        .is_none_or(|field| !selected.iter().any(|accepted| accepted == field))
+                })
+                .cloned()
+                .collect();
             let object = reconciliation
                 .as_object_mut()
                 .ok_or_else(|| ApiError::internal("invalid reconciliation metadata"))?;
-            object.insert("status".into(), json!("accepted"));
-            object.insert("diff".into(), json!([]));
+            object.insert(
+                "status".into(),
+                json!(if remaining.is_empty() { "accepted" } else { "changed" }),
+            );
+            object.insert("diff".into(), Value::Array(remaining));
             object.remove("ignored_diff");
             object.insert("decision_at".into(), json!(db::now_iso()));
             state
