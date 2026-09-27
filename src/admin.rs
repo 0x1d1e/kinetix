@@ -2330,6 +2330,196 @@ fn discovery_object(row: &db::ModelRow) -> Value {
     serde_json::from_str::<Value>(&row.discovery).unwrap_or_else(|_| json!({}))
 }
 
+fn provenance_mentions_models_dev(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|source| source.split('+').any(|part| part.starts_with("models.dev")))
+}
+
+fn provenance_is_live_observation(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_str).is_some_and(|source| {
+        source.contains("provider_metadata")
+            || source.contains("plugin_capabilities_json")
+            || source == "upstream_discovery"
+    })
+}
+
+fn set_provenance_field(target: &mut Value, field: &str, source: &Value) {
+    if let Some(fields) = target.as_object_mut() {
+        fields.insert(field.to_string(), source.clone());
+    }
+}
+
+fn set_observed_capability(
+    capabilities: &mut ModelCapabilityFlags,
+    field: &str,
+    value: Option<bool>,
+) {
+    match field {
+        "text" => capabilities.text = value,
+        "reasoning" => capabilities.reasoning = value,
+        "vision" => capabilities.vision = value,
+        "tool_calling" => capabilities.tool_calling = value,
+        "structured_output" => capabilities.structured_output = value,
+        _ => {}
+    }
+}
+
+/// When models.dev is unavailable, absence of fresh catalog data is not
+/// evidence that previously observed catalog facts disappeared. Reuse only
+/// persisted models.dev-owned fields, and never override fresh provider/plugin
+/// observations.
+fn preserve_last_known_catalog_observation(
+    row: &db::ModelRow,
+    observation: &mut DiscoveredObservation,
+) {
+    let previous = discovery_object(row);
+    let previous_sources = previous
+        .get("capability_sources")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    for field in ["context_window", "max_output_tokens"] {
+        let previous_source = previous_sources.get(field);
+        let current_source = observation.capability_sources.get(field);
+        if !provenance_mentions_models_dev(previous_source)
+            || provenance_is_live_observation(current_source)
+        {
+            continue;
+        }
+        match field {
+            "context_window" => {
+                observation.model.context_window =
+                    previous.get(field).and_then(Value::as_i64);
+            }
+            "max_output_tokens" => {
+                observation.model.max_output_tokens =
+                    previous.get(field).and_then(Value::as_i64);
+            }
+            _ => {}
+        }
+        if let Some(source) = previous_source {
+            set_provenance_field(&mut observation.capability_sources, field, source);
+        }
+    }
+
+    let previous_capabilities = previous
+        .get("capabilities")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    for field in [
+        "text",
+        "reasoning",
+        "vision",
+        "tool_calling",
+        "structured_output",
+    ] {
+        let previous_source = previous_sources.get(field);
+        let current_source = observation.capability_sources.get(field);
+        if !provenance_mentions_models_dev(previous_source)
+            || provenance_is_live_observation(current_source)
+        {
+            continue;
+        }
+        set_observed_capability(
+            &mut observation.capabilities,
+            field,
+            previous_capabilities.get(field).and_then(Value::as_bool),
+        );
+        if field == "reasoning" {
+            observation.reasoning_support =
+                previous_capabilities.get(field).and_then(Value::as_bool);
+            observation.reasoning = previous
+                .get("reasoning_capability")
+                .filter(|value| !value.is_null())
+                .and_then(|value| {
+                    normalize_reasoning_capability(&json!({
+                        "reasoning_capability": value
+                    }))
+                });
+            observation.thinking_map = previous
+                .get("thinking_map")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<ThinkingMap>(value).ok());
+        }
+        if let Some(source) = previous_source {
+            set_provenance_field(&mut observation.capability_sources, field, source);
+        }
+    }
+
+    let previous_prices = previous
+        .get("prices")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Prices>(value).ok())
+        .unwrap_or_default();
+    let previous_price_sources = previous
+        .get("price_sources")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    for field in PRICE_FIELDS {
+        let previous_source = previous_price_sources.get(field);
+        let current_source = observation.price_sources.get(field);
+        if !provenance_mentions_models_dev(previous_source)
+            || provenance_is_live_observation(current_source)
+        {
+            continue;
+        }
+        set_price_field(
+            &mut observation.prices,
+            field,
+            price_field(&previous_prices, field),
+        );
+        if let Some(source) = previous_source {
+            set_provenance_field(&mut observation.price_sources, field, source);
+        }
+    }
+
+    let previous_catalog_is_models_dev = previous
+        .pointer("/catalog/source_state/source")
+        .and_then(Value::as_str)
+        == Some("models.dev");
+    if previous_catalog_is_models_dev {
+        if observation.modalities.is_none() {
+            observation.modalities = previous.get("modalities").cloned();
+        }
+        let previous_model_type_source = previous_sources.get("model_type");
+        let current_model_type_source = observation.capability_sources.get("model_type");
+        if provenance_mentions_models_dev(previous_model_type_source)
+            && !provenance_is_live_observation(current_model_type_source)
+        {
+            observation.model_type = previous
+                .get("model_type")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            observation.execution_supported =
+                previous
+                    .get("execution_supported")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_else(|| {
+                        execution_supported_for_model_type(observation.model_type.as_deref())
+                    });
+            if let Some(source) = previous_model_type_source {
+                set_provenance_field(
+                    &mut observation.capability_sources,
+                    "model_type",
+                    source,
+                );
+            }
+        }
+
+        observation.catalog = previous.get("catalog").cloned();
+        observation.canonical_identity = previous.get("canonical_identity").cloned();
+        observation.canonical_model_id = previous
+            .get("canonical_model_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        observation.canonical_match = previous
+            .get("canonical_match")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+}
+
 fn explicit_deprecation(observation: &DiscoveredObservation) -> bool {
     fn marked(value: &Value) -> bool {
         value.get("deprecated").and_then(Value::as_bool) == Some(true)
@@ -2683,8 +2873,8 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
     // plugin instead of the built-in adapter. A bound-but-unavailable plugin
     // fails closed rather than silently falling back to native discovery
     // (§6.0).
-    let discovered: Vec<DiscoveredObservation> = if let Some(pref) =
-        provider.model_source_plugin_ref()
+    let (mut discovered, models_dev_available): (Vec<DiscoveredObservation>, bool) =
+        if let Some(pref) = provider.model_source_plugin_ref()
     {
         let manager = plugin_manager(&state)?;
         let reference = format!("plugin:{}/{}", pref.plugin_id, pref.capability);
@@ -2753,7 +2943,8 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
 
         let models_dev =
             crate::model_catalog::ModelsDevCatalog::fetch(&state.http, &provider.base_url).await;
-        list.into_iter()
+        let models_dev_available = models_dev.is_some();
+        let discovered = list.into_iter()
             .map(|m| {
                 let provider_metadata = m.raw_metadata.as_deref().map(|value| {
                     serde_json::from_str::<Value>(value)
@@ -2783,7 +2974,8 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                     Some(catalog),
                 )
             })
-            .collect()
+            .collect();
+        (discovered, models_dev_available)
     } else {
         discover_models_native(&state, &provider).await?
     };
@@ -2797,6 +2989,16 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
     let existing = db::models_for_provider(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?;
+    if !models_dev_available {
+        for observation in &mut discovered {
+            if let Some(row) = existing
+                .iter()
+                .find(|row| row.upstream_id == observation.model.id)
+            {
+                preserve_last_known_catalog_observation(row, observation);
+            }
+        }
+    }
     let now = db::now_iso();
     let discovered_ids: std::collections::HashSet<String> = discovered
         .iter()
@@ -3759,7 +3961,7 @@ async fn credential_for_admin_action(
 async fn discover_models_native(
     state: &AppState,
     provider: &db::ProviderRow,
-) -> Result<Vec<DiscoveredObservation>, ApiError> {
+) -> Result<(Vec<DiscoveredObservation>, bool), ApiError> {
     let accounts = db::accounts_for_provider(&state.pool, &provider.id)
         .await
         .map_err(ApiError::internal)?;
@@ -3784,6 +3986,7 @@ async fn discover_models_native(
         url::Url::parse(&url).map_err(|e| ApiError::bad(format!("invalid discovery URL: {e}")))?;
     let models_dev =
         crate::model_catalog::ModelsDevCatalog::fetch(&state.http, &provider.base_url).await;
+    let models_dev_available = models_dev.is_some();
     let dummy_model = db::ModelRow {
         id: "discovery".into(),
         provider_id: provider.id.clone(),
@@ -3881,7 +4084,7 @@ async fn discover_models_native(
         );
     }
 
-    Ok(discovered)
+    Ok((discovered, models_dev_available))
 }
 
 /// `POST /admin/api/providers/:id/test` — send a minimal probe (FR-10.11).
@@ -4801,6 +5004,115 @@ mod model_lifecycle_regression_tests {
         .is_err());
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn catalog_outage_preserves_persisted_models_dev_observation() {
+        let row = db::ModelRow {
+            id: "model".into(),
+            provider_id: "provider".into(),
+            upstream_id: "model".into(),
+            display_name: "Model".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: "{}".into(),
+            prices: "{}".into(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: json!({
+                "context_window": 200000,
+                "max_output_tokens": 32768,
+                "capabilities": {
+                    "text": true,
+                    "reasoning": true,
+                    "tool_calling": true
+                },
+                "reasoning_capability": {
+                    "mode": "level",
+                    "levels": ["low", "high"],
+                    "can_disable": false,
+                    "upstream_format": "openai_effort"
+                },
+                "thinking_map": {
+                    "mode": "level",
+                    "levels": {"low": "low", "high": "high"},
+                    "level_field": "reasoning_effort"
+                },
+                "capability_sources": {
+                    "context_window": "models.dev:provider",
+                    "max_output_tokens": "models.dev:provider",
+                    "text": "models.dev:canonical",
+                    "reasoning": "models.dev:provider",
+                    "tool_calling": "models.dev:provider",
+                    "model_type": "models.dev:provider"
+                },
+                "prices": {
+                    "input_per_1m": 1.0,
+                    "output_per_1m": 4.0
+                },
+                "price_sources": {
+                    "input_per_1m": "models.dev:provider",
+                    "output_per_1m": "models.dev:provider"
+                },
+                "modalities": {"input": ["text"], "output": ["text"]},
+                "model_type": "chat",
+                "execution_supported": true,
+                "canonical_identity": {"status": "resolved"},
+                "canonical_model_id": "openai/model",
+                "canonical_match": "exact_model_id",
+                "catalog": {
+                    "source_state": {
+                        "source": "models.dev",
+                        "retrieved_at": "2026-09-27T00:00:00Z",
+                        "freshness": "fresh"
+                    }
+                }
+            })
+            .to_string(),
+            created_at: db::now_iso(),
+            opaque_state_plugin: String::new(),
+        };
+        let mut observation = discovered_observation(
+            crate::adapters::DiscoveredModel {
+                id: "model".into(),
+                display_name: Some("Model".into()),
+                context_window: None,
+                max_output_tokens: None,
+            },
+            Some(json!({
+                "capabilities": {"tool_calling": false}
+            })),
+            None,
+            WireFormat::Openai,
+        );
+
+        preserve_last_known_catalog_observation(&row, &mut observation);
+
+        assert_eq!(observation.model.context_window, Some(200000));
+        assert_eq!(observation.model.max_output_tokens, Some(32768));
+        assert_eq!(observation.capabilities.reasoning, Some(true));
+        assert_eq!(observation.capabilities.tool_calling, Some(false));
+        assert_eq!(
+            observation.capability_sources["reasoning"],
+            "models.dev:provider"
+        );
+        assert_eq!(
+            observation.capability_sources["tool_calling"],
+            "provider_metadata"
+        );
+        assert_eq!(observation.prices.input_per_1m, Some(1.0));
+        assert_eq!(observation.prices.output_per_1m, Some(4.0));
+        assert_eq!(
+            observation.catalog.as_ref().unwrap()["source_state"]["source"],
+            "models.dev"
+        );
+        assert_eq!(
+            observation.canonical_model_id.as_deref(),
+            Some("openai/model")
+        );
+    }
+
 }
 
 #[cfg(test)]
