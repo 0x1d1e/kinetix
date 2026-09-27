@@ -407,6 +407,9 @@ pub fn resolve_execution_profile_for_target(
     };
 
     let mut parameters = model.params();
+    let operator_parameter_overrides = discovery
+        .get("operator_parameter_overrides")
+        .and_then(serde_json::Value::as_object);
     if let Some(evidence) = discovery
         .get("probe_evidence")
         .and_then(serde_json::Value::as_object)
@@ -418,6 +421,13 @@ pub fn resolve_execution_profile_for_target(
             let Some(spec) = parameters.get_mut(parameter) else {
                 continue;
             };
+            if let Some(supported) = operator_parameter_overrides
+                .and_then(|overrides| overrides.get(parameter))
+                .and_then(serde_json::Value::as_bool)
+            {
+                spec.supported = supported;
+                continue;
+            }
             match fresh_probe_status(item, &provider.id, &model.id, account_id, &transport) {
                 Some("supported") => spec.supported = true,
                 Some("unsupported") => spec.supported = false,
@@ -2265,6 +2275,76 @@ mod execution_profile_tests {
         let other =
             resolve_execution_profile_for_target(&provider, &model, Some("account-b")).unwrap();
         assert!(other.parameters["temperature"].supported);
+    }
+
+    #[test]
+    fn operator_parameter_override_beats_supported_probe() {
+        let provider = provider();
+        let mut model = model();
+        model.parameters = serde_json::json!({
+            "temperature": {
+                "supported": false,
+                "policy": "reject"
+            }
+        })
+        .to_string();
+        model.discovery = serde_json::json!({
+            "operator_parameter_overrides": {
+                "temperature": false
+            },
+            "probe_evidence": {
+                "parameter_temperature": {
+                    "status": "supported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        assert!(!profile.parameters["temperature"].supported);
+    }
+
+    #[test]
+    fn operator_parameter_override_beats_unsupported_probe() {
+        let provider = provider();
+        let mut model = model();
+        model.parameters = serde_json::json!({
+            "temperature": {
+                "supported": true,
+                "policy": "reject"
+            }
+        })
+        .to_string();
+        model.discovery = serde_json::json!({
+            "operator_parameter_overrides": {
+                "temperature": true
+            },
+            "probe_evidence": {
+                "parameter_temperature": {
+                    "status": "unsupported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        assert!(profile.parameters["temperature"].supported);
     }
 
     #[test]
