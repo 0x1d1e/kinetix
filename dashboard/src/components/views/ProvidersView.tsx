@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Server, Plus, RefreshCw, CheckCircle2, Globe, Cpu, Sliders, ExternalLink, HelpCircle, Trash2, X, Pencil, Search } from 'lucide-react';
 import { Provider, ModelConfig } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
@@ -53,6 +53,28 @@ const pluginManagedReasoning = (model: ModelConfig) => {
   };
 };
 
+const modelReconciliation = (model: ModelConfig) =>
+  (model.discovery as {
+    reconciliation?: {
+      status?: string;
+      checked_at?: string | null;
+      last_success_at?: string | null;
+      diff?: Array<{ field?: string; configured?: unknown; observed?: unknown; source?: unknown }>;
+      pinned_fields?: string[];
+    } | null;
+  } | undefined)?.reconciliation || null;
+
+const modelPricingSource = (model: ModelConfig) =>
+  (model.discovery as {
+    effective_pricing?: { source?: string | null; updated_at?: string | null } | null;
+  } | undefined)?.effective_pricing?.source || 'untracked';
+
+const modelProbeEvidence = (model: ModelConfig) =>
+  (model.discovery as {
+    probe_evidence?: Record<string, { status?: string; verified_at?: string; fresh_until?: string }> | null;
+  } | undefined)?.probe_evidence || {};
+
+
 interface ProvidersViewProps {
   providers: Provider[];
   models: ModelConfig[];
@@ -86,6 +108,23 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [discoverySearch, setDiscoverySearch] = useState('');
   const [providerSearch, setProviderSearch] = useState('');
   const [pingStatus, setPingStatus] = useState<Record<string, { ok: boolean; pingMs: number; error?: string }>>({});
+  const [lifecycleBusy, setLifecycleBusy] = useState<string | null>(null);
+  const [lifecycleNotice, setLifecycleNotice] = useState<string | null>(null);
+  const [probeStatus, setProbeStatus] = useState<Record<string, string>>({});
+  const [lifecycleSettings, setLifecycleSettings] = useState<{
+    reconciliation_interval_secs: number;
+    pricing_sync_interval_secs: number;
+    jitter_secs: number;
+    probe_freshness_secs: number;
+  } | null>(null);
+  const [savingLifecycleSettings, setSavingLifecycleSettings] = useState(false);
+
+  useEffect(() => {
+    Kinetix.modelLifecycleSettings()
+      .then(setLifecycleSettings)
+      .catch(() => setLifecycleSettings(null));
+  }, []);
+
 
   // New Provider Form State
   const [name, setName] = useState('');
@@ -202,6 +241,93 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         ...prev,
         [providerId]: { ok: false, pingMs: 0, error: e instanceof Error ? e.message : String(e) },
       }));
+    }
+  };
+
+  const handleReconcileProvider = async () => {
+    if (!activeProvider) return;
+    setLifecycleBusy('reconcile');
+    setLifecycleNotice(null);
+    try {
+      const result = await Kinetix.reconcileProvider(activeProvider.id);
+      setDiscoveryResults(result.models);
+      setLifecycleNotice(`Reconciled ${result.models.length} upstream model observations.`);
+      onRefresh?.();
+    } catch (error) {
+      setLifecycleNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const handleSyncPricing = async () => {
+    if (!activeProvider) return;
+    setLifecycleBusy('pricing');
+    setLifecycleNotice(null);
+    try {
+      const result = await Kinetix.syncProviderPricing(activeProvider.id);
+      setLifecycleNotice(
+        `Pricing sync updated ${result.updated.length}; preserved ${result.skipped_manual.length} manual models.`,
+      );
+      onRefresh?.();
+    } catch (error) {
+      setLifecycleNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const handleReconciliationAction = async (
+    modelId: string,
+    action: 'accept' | 'ignore' | 'pin',
+  ) => {
+    setLifecycleBusy(`${action}:${modelId}`);
+    try {
+      await Kinetix.reconcileModel(modelId, action);
+      setLifecycleNotice(`Model drift ${action} completed.`);
+      onRefresh?.();
+    } catch (error) {
+      setLifecycleNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const handleProbeModel = async (
+    modelId: string,
+    capability: 'transport' | 'reasoning' | 'tool_calling' | 'structured_output',
+  ) => {
+    const key = `${modelId}:${capability}`;
+    setLifecycleBusy(`probe:${key}`);
+    try {
+      const result = await Kinetix.probeModel(
+        modelId,
+        capability,
+        capability === 'reasoning' ? 'low' : undefined,
+      );
+      setProbeStatus((prev) => ({ ...prev, [key]: result.status }));
+      onRefresh?.();
+    } catch (error) {
+      setProbeStatus((prev) => ({
+        ...prev,
+        [key]: error instanceof Error ? error.message : String(error),
+      }));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const handleSaveLifecycleSettings = async () => {
+    if (!lifecycleSettings) return;
+    setSavingLifecycleSettings(true);
+    try {
+      const saved = await Kinetix.updateModelLifecycleSettings(lifecycleSettings);
+      setLifecycleSettings(saved);
+      setLifecycleNotice('Lifecycle schedule saved.');
+    } catch (error) {
+      setLifecycleNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSavingLifecycleSettings(false);
     }
   };
 
