@@ -794,6 +794,22 @@ impl ModelRow {
     pub fn prices(&self) -> Prices {
         serde_json::from_str(&self.prices).unwrap_or_default()
     }
+    pub fn price_provenance(&self) -> (String, Value) {
+        let discovery =
+            serde_json::from_str::<Value>(&self.discovery).unwrap_or_else(|_| serde_json::json!({}));
+        let effective = discovery.get("effective_pricing");
+        let source = effective
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("operator")
+            .to_string();
+        let metadata = effective
+            .and_then(|value| value.get("metadata"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        (source, metadata)
+    }
     pub fn params(&self) -> HashMap<String, ParamSpec> {
         serde_json::from_str(&self.parameters).unwrap_or_default()
     }
@@ -1019,12 +1035,20 @@ pub async fn delete_model(pool: &Pool, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Record a price version snapshot (FR-6.3).
-pub async fn insert_price_version(pool: &Pool, model_id: &str, p: &Prices) -> Result<String> {
+/// Record an immutable price snapshot with provenance (FR-6.3).
+pub async fn insert_price_version_with_source(
+    pool: &Pool,
+    model_id: &str,
+    p: &Prices,
+    source: &str,
+    source_metadata: &Value,
+) -> Result<String> {
     let id = format!("price_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
-        "INSERT INTO price_versions (id, model_id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m, thinking_per_1m, created_at)
-         VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO price_versions
+         (id, model_id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m,
+          thinking_per_1m, created_at, source, source_metadata)
+         VALUES (?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(model_id)
@@ -1034,9 +1058,62 @@ pub async fn insert_price_version(pool: &Pool, model_id: &str, p: &Prices) -> Re
     .bind(p.cache_write_per_1m)
     .bind(p.thinking_per_1m)
     .bind(now_iso())
+    .bind(source)
+    .bind(source_metadata.to_string())
     .execute(pool)
     .await?;
     Ok(id)
+}
+
+/// Backwards-compatible operator-owned price version insertion.
+pub async fn insert_price_version(pool: &Pool, model_id: &str, p: &Prices) -> Result<String> {
+    insert_price_version_with_source(pool, model_id, p, "operator", &serde_json::json!({})).await
+}
+
+fn price_snapshot_matches(row: &sqlx::sqlite::SqliteRow, p: &Prices) -> Result<bool> {
+    Ok(row.try_get::<Option<f64>, _>("input_per_1m")? == p.input_per_1m
+        && row.try_get::<Option<f64>, _>("output_per_1m")? == p.output_per_1m
+        && row.try_get::<Option<f64>, _>("cached_per_1m")? == p.cached_per_1m
+        && row.try_get::<Option<f64>, _>("cache_write_per_1m")? == p.cache_write_per_1m
+        && row.try_get::<Option<f64>, _>("thinking_per_1m")? == p.thinking_per_1m)
+}
+
+/// Resolve the immutable snapshot backing an effective price.
+///
+/// Identical consecutive prices reuse their latest snapshot, so ordinary model
+/// saves and repeated catalog syncs cannot create unbounded duplicate versions.
+pub async fn ensure_price_version(
+    pool: &Pool,
+    model_id: &str,
+    p: &Prices,
+    source: &str,
+    source_metadata: &Value,
+) -> Result<Option<String>> {
+    if !p.is_configured() {
+        return Ok(None);
+    }
+
+    let latest = sqlx::query(
+        "SELECT id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m,
+                thinking_per_1m
+         FROM price_versions
+         WHERE model_id = ?
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1",
+    )
+    .bind(model_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(row) = latest {
+        if price_snapshot_matches(&row, p)? {
+            return Ok(Some(row.try_get::<String, _>("id")?));
+        }
+    }
+
+    Ok(Some(
+        insert_price_version_with_source(pool, model_id, p, source, source_metadata).await?,
+    ))
 }
 
 // ===========================================================================
