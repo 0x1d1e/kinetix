@@ -2306,6 +2306,30 @@ async fn persist_model_discovery_update(
     db::merge_model_discovery(pool, &row.id, &fresh).await
 }
 
+async fn persist_provider_discovery_observations(
+    pool: &Pool,
+    provider_id: &str,
+    payload: &Value,
+) -> anyhow::Result<()> {
+    db::set_setting(
+        pool,
+        &provider_discovery_observations_key(provider_id),
+        &payload.to_string(),
+    )
+    .await
+}
+
+async fn load_provider_discovery_observations(
+    pool: &Pool,
+    provider_id: &str,
+) -> anyhow::Result<Option<Value>> {
+    db::get_setting(pool, &provider_discovery_observations_key(provider_id))
+        .await?
+        .map(|value| serde_json::from_str::<Value>(&value))
+        .transpose()
+        .map_err(Into::into)
+}
+
 fn discovery_object(row: &db::ModelRow) -> Value {
     serde_json::from_str::<Value>(&row.discovery).unwrap_or_else(|_| json!({}))
 }
@@ -2838,13 +2862,9 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
         }));
     }
     let result = json!({ "models": out, "disappeared": disappeared });
-    db::set_setting(
-        &state.pool,
-        &provider_discovery_observations_key(id),
-        &result.to_string(),
-    )
-    .await
-    .map_err(ApiError::internal)?;
+    persist_provider_discovery_observations(&state.pool, id, &result)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(result)
 }
 
@@ -2853,13 +2873,10 @@ pub async fn cached_model_discovery(
     _auth: AdminAuth,
     Path(id): Path<String>,
 ) -> ApiResult {
-    let payload = match db::get_setting(&state.pool, &provider_discovery_observations_key(&id))
+    let payload = load_provider_discovery_observations(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?
-    {
-        Some(value) => serde_json::from_str::<Value>(&value).map_err(ApiError::internal)?,
-        None => json!({ "models": [], "disappeared": [] }),
-    };
+        .unwrap_or_else(|| json!({ "models": [], "disappeared": [] }));
     let lifecycle = provider_lifecycle_status(&state.pool, &id).await?;
     let mut payload = payload;
     payload
@@ -2892,6 +2909,21 @@ pub struct ReconciliationActionBody {
     pub action: String,
     #[serde(default)]
     pub fields: Vec<String>,
+}
+
+fn remaining_reconciliation_diff(reconciliation: &Value, selected: &[String]) -> Vec<Value> {
+    reconciliation
+        .get("diff")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            item.get("field")
+                .and_then(Value::as_str)
+                .is_none_or(|field| !selected.iter().any(|candidate| candidate == field))
+        })
+        .cloned()
+        .collect()
 }
 
 fn reconciliation_fields(reconciliation: &Value) -> Vec<String> {
@@ -3023,6 +3055,52 @@ fn effective_price_source(fields: &serde_json::Map<String, Value>, prices: &Pric
     }
 }
 
+fn merge_automatic_price_observation(
+    current: &Prices,
+    observed: &Prices,
+    discovery: &Value,
+) -> (Prices, serde_json::Map<String, Value>, bool) {
+    let mut effective = current.clone();
+    let mut fields = effective_price_fields(discovery, current);
+    let mut preserved_manual = false;
+    let observed_at = discovery.get("last_seen").cloned().unwrap_or(Value::Null);
+    let catalog_source_state = discovery
+        .pointer("/catalog/source_state")
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    for field in PRICE_FIELDS {
+        let Some(value) = price_field(observed, field) else {
+            continue;
+        };
+        if price_field_operator_owned(&fields, current, field) {
+            preserved_manual = true;
+            continue;
+        }
+        set_price_field(&mut effective, field, Some(value));
+        let source = discovery
+            .pointer(&format!("/price_sources/{field}"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| automatic_price_source(discovery));
+        let source_state = if source.starts_with("models.dev") {
+            catalog_source_state.clone()
+        } else {
+            Value::Null
+        };
+        set_price_field_provenance(
+            &mut fields,
+            field,
+            &source,
+            json!({
+                "observed_at": observed_at,
+                "catalog_source_state": source_state,
+            }),
+        );
+    }
+    (effective, fields, preserved_manual)
+}
+
 fn automatic_price_source(discovery: &Value) -> String {
     let mut sources = std::collections::BTreeSet::new();
     if let Some(values) = discovery.get("price_sources").and_then(Value::as_object) {
@@ -3131,18 +3209,7 @@ pub async fn update_model_reconciliation(
                 "pinned_fields".into(),
                 Value::Array(merged.into_iter().map(Value::String).collect()),
             );
-            let remaining: Vec<Value> = object
-                .get("diff")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter(|item| {
-                    item.get("field")
-                        .and_then(Value::as_str)
-                        .is_none_or(|field| !pins.iter().any(|pinned| pinned == field))
-                })
-                .cloned()
-                .collect();
+            let remaining = remaining_reconciliation_diff(&reconciliation, &pins);
             object.insert("diff".into(), Value::Array(remaining.clone()));
             object.insert(
                 "status".into(),
@@ -3323,18 +3390,7 @@ pub async fn update_model_reconciliation(
                 .map_err(ApiError::internal)?;
             }
 
-            let remaining: Vec<Value> = reconciliation
-                .get("diff")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter(|item| {
-                    item.get("field")
-                        .and_then(Value::as_str)
-                        .is_none_or(|field| !selected.iter().any(|accepted| accepted == field))
-                })
-                .cloned()
-                .collect();
+            let remaining = remaining_reconciliation_diff(&reconciliation, &selected);
             let object = reconciliation
                 .as_object_mut()
                 .ok_or_else(|| ApiError::internal("invalid reconciliation metadata"))?;
@@ -3399,44 +3455,13 @@ pub(crate) async fn sync_provider_pricing_id(
         }
 
         let current = row.prices();
-        let mut effective = current.clone();
-        let mut fields = effective_price_fields(&discovery, &current);
-        let mut preserved_manual = false;
+        let (effective, fields, preserved_manual) =
+            merge_automatic_price_observation(&current, &observed, &discovery);
         let observed_at = discovery.get("last_seen").cloned().unwrap_or(Value::Null);
         let catalog_source_state = discovery
             .pointer("/catalog/source_state")
             .cloned()
             .unwrap_or(Value::Null);
-
-        for field in PRICE_FIELDS {
-            let Some(value) = price_field(&observed, field) else {
-                continue;
-            };
-            if price_field_operator_owned(&fields, &current, field) {
-                preserved_manual = true;
-                continue;
-            }
-            set_price_field(&mut effective, field, Some(value));
-            let source = discovery
-                .pointer(&format!("/price_sources/{field}"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| automatic_price_source(&discovery));
-            let source_state = if source.starts_with("models.dev") {
-                catalog_source_state.clone()
-            } else {
-                Value::Null
-            };
-            set_price_field_provenance(
-                &mut fields,
-                field,
-                &source,
-                json!({
-                    "observed_at": observed_at,
-                    "catalog_source_state": source_state,
-                }),
-            );
-        }
 
         if preserved_manual {
             skipped_manual.push(row.id.clone());
@@ -3981,6 +4006,120 @@ fn probe_cost_upper_bound(
         (input_tokens as f64 * input_rate + generated_tokens as f64 * generated_rate)
             / 1_000_000.0,
     )
+}
+
+#[cfg(test)]
+mod model_lifecycle_regression_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_price_ownership_preserves_manual_input_and_updates_automatic_output() {
+        let current = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(4.0),
+            ..Default::default()
+        };
+        let observed = Prices {
+            input_per_1m: Some(1.5),
+            output_per_1m: Some(5.0),
+            ..Default::default()
+        };
+        let discovery = json!({
+            "last_seen": "2026-09-27T00:00:00Z",
+            "price_sources": {
+                "input_per_1m": "models.dev:provider",
+                "output_per_1m": "models.dev:provider"
+            },
+            "effective_pricing": {
+                "source": "mixed",
+                "fields": {
+                    "input_per_1m": {"source": "operator", "metadata": {}},
+                    "output_per_1m": {"source": "models.dev:provider", "metadata": {}}
+                }
+            },
+            "catalog": {
+                "source_state": {
+                    "source": "models.dev",
+                    "retrieved_at": "2026-09-27T00:00:00Z",
+                    "freshness": "fresh"
+                }
+            }
+        });
+        let (effective, fields, preserved_manual) =
+            merge_automatic_price_observation(&current, &observed, &discovery);
+        assert_eq!(effective.input_per_1m, Some(1.0));
+        assert_eq!(effective.output_per_1m, Some(5.0));
+        assert!(preserved_manual);
+        assert_eq!(fields["input_per_1m"]["source"], "operator");
+        assert_eq!(fields["output_per_1m"]["source"], "models.dev:provider");
+    }
+
+    #[test]
+    fn partial_reconciliation_selection_keeps_unselected_drift() {
+        let reconciliation = json!({
+            "diff": [
+                {"field":"context_window","configured":1,"observed":2},
+                {"field":"capabilities.reasoning","configured":false,"observed":true}
+            ]
+        });
+        let selected = vec!["context_window".to_string()];
+        let remaining = remaining_reconciliation_diff(&reconciliation, &selected);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["field"], "capabilities.reasoning");
+    }
+
+    #[tokio::test]
+    async fn scheduled_discovery_payload_survives_for_later_api_read() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-model-lifecycle-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("test.db").display());
+        let pool = db::connect(&url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let payload = json!({
+            "models": [{
+                "id": "new-upstream-model",
+                "already_imported": false,
+                "reconciliation": {"status": "new"}
+            }],
+            "disappeared": []
+        });
+        persist_provider_discovery_observations(&pool, "provider-a", &payload)
+            .await
+            .unwrap();
+        let loaded = load_provider_discovery_observations(&pool, "provider-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, payload);
+        drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn discovery_persistence_failure_is_not_silently_successful() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-model-lifecycle-failure-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("test.db").display());
+        let pool = db::connect(&url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        pool.close().await;
+        assert!(
+            persist_provider_discovery_observations(
+                &pool,
+                "provider-a",
+                &json!({"models":[],"disappeared":[]}),
+            )
+            .await
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]
