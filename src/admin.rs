@@ -12919,6 +12919,106 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn model_update_keeps_effective_price_when_version_persistence_fails() {
+        let (state, root) = test_state("model-price-rollback").await;
+        let provider_id = insert_provider(
+            &state,
+            "pricing-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let old_prices = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(2.0),
+            ..Prices::default()
+        };
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "priced-model",
+                display_name: "Priced Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: serde_json::to_value(&old_prices).unwrap(),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let old_version = db::commit_effective_model_pricing(
+            &state.pool,
+            &model_id,
+            &old_prices,
+            "operator",
+            &json!({"configured_by": "test"}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        sqlx::query(
+            "CREATE TRIGGER reject_model_price_version_insert
+             BEFORE INSERT ON price_versions
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected price version persistence failure');
+             END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let result = update_model(
+            State(state.clone()),
+            auth(),
+            Path(model_id.clone()),
+            Json(ModelBody {
+                upstream_id: "priced-model".into(),
+                display_name: Some("Priced Model".into()),
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({
+                    "input_per_1m": 9.0,
+                    "output_per_1m": 18.0
+                }),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({}),
+                transport_override: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let row = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.prices().input_per_1m, Some(1.0));
+        assert_eq!(row.prices().output_per_1m, Some(2.0));
+        let discovery: Value = serde_json::from_str(&row.discovery).unwrap();
+        assert_eq!(
+            discovery
+                .pointer("/effective_pricing/price_version_id")
+                .and_then(Value::as_str),
+            Some(old_version.as_str())
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn completed_oauth_with_expired_credential_disables_account_and_requires_reauthorization()
     {
         let (state, root) = test_state("expired-completion").await;
