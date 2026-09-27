@@ -1190,6 +1190,133 @@ pub async fn ensure_price_version(
     ))
 }
 
+
+async fn ensure_price_version_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    model_id: &str,
+    p: &Prices,
+    source: &str,
+    source_metadata: &Value,
+) -> Result<Option<String>> {
+    if !p.is_configured() {
+        return Ok(None);
+    }
+
+    let candidates = sqlx::query(
+        "SELECT id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m,
+                thinking_per_1m, source, source_metadata
+         FROM price_versions
+         WHERE model_id = ?
+           AND input_per_1m IS ?
+           AND output_per_1m IS ?
+           AND cached_per_1m IS ?
+           AND cache_write_per_1m IS ?
+           AND thinking_per_1m IS ?
+           AND source = ?
+         ORDER BY created_at DESC, rowid DESC",
+    )
+    .bind(model_id)
+    .bind(p.input_per_1m)
+    .bind(p.output_per_1m)
+    .bind(p.cached_per_1m)
+    .bind(p.cache_write_per_1m)
+    .bind(p.thinking_per_1m)
+    .bind(source)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for row in candidates {
+        if price_snapshot_matches(&row, p, source, source_metadata)? {
+            return Ok(Some(row.try_get::<String, _>("id")?));
+        }
+    }
+
+    let id = format!("price_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO price_versions
+         (id, model_id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m,
+          thinking_per_1m, created_at, source, source_metadata)
+         VALUES (?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&id)
+    .bind(model_id)
+    .bind(p.input_per_1m)
+    .bind(p.output_per_1m)
+    .bind(p.cached_per_1m)
+    .bind(p.cache_write_per_1m)
+    .bind(p.thinking_per_1m)
+    .bind(now_iso())
+    .bind(source)
+    .bind(source_metadata.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(Some(id))
+}
+
+async fn apply_effective_model_pricing_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    model_id: &str,
+    prices: &Prices,
+    source: &str,
+    source_metadata: &Value,
+) -> Result<Option<String>> {
+    let version_id =
+        ensure_price_version_in_transaction(tx, model_id, prices, source, source_metadata).await?;
+    let effective_pricing = serde_json::json!({
+        "source": source,
+        "fields": source_metadata
+            .get("fields")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+        "metadata": source_metadata,
+        "price_version_id": version_id,
+        "updated_at": now_iso(),
+    });
+    let result = sqlx::query(
+        "UPDATE models
+         SET prices = ?,
+             discovery = json_set(
+                 CASE WHEN json_valid(discovery) THEN
+                     CASE WHEN json_type(discovery) = 'object' THEN discovery ELSE '{}' END
+                 ELSE '{}' END,
+                 '$.effective_pricing',
+                 json(?)
+             )
+         WHERE id = ?",
+    )
+    .bind(serde_json::to_string(prices)?)
+    .bind(effective_pricing.to_string())
+    .bind(model_id)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!("model '{model_id}' disappeared while committing effective pricing");
+    }
+    Ok(version_id)
+}
+
+/// Atomically bind the effective model prices to the immutable price version and
+/// the provenance used by request accounting.
+pub async fn commit_effective_model_pricing(
+    pool: &Pool,
+    model_id: &str,
+    prices: &Prices,
+    source: &str,
+    source_metadata: &Value,
+) -> Result<Option<String>> {
+    let mut tx = pool.begin().await?;
+    let version_id = apply_effective_model_pricing_transaction(
+        &mut tx,
+        model_id,
+        prices,
+        source,
+        source_metadata,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(version_id)
+}
+
 // ===========================================================================
 // Aliases
 // ===========================================================================
@@ -2295,4 +2422,124 @@ mod price_version_identity_tests {
         drop(pool);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[tokio::test]
+    async fn effective_pricing_transaction_rolls_back_price_version_and_model_state() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-effective-pricing-rollback-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("test.db").display());
+        let pool = connect(&url).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        let provider_id = insert_provider(
+            &pool,
+            &NewProvider {
+                name: "Provider",
+                base_url: "https://example.test",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 120_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "example.test",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let old_prices = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(2.0),
+            ..Default::default()
+        };
+        let old_effective = json!({
+            "source": "operator",
+            "fields": {
+                "input_per_1m": {"source": "operator"},
+                "output_per_1m": {"source": "operator"}
+            },
+            "metadata": {},
+            "price_version_id": null,
+            "updated_at": "2026-09-27T00:00:00Z"
+        });
+        let model_id = insert_model(
+            &pool,
+            &NewModel {
+                provider_id: &provider_id,
+                upstream_id: "model",
+                display_name: "Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: serde_json::to_value(&old_prices).unwrap(),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({"effective_pricing": old_effective}),
+            },
+        )
+        .await
+        .unwrap();
+
+        let new_prices = Prices {
+            input_per_1m: Some(3.0),
+            output_per_1m: Some(4.0),
+            ..Default::default()
+        };
+        let metadata = json!({
+            "fields": {
+                "input_per_1m": {"source": "models.dev:provider"},
+                "output_per_1m": {"source": "models.dev:provider"}
+            }
+        });
+        let mut tx = pool.begin().await.unwrap();
+        apply_effective_model_pricing_transaction(
+            &mut tx,
+            &model_id,
+            &new_prices,
+            "models.dev",
+            &metadata,
+        )
+        .await
+        .unwrap();
+
+        let forced_failure = sqlx::query("INSERT INTO definitely_missing_table(value) VALUES (?)")
+            .bind("fail")
+            .execute(&mut *tx)
+            .await;
+        assert!(forced_failure.is_err());
+        tx.rollback().await.unwrap();
+
+        let row = get_model(&pool, &model_id).await.unwrap().unwrap();
+        assert_eq!(row.prices().input_per_1m, old_prices.input_per_1m);
+        assert_eq!(row.prices().output_per_1m, old_prices.output_per_1m);
+        let discovery: Value = serde_json::from_str(&row.discovery).unwrap();
+        assert_eq!(discovery["effective_pricing"], old_effective);
+        let versions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id = ?")
+                .bind(&model_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(versions, 0);
+
+        drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
 }
