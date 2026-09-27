@@ -824,6 +824,29 @@ mod tests {
     }
 
     #[test]
+    fn responses_reasoning_disable_uses_nested_none_effort() {
+        let provider = provider();
+        let mut model = model();
+        model.thinking_map = json!({
+            "levels": {"off": "none"},
+            "mode": "level",
+            "level_field": "reasoning.effort"
+        })
+        .to_string();
+        let ctx = UpstreamContext {
+            provider: &provider,
+            model: &model,
+            account_id: None,
+            credential: "secret".into(),
+        };
+        let mut req = request();
+        req.thinking = Some(ThinkingLevel::Off);
+        let body = OpenAiResponsesAdapter.build_body(&ctx, &req).unwrap();
+        assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("none")));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn responses_stream_events_normalize_text_tool_calls_usage_and_finish() {
         let adapter = OpenAiResponsesAdapter;
         let text = adapter
