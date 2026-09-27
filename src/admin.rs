@@ -3044,7 +3044,12 @@ pub async fn test_provider(
             opaque_state_plugin: String::new(),
         });
 
-    let adapter = state.adapters.for_provider(&provider);
+    let profile = crate::adapters::resolve_execution_profile(&provider, &model)
+        .map_err(|error| ApiError::bad(error.message))?;
+    let adapter = state
+        .adapters
+        .for_transport(&profile.transport)
+        .map_err(|error| ApiError::bad(error.message))?;
     let ctx = UpstreamContext {
         provider: &provider,
         model: &model,
