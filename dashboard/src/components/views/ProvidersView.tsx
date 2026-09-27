@@ -3,7 +3,7 @@ import { Server, Plus, RefreshCw, CheckCircle2, Globe, Cpu, Sliders, ExternalLin
 import { Provider, ModelConfig } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { DESIGN_TOKENS } from '../../lib/designSystem';
-import { Kinetix, DiscoveredModel } from '../../lib/resources';
+import { Kinetix, DiscoveredModel, ProviderLifecycleStatus } from '../../lib/resources';
 
 /**
  * Defaults for newly configured manual models. Imported/discovered sparse
@@ -83,6 +83,12 @@ const modelReasoningLevels = (model: ModelConfig) => {
   return Array.from(new Set([...discovered, ...mapped])).filter((level) => level && level !== 'off' && level !== 'default');
 };
 
+const formatDriftValue = (value: unknown) => {
+  if (value === undefined) return 'undefined';
+  const serialized = JSON.stringify(value, null, 2);
+  return serialized === undefined ? String(value) : serialized;
+};
+
 const modelCanProbeReasoningDisable = (model: ModelConfig) => {
   const discovery = model.discovery as {
     reasoning_capability?: { can_disable?: boolean } | null;
@@ -135,6 +141,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     probe_freshness_secs: number;
   } | null>(null);
   const [savingLifecycleSettings, setSavingLifecycleSettings] = useState(false);
+  const [providerLifecycle, setProviderLifecycle] = useState<ProviderLifecycleStatus | null>(null);
+  const [reconciliationSelections, setReconciliationSelections] = useState<Record<string, string[]>>({});
 
   useEffect(() => {
     Kinetix.modelLifecycleSettings()
@@ -223,6 +231,27 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     filteredProviders[0];
   const providerModels = models.filter((m) => m.providerId === activeProvider?.id);
 
+  useEffect(() => {
+    if (!activeProvider) {
+      setDiscoveryResults(null);
+      setProviderLifecycle(null);
+      return;
+    }
+    let cancelled = false;
+    Kinetix.cachedDiscovery(activeProvider.id)
+      .then((cached) => {
+        if (cancelled) return;
+        setDiscoveryResults(cached.models);
+        setProviderLifecycle(cached.lifecycle);
+      })
+      .catch(() => {
+        if (!cancelled) setProviderLifecycle(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProvider?.id]);
+
   // Fuzzy search over the discovered model list: case-insensitive, and every
   // whitespace-separated term must match as a subsequence of the model id.
   const discoveryMatches = (id: string, query: string) => {
@@ -297,11 +326,13 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const handleReconciliationAction = async (
     modelId: string,
     action: 'accept' | 'ignore' | 'pin',
+    fields: string[] = [],
   ) => {
     setLifecycleBusy(`${action}:${modelId}`);
     try {
-      await Kinetix.reconcileModel(modelId, action);
+      await Kinetix.reconcileModel(modelId, action, fields);
       setLifecycleNotice(`Model drift ${action} completed.`);
+      setReconciliationSelections((current) => ({ ...current, [modelId]: [] }));
       onRefresh?.();
     } catch (error) {
       setLifecycleNotice(error instanceof Error ? error.message : String(error));
@@ -1097,6 +1128,28 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     <div>Metadata reconciliation observes drift; it never silently changes configured model fields.</div>
                     <div>Pricing sync preserves operator-owned prices and only adopts known upstream/catalog price fields.</div>
                     <div>Capability probes are explicit, bounded, scoped, and expire after the configured freshness window.</div>
+                    {providerLifecycle && (
+                      <div className="mt-2 pt-2 border-t border-[var(--ink)]/20 space-y-1">
+                        <div>
+                          Reconcile · attempt {providerLifecycle.reconciliation.last_attempt ? new Date(providerLifecycle.reconciliation.last_attempt).toLocaleString() : '—'}
+                          {' · '}success {providerLifecycle.reconciliation.last_success ? new Date(providerLifecycle.reconciliation.last_success).toLocaleString() : '—'}
+                        </div>
+                        {providerLifecycle.reconciliation.last_error && (
+                          <div className="text-[var(--danger-text)]">
+                            Last reconciliation failure: {providerLifecycle.reconciliation.last_error}
+                          </div>
+                        )}
+                        <div>
+                          Pricing · attempt {providerLifecycle.pricing_sync.last_attempt ? new Date(providerLifecycle.pricing_sync.last_attempt).toLocaleString() : '—'}
+                          {' · '}success {providerLifecycle.pricing_sync.last_success ? new Date(providerLifecycle.pricing_sync.last_success).toLocaleString() : '—'}
+                        </div>
+                        {providerLifecycle.pricing_sync.last_error && (
+                          <div className="text-[var(--danger-text)]">
+                            Last pricing failure: {providerLifecycle.pricing_sync.last_error}
+                          </div>
+                        )}
+                      </div>
+                    )}
                     {lifecycleNotice && (
                       <div className="mt-2 pt-2 border-t border-[var(--ink)]/20 text-[var(--pen-blue)]">
                         {lifecycleNotice}
@@ -1345,11 +1398,32 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                 <div className="flex flex-wrap gap-1">
                                   <button
                                     type="button"
-                                    disabled={lifecycleBusy === `accept:${m.id}`}
-                                    onClick={() => handleReconciliationAction(m.id, 'accept')}
-                                    className="px-2 py-1 border border-[var(--pen-green)] text-[var(--pen-green)] rounded font-bold"
+                                    onClick={() =>
+                                      setReconciliationSelections((current) => ({
+                                        ...current,
+                                        [m.id]: modelReconciliation(m)?.diff?.map((diff) => diff.field || '').filter(Boolean) || [],
+                                      }))
+                                    }
+                                    className="px-2 py-1 border border-[var(--ink)] rounded"
                                   >
-                                    Accept
+                                    Select all
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `accept:${m.id}`
+                                      || !(reconciliationSelections[m.id]?.length)
+                                    }
+                                    onClick={() =>
+                                      handleReconciliationAction(
+                                        m.id,
+                                        'accept',
+                                        reconciliationSelections[m.id] || [],
+                                      )
+                                    }
+                                    className="px-2 py-1 border border-[var(--pen-green)] text-[var(--pen-green)] rounded font-bold disabled:opacity-40"
+                                  >
+                                    Accept selected
                                   </button>
                                   <button
                                     type="button"
@@ -1361,20 +1435,67 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                   </button>
                                   <button
                                     type="button"
-                                    disabled={lifecycleBusy === `pin:${m.id}`}
-                                    onClick={() => handleReconciliationAction(m.id, 'pin')}
-                                    className="px-2 py-1 border border-[var(--pen-blue)] text-[var(--pen-blue)] rounded font-bold"
+                                    disabled={
+                                      lifecycleBusy === `pin:${m.id}`
+                                      || !(reconciliationSelections[m.id]?.length)
+                                    }
+                                    onClick={() =>
+                                      handleReconciliationAction(
+                                        m.id,
+                                        'pin',
+                                        reconciliationSelections[m.id] || [],
+                                      )
+                                    }
+                                    className="px-2 py-1 border border-[var(--pen-blue)] text-[var(--pen-blue)] rounded font-bold disabled:opacity-40"
                                   >
-                                    Pin configured
+                                    Pin selected
                                   </button>
                                 </div>
                               )}
                             </div>
                             {!!modelReconciliation(m)?.diff?.length && (
-                              <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[var(--ink)]/70">
-                                {modelReconciliation(m)?.diff?.slice(0, 6).map((diff) => (
-                                  <span key={diff.field}>Δ {diff.field}</span>
-                                ))}
+                              <div className="mt-3 space-y-2">
+                                {modelReconciliation(m)?.diff?.map((diff) => {
+                                  const selected = reconciliationSelections[m.id]?.includes(diff.field || '') || false;
+                                  return (
+                                    <label
+                                      key={diff.field}
+                                      className="block p-2 bg-[var(--surface)] border border-[var(--ink)]/30 rounded cursor-pointer"
+                                    >
+                                      <div className="flex items-center gap-2 font-bold">
+                                        <input
+                                          type="checkbox"
+                                          checked={selected}
+                                          onChange={() =>
+                                            setReconciliationSelections((current) => {
+                                              const existing = current[m.id] || [];
+                                              const field = diff.field || '';
+                                              const next = existing.includes(field)
+                                                ? existing.filter((candidate) => candidate !== field)
+                                                : [...existing, field];
+                                              return { ...current, [m.id]: next };
+                                            })
+                                          }
+                                        />
+                                        <span>Δ {diff.field}</span>
+                                      </div>
+                                      <div className="mt-1 grid grid-cols-1 lg:grid-cols-3 gap-2 text-[var(--ink)]/70">
+                                        <div>
+                                          <strong>Configured</strong>
+                                          <pre className="whitespace-pre-wrap break-all">{formatDriftValue(diff.configured)}</pre>
+                                        </div>
+                                        <div>
+                                          <strong>Observed</strong>
+                                          <pre className="whitespace-pre-wrap break-all">{formatDriftValue(diff.observed)}</pre>
+                                        </div>
+                                        <div>
+                                          <strong>Source</strong>
+                                          <pre className="whitespace-pre-wrap break-all">{formatDriftValue(diff.source)}</pre>
+                                        </div>
+                                      </div>
+                                    </label>
+                                  );
+                                })}
                               </div>
                             )}
                           </div>
