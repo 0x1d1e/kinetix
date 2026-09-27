@@ -3602,6 +3602,28 @@ fn merge_selected_capability_overrides(
     overrides
 }
 
+fn merge_selected_reasoning_overrides(
+    discovery: &Value,
+    source: &Value,
+    selected: &[String],
+) -> serde_json::Map<String, Value> {
+    let mut overrides = discovery
+        .get("operator_reasoning_overrides")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if selected.iter().any(|field| field == "reasoning_capability") {
+        overrides.insert(
+            "reasoning_capability".into(),
+            source
+                .get("reasoning_capability")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+    overrides
+}
+
 fn pin_selected_price_fields(
     discovery: &Value,
     current: &Prices,
@@ -3748,6 +3770,7 @@ pub async fn update_model_reconciliation(
             let extra_request = row.extra_request_value();
             let current_prices = row.prices();
             let has_capability_pins = pins.iter().any(|field| field.starts_with("capabilities."));
+            let has_reasoning_pins = pins.iter().any(|field| field == "reasoning_capability");
             let has_price_pins = pins.iter().any(|field| field.starts_with("prices."));
 
             let mut discovery_patch = serde_json::Map::new();
@@ -3760,6 +3783,14 @@ pub async fn update_model_reconciliation(
                 );
                 discovery_patch.insert(
                     "operator_capability_overrides".into(),
+                    Value::Object(overrides),
+                );
+            }
+            if has_reasoning_pins {
+                let overrides =
+                    merge_selected_reasoning_overrides(&discovery, &discovery, &pins);
+                discovery_patch.insert(
+                    "operator_reasoning_overrides".into(),
                     Value::Object(overrides),
                 );
             }
@@ -3934,6 +3965,14 @@ pub async fn update_model_reconciliation(
                 accepted_discovery.insert(
                     "operator_capability_overrides".into(),
                     Value::Object(capability_overrides),
+                );
+            }
+            if selected.iter().any(|field| field == "reasoning_capability") {
+                let reasoning_overrides =
+                    merge_selected_reasoning_overrides(&discovery, &observed, &selected);
+                accepted_discovery.insert(
+                    "operator_reasoning_overrides".into(),
+                    Value::Object(reasoning_overrides),
                 );
             }
 
@@ -4674,6 +4713,22 @@ fn probe_thinking_level(value: Option<&Value>) -> Result<crate::types::ThinkingL
             "unsupported canonical reasoning level '{other}'"
         ))),
     }
+}
+
+fn reasoning_disable_probe_thinking_map(
+    transport: &crate::adapters::TargetTransport,
+) -> Option<ThinkingMap> {
+    let level_field = match transport {
+        crate::adapters::TargetTransport::OpenAiChat => "reasoning_effort",
+        crate::adapters::TargetTransport::OpenAiResponses => "reasoning.effort",
+        _ => return None,
+    };
+    Some(ThinkingMap {
+        levels: [("off".to_string(), json!("none"))].into_iter().collect(),
+        mode: Some(crate::types::ThinkingMode::Level),
+        budget_field: None,
+        level_field: Some(level_field.to_string()),
+    })
 }
 
 fn normalize_capability_probe_value(
@@ -5608,6 +5663,29 @@ mod model_lifecycle_regression_tests {
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
+    #[test]
+    fn reasoning_disable_probe_uses_transport_specific_candidate_mapping() {
+        let responses =
+            reasoning_disable_probe_thinking_map(&crate::adapters::TargetTransport::OpenAiResponses)
+                .unwrap();
+        assert_eq!(
+            responses.level_field.as_deref(),
+            Some("reasoning.effort")
+        );
+        assert_eq!(responses.levels.get("off"), Some(&json!("none")));
+
+        let chat =
+            reasoning_disable_probe_thinking_map(&crate::adapters::TargetTransport::OpenAiChat)
+                .unwrap();
+        assert_eq!(chat.level_field.as_deref(), Some("reasoning_effort"));
+        assert_eq!(chat.levels.get("off"), Some(&json!("none")));
+
+        assert!(
+            reasoning_disable_probe_thinking_map(&crate::adapters::TargetTransport::Anthropic)
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn initial_scheduled_pass_waits_for_stable_jitter_without_fake_attempt() {
         let root = std::env::temp_dir().join(format!(
@@ -6066,7 +6144,7 @@ pub async fn probe_model_capability(
             effective_prices = prices;
         }
     }
-    let probe_thinking_map = profile.thinking_map.clone();
+    let mut probe_thinking_map = profile.thinking_map.clone();
     let mut probe_parameters = profile.parameters.clone();
 
     let mut internal = crate::types::InternalRequest {
@@ -6094,7 +6172,7 @@ pub async fn probe_model_capability(
 
     match body.capability.as_str() {
         "transport" => {}
-        "reasoning" | "reasoning_disable" => {
+        "reasoning" => {
             let level = probe_thinking_level(probe_value.as_ref())?;
             if !probe_thinking_map.level_is_executable(level.as_key()) {
                 return Ok(Json(json!({
@@ -6104,6 +6182,19 @@ pub async fn probe_model_capability(
                     "level": level.as_key(),
                 })));
             }
+            internal.thinking = Some(level);
+        }
+        "reasoning_disable" => {
+            let level = probe_thinking_level(probe_value.as_ref())?;
+            let Some(candidate) = reasoning_disable_probe_thinking_map(&profile.transport) else {
+                return Ok(Json(json!({
+                    "status": "inconclusive",
+                    "reason": "no conservative reasoning-disable probe mapping for this transport",
+                    "transport": profile.transport.as_str(),
+                    "level": level.as_key(),
+                })));
+            };
+            probe_thinking_map = candidate;
             internal.thinking = Some(level);
         }
         "tool_calling" => {
@@ -13531,6 +13622,256 @@ mod credential_enrollment_regression_tests {
         assert_eq!(effective.output_per_1m, Some(5.0));
         assert!(preserved_manual);
         assert_eq!(fields["output_per_1m"]["source"], "operator_pin");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn accept_reasoning_capability_owns_runtime_against_disable_probe() {
+        let (state, root) = test_state("accept-reasoning-ownership").await;
+        let provider_id = insert_provider(
+            &state,
+            "accept-reasoning-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let observed_reasoning = json!({
+            "mode": "level",
+            "levels": ["low", "high"],
+            "can_disable": true,
+            "upstream_format": "openai_effort"
+        });
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "accept-reasoning-model",
+                display_name: "Accept Reasoning Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({"reasoning": true}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({
+                    "latest_observation": {
+                        "reasoning_capability": observed_reasoning.clone()
+                    },
+                    "reconciliation": {
+                        "status": "changed",
+                        "diff": [{
+                            "field": "reasoning_capability",
+                            "configured": null,
+                            "observed": observed_reasoning.clone()
+                        }]
+                    }
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        update_model_reconciliation(
+            State(state.clone()),
+            auth(),
+            Path(model_id.clone()),
+            Json(ReconciliationActionBody {
+                action: "accept".into(),
+                fields: vec!["reasoning_capability".into()],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let accepted = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted_discovery = discovery_object(&accepted);
+        assert_eq!(
+            accepted_discovery
+                .pointer("/operator_reasoning_overrides/reasoning_capability/can_disable")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        db::merge_model_discovery(
+            &state.pool,
+            &model_id,
+            &json!({
+                "probe_evidence": {
+                    "reasoning_disable": {
+                        "status": "unsupported",
+                        "fresh_until": "2999-01-01T00:00:00Z",
+                        "scope": {
+                            "provider_id": provider_id.clone(),
+                            "account_id": "account-a",
+                            "model_id": model_id.clone(),
+                            "transport": "openai"
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let accepted = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let profile = crate::adapters::resolve_execution_profile_for_target(
+            &provider,
+            &accepted,
+            Some("account-a"),
+        )
+        .unwrap();
+        assert!(profile.reasoning.as_ref().unwrap().can_disable);
+        assert!(profile.thinking_map.level_is_executable("off"));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pin_reasoning_capability_owns_runtime_against_effort_and_disable_probes() {
+        let (state, root) = test_state("pin-reasoning-ownership").await;
+        let provider_id = insert_provider(
+            &state,
+            "pin-reasoning-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let configured_reasoning = json!({
+            "mode": "level",
+            "levels": ["low", "high"],
+            "can_disable": true,
+            "upstream_format": "openai_effort"
+        });
+        let observed_reasoning = json!({
+            "mode": "level",
+            "levels": ["low"],
+            "can_disable": false,
+            "upstream_format": "openai_effort"
+        });
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "pin-reasoning-model",
+                display_name: "Pin Reasoning Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({"reasoning": true}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({
+                    "reasoning_capability": configured_reasoning.clone(),
+                    "latest_observation": {
+                        "reasoning_capability": observed_reasoning.clone()
+                    },
+                    "reconciliation": {
+                        "status": "changed",
+                        "diff": [{
+                            "field": "reasoning_capability",
+                            "configured": configured_reasoning.clone(),
+                            "observed": observed_reasoning
+                        }]
+                    }
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        update_model_reconciliation(
+            State(state.clone()),
+            auth(),
+            Path(model_id.clone()),
+            Json(ReconciliationActionBody {
+                action: "pin".into(),
+                fields: vec!["reasoning_capability".into()],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let pinned = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pinned_discovery = discovery_object(&pinned);
+        assert_eq!(
+            pinned_discovery
+                .pointer("/operator_reasoning_overrides/reasoning_capability/can_disable")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        db::merge_model_discovery(
+            &state.pool,
+            &model_id,
+            &json!({
+                "probe_evidence": {
+                    "reasoning_disable": {
+                        "status": "unsupported",
+                        "fresh_until": "2999-01-01T00:00:00Z",
+                        "scope": {
+                            "provider_id": provider_id.clone(),
+                            "account_id": "account-a",
+                            "model_id": model_id.clone(),
+                            "transport": "openai"
+                        }
+                    },
+                    "reasoning_effort_high": {
+                        "status": "unsupported",
+                        "fresh_until": "2999-01-01T00:00:00Z",
+                        "scope": {
+                            "provider_id": provider_id.clone(),
+                            "account_id": "account-a",
+                            "model_id": model_id.clone(),
+                            "transport": "openai"
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let pinned = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let profile = crate::adapters::resolve_execution_profile_for_target(
+            &provider,
+            &pinned,
+            Some("account-a"),
+        )
+        .unwrap();
+        let reasoning = profile.reasoning.as_ref().unwrap();
+        assert!(reasoning.can_disable);
+        assert!(reasoning.levels.iter().any(|level| level == "high"));
+        assert!(profile.thinking_map.level_is_executable("off"));
+        assert!(profile.thinking_map.level_is_executable("high"));
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);
