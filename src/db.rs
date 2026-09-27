@@ -1140,6 +1140,19 @@ fn price_snapshot_matches(
     )
 }
 
+fn price_version_lock(
+    model_id: &str,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(dashmap::DashMap::new)
+        .entry(model_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Resolve the immutable snapshot backing an effective price.
 ///
 /// Snapshot identity is global within a model's price history, not merely
@@ -1155,6 +1168,12 @@ pub async fn ensure_price_version(
     if !p.is_configured() {
         return Ok(None);
     }
+
+    // Request finalization, pricing sync, and admin edits can all resolve the
+    // same immutable snapshot concurrently. Serialize identity resolution per
+    // model so the SELECT -> INSERT sequence cannot create duplicate versions.
+    let lock = price_version_lock(model_id);
+    let _guard = lock.lock().await;
 
     let candidates = sqlx::query(
         "SELECT id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m,
@@ -1261,16 +1280,20 @@ async fn apply_effective_model_pricing_transaction(
 ) -> Result<Option<String>> {
     let version_id =
         ensure_price_version_in_transaction(tx, model_id, prices, source, source_metadata).await?;
-    let effective_pricing = serde_json::json!({
-        "source": source,
-        "fields": source_metadata
-            .get("fields")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({})),
-        "metadata": source_metadata,
-        "price_version_id": version_id,
-        "updated_at": now_iso(),
-    });
+    let effective_pricing = if prices.is_configured() {
+        serde_json::json!({
+            "source": source,
+            "fields": source_metadata
+                .get("fields")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            "metadata": source_metadata,
+            "price_version_id": version_id,
+            "updated_at": now_iso(),
+        })
+    } else {
+        Value::Null
+    };
     let result = sqlx::query(
         "UPDATE models
          SET prices = ?,
@@ -1303,6 +1326,8 @@ pub async fn commit_effective_model_pricing(
     source: &str,
     source_metadata: &Value,
 ) -> Result<Option<String>> {
+    let lock = price_version_lock(model_id);
+    let _guard = lock.lock().await;
     let mut tx = pool.begin().await?;
     let version_id = apply_effective_model_pricing_transaction(
         &mut tx,
@@ -2128,6 +2153,136 @@ pub async fn purge_old_route_traces(pool: &Pool, retain_days: i64) -> Result<u64
 mod price_version_identity_tests {
     use super::*;
     use serde_json::json;
+
+    async fn pricing_test_model(tag: &str) -> (Pool, String, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-price-version-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}", root.join("kinetix.db").display());
+        let pool = connect(&database_url).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let provider_id = insert_provider(
+            &pool,
+            &NewProvider {
+                name: "pricing-test",
+                base_url: "https://example.invalid/v1",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let model_id = insert_model(
+            &pool,
+            &NewModel {
+                provider_id: &provider_id,
+                upstream_id: "priced-model",
+                display_name: "Priced Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({
+                    "input_per_1m": 1.0,
+                    "output_per_1m": 2.0
+                }),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        (pool, model_id, root)
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_price_resolution_reuses_one_version() {
+        let (pool, model_id, root) = pricing_test_model("concurrent").await;
+        let prices = Prices {
+            input_per_1m: Some(1.25),
+            output_per_1m: Some(2.5),
+            ..Prices::default()
+        };
+        let metadata = json!({"configured_by": "test"});
+        let (left, right) = tokio::join!(
+            ensure_price_version(&pool, &model_id, &prices, "operator", &metadata),
+            ensure_price_version(&pool, &model_id, &prices, "operator", &metadata),
+        );
+        let left = left.unwrap().unwrap();
+        let right = right.unwrap().unwrap();
+        assert_eq!(left, right);
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM price_versions WHERE model_id = ?",
+        )
+        .bind(&model_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn effective_price_rolls_back_when_version_persistence_fails() {
+        let (pool, model_id, root) = pricing_test_model("rollback").await;
+        sqlx::query(
+            "CREATE TRIGGER reject_price_version_insert
+             BEFORE INSERT ON price_versions
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected price version failure');
+             END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let next = Prices {
+            input_per_1m: Some(9.0),
+            output_per_1m: Some(18.0),
+            ..Prices::default()
+        };
+        let result = commit_effective_model_pricing(
+            &pool,
+            &model_id,
+            &next,
+            "operator",
+            &json!({"configured_by": "test"}),
+        )
+        .await;
+        assert!(result.is_err());
+
+        let row = get_model(&pool, &model_id).await.unwrap().unwrap();
+        assert_eq!(row.prices().input_per_1m, Some(1.0));
+        assert_eq!(row.prices().output_per_1m, Some(2.0));
+        let discovery: Value = serde_json::from_str(&row.discovery).unwrap();
+        assert!(discovery.get("effective_pricing").is_none());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn volatile_catalog_metadata_does_not_change_price_identity() {
