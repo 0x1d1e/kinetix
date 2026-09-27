@@ -3489,7 +3489,31 @@ pub async fn create_model(
         }
     }
     if prices.is_configured() {
-        let _ = db::insert_price_version(&state.pool, &id, &prices).await;
+        let metadata = json!({ "configured_by": "admin" });
+        db::ensure_price_version(&state.pool, &id, &prices, "operator", &metadata)
+            .await
+            .map_err(ApiError::internal)?;
+        db::merge_model_discovery(
+            &state.pool,
+            &id,
+            &json!({
+                "effective_pricing": {
+                    "source": "operator",
+                    "metadata": metadata,
+                    "updated_at": db::now_iso(),
+                }
+            }),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    } else {
+        db::merge_model_discovery(
+            &state.pool,
+            &id,
+            &json!({ "effective_pricing": Value::Null }),
+        )
+        .await
+        .map_err(ApiError::internal)?;
     }
     let _ = db::insert_audit(
         &state.pool,
@@ -3547,7 +3571,31 @@ pub async fn update_model(
         .await
         .map_err(ApiError::internal)?;
     if prices.is_configured() {
-        let _ = db::insert_price_version(&state.pool, &id, &prices).await;
+        let metadata = json!({ "configured_by": "admin" });
+        db::ensure_price_version(&state.pool, &id, &prices, "operator", &metadata)
+            .await
+            .map_err(ApiError::internal)?;
+        db::merge_model_discovery(
+            &state.pool,
+            &id,
+            &json!({
+                "effective_pricing": {
+                    "source": "operator",
+                    "metadata": metadata,
+                    "updated_at": db::now_iso(),
+                }
+            }),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    } else {
+        db::merge_model_discovery(
+            &state.pool,
+            &id,
+            &json!({ "effective_pricing": Value::Null }),
+        )
+        .await
+        .map_err(ApiError::internal)?;
     }
     let _ = db::insert_audit(
         &state.pool,
