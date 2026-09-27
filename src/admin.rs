@@ -6344,6 +6344,16 @@ pub async fn create_model(
         )
         .await
         .map_err(ApiError::internal)?;
+    } else {
+        // Imported parameter metadata is not operator-owned. Keep an explicit
+        // empty ownership envelope so fresh scoped probe evidence may refine it.
+        db::merge_model_discovery(
+            &state.pool,
+            &id,
+            &json!({ "operator_parameter_overrides": {} }),
+        )
+        .await
+        .map_err(ApiError::internal)?;
     }
     let valid_opaque_state = body
         .discovery
