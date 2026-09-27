@@ -579,11 +579,11 @@ pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
                 tracing::warn!(provider = %provider.id, %error, "failed to persist pricing-sync attempt state");
                 continue;
             }
-            if reconcile_due
-                && let Err(error) = db::set_setting(&state.pool, &reconcile_key, &now).await
-            {
-                tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation attempt state");
-                continue;
+            if reconcile_due {
+                if let Err(error) = db::set_setting(&state.pool, &reconcile_key, &now).await {
+                    tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation attempt state");
+                    continue;
+                }
             }
             match sync_provider_pricing_id(state, &provider.id).await {
                 Ok(_) => {
@@ -592,11 +592,12 @@ pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
                     {
                         tracing::warn!(provider = %provider.id, %error, "failed to persist pricing-sync success state");
                     }
-                    if reconcile_due
-                        && let Err(error) =
+                    if reconcile_due {
+                        if let Err(error) =
                             record_lifecycle_success(&state.pool, "reconciliation", &provider.id).await
-                    {
-                        tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation success state");
+                        {
+                            tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation success state");
+                        }
                     }
                 }
                 Err(error) => {
