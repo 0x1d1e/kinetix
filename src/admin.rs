@@ -3287,19 +3287,34 @@ pub async fn update_model_reconciliation(
             }
 
             if accepted_prices && prices.is_configured() {
-                let metadata = json!({
-                    "accepted_from": discovery.get("price_sources").cloned().unwrap_or(Value::Null),
-                });
-                db::ensure_price_version(&state.pool, &id, &prices, "operator_accept", &metadata)
-                    .await
-                    .map_err(ApiError::internal)?;
+                let mut fields = effective_price_fields(&discovery, &row.prices());
+                for selected_field in selected.iter().filter_map(|field| field.strip_prefix("prices.")) {
+                    let accepted_from = discovery
+                        .pointer(&format!("/price_sources/{selected_field}"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    set_price_field_provenance(
+                        &mut fields,
+                        selected_field,
+                        "operator_accept",
+                        json!({ "accepted_from": accepted_from }),
+                    );
+                }
+                let source = effective_price_source(&fields, &prices);
+                let metadata = json!({ "fields": fields });
+                let version_id =
+                    db::ensure_price_version(&state.pool, &id, &prices, &source, &metadata)
+                        .await
+                        .map_err(ApiError::internal)?;
                 db::merge_model_discovery(
                     &state.pool,
                     &id,
                     &json!({
                         "effective_pricing": {
-                            "source": "operator_accept",
+                            "source": source,
+                            "fields": fields,
                             "metadata": metadata,
+                            "price_version_id": version_id,
                             "updated_at": db::now_iso(),
                         }
                     }),
@@ -4753,23 +4768,26 @@ pub async fn update_model(
     }
     if prices.is_configured() {
         let existing_discovery = discovery_object(&model);
-        let existing_source = existing_discovery
-            .pointer("/effective_pricing/source")
-            .and_then(Value::as_str);
-        let price_changed = !prices_equal(&model.prices(), &prices);
-        let (source, metadata) = if price_changed {
-            ("operator".to_string(), json!({ "configured_by": "admin" }))
-        } else if let Some(source) = existing_source {
-            (
-                source.to_string(),
-                existing_discovery
-                    .pointer("/effective_pricing/metadata")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-            )
-        } else {
-            ("operator".to_string(), json!({ "configured_by": "admin" }))
-        };
+        let previous_prices = model.prices();
+        let mut fields = effective_price_fields(&existing_discovery, &previous_prices);
+        for field in PRICE_FIELDS {
+            let previous = price_field(&previous_prices, field);
+            let next = price_field(&prices, field);
+            if previous != next {
+                if next.is_some() {
+                    set_price_field_provenance(
+                        &mut fields,
+                        field,
+                        "operator",
+                        json!({ "configured_by": "admin" }),
+                    );
+                } else {
+                    fields.remove(field);
+                }
+            }
+        }
+        let source = effective_price_source(&fields, &prices);
+        let metadata = json!({ "fields": fields });
         let version_id = db::ensure_price_version(&state.pool, &id, &prices, &source, &metadata)
             .await
             .map_err(ApiError::internal)?;
@@ -4779,6 +4797,7 @@ pub async fn update_model(
             &json!({
                 "effective_pricing": {
                     "source": source,
+                    "fields": fields,
                     "metadata": metadata,
                     "price_version_id": version_id,
                     "updated_at": db::now_iso(),
