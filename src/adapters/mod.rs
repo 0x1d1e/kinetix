@@ -407,9 +407,9 @@ pub fn resolve_execution_profile_for_target(
     };
 
     let mut parameters = model.params();
-    let operator_parameter_overrides = discovery
-        .get("operator_parameter_overrides")
-        .and_then(serde_json::Value::as_object);
+    let parameter_ownership = discovery.get("operator_parameter_overrides");
+    let operator_parameter_overrides =
+        parameter_ownership.and_then(serde_json::Value::as_object);
     if let Some(evidence) = discovery
         .get("probe_evidence")
         .and_then(serde_json::Value::as_object)
@@ -426,6 +426,13 @@ pub fn resolve_execution_profile_for_target(
                 .and_then(serde_json::Value::as_bool)
             {
                 spec.supported = supported;
+                continue;
+            }
+            // Before parameter ownership was tracked, model.parameters was the
+            // only configuration surface. Preserve those legacy values as
+            // operator-owned. A present ownership object (possibly empty)
+            // opts the model into probe refinement for unowned parameters.
+            if parameter_ownership.is_none() {
                 continue;
             }
             match fresh_probe_status(item, &provider.id, &model.id, account_id, &transport) {
@@ -2253,6 +2260,7 @@ mod execution_profile_tests {
         })
         .to_string();
         model.discovery = serde_json::json!({
+            "operator_parameter_overrides": {},
             "probe_evidence": {
                 "parameter_temperature": {
                     "status": "unsupported",
@@ -2275,6 +2283,38 @@ mod execution_profile_tests {
         let other =
             resolve_execution_profile_for_target(&provider, &model, Some("account-b")).unwrap();
         assert!(other.parameters["temperature"].supported);
+    }
+
+    #[test]
+    fn legacy_configured_parameter_is_operator_owned() {
+        let provider = provider();
+        let mut model = model();
+        model.parameters = serde_json::json!({
+            "temperature": {
+                "supported": false,
+                "policy": "reject"
+            }
+        })
+        .to_string();
+        model.discovery = serde_json::json!({
+            "probe_evidence": {
+                "parameter_temperature": {
+                    "status": "supported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+        assert!(!profile.parameters["temperature"].supported);
     }
 
     #[test]
