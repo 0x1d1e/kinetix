@@ -255,6 +255,29 @@ pub fn resolve_execution_profile_for_target(
         || admin_thinking.mode.is_some()
         || admin_thinking.budget_field.is_some()
         || admin_thinking.level_field.is_some();
+
+    // A reasoning-disable probe changes runtime executability, not just
+    // descriptive capability metadata. Apply it before deriving the effective
+    // map, while keeping an explicit operator thinking map authoritative.
+    let reasoning_disable_status = if admin_thinking_configured {
+        None
+    } else {
+        discovery
+            .get("probe_evidence")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|evidence| evidence.get("reasoning_disable"))
+            .and_then(|item| {
+                fresh_probe_status(item, &provider.id, &model.id, account_id, &transport)
+            })
+    };
+    if let Some(capability) = reasoning.as_mut() {
+        match reasoning_disable_status {
+            Some("supported") => capability.can_disable = true,
+            Some("unsupported") => capability.can_disable = false,
+            _ => {}
+        }
+    }
+
     let mut thinking_map = if admin_thinking_configured {
         admin_thinking
     } else {
@@ -274,6 +297,33 @@ pub fn resolve_execution_profile_for_target(
             })
             .unwrap_or_default()
     };
+
+    if !admin_thinking_configured {
+        match reasoning_disable_status {
+            Some("unsupported") => {
+                thinking_map.levels.remove("off");
+            }
+            Some("supported") if !thinking_map.level_is_executable("off") => {
+                if let Some(candidate) = reasoning
+                    .as_ref()
+                    .and_then(|capability| thinking_map_for_transport(capability, &transport))
+                {
+                    let compatible = thinking_map.levels.is_empty()
+                        || (thinking_map.mode == candidate.mode
+                            && thinking_map.budget_field == candidate.budget_field
+                            && thinking_map.level_field == candidate.level_field);
+                    if compatible {
+                        if thinking_map.levels.is_empty() {
+                            thinking_map = candidate;
+                        } else if let Some(off) = candidate.levels.get("off").cloned() {
+                            thinking_map.levels.insert("off".to_string(), off);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     // Effort probes are evidence about one canonical level, not about the
     // model's entire reasoning capability. A rejected "max" must never turn
@@ -307,15 +357,6 @@ pub fn resolve_execution_profile_for_target(
                         }
                     }
                     _ => {}
-                }
-            } else if key == "reasoning_disable" && !admin_thinking_configured {
-                if let Some(capability) = reasoning.as_mut() {
-                    match fresh_probe_status(item, &provider.id, &model.id, account_id, &transport)
-                    {
-                        Some("supported") => capability.can_disable = true,
-                        Some("unsupported") => capability.can_disable = false,
-                        _ => {}
-                    }
                 }
             }
         }
@@ -421,7 +462,7 @@ pub(crate) fn thinking_map_for_transport(
         (TargetTransport::Gemini, "gemini_thinking_level") => "thinkingConfig.thinkingLevel",
         _ => return None,
     };
-    let levels = capability
+    let mut levels: std::collections::HashMap<String, serde_json::Value> = capability
         .levels
         .iter()
         .map(|level| {
@@ -433,6 +474,21 @@ pub(crate) fn thinking_map_for_transport(
             (level.clone(), serde_json::Value::String(upstream))
         })
         .collect();
+    if capability.can_disable
+        && matches!(
+            transport,
+            TargetTransport::OpenAiChat | TargetTransport::OpenAiResponses
+        )
+    {
+        let upstream = capability
+            .upstream_levels
+            .get("off")
+            .cloned()
+            .unwrap_or_else(|| "none".to_string());
+        levels
+            .entry("off".to_string())
+            .or_insert_with(|| serde_json::Value::String(upstream));
+    }
     Some(ThinkingMap {
         levels,
         mode: Some(crate::types::ThinkingMode::Level),
@@ -2247,4 +2303,87 @@ mod execution_profile_tests {
             Some(&serde_json::json!("vendor_high"))
         );
     }
+
+    #[test]
+    fn reasoning_disable_supported_probe_enables_executable_off_mapping() {
+        let provider = provider();
+        let mut model = model();
+        model.discovery = serde_json::json!({
+            "reasoning_capability": {
+                "mode": "level",
+                "levels": ["low", "high"],
+                "can_disable": false,
+                "upstream_format": "openai_effort"
+            },
+            "thinking_map": {
+                "mode": "level",
+                "levels": {"low": "low", "high": "high"},
+                "level_field": "reasoning_effort"
+            },
+            "probe_evidence": {
+                "reasoning_disable": {
+                    "status": "supported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+
+        assert!(profile.reasoning.as_ref().unwrap().can_disable);
+        assert!(profile.thinking_map.level_is_executable("off"));
+        assert_eq!(
+            profile.thinking_map.levels.get("off"),
+            Some(&serde_json::json!("none"))
+        );
+    }
+
+    #[test]
+    fn reasoning_disable_unsupported_probe_removes_executable_off_mapping() {
+        let provider = provider();
+        let mut model = model();
+        model.discovery = serde_json::json!({
+            "reasoning_capability": {
+                "mode": "level",
+                "levels": ["off", "low", "high"],
+                "can_disable": true,
+                "upstream_format": "openai_effort",
+                "upstream_levels": {"off": "none"}
+            },
+            "thinking_map": {
+                "mode": "level",
+                "levels": {"off": "none", "low": "low", "high": "high"},
+                "level_field": "reasoning_effort"
+            },
+            "probe_evidence": {
+                "reasoning_disable": {
+                    "status": "unsupported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+
+        assert!(!profile.reasoning.as_ref().unwrap().can_disable);
+        assert!(!profile.thinking_map.level_is_executable("off"));
+        assert!(!profile.thinking_map.levels.contains_key("off"));
+    }
+
 }
