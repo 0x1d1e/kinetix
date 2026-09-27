@@ -166,12 +166,24 @@ export interface CapabilityProbeResult {
   status: 'supported' | 'unsupported' | 'inconclusive';
   reason?: string;
   transport?: string;
+  scope?: {
+    provider_id: string;
+    account_id: string;
+    model_id: string;
+    transport: string;
+  };
   evidence?: {
     status: string;
     verified_at?: string;
     fresh_until?: string;
     estimated_max_cost_usd?: number;
     detail?: string | null;
+    scope?: {
+      provider_id: string;
+      account_id: string;
+      model_id: string;
+      transport: string;
+    };
   };
 }
 
@@ -507,11 +519,13 @@ export const Kinetix = {
     capability: string,
     value?: unknown,
     max_cost_usd?: number,
+    account_id?: string,
   ) =>
     api.post<CapabilityProbeResult>(`/admin/api/models/${id}/probe`, {
       capability,
       ...(value === undefined ? {} : { value }),
       ...(max_cost_usd === undefined ? {} : { max_cost_usd }),
+      ...(account_id === undefined ? {} : { account_id }),
     }),
   deleteModel: (id: string) => api.del(`/admin/api/models/${id}`),
 
