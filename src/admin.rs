@@ -4672,7 +4672,9 @@ mod model_lifecycle_regression_tests {
         .await
         .unwrap();
 
-        let status = lifecycle_lane_status(&pool, lane, provider_id).await.unwrap();
+        let status = lifecycle_lane_status(&pool, lane, provider_id)
+            .await
+            .unwrap();
         assert_eq!(status["last_success"].as_str(), Some(previous_success));
         assert_eq!(
             status["last_attempt"].as_str(),

@@ -1418,12 +1418,7 @@ mod tests {
     fn stale_fallback_exposes_failed_refresh_without_dropping_catalog() {
         let catalog = ModelsDevCatalog::from_parts(json!({}), json!({}))
             .unwrap()
-            .with_source_state(
-                "2026-09-26T00:00:00Z".to_string(),
-                "fresh",
-                None,
-                None,
-            );
+            .with_source_state("2026-09-26T00:00:00Z".to_string(), "fresh", None, None);
         let fetch = models_dev_stale_fallback(Some(ModelsDevCacheEntry {
             catalog,
             etag: None,
@@ -1434,7 +1429,8 @@ mod tests {
 
         assert_eq!(fetch.outcome, ModelsDevRefreshOutcome::StaleFallback);
         assert_eq!(
-            fetch.catalog
+            fetch
+                .catalog
                 .provenance
                 .as_ref()
                 .and_then(|value| value.get("freshness"))
