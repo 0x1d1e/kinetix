@@ -1027,6 +1027,15 @@ pub async fn update_model(
     Ok(())
 }
 
+pub async fn update_model_prices(pool: &Pool, id: &str, prices: &Prices) -> Result<()> {
+    sqlx::query("UPDATE models SET prices = ? WHERE id = ?")
+        .bind(serde_json::to_string(prices)?)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn delete_model(pool: &Pool, id: &str) -> Result<()> {
     sqlx::query("DELETE FROM models WHERE id = ?")
         .bind(id)
