@@ -273,6 +273,92 @@ const MODEL_PRICING_SYNC_INTERVAL_SETTING: &str = "model_pricing_sync_interval_s
 const MODEL_LIFECYCLE_JITTER_SETTING: &str = "model_lifecycle_jitter_secs";
 const MODEL_PROBE_FRESHNESS_SETTING: &str = "model_probe_freshness_secs";
 
+fn provider_discovery_observations_key(provider_id: &str) -> String {
+    format!("model_discovery_observations:{provider_id}")
+}
+
+fn lifecycle_setting_key(lane: &str, field: &str, provider_id: &str) -> String {
+    format!("model_{lane}_{field}:{provider_id}")
+}
+
+async fn lifecycle_lane_status(pool: &Pool, lane: &str, provider_id: &str) -> Result<Value, ApiError> {
+    let last_attempt = db::get_setting(
+        pool,
+        &lifecycle_setting_key(lane, "last_attempt", provider_id),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let last_success = db::get_setting(
+        pool,
+        &lifecycle_setting_key(lane, "last_success", provider_id),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let last_failure = db::get_setting(
+        pool,
+        &lifecycle_setting_key(lane, "last_failure", provider_id),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let last_error = db::get_setting(
+        pool,
+        &lifecycle_setting_key(lane, "last_error", provider_id),
+    )
+    .await
+    .map_err(ApiError::internal)?
+    .filter(|value| !value.is_empty());
+    Ok(json!({
+        "last_attempt": last_attempt,
+        "last_success": last_success,
+        "last_failure": last_failure,
+        "last_error": last_error,
+    }))
+}
+
+async fn provider_lifecycle_status(pool: &Pool, provider_id: &str) -> Result<Value, ApiError> {
+    Ok(json!({
+        "reconciliation": lifecycle_lane_status(pool, "reconciliation", provider_id).await?,
+        "pricing_sync": lifecycle_lane_status(pool, "pricing_sync", provider_id).await?,
+    }))
+}
+
+async fn record_lifecycle_success(pool: &Pool, lane: &str, provider_id: &str) -> anyhow::Result<()> {
+    db::set_setting(
+        pool,
+        &lifecycle_setting_key(lane, "last_success", provider_id),
+        &db::now_iso(),
+    )
+    .await?;
+    db::set_setting(
+        pool,
+        &lifecycle_setting_key(lane, "last_error", provider_id),
+        "",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn record_lifecycle_failure(
+    pool: &Pool,
+    lane: &str,
+    provider_id: &str,
+    error: &str,
+) -> anyhow::Result<()> {
+    db::set_setting(
+        pool,
+        &lifecycle_setting_key(lane, "last_failure", provider_id),
+        &db::now_iso(),
+    )
+    .await?;
+    db::set_setting(
+        pool,
+        &lifecycle_setting_key(lane, "last_error", provider_id),
+        &truncate(&crypto::redact(error), 400),
+    )
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ModelLifecycleSettings {
     reconciliation_interval_secs: u64,
@@ -470,8 +556,8 @@ pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
     };
 
     for provider in providers {
-        let reconcile_key = format!("model_reconciliation_last_attempt:{}", provider.id);
-        let pricing_key = format!("model_pricing_sync_last_attempt:{}", provider.id);
+        let reconcile_key = lifecycle_setting_key("reconciliation", "last_attempt", &provider.id);
+        let pricing_key = lifecycle_setting_key("pricing_sync", "last_attempt", &provider.id);
         let reconcile_due = scheduled_due(
             &state.pool,
             &reconcile_key,
@@ -489,54 +575,87 @@ pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
 
         if pricing_due {
             let now = db::now_iso();
-            let _ = db::set_setting(&state.pool, &pricing_key, &now).await;
-            if reconcile_due {
-                let _ = db::set_setting(&state.pool, &reconcile_key, &now).await;
+            if let Err(error) = db::set_setting(&state.pool, &pricing_key, &now).await {
+                tracing::warn!(provider = %provider.id, %error, "failed to persist pricing-sync attempt state");
+                continue;
+            }
+            if reconcile_due
+                && let Err(error) = db::set_setting(&state.pool, &reconcile_key, &now).await
+            {
+                tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation attempt state");
+                continue;
             }
             match sync_provider_pricing_id(state, &provider.id).await {
                 Ok(_) => {
-                    let success = db::now_iso();
-                    let _ = db::set_setting(
+                    if let Err(error) =
+                        record_lifecycle_success(&state.pool, "pricing_sync", &provider.id).await
+                    {
+                        tracing::warn!(provider = %provider.id, %error, "failed to persist pricing-sync success state");
+                    }
+                    if reconcile_due
+                        && let Err(error) =
+                            record_lifecycle_success(&state.pool, "reconciliation", &provider.id).await
+                    {
+                        tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation success state");
+                    }
+                }
+                Err(error) => {
+                    let message = error.1.clone();
+                    let _ = record_lifecycle_failure(
                         &state.pool,
-                        &format!("model_pricing_sync_last_success:{}", provider.id),
-                        &success,
+                        "pricing_sync",
+                        &provider.id,
+                        &message,
                     )
                     .await;
                     if reconcile_due {
-                        let _ = db::set_setting(
+                        let _ = record_lifecycle_failure(
                             &state.pool,
-                            &format!("model_reconciliation_last_success:{}", provider.id),
-                            &success,
+                            "reconciliation",
+                            &provider.id,
+                            &message,
                         )
                         .await;
                     }
+                    tracing::warn!(
+                        provider = %provider.id,
+                        error = ?error,
+                        "scheduled pricing sync failed; preserving last-known metadata and prices"
+                    );
                 }
-                Err(error) => tracing::warn!(
-                    provider = %provider.id,
-                    error = ?error,
-                    "scheduled pricing sync failed; preserving last-known metadata and prices"
-                ),
             }
             continue;
         }
 
         if reconcile_due {
             let now = db::now_iso();
-            let _ = db::set_setting(&state.pool, &reconcile_key, &now).await;
+            if let Err(error) = db::set_setting(&state.pool, &reconcile_key, &now).await {
+                tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation attempt state");
+                continue;
+            }
             match reconcile_provider_id(state, &provider.id).await {
                 Ok(_) => {
-                    let _ = db::set_setting(
+                    if let Err(error) =
+                        record_lifecycle_success(&state.pool, "reconciliation", &provider.id).await
+                    {
+                        tracing::warn!(provider = %provider.id, %error, "failed to persist reconciliation success state");
+                    }
+                }
+                Err(error) => {
+                    let message = error.1.clone();
+                    let _ = record_lifecycle_failure(
                         &state.pool,
-                        &format!("model_reconciliation_last_success:{}", provider.id),
-                        &db::now_iso(),
+                        "reconciliation",
+                        &provider.id,
+                        &message,
                     )
                     .await;
+                    tracing::warn!(
+                        provider = %provider.id,
+                        error = ?error,
+                        "scheduled model reconciliation failed; existing state left intact"
+                    );
                 }
-                Err(error) => tracing::warn!(
-                    provider = %provider.id,
-                    error = ?error,
-                    "scheduled model reconciliation failed; existing state left intact"
-                ),
             }
         }
     }
@@ -2595,7 +2714,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
         let m = &observation.model;
         if let Some(row) = existing.iter().find(|e| e.upstream_id == m.id) {
             let reconciliation = reconciliation_state(row, observation, &now);
-            let _ = persist_model_discovery_update(
+            persist_model_discovery_update(
                 &state.pool,
                 row,
                 json!({
@@ -2626,14 +2745,17 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                     "disappeared": false,
                 }),
             )
-            .await;
+            .await
+            .map_err(ApiError::internal)?;
             if let Some(plugin_id) = discovery_plugin_id.as_deref() {
                 let provenance = if observation.opaque_state.is_some() {
                     plugin_id
                 } else {
                     ""
                 };
-                let _ = db::set_model_opaque_state_plugin(&state.pool, &row.id, provenance).await;
+                db::set_model_opaque_state_plugin(&state.pool, &row.id, provenance)
+                    .await
+                    .map_err(ApiError::internal)?;
             }
         }
         out.push(json!({
@@ -2684,7 +2806,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
         if discovered_ids.contains(&row.upstream_id) {
             continue;
         }
-        let _ = persist_model_discovery_update(
+        persist_model_discovery_update(
             &state.pool,
             row,
             json!({
@@ -2707,14 +2829,44 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                 },
             }),
         )
-        .await;
+        .await
+        .map_err(ApiError::internal)?;
         disappeared.push(json!({
             "upstream_id": row.upstream_id,
             "display_name": row.display_name,
             "model_id": row.id,
         }));
     }
-    Ok(json!({ "models": out, "disappeared": disappeared }))
+    let result = json!({ "models": out, "disappeared": disappeared });
+    db::set_setting(
+        &state.pool,
+        &provider_discovery_observations_key(id),
+        &result.to_string(),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(result)
+}
+
+pub async fn cached_model_discovery(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let payload = match db::get_setting(&state.pool, &provider_discovery_observations_key(&id))
+        .await
+        .map_err(ApiError::internal)?
+    {
+        Some(value) => serde_json::from_str::<Value>(&value).map_err(ApiError::internal)?,
+        None => json!({ "models": [], "disappeared": [] }),
+    };
+    let lifecycle = provider_lifecycle_status(&state.pool, &id).await?;
+    let mut payload = payload;
+    payload
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("invalid cached model discovery payload"))?
+        .insert("lifecycle".into(), lifecycle);
+    Ok(Json(payload))
 }
 
 /// Manual discovery and reconciliation share one implementation so scheduled
