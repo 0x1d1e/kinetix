@@ -11,6 +11,8 @@ import { Kinetix, DiscoveredModel, ProviderLifecycleStatus } from '../../lib/res
  */
 const DEFAULT_CONTEXT_WINDOW = 200000;
 const DEFAULT_MAX_OUTPUT = 8192;
+const PROBE_MAX_REQUESTS = 1;
+const PROBE_MAX_COST_USD = 0.05;
 const CANONICAL_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 type CanonicalThinkingLevel = (typeof CANONICAL_THINKING_LEVELS)[number];
 
@@ -79,6 +81,7 @@ type ProbeEvidenceEntry = {
   status?: string;
   verified_at?: string;
   fresh_until?: string;
+  estimated_max_cost_usd?: number;
   scope?: {
     provider_id?: string;
     account_id?: string;
@@ -104,8 +107,26 @@ const probeEvidenceSummary = (model: ModelConfig, key: string, accountId: string
   );
   if (!entries.length) return '—';
   return entries
-    .map((entry) => `${entry.scope?.transport || 'unknown'}:${entry.status || '—'}`)
-    .join('/');
+    .map((entry) => {
+      const verifiedAt = entry.verified_at ? new Date(entry.verified_at) : null;
+      const verifiedLabel =
+        verifiedAt && !Number.isNaN(verifiedAt.getTime())
+          ? verifiedAt.toLocaleString()
+          : entry.verified_at || 'unknown';
+      const freshUntil = entry.fresh_until ? new Date(entry.fresh_until) : null;
+      const freshness =
+        freshUntil && !Number.isNaN(freshUntil.getTime())
+          ? freshUntil.getTime() > Date.now()
+            ? 'fresh'
+            : 'expired'
+          : 'freshness unknown';
+      const cost =
+        typeof entry.estimated_max_cost_usd === 'number'
+          ? ` · ≤ USD ${entry.estimated_max_cost_usd.toFixed(6)}`
+          : '';
+      return `${entry.scope?.transport || 'unknown'}:${entry.status || '—'} · verified ${verifiedLabel} · ${freshness}${cost}`;
+    })
+    .join(' / ');
 };
 
 const modelProbeTransport = (model: ModelConfig, provider: Provider) => {
@@ -430,7 +451,13 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     }
     setLifecycleBusy(`probe:${key}`);
     try {
-      const result = await Kinetix.probeModel(model.id, capability, value, undefined, accountId);
+      const result = await Kinetix.probeModel(
+        model.id,
+        capability,
+        value,
+        PROBE_MAX_COST_USD,
+        accountId,
+      );
       setProbeStatus((prev) => ({ ...prev, [key]: result.status }));
       onRefresh?.();
     } catch (error) {
@@ -1640,6 +1667,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                               </label>
                               <span>
                                 Target: {activeProvider.name} / {selectedProbeAccount(m.providerId)?.label || 'no account'} / {m.upstreamModelId} / {modelProbeTransport(m, activeProvider)}
+                              </span>
+                              <span>
+                                Safety: {PROBE_MAX_REQUESTS} request · max cost ${PROBE_MAX_COST_USD.toFixed(2)}
                               </span>
                             </div>
                             <div className="flex flex-wrap gap-1">

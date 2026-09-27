@@ -407,6 +407,19 @@ pub struct ModelsDevCatalog {
     provenance: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelsDevRefreshOutcome {
+    Fresh,
+    NotModified,
+    StaleFallback,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelsDevFetch {
+    pub catalog: ModelsDevCatalog,
+    pub outcome: ModelsDevRefreshOutcome,
+}
+
 #[derive(Debug, Clone)]
 struct ModelsDevCacheEntry {
     catalog: ModelsDevCatalog,
@@ -429,6 +442,15 @@ const MODELS_DEV_STALE_IF_ERROR_TTL: Duration = Duration::from_secs(7 * 24 * 60 
 fn models_dev_cache() -> &'static tokio::sync::RwLock<Option<ModelsDevCacheEntry>> {
     static CACHE: OnceLock<tokio::sync::RwLock<Option<ModelsDevCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| tokio::sync::RwLock::new(None))
+}
+
+fn models_dev_stale_fallback(cached: Option<ModelsDevCacheEntry>) -> Option<ModelsDevFetch> {
+    cached
+        .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
+        .map(|entry| ModelsDevFetch {
+            catalog: entry.catalog.with_freshness("stale"),
+            outcome: ModelsDevRefreshOutcome::StaleFallback,
+        })
 }
 
 impl ModelsDevCatalog {
@@ -482,7 +504,16 @@ impl ModelsDevCatalog {
         self
     }
 
-    pub async fn fetch(client: &reqwest::Client, _base_url: &str) -> Option<Self> {
+    pub async fn fetch(client: &reqwest::Client, base_url: &str) -> Option<Self> {
+        Self::fetch_with_outcome(client, base_url)
+            .await
+            .map(|fetch| fetch.catalog)
+    }
+
+    pub async fn fetch_with_outcome(
+        client: &reqwest::Client,
+        _base_url: &str,
+    ) -> Option<ModelsDevFetch> {
         // The catalog destination is fixed and never derived from provider input.
         // Apply the existing SSRF/private-network guard to the actual outbound
         // destination rather than suppressing enrichment for private gateways.
@@ -493,7 +524,10 @@ impl ModelsDevCatalog {
         let cached = models_dev_cache().read().await.clone();
         if let Some(entry) = cached.as_ref() {
             if entry.fetched_at.elapsed() <= MODELS_DEV_FRESH_TTL {
-                return Some(entry.catalog.clone().with_freshness("fresh"));
+                return Some(ModelsDevFetch {
+                    catalog: entry.catalog.clone().with_freshness("fresh"),
+                    outcome: ModelsDevRefreshOutcome::Fresh,
+                });
             }
         }
 
@@ -512,11 +546,7 @@ impl ModelsDevCatalog {
 
         let response = match request.send().await {
             Ok(response) => response,
-            Err(_) => {
-                return cached
-                    .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
-                    .map(|entry| entry.catalog.with_freshness("stale"));
-            }
+            Err(_) => return models_dev_stale_fallback(cached),
         };
 
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
@@ -524,15 +554,16 @@ impl ModelsDevCatalog {
                 let entry = entry.mark_validated();
                 let catalog = entry.catalog.clone();
                 *models_dev_cache().write().await = Some(entry);
-                return Some(catalog);
+                return Some(ModelsDevFetch {
+                    catalog,
+                    outcome: ModelsDevRefreshOutcome::NotModified,
+                });
             }
             return None;
         }
 
         if !response.status().is_success() {
-            return cached
-                .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
-                .map(|entry| entry.catalog.with_freshness("stale"));
+            return models_dev_stale_fallback(cached);
         }
 
         let etag = response
@@ -549,9 +580,7 @@ impl ModelsDevCatalog {
             .content_length()
             .is_some_and(|length| length > MAX_MODELS_DEV_BYTES as u64)
         {
-            return cached
-                .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
-                .map(|entry| entry.catalog.with_freshness("stale"));
+            return models_dev_stale_fallback(cached);
         }
 
         let mut response = response;
@@ -565,26 +594,16 @@ impl ModelsDevCatalog {
             let chunk = match response.chunk().await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
-                Err(_) => {
-                    return cached
-                        .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
-                        .map(|entry| entry.catalog.with_freshness("stale"));
-                }
+                Err(_) => return models_dev_stale_fallback(cached),
             };
             if bytes.len().saturating_add(chunk.len()) > MAX_MODELS_DEV_BYTES {
-                return cached
-                    .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
-                    .map(|entry| entry.catalog.with_freshness("stale"));
+                return models_dev_stale_fallback(cached);
             }
             bytes.extend_from_slice(&chunk);
         }
         let catalog = match Self::from_slice(&bytes) {
             Some(catalog) => catalog,
-            None => {
-                return cached
-                    .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
-                    .map(|entry| entry.catalog.with_freshness("stale"));
-            }
+            None => return models_dev_stale_fallback(cached),
         };
         let catalog = catalog.with_source_state(
             chrono::Utc::now().to_rfc3339(),
@@ -598,7 +617,10 @@ impl ModelsDevCatalog {
             last_modified,
             fetched_at: Instant::now(),
         });
-        Some(catalog)
+        Some(ModelsDevFetch {
+            catalog,
+            outcome: ModelsDevRefreshOutcome::Fresh,
+        })
     }
 
     fn provider_id_for_base(&self, base_url: &str) -> Option<String> {
@@ -1391,6 +1413,35 @@ fn resolve_with_bundled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_fallback_exposes_failed_refresh_without_dropping_catalog() {
+        let catalog = ModelsDevCatalog::from_parts(json!({}), json!({}))
+            .unwrap()
+            .with_source_state(
+                "2026-09-26T00:00:00Z".to_string(),
+                "fresh",
+                None,
+                None,
+            );
+        let fetch = models_dev_stale_fallback(Some(ModelsDevCacheEntry {
+            catalog,
+            etag: None,
+            last_modified: None,
+            fetched_at: Instant::now(),
+        }))
+        .unwrap();
+
+        assert_eq!(fetch.outcome, ModelsDevRefreshOutcome::StaleFallback);
+        assert_eq!(
+            fetch.catalog
+                .provenance
+                .as_ref()
+                .and_then(|value| value.get("freshness"))
+                .and_then(Value::as_str),
+            Some("stale")
+        );
+    }
 
     fn models_dev_fixture() -> ModelsDevCatalog {
         ModelsDevCatalog::from_parts(

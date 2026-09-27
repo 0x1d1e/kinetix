@@ -3986,14 +3986,19 @@ pub(crate) async fn sync_provider_pricing_id(
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
-    let models_dev =
-        crate::model_catalog::ModelsDevCatalog::fetch(&state.http, &provider.base_url)
+    let models_dev_fetch =
+        crate::model_catalog::ModelsDevCatalog::fetch_with_outcome(&state.http, &provider.base_url)
             .await
             .ok_or_else(|| {
                 ApiError::bad(
                     "models.dev pricing refresh unavailable; preserving last-known observations and effective prices",
                 )
             })?;
+    let stale_fallback = matches!(
+        models_dev_fetch.outcome,
+        crate::model_catalog::ModelsDevRefreshOutcome::StaleFallback
+    );
+    let models_dev = models_dev_fetch.catalog;
 
     let models = db::models_for_provider(&state.pool, id)
         .await
@@ -4053,6 +4058,11 @@ pub(crate) async fn sync_provider_pricing_id(
             .reload(&state.pool)
             .await
             .map_err(ApiError::internal)?;
+    }
+    if stale_fallback {
+        return Err(ApiError::bad(
+            "models.dev pricing refresh failed; stale cached catalog preserved last-known observations and effective prices",
+        ));
     }
     Ok(json!({
         "ok": true,
@@ -4623,6 +4633,95 @@ fn probe_cost_upper_bound(
 #[cfg(test)]
 mod model_lifecycle_regression_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pricing_refresh_failure_does_not_advance_last_success() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-pricing-lifecycle-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("test.db").display());
+        let pool = db::connect(&url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+
+        let provider_id = "provider-pricing-stale";
+        let lane = "pricing_sync";
+        let previous_success = "2026-09-26T00:00:00Z";
+        db::set_setting(
+            &pool,
+            &lifecycle_setting_key(lane, "last_success", provider_id),
+            previous_success,
+        )
+        .await
+        .unwrap();
+        db::set_setting(
+            &pool,
+            &lifecycle_setting_key(lane, "last_attempt", provider_id),
+            "2026-09-27T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        record_lifecycle_failure(
+            &pool,
+            lane,
+            provider_id,
+            "models.dev refresh failed; stale cached catalog retained",
+        )
+        .await
+        .unwrap();
+
+        let status = lifecycle_lane_status(&pool, lane, provider_id).await.unwrap();
+        assert_eq!(status["last_success"].as_str(), Some(previous_success));
+        assert_eq!(
+            status["last_attempt"].as_str(),
+            Some("2026-09-27T00:00:00Z")
+        );
+        assert!(status["last_failure"].as_str().is_some());
+        assert!(status["last_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("stale cached catalog")));
+
+        drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_catalog_observation_preserves_effective_automatic_price() {
+        let current = Prices {
+            output_per_1m: Some(5.0),
+            ..Default::default()
+        };
+        let observed = Prices {
+            output_per_1m: Some(5.0),
+            ..Default::default()
+        };
+        let discovery = json!({
+            "price_sources": {
+                "output_per_1m": "models.dev:provider"
+            },
+            "effective_pricing": {
+                "source": "models.dev:provider",
+                "fields": {
+                    "output_per_1m": {"source": "models.dev:provider", "metadata": {}}
+                }
+            },
+            "catalog": {
+                "source_state": {
+                    "source": "models.dev",
+                    "retrieved_at": "2026-09-26T00:00:00Z",
+                    "freshness": "stale"
+                }
+            }
+        });
+
+        let (effective, fields, preserved_manual) =
+            merge_automatic_price_observation(&current, &observed, &discovery);
+        assert_eq!(effective.output_per_1m, Some(5.0));
+        assert!(!preserved_manual);
+        assert_eq!(fields["output_per_1m"]["source"], "models.dev:provider");
+    }
 
     #[test]
     fn mixed_price_ownership_preserves_manual_input_and_updates_automatic_output() {
@@ -5445,6 +5544,13 @@ mod probe_cost_regression_tests {
     }
 }
 
+fn structured_output_probe_contract(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.len() == 1 && object.get("ok").and_then(Value::as_str).is_some()
+}
+
 #[cfg(test)]
 mod probe_rejection_regression_tests {
     use super::*;
@@ -5473,6 +5579,49 @@ mod probe_rejection_regression_tests {
             "unsupported value 'high' for reasoning_effort",
         ));
     }
+
+    #[test]
+    fn forced_tool_choice_rejection_is_inconclusive_for_base_tool_support() {
+        for body in [
+            "tool_choice is unsupported",
+            "tool choice is not supported",
+            "function_call is not supported",
+            "Tool 'kinetix_probe_noop' not found in provided tools",
+        ] {
+            assert!(!deterministic_probe_rejection(
+                "tool_calling",
+                None,
+                400,
+                body,
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_tool_declaration_rejection_is_deterministic() {
+        for body in [
+            "tools are unsupported",
+            "tool declarations are not supported",
+            "function declarations are unsupported",
+        ] {
+            assert!(deterministic_probe_rejection(
+                "tool_calling",
+                None,
+                400,
+                body,
+            ));
+        }
+    }
+
+    #[test]
+    fn structured_output_probe_requires_exact_object_shape() {
+        assert!(structured_output_probe_contract(&json!({"ok": "yes"})));
+        assert!(!structured_output_probe_contract(
+            &json!({"ok": "yes", "extra": true})
+        ));
+        assert!(!structured_output_probe_contract(&json!({"ok": 1})));
+        assert!(!structured_output_probe_contract(&json!(["ok"])));
+    }
 }
 
 fn deterministic_probe_rejection(
@@ -5497,12 +5646,12 @@ fn deterministic_probe_rejection(
             "thinking effort".into(),
         ],
         "tool_calling" => vec![
-            "tool_choice".into(),
-            "tool choice".into(),
             "tool calling".into(),
-            "function_call".into(),
-            "function call".into(),
             "tools".into(),
+            "tool declaration".into(),
+            "tool declarations".into(),
+            "function declaration".into(),
+            "function declarations".into(),
         ],
         "structured_output" => vec![
             "response_format".into(),
@@ -5987,10 +6136,7 @@ pub async fn probe_model_capability(
                                 .collect::<String>()
                         })
                         .and_then(|text| serde_json::from_str::<Value>(text.trim()).ok())
-                        .and_then(|value| {
-                            value.get("ok").and_then(Value::as_str).map(str::to_string)
-                        })
-                        .is_some(),
+                        .is_some_and(|value| structured_output_probe_contract(&value)),
                     _ => true,
                 };
                 if contract_verified {
