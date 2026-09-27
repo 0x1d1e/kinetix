@@ -209,7 +209,9 @@ pub fn resolve_execution_profile(
         let evidence = discovery
             .get("probe_evidence")
             .and_then(|value| value.get(name))?;
-        let fresh_until = evidence.get("fresh_until").and_then(serde_json::Value::as_str)?;
+        let fresh_until = evidence
+            .get("fresh_until")
+            .and_then(serde_json::Value::as_str)?;
         let fresh_until = chrono::DateTime::parse_from_rfc3339(fresh_until).ok()?;
         if fresh_until.with_timezone(&chrono::Utc) <= chrono::Utc::now() {
             return None;

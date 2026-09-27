@@ -376,9 +376,13 @@ pub async fn update_model_lifecycle_settings(
         if value > 3600 {
             return Err(ApiError::bad("jitter_secs must be <= 3600"));
         }
-        db::set_setting(&state.pool, MODEL_LIFECYCLE_JITTER_SETTING, &value.to_string())
-            .await
-            .map_err(ApiError::internal)?;
+        db::set_setting(
+            &state.pool,
+            MODEL_LIFECYCLE_JITTER_SETTING,
+            &value.to_string(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
     }
     if let Some(value) = body.probe_freshness_secs {
         if !(60..=365 * 24 * 3600).contains(&value) {
@@ -386,9 +390,13 @@ pub async fn update_model_lifecycle_settings(
                 "probe_freshness_secs must be between 60 and 31536000",
             ));
         }
-        db::set_setting(&state.pool, MODEL_PROBE_FRESHNESS_SETTING, &value.to_string())
-            .await
-            .map_err(ApiError::internal)?;
+        db::set_setting(
+            &state.pool,
+            MODEL_PROBE_FRESHNESS_SETTING,
+            &value.to_string(),
+        )
+        .await
+        .map_err(ApiError::internal)?;
     }
 
     let settings = model_lifecycle_settings(&state).await?;
@@ -2210,7 +2218,13 @@ fn explicit_deprecation(observation: &DiscoveredObservation) -> bool {
 }
 
 fn reconciliation_diff(row: &db::ModelRow, observation: &DiscoveredObservation) -> Vec<Value> {
-    fn push_diff(out: &mut Vec<Value>, field: &str, configured: Value, observed: Value, source: Value) {
+    fn push_diff(
+        out: &mut Vec<Value>,
+        field: &str,
+        configured: Value,
+        observed: Value,
+        source: Value,
+    ) {
         if configured != observed && !observed.is_null() {
             out.push(json!({
                 "field": field,
@@ -2260,7 +2274,13 @@ fn reconciliation_diff(row: &db::ModelRow, observation: &DiscoveredObservation) 
     let configured_caps =
         serde_json::from_str::<Value>(&row.capabilities).unwrap_or_else(|_| json!({}));
     let observed_caps = discovered_capabilities(observation);
-    for field in ["text", "reasoning", "vision", "tool_calling", "structured_output"] {
+    for field in [
+        "text",
+        "reasoning",
+        "vision",
+        "tool_calling",
+        "structured_output",
+    ] {
         if let Some(observed) = observed_caps.get(field).filter(|value| !value.is_null()) {
             push_diff(
                 &mut diff,
@@ -2374,9 +2394,14 @@ fn reconciliation_state(
     checked_at: &str,
 ) -> Value {
     let discovery = discovery_object(row);
-    let previous = discovery.get("reconciliation").cloned().unwrap_or_else(|| json!({}));
+    let previous = discovery
+        .get("reconciliation")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let diff = Value::Array(reconciliation_diff(row, observation));
-    let ignored = previous.get("ignored_diff").is_some_and(|value| value == &diff);
+    let ignored = previous
+        .get("ignored_diff")
+        .is_some_and(|value| value == &diff);
     let deprecated = explicit_deprecation(observation);
     let status = if deprecated {
         "deprecated"
@@ -2434,10 +2459,7 @@ fn raw_discovery_metadata<'a>(payload: &'a Value, model_id: &str) -> Option<&'a 
 
 /// `POST /admin/api/providers/:id/discover` — fetch the upstream model list
 /// using the provider's credentials (FR-10.4).
-pub(crate) async fn reconcile_provider_id(
-    state: &AppState,
-    id: &str,
-) -> Result<Value, ApiError> {
+pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<Value, ApiError> {
     let provider = db::get_provider(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?
@@ -2697,7 +2719,6 @@ pub async fn reconcile_models(
     reconcile_provider_id(&state, &id).await.map(Json)
 }
 
-
 #[derive(Deserialize)]
 pub struct ReconciliationActionBody {
     pub action: String,
@@ -2750,7 +2771,10 @@ fn automatic_price_source(discovery: &Value) -> String {
         }
     }
     if sources.len() == 1 {
-        sources.into_iter().next().unwrap_or_else(|| "discovery".into())
+        sources
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "discovery".into())
     } else if sources.is_empty() {
         "discovery".into()
     } else {
@@ -2868,7 +2892,8 @@ pub async fn update_model_reconciliation(
                         }
                     }
                     "context_window" => {
-                        if let Some(value) = discovery.get("context_window").and_then(Value::as_i64) {
+                        if let Some(value) = discovery.get("context_window").and_then(Value::as_i64)
+                        {
                             context_window = Some(value);
                         }
                     }
@@ -2881,7 +2906,8 @@ pub async fn update_model_reconciliation(
                     }
                     "thinking_map" => {
                         if let Some(value) = discovery.get("thinking_map") {
-                            if let Ok(parsed) = serde_json::from_value::<ThinkingMap>(value.clone()) {
+                            if let Ok(parsed) = serde_json::from_value::<ThinkingMap>(value.clone())
+                            {
                                 validate_thinking_map(&parsed)?;
                                 thinking_map = parsed;
                             }
@@ -2952,7 +2978,10 @@ pub async fn update_model_reconciliation(
                     .map_err(ApiError::internal)?;
             }
 
-            if selected.iter().any(|field| field.starts_with("capabilities.")) {
+            if selected
+                .iter()
+                .any(|field| field.starts_with("capabilities."))
+            {
                 db::merge_model_discovery(
                     &state.pool,
                     &id,
@@ -3575,10 +3604,16 @@ fn deterministic_probe_rejection(
         }
         "tool_calling" => vec!["tool".into(), "function".into()],
         "structured_output" => {
-            vec!["response_format".into(), "json_schema".into(), "schema".into()]
+            vec![
+                "response_format".into(),
+                "json_schema".into(),
+                "schema".into(),
+            ]
         }
         capability if capability.starts_with("parameter.") => {
-            vec![capability.trim_start_matches("parameter.").to_ascii_lowercase()]
+            vec![capability
+                .trim_start_matches("parameter.")
+                .to_ascii_lowercase()]
         }
         _ => Vec::new(),
     };
@@ -3655,7 +3690,9 @@ pub async fn probe_model_capability(
     let reasoning_probe = matches!(body.capability.as_str(), "reasoning" | "reasoning_disable");
     let max_cost = body.max_cost_usd.unwrap_or(0.05);
     if !max_cost.is_finite() || max_cost < 0.0 {
-        return Err(ApiError::bad("max_cost_usd must be a finite non-negative number"));
+        return Err(ApiError::bad(
+            "max_cost_usd must be a finite non-negative number",
+        ));
     }
     let estimated_cost = probe_cost_upper_bound(&effective_prices, reasoning_probe)
         .ok_or_else(|| ApiError::bad(
@@ -3815,8 +3852,8 @@ pub async fn probe_model_capability(
     let outbound = adapter
         .build_body(&ctx, &internal)
         .map_err(|failure| ApiError::bad(failure.message))?;
-    let parsed_url =
-        url::Url::parse(&url).map_err(|error| ApiError::bad(format!("invalid probe URL: {error}")))?;
+    let parsed_url = url::Url::parse(&url)
+        .map_err(|error| ApiError::bad(format!("invalid probe URL: {error}")))?;
 
     let started = std::time::Instant::now();
     let response = crate::outbound::send_provider_request(
@@ -4216,10 +4253,9 @@ pub async fn create_model(
         } else {
             ("operator".to_string(), json!({ "configured_by": "admin" }))
         };
-        let version_id =
-            db::ensure_price_version(&state.pool, &id, &prices, &source, &metadata)
-                .await
-                .map_err(ApiError::internal)?;
+        let version_id = db::ensure_price_version(&state.pool, &id, &prices, &source, &metadata)
+            .await
+            .map_err(ApiError::internal)?;
         db::merge_model_discovery(
             &state.pool,
             &id,
@@ -4329,10 +4365,9 @@ pub async fn update_model(
         } else {
             ("operator".to_string(), json!({ "configured_by": "admin" }))
         };
-        let version_id =
-            db::ensure_price_version(&state.pool, &id, &prices, &source, &metadata)
-                .await
-                .map_err(ApiError::internal)?;
+        let version_id = db::ensure_price_version(&state.pool, &id, &prices, &source, &metadata)
+            .await
+            .map_err(ApiError::internal)?;
         db::merge_model_discovery(
             &state.pool,
             &id,

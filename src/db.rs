@@ -795,8 +795,8 @@ impl ModelRow {
         serde_json::from_str(&self.prices).unwrap_or_default()
     }
     pub fn price_provenance(&self) -> (String, Value) {
-        let discovery =
-            serde_json::from_str::<Value>(&self.discovery).unwrap_or_else(|_| serde_json::json!({}));
+        let discovery = serde_json::from_str::<Value>(&self.discovery)
+            .unwrap_or_else(|_| serde_json::json!({}));
         let effective = discovery.get("effective_pricing");
         let source = effective
             .and_then(|value| value.get("source"))
@@ -1080,11 +1080,13 @@ pub async fn insert_price_version(pool: &Pool, model_id: &str, p: &Prices) -> Re
 }
 
 fn price_snapshot_matches(row: &sqlx::sqlite::SqliteRow, p: &Prices) -> Result<bool> {
-    Ok(row.try_get::<Option<f64>, _>("input_per_1m")? == p.input_per_1m
-        && row.try_get::<Option<f64>, _>("output_per_1m")? == p.output_per_1m
-        && row.try_get::<Option<f64>, _>("cached_per_1m")? == p.cached_per_1m
-        && row.try_get::<Option<f64>, _>("cache_write_per_1m")? == p.cache_write_per_1m
-        && row.try_get::<Option<f64>, _>("thinking_per_1m")? == p.thinking_per_1m)
+    Ok(
+        row.try_get::<Option<f64>, _>("input_per_1m")? == p.input_per_1m
+            && row.try_get::<Option<f64>, _>("output_per_1m")? == p.output_per_1m
+            && row.try_get::<Option<f64>, _>("cached_per_1m")? == p.cached_per_1m
+            && row.try_get::<Option<f64>, _>("cache_write_per_1m")? == p.cache_write_per_1m
+            && row.try_get::<Option<f64>, _>("thinking_per_1m")? == p.thinking_per_1m,
+    )
 }
 
 /// Resolve the immutable snapshot backing an effective price.

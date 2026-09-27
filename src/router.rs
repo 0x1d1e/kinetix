@@ -52,8 +52,7 @@ pub fn build(state: AppState) -> Router {
         )
         .route(
             "/settings/model-lifecycle",
-            get(admin::get_model_lifecycle_settings)
-                .put(admin::update_model_lifecycle_settings),
+            get(admin::get_model_lifecycle_settings).put(admin::update_model_lifecycle_settings),
         )
         .route("/overview", get(admin::overview))
         .route("/test-stream", post(admin::test_stream))
