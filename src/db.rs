@@ -1568,12 +1568,7 @@ pub async fn commit_provider_pricing_batch(
         let discovery_patch = serde_json::json!({
             "latest_observation": mutation.latest_observation,
         });
-        merge_model_discovery_in_transaction(
-            &mut tx,
-            mutation.model_id,
-            &discovery_patch,
-        )
-        .await?;
+        merge_model_discovery_in_transaction(&mut tx, mutation.model_id, &discovery_patch).await?;
 
         let version_id = if let Some(pricing) = mutation.pricing.as_ref() {
             apply_effective_model_pricing_transaction(
