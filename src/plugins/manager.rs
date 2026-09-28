@@ -748,8 +748,8 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        let validated = manifest::validate(manifest, self.inner.policy)?;
-        self.ensure_permissions_approved(id, &validated.manifest)
+        let (validated, _) = self
+            .validated_manifest_with_approved_permissions(id, manifest)
             .await?;
         let component = self.compiled_component(&row)?;
         self.validate_component_contract(
@@ -765,6 +765,42 @@ impl PluginManager {
 
     pub async fn disable(&self, id: &str) -> Result<()> {
         store::set_enabled(&self.inner.pool, id, false).await?;
+        Ok(())
+    }
+
+    /// Disable enabled plugins whose persisted manifest or approved grants no
+    /// longer satisfy the current host contract.
+    pub async fn reconcile_enabled_plugins(&self) -> Result<()> {
+        let rows = store::list_plugins(&self.inner.pool).await?;
+        for row in rows.into_iter().filter(|row| row.status().is_enabled()) {
+            let validated = match row.manifest() {
+                Some(manifest) => match self.validate_persisted_manifest(manifest) {
+                    Ok(validated) => validated,
+                    Err(error) => {
+                        tracing::warn!(
+                            plugin = %row.id,
+                            error = %error,
+                            "disabling plugin that fails startup validation"
+                        );
+                        store::set_enabled(&self.inner.pool, &row.id, false).await?;
+                        continue;
+                    }
+                },
+                None => {
+                    tracing::warn!(plugin = %row.id, "disabling plugin with an unreadable manifest");
+                    store::set_enabled(&self.inner.pool, &row.id, false).await?;
+                    continue;
+                }
+            };
+            let approved = self.approved_permissions(&row.id).await?;
+            if !permission_grants_match(&permission_grants(&validated.manifest), &approved) {
+                tracing::warn!(
+                    plugin = %row.id,
+                    "disabling plugin whose approved permissions no longer match its manifest"
+                );
+                store::set_enabled(&self.inner.pool, &row.id, false).await?;
+            }
+        }
         Ok(())
     }
 
@@ -929,8 +965,8 @@ impl PluginManager {
     /// requested key must be declared by the manifest; the grant is written
     /// with exactly the requested scope (e.g. a subset of `network_hosts`), so
     /// the operator is not forced to rubber-stamp the full declaration.
-    /// `ensure_permissions_approved` still requires the effective grant set to
-    /// match the manifest exactly before enablement.
+    /// Enablement and runtime use still require the effective grant set to
+    /// match the validated manifest exactly.
     pub async fn approve_permissions_scoped(
         &self,
         id: &str,
@@ -1001,40 +1037,42 @@ impl PluginManager {
         self.disable(id).await
     }
 
-    /// Return approved grants only when they exactly match the current manifest.
-    async fn ensure_permissions_approved(
+    /// Validate a persisted manifest against the current host contract.
+    fn validate_persisted_manifest(
+        &self,
+        manifest: Manifest,
+    ) -> Result<manifest::ValidatedManifest> {
+        manifest::validate(manifest, self.inner.policy)
+    }
+
+    /// Validate a persisted manifest and return grants only when they exactly
+    /// match its current permission declarations.
+    async fn validated_manifest_with_approved_permissions(
         &self,
         id: &str,
-        manifest: &Manifest,
-    ) -> Result<Vec<PermissionGrant>> {
-        if !manifest.compatible() {
-            bail!("plugin '{id}' is not compatible with this Kinetix host version");
+        manifest: Manifest,
+    ) -> Result<(manifest::ValidatedManifest, Vec<PermissionGrant>)> {
+        let validated = self.validate_persisted_manifest(manifest)?;
+        let requested = permission_grants(&validated.manifest);
+        let approved = self.approved_permissions(id).await?;
+
+        if !permission_grants_match(&requested, &approved) {
+            bail!(
+                "plugin '{id}' permissions are not approved for the current manifest; run kinetix plugin approve {id}"
+            );
         }
-        let requested = permission_grants(manifest);
-        let approved: Vec<PermissionGrant> = store::permissions(&self.inner.pool, id)
+        Ok((validated, approved))
+    }
+
+    async fn approved_permissions(&self, id: &str) -> Result<Vec<PermissionGrant>> {
+        Ok(store::permissions(&self.inner.pool, id)
             .await?
             .into_iter()
             .map(|row| PermissionGrant {
                 permission: row.permission,
                 value_json: row.value_json,
             })
-            .collect();
-
-        let requested_set: std::collections::BTreeSet<_> = requested
-            .iter()
-            .map(|g| (g.permission.clone(), g.value_json.clone()))
-            .collect();
-        let approved_set: std::collections::BTreeSet<_> = approved
-            .iter()
-            .map(|g| (g.permission.clone(), g.value_json.clone()))
-            .collect();
-
-        if requested_set != approved_set {
-            bail!(
-                "plugin '{id}' permissions are not approved for the current manifest; run kinetix plugin approve {id}"
-            );
-        }
-        Ok(approved)
+            .collect())
     }
 
     /// Read the plugin's host-stamped cached routing facts (§6.4) for the
@@ -1082,7 +1120,7 @@ impl PluginManager {
             return false;
         };
         if self
-            .ensure_permissions_approved(id, &manifest)
+            .validated_manifest_with_approved_permissions(id, manifest)
             .await
             .is_err()
         {
@@ -1402,9 +1440,11 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        let grants = self.ensure_permissions_approved(id, &manifest).await?;
+        let (validated, grants) = self
+            .validated_manifest_with_approved_permissions(id, manifest)
+            .await?;
         self.ensure_circuit_ready(id).await?;
-        let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
+        let limits = validated.effective;
         let component = self.compiled_component(&row)?;
         let linker = self.inner.runtime.linker()?;
         let mut store = self.new_store(
@@ -1440,8 +1480,10 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        let grants = self.ensure_permissions_approved(id, &manifest).await?;
-        let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
+        let (validated, grants) = self
+            .validated_manifest_with_approved_permissions(id, manifest)
+            .await?;
+        let limits = validated.effective;
         let component = self.inner.runtime.compile(&row.component)?;
         let linker = self.inner.runtime.linker()?;
         let mut store = self.new_store(&row, &limits, &grants, false, true, "model_source");
@@ -1469,9 +1511,11 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        let grants = self.ensure_permissions_approved(id, &manifest).await?;
+        let (validated, grants) = self
+            .validated_manifest_with_approved_permissions(id, manifest)
+            .await?;
         self.ensure_circuit_ready(id).await?;
-        let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
+        let limits = validated.effective;
         let component = self.compiled_component(&row)?;
         let linker = self.inner.runtime.linker()?;
         let mut store = self.new_store(&row, &limits, &grants, false, true, "auth_flow");
@@ -1588,9 +1632,11 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        let grants = self.ensure_permissions_approved(id, &manifest).await?;
+        let (validated, grants) = self
+            .validated_manifest_with_approved_permissions(id, manifest)
+            .await?;
         self.ensure_circuit_ready(id).await?;
-        let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
+        let limits = validated.effective;
         let component = self.compiled_component(&row)?;
         let linker = self.inner.runtime.linker()?;
         let mut store = self.new_store(&row, &limits, &grants, true, false, "provider_adapter");
@@ -2200,7 +2246,7 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        let validated = manifest::validate(manifest, self.inner.policy)?;
+        let validated = self.validate_persisted_manifest(manifest)?;
         let component = self.compiled_component(&row)?;
         self.validate_component_contract(
             &validated.manifest,
@@ -2595,6 +2641,18 @@ pub fn permission_grants(manifest: &Manifest) -> Vec<PermissionGrant> {
         });
     }
     grants
+}
+
+fn permission_grants_match(requested: &[PermissionGrant], approved: &[PermissionGrant]) -> bool {
+    let requested_set: std::collections::BTreeSet<_> = requested
+        .iter()
+        .map(|grant| (grant.permission.as_str(), grant.value_json.as_str()))
+        .collect();
+    let approved_set: std::collections::BTreeSet<_> = approved
+        .iter()
+        .map(|grant| (grant.permission.as_str(), grant.value_json.as_str()))
+        .collect();
+    requested_set == approved_set
 }
 
 /// The set of capabilities an enabled plugin provides, for the dashboard.

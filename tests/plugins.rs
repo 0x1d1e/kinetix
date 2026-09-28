@@ -101,6 +101,22 @@ fn build_kxp(manifest: &str, wasm: &[u8]) -> Vec<u8> {
     builder.into_inner().unwrap()
 }
 
+async fn set_persisted_manifest_version(pool: &Pool, id: &str, version: &str) {
+    let stored: String = sqlx::query_scalar("SELECT manifest_json FROM plugins WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    manifest["version"] = serde_json::Value::String(version.into());
+    sqlx::query("UPDATE plugins SET manifest_json = ? WHERE id = ?")
+        .bind(manifest.to_string())
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn install_is_disabled_and_records_provenance() {
     let (m, pool) = manager().await;
@@ -129,15 +145,7 @@ async fn legacy_invalid_manifest_is_rejected_by_validate_and_enable() {
     let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     m.install(&kxp, None, &[], false).await.unwrap();
 
-    let row = m.get("dev.example.foo").await.unwrap().unwrap();
-    let mut manifest: serde_json::Value = serde_json::from_str(&row.manifest_json).unwrap();
-    manifest["version"] = serde_json::Value::String("not-semver".into());
-    sqlx::query("UPDATE plugins SET manifest_json = ? WHERE id = ?")
-        .bind(manifest.to_string())
-        .bind("dev.example.foo")
-        .execute(&pool)
-        .await
-        .unwrap();
+    set_persisted_manifest_version(&pool, "dev.example.foo", "not-semver").await;
 
     let validate_error = m.validate("dev.example.foo").await.unwrap_err();
     assert!(validate_error
@@ -148,6 +156,52 @@ async fn legacy_invalid_manifest_is_rejected_by_validate_and_enable() {
     assert!(enable_error
         .to_string()
         .contains("invalid manifest `version`"));
+}
+
+#[tokio::test]
+async fn invalid_enabled_manifest_fails_closed_at_runtime() {
+    let (m, pool) = manager().await;
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
+    m.install(&kxp, None, &[], false).await.unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+    m.enable("dev.example.foo").await.unwrap();
+
+    set_persisted_manifest_version(&pool, "dev.example.foo", "release-1").await;
+
+    assert!(!m.is_usable("dev.example.foo").await);
+    assert!(m
+        .resolve_binding("plugin:dev.example.foo/foo-models", Capability::ModelSource)
+        .await
+        .is_none());
+    let error = m
+        .model_discover(
+            "dev.example.foo",
+            "provider-foo",
+            "https://api.foo.example",
+            "/models",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("invalid manifest `version`"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn startup_reconciliation_disables_invalid_enabled_manifests() {
+    let (m, pool) = manager().await;
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
+    m.install(&kxp, None, &[], false).await.unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+    m.enable("dev.example.foo").await.unwrap();
+    set_persisted_manifest_version(&pool, "dev.example.foo", "release-1").await;
+
+    m.reconcile_enabled_plugins().await.unwrap();
+
+    let row = m.get("dev.example.foo").await.unwrap().unwrap();
+    assert_eq!(row.enabled, 0);
+    assert!(!m.is_usable("dev.example.foo").await);
 }
 
 #[tokio::test]
