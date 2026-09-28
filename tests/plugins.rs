@@ -124,6 +124,33 @@ async fn install_is_disabled_and_records_provenance() {
 }
 
 #[tokio::test]
+async fn legacy_invalid_manifest_is_rejected_by_validate_and_enable() {
+    let (m, pool) = manager().await;
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
+    m.install(&kxp, None, &[], false).await.unwrap();
+
+    let row = m.get("dev.example.foo").await.unwrap().unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&row.manifest_json).unwrap();
+    manifest["version"] = serde_json::Value::String("not-semver".into());
+    sqlx::query("UPDATE plugins SET manifest_json = ? WHERE id = ?")
+        .bind(manifest.to_string())
+        .bind("dev.example.foo")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let validate_error = m.validate("dev.example.foo").await.unwrap_err();
+    assert!(validate_error
+        .to_string()
+        .contains("invalid manifest `version`"));
+
+    let enable_error = m.enable("dev.example.foo").await.unwrap_err();
+    assert!(enable_error
+        .to_string()
+        .contains("invalid manifest `version`"));
+}
+
+#[tokio::test]
 async fn install_preserves_exact_package_and_provenance() {
     let (m, pool) = manager().await;
     let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);

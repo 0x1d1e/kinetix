@@ -748,14 +748,16 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        if !manifest.compatible() {
-            bail!("plugin '{id}' is not API-compatible with this host");
-        }
-        self.ensure_permissions_approved(id, &manifest).await?;
-        let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
-        let component = self.compiled_component(&row)?;
-        self.validate_component_contract(&manifest, &limits, component.as_ref())
+        let validated = manifest::validate(manifest, self.inner.policy)?;
+        self.ensure_permissions_approved(id, &validated.manifest)
             .await?;
+        let component = self.compiled_component(&row)?;
+        self.validate_component_contract(
+            &validated.manifest,
+            &validated.effective,
+            component.as_ref(),
+        )
+        .await?;
         store::set_enabled(&self.inner.pool, id, true).await?;
         store::clear_plugin_failures(&self.inner.pool, id).await?;
         Ok(())
@@ -2198,14 +2200,15 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        if !manifest.compatible() {
-            bail!("plugin '{id}' is not compatible with this Kinetix host version");
-        }
-        let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
+        let validated = manifest::validate(manifest, self.inner.policy)?;
         let component = self.compiled_component(&row)?;
-        self.validate_component_contract(&manifest, &limits, component.as_ref())
-            .await?;
-        Ok(manifest.provides.provided())
+        self.validate_component_contract(
+            &validated.manifest,
+            &validated.effective,
+            component.as_ref(),
+        )
+        .await?;
+        Ok(validated.manifest.provides.provided())
     }
 
     /// Resolve a `plugin:<id>/<capability>` reference to an enabled plugin that
