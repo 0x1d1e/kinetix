@@ -1663,16 +1663,12 @@ async fn direct_api_manifest_trust(
     let plugin_id = source_plugin_id
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            format!(
-                "provider '{name}': pricing_scope 'direct_api' requires source_plugin_id"
-            )
+            format!("provider '{name}': pricing_scope 'direct_api' requires source_plugin_id")
         })?;
     let integration_id = source_integration_id
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            format!(
-                "provider '{name}': pricing_scope 'direct_api' requires source_integration_id"
-            )
+            format!("provider '{name}': pricing_scope 'direct_api' requires source_integration_id")
         })?;
     let Some(manager) = state.plugin_manager() else {
         return Ok(DirectApiManifestTrust::PluginUnavailable);
@@ -1754,9 +1750,8 @@ pub async fn update_provider(
         let scope_drivers_unchanged = existing.wire_plugin == body.wire_plugin
             && existing.credential_plugin == body.credential_plugin
             && existing.model_source_plugin == body.model_source_plugin;
-        let endpoint_unchanged =
-            normalize_provider_endpoint_identity(&existing.base_url)
-                == normalize_provider_endpoint_identity(&body.base_url);
+        let endpoint_unchanged = normalize_provider_endpoint_identity(&existing.base_url)
+            == normalize_provider_endpoint_identity(&body.base_url);
         if scope == "direct_api" && conservative_scope != "direct_api" {
             let reusable_existing_trust = existing.pricing_scope == "direct_api"
                 && scope_drivers_unchanged
@@ -9422,10 +9417,7 @@ fn parse_imported_model_ownership(model: &Value) -> Result<Option<ImportedModelO
         "operator_reasoning_overrides",
         "operator_thinking_overrides",
     ] {
-        let value = ownership
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let value = ownership.get(key).cloned().unwrap_or_else(|| json!({}));
         if !value.is_object() {
             return Err(format!("ownership.{key} must be an object"));
         }
@@ -9436,9 +9428,9 @@ fn parse_imported_model_ownership(model: &Value) -> Result<Option<ImportedModelO
     let pricing = match ownership.get("effective_pricing") {
         None | Some(Value::Null) => None,
         Some(value) => {
-            let effective = value
-                .as_object()
-                .ok_or_else(|| "ownership.effective_pricing must be an object or null".to_string())?;
+            let effective = value.as_object().ok_or_else(|| {
+                "ownership.effective_pricing must be an object or null".to_string()
+            })?;
             let source = effective
                 .get("source")
                 .and_then(Value::as_str)
@@ -9450,21 +9442,15 @@ fn parse_imported_model_ownership(model: &Value) -> Result<Option<ImportedModelO
             let metadata = effective
                 .get("metadata")
                 .cloned()
-                .ok_or_else(|| {
-                    "ownership.effective_pricing.metadata is required".to_string()
-                })?;
+                .ok_or_else(|| "ownership.effective_pricing.metadata is required".to_string())?;
             if !metadata.is_object() {
-                return Err(
-                    "ownership.effective_pricing.metadata must be an object".to_string(),
-                );
+                return Err("ownership.effective_pricing.metadata must be an object".to_string());
             }
             Some((source, metadata))
         }
     };
     if prices.is_configured() && pricing.is_none() {
-        return Err(
-            "configured prices require ownership.effective_pricing provenance".to_string(),
-        );
+        return Err("configured prices require ownership.effective_pricing provenance".to_string());
     }
 
     Ok(Some(ImportedModelOwnership {
@@ -10099,14 +10085,9 @@ pub async fn import_config(
             )
             .await
             .map_err(ApiError::bad)?;
-            db::update_provider(
-                &state.pool,
-                &existing_id,
-                &provider,
-                Some(&pricing_scope),
-            )
-            .await
-            .map_err(ApiError::internal)?;
+            db::update_provider(&state.pool, &existing_id, &provider, Some(&pricing_scope))
+                .await
+                .map_err(ApiError::internal)?;
             reconcile_provider_account_mode(&state, &existing_id, credential_mode).await?;
         } else {
             let credential_mode = explicit_mode.unwrap_or(crate::plugins::CredentialMode::Manual);
@@ -10252,8 +10233,7 @@ pub async fn import_config(
             validate_model_transport_override(&provider_row, requested_transport)?;
 
         let model_key = format!("{provider}/{upstream}");
-        let imported_ownership =
-            parse_imported_model_ownership(m).map_err(ApiError::bad)?;
+        let imported_ownership = parse_imported_model_ownership(m).map_err(ApiError::bad)?;
         let existing = db::find_model_by_upstream(&state.pool, pid, upstream)
             .await
             .map_err(ApiError::internal)?;
@@ -10262,73 +10242,69 @@ pub async fn import_config(
             model_ids.insert(model_key.clone(), existing_id.clone());
             let existing_discovery = discovery_object(&existing);
             let previous_prices = existing.prices();
-            let (price_source, price_metadata, discovery_patch) =
-                if let Some(ownership) = imported_ownership.as_ref() {
-                    let (source, metadata) = ownership
-                        .pricing
-                        .clone()
-                        .unwrap_or_else(|| ("untracked".to_string(), json!({ "fields": {} })));
-                    (source, metadata, ownership.discovery_patch.clone())
-                } else {
-                    let mut price_fields =
-                        effective_price_fields(&existing_discovery, &previous_prices);
-                    for field in PRICE_FIELDS {
-                        let previous = price_field(&previous_prices, field);
-                        let next = price_field(&prices, field);
-                        if previous != next {
-                            if next.is_some() {
-                                set_price_field_provenance(
-                                    &mut price_fields,
-                                    field,
-                                    "operator",
-                                    json!({ "configured_by": "config_import" }),
-                                );
-                            } else {
-                                price_fields.remove(field);
-                            }
+            let (price_source, price_metadata, discovery_patch) = if let Some(ownership) =
+                imported_ownership.as_ref()
+            {
+                let (source, metadata) = ownership
+                    .pricing
+                    .clone()
+                    .unwrap_or_else(|| ("untracked".to_string(), json!({ "fields": {} })));
+                (source, metadata, ownership.discovery_patch.clone())
+            } else {
+                let mut price_fields =
+                    effective_price_fields(&existing_discovery, &previous_prices);
+                for field in PRICE_FIELDS {
+                    let previous = price_field(&previous_prices, field);
+                    let next = price_field(&prices, field);
+                    if previous != next {
+                        if next.is_some() {
+                            set_price_field_provenance(
+                                &mut price_fields,
+                                field,
+                                "operator",
+                                json!({ "configured_by": "config_import" }),
+                            );
+                        } else {
+                            price_fields.remove(field);
                         }
                     }
-                    let price_source = if prices.is_configured() {
-                        effective_price_source(&price_fields, &prices)
-                    } else {
-                        "operator".to_string()
-                    };
-                    let price_metadata = json!({ "fields": price_fields });
-
-                    let existing_caps = normalize_model_capabilities(
-                        &serde_json::from_str::<Value>(&existing.capabilities)
-                            .unwrap_or_else(|_| json!({})),
-                    );
-                    let existing_parameters = serde_json::from_str::<Value>(&existing.parameters)
-                        .unwrap_or_else(|_| json!({}));
-                    let existing_thinking_map = serde_json::to_value(existing.thinking())
-                        .expect("ThinkingMap serialization is infallible");
-                    let mut discovery_patch = serde_json::Map::new();
-                    if existing_caps != caps {
-                        discovery_patch
-                            .insert("operator_capability_overrides".into(), caps.clone());
-                    }
-                    if existing_parameters != parameters {
-                        discovery_patch.insert(
-                            "operator_parameter_overrides".into(),
-                            operator_parameter_support_overrides(&parameters),
-                        );
-                    }
-                    if existing_thinking_map != thinking_map {
-                        discovery_patch.insert(
-                            "operator_thinking_overrides".into(),
-                            Value::Object(merge_operator_thinking_map_override(
-                                &existing_discovery,
-                                &thinking_map,
-                            )),
-                        );
-                    }
-                    (
-                        price_source,
-                        price_metadata,
-                        Value::Object(discovery_patch),
-                    )
+                }
+                let price_source = if prices.is_configured() {
+                    effective_price_source(&price_fields, &prices)
+                } else {
+                    "operator".to_string()
                 };
+                let price_metadata = json!({ "fields": price_fields });
+
+                let existing_caps = normalize_model_capabilities(
+                    &serde_json::from_str::<Value>(&existing.capabilities)
+                        .unwrap_or_else(|_| json!({})),
+                );
+                let existing_parameters = serde_json::from_str::<Value>(&existing.parameters)
+                    .unwrap_or_else(|_| json!({}));
+                let existing_thinking_map = serde_json::to_value(existing.thinking())
+                    .expect("ThinkingMap serialization is infallible");
+                let mut discovery_patch = serde_json::Map::new();
+                if existing_caps != caps {
+                    discovery_patch.insert("operator_capability_overrides".into(), caps.clone());
+                }
+                if existing_parameters != parameters {
+                    discovery_patch.insert(
+                        "operator_parameter_overrides".into(),
+                        operator_parameter_support_overrides(&parameters),
+                    );
+                }
+                if existing_thinking_map != thinking_map {
+                    discovery_patch.insert(
+                        "operator_thinking_overrides".into(),
+                        Value::Object(merge_operator_thinking_map_override(
+                            &existing_discovery,
+                            &thinking_map,
+                        )),
+                    );
+                }
+                (price_source, price_metadata, Value::Object(discovery_patch))
+            };
 
             db::commit_model_operator_mutation(
                 &state.pool,
@@ -10357,10 +10333,7 @@ pub async fn import_config(
         } else {
             let (discovery_patch, pricing_values) =
                 if let Some(ownership) = imported_ownership.as_ref() {
-                    (
-                        ownership.discovery_patch.clone(),
-                        ownership.pricing.clone(),
-                    )
+                    (ownership.discovery_patch.clone(), ownership.pricing.clone())
                 } else {
                     let thinking_map_configured = !thinking.levels.is_empty()
                         || thinking.mode.is_some()
@@ -18057,14 +18030,11 @@ mod credential_enrollment_regression_tests {
             .into_iter()
             .find(|provider| provider.name == "portable-google")
             .unwrap();
-        let imported = db::find_model_by_upstream(
-            &target.pool,
-            &target_provider.id,
-            "portable-model",
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let imported =
+            db::find_model_by_upstream(&target.pool, &target_provider.id, "portable-model")
+                .await
+                .unwrap()
+                .unwrap();
         let discovery = discovery_object(&imported);
         assert_eq!(
             discovery
@@ -18072,18 +18042,9 @@ mod credential_enrollment_regression_tests {
                 .and_then(Value::as_str),
             Some("models.dev:provider")
         );
-        assert_eq!(
-            discovery["operator_capability_overrides"],
-            json!({})
-        );
-        assert_eq!(
-            discovery["operator_parameter_overrides"],
-            json!({})
-        );
-        assert_eq!(
-            discovery["operator_thinking_overrides"],
-            json!({})
-        );
+        assert_eq!(discovery["operator_capability_overrides"], json!({}));
+        assert_eq!(discovery["operator_parameter_overrides"], json!({}));
+        assert_eq!(discovery["operator_thinking_overrides"], json!({}));
 
         let catalog = crate::model_catalog::ModelsDevCatalog::from_parts(
             json!({}),
