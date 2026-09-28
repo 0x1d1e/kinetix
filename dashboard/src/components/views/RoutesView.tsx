@@ -289,7 +289,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
 
           {/* Right Column: Selected Route Detail & Target Fallback Chain */}
           {activeRoute && (
-            <div className="lg:col-span-2 space-y-5">
+            <div className="lg:col-span-2 min-w-0 space-y-5">
               <WobblyCard decoration="tape" className="p-6">
                 <div className="flex flex-wrap items-start justify-between gap-4 mb-4 pb-3 border-b-2 border-dashed border-[var(--ink)]/30">
                   <div>
@@ -479,7 +479,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                       <select
                         value={newTargetModelId}
                         onChange={(e) => setNewTargetModelId(e.target.value)}
-                        className="flex-1 bg-[var(--surface)] border-2 border-[var(--ink)] px-2 py-1.5 text-sm font-mono rounded focus:outline-none"
+                        className="flex-1 min-w-0 bg-[var(--surface)] border-2 border-[var(--ink)] px-2 py-1.5 text-sm font-mono rounded focus:outline-none"
                       >
                         <option value="">Select a model…</option>
                         {models.map((m) => (
@@ -491,7 +491,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                       <select
                         value={newTargetAccountId}
                         onChange={(e) => setNewTargetAccountId(e.target.value)}
-                        className="flex-1 bg-[var(--surface)] border-2 border-[var(--ink)] px-2 py-1.5 text-sm font-mono rounded focus:outline-none"
+                        className="flex-1 min-w-0 bg-[var(--surface)] border-2 border-[var(--ink)] px-2 py-1.5 text-sm font-mono rounded focus:outline-none"
                       >
                         <option value="">Account: auto (lowest priority)</option>
                         {accounts.map((a) => (
