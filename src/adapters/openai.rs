@@ -655,6 +655,7 @@ mod tests {
             credential_mode: "manual".into(),
             source_plugin_id: None,
             source_integration_id: None,
+            pricing_scope: "direct_api".into(),
         }
     }
 
@@ -960,6 +961,7 @@ mod param_default_tests {
             credential_mode: "manual".into(),
             source_plugin_id: None,
             source_integration_id: None,
+            pricing_scope: "direct_api".into(),
         }
     }
 
