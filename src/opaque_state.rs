@@ -1610,10 +1610,8 @@ mod tests {
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
         capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
-        store.flush().await;
-        // A target that cannot carry Gemini opaque state (capability = None)
-        // must still observe that stored state exists, so portability policy
-        // can act on it.
+        // Do not flush: capability-less portability decisions must observe the
+        // synchronous RAM capture just like cross-model decisions do.
         let result = store
             .resolve_tool_signature(&scope, None, None, "call_1", "bash")
             .await;
