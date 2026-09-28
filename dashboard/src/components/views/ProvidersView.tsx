@@ -72,10 +72,57 @@ const modelReconciliation = (model: ModelConfig) =>
     } | null;
   } | undefined)?.reconciliation || null;
 
-const modelPricingSource = (model: ModelConfig) =>
-  (model.discovery as {
-    effective_pricing?: { source?: string | null; updated_at?: string | null } | null;
-  } | undefined)?.effective_pricing?.source || 'untracked';
+type PricingField =
+  | 'input_per_1m'
+  | 'output_per_1m'
+  | 'cached_per_1m'
+  | 'cache_write_per_1m'
+  | 'thinking_per_1m';
+
+type PricingObservation = {
+  prices?: Partial<Record<PricingField, number | null>> | null;
+  price_sources?: Partial<Record<PricingField, string | null>> | null;
+  catalog?: {
+    source_state?: {
+      source?: string | null;
+      retrieved_at?: string | null;
+      freshness?: string | null;
+    } | null;
+  } | null;
+};
+
+const modelPricingDetails = (model: ModelConfig) => {
+  const discovery = model.discovery as {
+    effective_pricing?: {
+      source?: string | null;
+      fields?: Partial<Record<PricingField, { source?: string | null }>> | null;
+      updated_at?: string | null;
+    } | null;
+    latest_observation?: PricingObservation | null;
+    prices?: PricingObservation['prices'];
+    price_sources?: PricingObservation['price_sources'];
+    catalog?: PricingObservation['catalog'];
+  } | undefined;
+  const observation: PricingObservation = discovery?.latest_observation || {
+    prices: discovery?.prices,
+    price_sources: discovery?.price_sources,
+    catalog: discovery?.catalog,
+  };
+  return {
+    effectiveSource: discovery?.effective_pricing?.source || 'untracked',
+    effectiveFields: discovery?.effective_pricing?.fields || {},
+    observation,
+  };
+};
+
+const formatPricingValue = (value: number | null | undefined) =>
+  value == null ? 'unknown' : `${value} / 1M`;
+
+const formatPricingTimestamp = (value: string | null | undefined) => {
+  if (!value) return '—';
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+};
 
 type ProbeEvidenceEntry = {
   status?: string;
@@ -1764,16 +1811,55 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                         {/* Prices & Parameter policies */}
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs font-mono">
                           <div className="bg-[var(--paper)] p-2 border border-[var(--ink)] rounded">
-                            <strong className="font-heading text-sm text-[var(--ink)] block mb-1">
-                              💵 Token Pricing · {modelPricingSource(m)}
-                            </strong>
-                            <div>Input: {m.prices.inputPer1M == null ? 'unknown' : `${m.prices.inputPer1M} / 1M`}</div>
-                            <div>Output: {m.prices.outputPer1M == null ? 'unknown' : `${m.prices.outputPer1M} / 1M`}</div>
-                            <div>Cache read: {m.prices.cachedPer1M == null ? 'unknown' : `${m.prices.cachedPer1M} / 1M`}</div>
-                            <div>Cache write: {m.prices.cacheWritePer1M == null ? 'unknown' : `${m.prices.cacheWritePer1M} / 1M`}</div>
-                            {m.capabilities.reasoning && (
-                              <div>Thinking: {m.prices.thinkingPer1M == null ? 'output-rate fallback' : `${m.prices.thinkingPer1M} / 1M`}</div>
-                            )}
+                            {(() => {
+                              const pricing = modelPricingDetails(m);
+                              const rows: Array<{
+                                field: PricingField;
+                                label: string;
+                                effective: number | null;
+                              }> = [
+                                { field: 'input_per_1m', label: 'Input', effective: m.prices.inputPer1M },
+                                { field: 'output_per_1m', label: 'Output', effective: m.prices.outputPer1M },
+                                { field: 'cached_per_1m', label: 'Cache read', effective: m.prices.cachedPer1M },
+                                { field: 'cache_write_per_1m', label: 'Cache write', effective: m.prices.cacheWritePer1M },
+                                { field: 'thinking_per_1m', label: 'Thinking', effective: m.prices.thinkingPer1M },
+                              ];
+                              const sourceState = pricing.observation.catalog?.source_state;
+                              return (
+                                <>
+                                  <strong className="font-heading text-sm text-[var(--ink)] block mb-2">
+                                    💵 Token Pricing
+                                  </strong>
+                                  <div className="grid grid-cols-[minmax(5rem,0.8fr)_minmax(0,1fr)_minmax(0,1fr)] gap-x-2 gap-y-1">
+                                    <div className="font-bold">Field</div>
+                                    <div className="font-bold">Effective</div>
+                                    <div className="font-bold">Latest observed</div>
+                                    {rows.map((row) => (
+                                      <React.Fragment key={row.field}>
+                                        <div>{row.label}</div>
+                                        <div>
+                                          {formatPricingValue(row.effective)}
+                                          <span className="block text-[var(--ink)]/55">
+                                            {pricing.effectiveFields[row.field]?.source || pricing.effectiveSource}
+                                          </span>
+                                        </div>
+                                        <div>
+                                          {formatPricingValue(pricing.observation.prices?.[row.field])}
+                                          <span className="block text-[var(--ink)]/55">
+                                            {pricing.observation.price_sources?.[row.field] || 'untracked'}
+                                          </span>
+                                        </div>
+                                      </React.Fragment>
+                                    ))}
+                                  </div>
+                                  <div className="mt-2 pt-2 border-t border-[var(--ink)]/20 text-[var(--ink)]/70">
+                                    Catalog: {sourceState?.freshness || 'unknown'}
+                                    {' · '}retrieved {formatPricingTimestamp(sourceState?.retrieved_at)}
+                                    {sourceState?.source ? ` · ${sourceState.source}` : ''}
+                                  </div>
+                                </>
+                              );
+                            })()}
                           </div>
 
                           <div className="bg-[var(--paper)] p-2 border border-[var(--ink)] rounded">

@@ -3487,6 +3487,56 @@ fn effective_price_source(fields: &serde_json::Map<String, Value>, prices: &Pric
     }
 }
 
+fn automatic_price_provenance(
+    prices: &Prices,
+    observation: &Value,
+) -> (String, Value) {
+    let provider_observed_at = observation.get("last_seen").cloned().unwrap_or(Value::Null);
+    let catalog_source_state = observation
+        .pointer("/catalog/source_state")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let catalog_observed_at = catalog_source_state
+        .get("retrieved_at")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut fields = serde_json::Map::new();
+
+    for field in PRICE_FIELDS {
+        if price_field(prices, field).is_none() {
+            continue;
+        }
+        let source = observation
+            .pointer(&format!("/price_sources/{field}"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| automatic_price_source(observation));
+        let (observed_at, source_state) = if source.starts_with("models.dev") {
+            (catalog_observed_at.clone(), catalog_source_state.clone())
+        } else {
+            (provider_observed_at.clone(), Value::Null)
+        };
+        set_price_field_provenance(
+            &mut fields,
+            field,
+            &source,
+            json!({
+                "observed_at": observed_at,
+                "catalog_source_state": source_state,
+            }),
+        );
+    }
+
+    let source = effective_price_source(&fields, prices);
+    (
+        source,
+        json!({
+            "fields": fields,
+            "catalog_source_state": catalog_source_state,
+        }),
+    )
+}
+
 fn merge_automatic_price_observation(
     current: &Prices,
     observed: &Prices,
@@ -7110,115 +7160,96 @@ pub async fn create_model(
         || body.thinking_map.mode.is_some()
         || body.thinking_map.budget_field.is_some()
         || body.thinking_map.level_field.is_some();
-
-    let id = db::insert_model(
-        &state.pool,
-        &db::NewModel {
-            provider_id: &provider_id,
-            upstream_id: &body.upstream_id,
-            display_name: body.display_name.as_deref().unwrap_or(&body.upstream_id),
-            enabled: body.enabled,
-            context_window: body.context_window,
-            max_output_tokens: body.max_output_tokens,
-            capabilities: caps.clone(),
-            prices: serde_json::to_value(&prices).unwrap(),
-            parameters: body.parameters.clone(),
-            thinking_map: thinking_map.clone(),
-            extra_request: body.extra_request.clone(),
-            discovery: body.discovery.clone(),
-        },
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    db::set_model_transport_override(&state.pool, &id, transport_override.as_deref())
-        .await
-        .map_err(ApiError::internal)?;
     let imported_from_discovery = body
         .discovery
         .get("imported_from_discovery")
         .and_then(Value::as_bool)
         == Some(true);
-    if !imported_from_discovery {
-        db::merge_model_discovery(
-            &state.pool,
-            &id,
-            &json!({
-                "operator_capability_overrides": caps.clone(),
-                "operator_parameter_overrides": operator_parameter_support_overrides(
-                    &body.parameters
-                ),
-                "operator_thinking_overrides": if thinking_map_configured {
-                    json!({ "thinking_map": thinking_map.clone() })
-                } else {
-                    json!({})
-                },
-            }),
-        )
-        .await
-        .map_err(ApiError::internal)?;
+
+    let mut discovery_patch = serde_json::Map::new();
+    if imported_from_discovery {
+        discovery_patch.insert("operator_capability_overrides".into(), json!({}));
+        discovery_patch.insert("operator_parameter_overrides".into(), json!({}));
+        discovery_patch.insert("operator_thinking_overrides".into(), json!({}));
     } else {
-        // Imported parameter metadata is not operator-owned. Keep an explicit
-        // empty ownership envelope so fresh scoped probe evidence may refine it.
-        db::merge_model_discovery(
-            &state.pool,
-            &id,
-            &json!({
-                "operator_capability_overrides": {},
-                "operator_parameter_overrides": {},
-                "operator_thinking_overrides": {}
-            }),
-        )
-        .await
-        .map_err(ApiError::internal)?;
+        discovery_patch.insert("operator_capability_overrides".into(), caps.clone());
+        discovery_patch.insert(
+            "operator_parameter_overrides".into(),
+            operator_parameter_support_overrides(&body.parameters),
+        );
+        discovery_patch.insert(
+            "operator_thinking_overrides".into(),
+            if thinking_map_configured {
+                json!({ "thinking_map": thinking_map.clone() })
+            } else {
+                json!({})
+            },
+        );
     }
-    let valid_opaque_state = body
-        .discovery
-        .get("opaque_state")
-        .and_then(parse_plugin_opaque_state_capability)
-        .is_some();
-    if imported_from_discovery && valid_opaque_state {
-        if let Some(reference) = provider.model_source_plugin_ref() {
-            let _ = db::set_model_opaque_state_plugin(&state.pool, &id, &reference.plugin_id).await;
-        }
+    if !prices.is_configured() {
+        discovery_patch.insert("effective_pricing".into(), Value::Null);
     }
-    if prices.is_configured() {
-        let (source, metadata) = if imported_from_discovery {
-            (
-                automatic_price_source(&body.discovery),
-                json!({
-                    "price_sources": body.discovery.get("price_sources").cloned().unwrap_or(Value::Null),
-                    "imported_from_discovery": true,
-                }),
-            )
+    let discovery_patch = Value::Object(discovery_patch);
+
+    let opaque_state_plugin = if imported_from_discovery
+        && body
+            .discovery
+            .get("opaque_state")
+            .and_then(parse_plugin_opaque_state_capability)
+            .is_some()
+    {
+        provider
+            .model_source_plugin_ref()
+            .map(|reference| reference.plugin_id)
+    } else {
+        None
+    };
+
+    let mut pricing_source = String::new();
+    let mut pricing_metadata = Value::Null;
+    let pricing = if prices.is_configured() {
+        if imported_from_discovery {
+            (pricing_source, pricing_metadata) =
+                automatic_price_provenance(&prices, &body.discovery);
         } else {
-            ("operator".to_string(), json!({ "configured_by": "admin" }))
-        };
-        let version_id = db::ensure_price_version(&state.pool, &id, &prices, &source, &metadata)
-            .await
-            .map_err(ApiError::internal)?;
-        db::merge_model_discovery(
-            &state.pool,
-            &id,
-            &json!({
-                "effective_pricing": {
-                    "source": source,
-                    "metadata": metadata,
-                    "price_version_id": version_id,
-                    "updated_at": db::now_iso(),
-                }
-            }),
-        )
-        .await
-        .map_err(ApiError::internal)?;
+            pricing_source = "operator".to_string();
+            pricing_metadata = json!({ "configured_by": "admin" });
+        }
+        Some(db::ModelPricingMutation {
+            prices: &prices,
+            source: &pricing_source,
+            metadata: &pricing_metadata,
+        })
     } else {
-        db::merge_model_discovery(
-            &state.pool,
-            &id,
-            &json!({ "effective_pricing": Value::Null }),
-        )
-        .await
-        .map_err(ApiError::internal)?;
-    }
+        None
+    };
+
+    let (id, _) = db::commit_model_creation(
+        &state.pool,
+        &db::ModelCreation {
+            model: db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: &body.upstream_id,
+                display_name: body.display_name.as_deref().unwrap_or(&body.upstream_id),
+                enabled: body.enabled,
+                context_window: body.context_window,
+                max_output_tokens: body.max_output_tokens,
+                capabilities: caps,
+                prices: serde_json::to_value(&prices).unwrap(),
+                parameters: body.parameters.clone(),
+                thinking_map,
+                extra_request: body.extra_request.clone(),
+                discovery: body.discovery.clone(),
+            },
+            transport: transport_override.as_deref(),
+            discovery_patch: &discovery_patch,
+            opaque_state_plugin: opaque_state_plugin.as_deref(),
+            pricing,
+        },
+    )
+    .await
+    .map_err(ApiError::internal)?;
+
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -13856,6 +13887,174 @@ mod credential_enrollment_regression_tests {
                 .and_then(Value::as_str),
             Some(old_version.as_str())
         );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn model_creation_rolls_back_when_price_version_persistence_fails() {
+        let (state, root) = test_state("model-create-price-rollback").await;
+        let provider_id = insert_provider(
+            &state,
+            "create-pricing-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+
+        sqlx::query(
+            "CREATE TRIGGER reject_created_model_price_version
+             BEFORE INSERT ON price_versions
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected create price version persistence failure');
+             END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let result = create_model(
+            State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+            Json(ModelBody {
+                upstream_id: "failed-priced-model".into(),
+                display_name: Some("Failed Priced Model".into()),
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({
+                    "input_per_1m": 1.0,
+                    "output_per_1m": 2.0
+                }),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({}),
+                transport_override: None,
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            db::find_model_by_upstream(&state.pool, &provider_id, "failed-priced-model")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        state.registry.reload(&state.pool).await.unwrap();
+        assert!(state.registry.resolve("failed-priced-model").is_none());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn imported_price_provenance_reuses_version_on_unchanged_sync() {
+        let (state, root) = test_state("import-price-version-reuse").await;
+        let provider_id = insert_provider(
+            &state,
+            "import-pricing-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let observed_prices = json!({
+            "input_per_1m": 1.0,
+            "output_per_1m": 5.0
+        });
+        let catalog_source_state = json!({
+            "source": "models.dev",
+            "retrieved_at": "2026-09-28T00:00:00Z",
+            "freshness": "fresh"
+        });
+
+        let Json(created) = create_model(
+            State(state.clone()),
+            auth(),
+            Path(provider_id),
+            Json(ModelBody {
+                upstream_id: "imported-priced-model".into(),
+                display_name: Some("Imported Priced Model".into()),
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: observed_prices.clone(),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({
+                    "prices": observed_prices,
+                    "price_sources": {
+                        "input_per_1m": "models.dev:provider",
+                        "output_per_1m": "models.dev:provider"
+                    },
+                    "catalog": {
+                        "source_state": catalog_source_state
+                    },
+                    "execution_supported": true,
+                    "imported_from_discovery": true
+                }),
+                transport_override: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let model_id = created["id"].as_str().unwrap().to_string();
+
+        let imported = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let discovery = discovery_object(&imported);
+        let original_version = discovery
+            .pointer("/effective_pricing/price_version_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let observation = latest_reconciliation_observation(&discovery);
+        let observed: Prices =
+            serde_json::from_value(observation["prices"].clone()).unwrap();
+        let (effective, fields, preserved_manual) = merge_automatic_price_observation(
+            &imported.prices(),
+            &observed,
+            observation,
+            &discovery,
+        );
+        assert!(!preserved_manual);
+        let source = effective_price_source(&fields, &effective);
+        let metadata = json!({
+            "fields": fields,
+            "catalog_source_state": observation
+                .pointer("/catalog/source_state")
+                .cloned()
+                .unwrap_or(Value::Null),
+        });
+        let reused_version = db::commit_effective_model_pricing(
+            &state.pool,
+            &model_id,
+            &effective,
+            &source,
+            &metadata,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(reused_version, original_version);
+        let version_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id = ?")
+                .bind(&model_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(version_count, 1);
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);

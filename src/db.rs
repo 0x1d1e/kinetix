@@ -898,7 +898,18 @@ pub struct ModelOperatorMutation<'a> {
     pub pricing: Option<ModelPricingMutation<'a>>,
 }
 
-pub async fn insert_model(pool: &Pool, m: &NewModel<'_>) -> Result<String> {
+pub struct ModelCreation<'a> {
+    pub model: NewModel<'a>,
+    pub transport: Option<&'a str>,
+    pub discovery_patch: &'a Value,
+    pub opaque_state_plugin: Option<&'a str>,
+    pub pricing: Option<ModelPricingMutation<'a>>,
+}
+
+async fn insert_model_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    m: &NewModel<'_>,
+) -> Result<String> {
     let id = format!("model_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
         "INSERT INTO models
@@ -920,8 +931,15 @@ pub async fn insert_model(pool: &Pool, m: &NewModel<'_>) -> Result<String> {
     .bind(m.extra_request.to_string())
     .bind(m.discovery.to_string())
     .bind(now_iso())
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
+    Ok(id)
+}
+
+pub async fn insert_model(pool: &Pool, m: &NewModel<'_>) -> Result<String> {
+    let mut tx = pool.begin().await?;
+    let id = insert_model_in_transaction(&mut tx, m).await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -1110,6 +1128,22 @@ async fn set_model_transport_override_in_transaction(
     Ok(())
 }
 
+async fn set_model_opaque_state_plugin_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    plugin_id: &str,
+) -> Result<()> {
+    let result = sqlx::query("UPDATE models SET opaque_state_plugin=? WHERE id=?")
+        .bind(plugin_id)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!("model '{id}' disappeared while binding opaque-state plugin");
+    }
+    Ok(())
+}
+
 async fn merge_model_discovery_in_transaction(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: &str,
@@ -1143,6 +1177,39 @@ async fn merge_model_discovery_in_transaction(
         anyhow::bail!("model '{id}' disappeared while merging discovery metadata");
     }
     Ok(())
+}
+
+/// Create one complete runtime-visible model state as a single database
+/// transaction. A registry reload can only observe the model after transport,
+/// ownership metadata, opaque-state binding, and immutable pricing are complete.
+pub async fn commit_model_creation(
+    pool: &Pool,
+    creation: &ModelCreation<'_>,
+) -> Result<(String, Option<String>)> {
+    let mut tx = pool.begin().await?;
+    let id = insert_model_in_transaction(&mut tx, &creation.model).await?;
+
+    set_model_transport_override_in_transaction(&mut tx, &id, creation.transport).await?;
+    merge_model_discovery_in_transaction(&mut tx, &id, creation.discovery_patch).await?;
+    if let Some(plugin_id) = creation.opaque_state_plugin {
+        set_model_opaque_state_plugin_in_transaction(&mut tx, &id, plugin_id).await?;
+    }
+
+    let version_id = if let Some(pricing) = creation.pricing.as_ref() {
+        apply_effective_model_pricing_transaction(
+            &mut tx,
+            &id,
+            pricing.prices,
+            pricing.source,
+            pricing.metadata,
+        )
+        .await?
+    } else {
+        None
+    };
+
+    tx.commit().await?;
+    Ok((id, version_id))
 }
 
 /// Apply one operator-owned model mutation as a single database transaction.
