@@ -585,12 +585,12 @@ pub async fn update_provider_pricing_scope(
 }
 
 pub async fn provider_pricing_scope(pool: &Pool, id: &str) -> Result<String> {
-    Ok(sqlx::query_scalar::<_, String>(
-        "SELECT pricing_scope FROM providers WHERE id=?",
+    Ok(
+        sqlx::query_scalar::<_, String>("SELECT pricing_scope FROM providers WHERE id=?")
+            .bind(id)
+            .fetch_one(pool)
+            .await?,
     )
-    .bind(id)
-    .fetch_one(pool)
-    .await?)
 }
 
 pub async fn delete_provider(pool: &Pool, id: &str) -> Result<()> {
