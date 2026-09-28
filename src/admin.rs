@@ -13963,8 +13963,7 @@ mod credential_enrollment_regression_tests {
             .unwrap();
         let configured_discovery = discovery_object(&configured);
         assert_eq!(
-            configured_discovery
-                .pointer("/operator_thinking_overrides/thinking_map/levels/max"),
+            configured_discovery.pointer("/operator_thinking_overrides/thinking_map/levels/max"),
             Some(&json!("vendor-max"))
         );
 
