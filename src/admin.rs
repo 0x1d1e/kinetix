@@ -14372,15 +14372,9 @@ mod credential_enrollment_regression_tests {
             },
             "catalog_source_state": {"source": "models.dev"}
         });
-        db::commit_effective_model_pricing(
-            &state.pool,
-            &model_id,
-            &prices,
-            "mixed",
-            &metadata,
-        )
-        .await
-        .unwrap();
+        db::commit_effective_model_pricing(&state.pool, &model_id, &prices, "mixed", &metadata)
+            .await
+            .unwrap();
 
         db::update_provider_pricing_scope(&state.pool, &provider_id, "integration")
             .await
@@ -14486,7 +14480,9 @@ mod credential_enrollment_regression_tests {
         .execute(&state.pool)
         .await
         .unwrap();
-        db::enforce_provider_pricing_scopes(&state.pool).await.unwrap();
+        db::enforce_provider_pricing_scopes(&state.pool)
+            .await
+            .unwrap();
 
         assert_eq!(
             db::get_model(&state.pool, &model_id)
