@@ -649,7 +649,11 @@ pub async fn update_provider_credential_semantics_with_scope(
     Ok(())
 }
 
-pub async fn update_provider_pricing_scope(pool: &Pool, id: &str, pricing_scope: &str) -> Result<()> {
+pub async fn update_provider_pricing_scope(
+    pool: &Pool,
+    id: &str,
+    pricing_scope: &str,
+) -> Result<()> {
     if !matches!(pricing_scope, "integration" | "direct_api") {
         anyhow::bail!("invalid provider pricing scope '{pricing_scope}'");
     }
@@ -757,7 +761,7 @@ async fn revoke_models_dev_effective_pricing_in_transaction(
                     .get("source")
                     .and_then(Value::as_str)
                     .is_some_and(|source| source.starts_with("models.dev"))
-                    .then(|| field.clone())
+                    .then_some(field.clone())
             })
             .collect();
         let legacy_models_dev_snapshot =
