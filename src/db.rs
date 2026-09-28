@@ -576,7 +576,7 @@ pub async fn update_provider(
     .await?;
 
     if pricing_scope == "integration" || catalog_identity_changed {
-        revoke_models_dev_effective_pricing_in_transaction(&mut tx, id).await?;
+        revoke_external_catalog_effective_pricing_in_transaction(&mut tx, id).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -644,7 +644,7 @@ pub async fn update_provider_credential_semantics_with_scope(
     .execute(&mut *tx)
     .await?;
     if pricing_scope == "integration" || drivers_changed {
-        revoke_models_dev_effective_pricing_in_transaction(&mut tx, id).await?;
+        revoke_external_catalog_effective_pricing_in_transaction(&mut tx, id).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -666,7 +666,7 @@ pub async fn update_provider_pricing_scope(
         .execute(&mut *tx)
         .await?;
     if pricing_scope == "integration" {
-        revoke_models_dev_effective_pricing_in_transaction(&mut tx, id).await?;
+        revoke_external_catalog_effective_pricing_in_transaction(&mut tx, id).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -724,14 +724,16 @@ fn effective_source_after_revocation(
             .unwrap_or("untracked")
             .to_string(),
         n if n > 1 => "mixed".to_string(),
-        _ if prices.is_configured() && !previous_source.starts_with("models.dev") => {
+        _ if prices.is_configured()
+            && !crate::model_catalog::is_external_catalog_price_source(previous_source) =>
+        {
             previous_source.to_string()
         }
         _ => "untracked".to_string(),
     }
 }
 
-async fn revoke_models_dev_effective_pricing_in_transaction(
+async fn revoke_external_catalog_effective_pricing_in_transaction(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     provider_id: &str,
 ) -> Result<()> {
@@ -760,23 +762,23 @@ async fn revoke_models_dev_effective_pricing_in_transaction(
             .cloned()
             .unwrap_or_default();
 
-        let models_dev_fields: Vec<String> = fields
+        let external_catalog_fields: Vec<String> = fields
             .iter()
             .filter_map(|(field, provenance)| {
                 provenance
                     .get("source")
                     .and_then(Value::as_str)
-                    .is_some_and(|source| source.starts_with("models.dev"))
+                    .is_some_and(crate::model_catalog::is_external_catalog_price_source)
                     .then_some(field.clone())
             })
             .collect();
-        let legacy_models_dev_snapshot =
-            models_dev_fields.is_empty() && previous_source.starts_with("models.dev");
-        if models_dev_fields.is_empty() && !legacy_models_dev_snapshot {
+        let legacy_external_catalog_snapshot = external_catalog_fields.is_empty()
+            && crate::model_catalog::is_external_catalog_price_source(previous_source);
+        if external_catalog_fields.is_empty() && !legacy_external_catalog_snapshot {
             continue;
         }
 
-        if legacy_models_dev_snapshot {
+        if legacy_external_catalog_snapshot {
             for field in [
                 "input_per_1m",
                 "output_per_1m",
@@ -788,7 +790,7 @@ async fn revoke_models_dev_effective_pricing_in_transaction(
             }
             fields.clear();
         } else {
-            for field in models_dev_fields {
+            for field in external_catalog_fields {
                 clear_price_field(&mut prices, &field);
                 fields.remove(&field);
             }
@@ -806,7 +808,7 @@ async fn revoke_models_dev_effective_pricing_in_transaction(
             field
                 .get("source")
                 .and_then(Value::as_str)
-                .is_some_and(|source| source.starts_with("models.dev"))
+                .is_some_and(crate::model_catalog::is_external_catalog_price_source)
         }) {
             if let Some(object) = metadata.as_object_mut() {
                 object.remove("catalog_source_state");
