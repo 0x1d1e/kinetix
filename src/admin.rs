@@ -9887,7 +9887,12 @@ pub async fn import_config(
     let mut problems: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut effective_provider_scopes: std::collections::HashMap<String, String> =
-        Default::default();
+        db::list_providers(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+            .into_iter()
+            .map(|provider| (provider.name, provider.pricing_scope))
+            .collect();
 
     let empty = Vec::new();
     let providers = cfg["providers"].as_array().unwrap_or(&empty);
@@ -10973,7 +10978,8 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
             continue;
         };
         let existing = providers.into_iter().find(|provider| {
-            provider.base_url == template.base_url
+            normalize_provider_endpoint_identity(&provider.base_url)
+                == normalize_provider_endpoint_identity(&template.base_url)
                 && provider.wire_plugin == wire_plugin
                 && provider.credential_plugin == credential_plugin
                 && provider.model_source_plugin == model_source_plugin
@@ -11661,7 +11667,8 @@ pub async fn setup_plugin_integration_provider(
         .map_err(ApiError::internal)?
         .into_iter()
         .find(|provider| {
-            provider.base_url == template.base_url
+            normalize_provider_endpoint_identity(&provider.base_url)
+                == normalize_provider_endpoint_identity(&template.base_url)
                 && provider.wire_plugin == wire_plugin
                 && provider.credential_plugin == credential_plugin
                 && provider.model_source_plugin == model_source_plugin
@@ -17993,13 +18000,15 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
-    async fn config_import_restores_missing_plugin_direct_api_conservatively_then_promotes() {
+    async fn config_import_restores_missing_plugin_direct_api_conservatively_then_promotes_normalized_endpoint(
+    ) {
         let (state, root) = test_state_with_plugins("portable-direct-api-import").await;
-        let base_url = "https://provider-a.example/v1";
+        let restored_base_url = "https://provider-a.example/v1/";
+        let manifest_base_url = "https://provider-a.example/v1";
         let config = json!({
             "providers": [{
                 "name": "portable-direct-provider",
-                "base_url": base_url,
+                "base_url": restored_base_url,
                 "wire_format": "openai",
                 "auth_scheme": "bearer",
                 "extra_headers": {},
@@ -18125,13 +18134,139 @@ mod credential_enrollment_regression_tests {
                 .unwrap();
         assert_eq!(version_count, 0);
 
-        install_direct_api_test_plugin(&state, base_url).await;
+        let restored_provider_id = provider.id.clone();
+        install_direct_api_test_plugin(&state, manifest_base_url).await;
         auto_provision_plugin_providers(&state, "plugin.test").await;
-        let provider = db::get_provider(&state.pool, &provider.id)
-            .await
-            .unwrap()
+        let providers = db::list_providers(&state.pool).await.unwrap();
+        assert_eq!(providers.len(), 1);
+        let provider = providers
+            .into_iter()
+            .find(|provider| provider.id == restored_provider_id)
             .unwrap();
+        assert_eq!(provider.base_url, restored_base_url);
         assert_eq!(provider.pricing_scope, "direct_api");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn model_only_import_dry_run_uses_existing_provider_pricing_scope() {
+        let (state, root) = test_state("model-only-import-pricing-scope").await;
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "existing-integration-provider",
+                base_url: "https://integration.example/v1",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::update_provider_pricing_scope(&state.pool, &provider_id, "integration")
+            .await
+            .unwrap();
+
+        let config = json!({
+            "models": [{
+                "provider": "existing-integration-provider",
+                "upstream_id": "model-only-priced-model",
+                "display_name": "Model-only Priced Model",
+                "enabled": true,
+                "capabilities": {},
+                "prices": {
+                    "input_per_1m": 1.25
+                },
+                "parameters": {},
+                "thinking_map": {},
+                "extra_request": {},
+                "ownership": {
+                    "operator_capability_overrides": {},
+                    "operator_parameter_overrides": {},
+                    "operator_reasoning_overrides": {},
+                    "operator_thinking_overrides": {},
+                    "effective_pricing": {
+                        "source": "models.dev:provider",
+                        "metadata": {
+                            "fields": {
+                                "input_per_1m": {
+                                    "source": "models.dev:provider",
+                                    "metadata": {}
+                                }
+                            },
+                            "catalog_source_state": {
+                                "source": "models.dev"
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+
+        let dry_run = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: config.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true);
+        let model_plan = dry_run["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["kind"] == "model")
+            .unwrap();
+        assert_eq!(
+            model_plan["suppressed_external_price_fields"],
+            json!(["input_per_1m"])
+        );
+
+        import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let model = db::find_model_by_upstream(
+            &state.pool,
+            &provider_id,
+            "model-only-priced-model",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(model.prices().input_per_1m, None);
+        let discovery = discovery_object(&model);
+        assert!(discovery
+            .get("effective_pricing")
+            .is_none_or(Value::is_null));
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);
