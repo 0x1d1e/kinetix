@@ -43,9 +43,11 @@ Codex, and Anthropic Messages for Claude Code. OpenCode profiles target the
 stable v1 custom-provider schema, not the separate v2 configuration format.
 
 Profiles are previews and downloads only; Kinetix does not edit local files.
-When the full virtual key is available, it is included in the generated
-credential file, not saved by Kinetix. Otherwise, the output contains a
-placeholder. Kinetix cannot recover an existing key from its stored hash.
+The UI labels whether each output is a merge snippet, a sourced key helper, or a
+launch helper. Pi, Codex, and OpenCode configuration are partial snippets, not
+full-file replacements. When the full virtual key is available, it is included in the
+generated credential file, not saved by Kinetix. Otherwise, the output contains
+a placeholder. Kinetix cannot recover an existing key from its stored hash.
 Profiles include no upstream credentials or guessed model capabilities. Pi
 profiles carry only registered reasoning, input, and token-limit metadata, and
 enable the session-affinity settings verified by the real-client acceptance.

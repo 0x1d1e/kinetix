@@ -153,7 +153,7 @@ fn model_entries_in(
     key_allowed_providers: &[String],
 ) -> Vec<ModelEntry> {
     // Client-facing names: aliases and Routes first, then upstream IDs. Add
-    // provider-qualified IDs only when a key explicitly grants one.
+    // provider-qualified IDs whenever the model grant permits the qualified name.
     let mut entries: Vec<ModelEntry> = Vec::new();
     for alias in snap.aliases.values() {
         let (context_window, max_output_tokens, capabilities) = match alias.target_type.as_str() {
@@ -205,7 +205,7 @@ fn model_entries_in(
         provider_names.sort_unstable();
         for provider_name in provider_names {
             let name = format!("{provider_name}/{}", model.upstream_id);
-            if !has_provider_qualified_grant(key_allowed, &name)
+            if !crate::db::VirtualKeyRow::model_is_allowed(key_allowed, &name)
                 || entries.iter().any(|entry| entry.name == name)
             {
                 continue;
@@ -225,15 +225,6 @@ fn model_entries_in(
     });
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
-}
-
-fn has_provider_qualified_grant(allowed: &[String], model: &str) -> bool {
-    // Only expose qualified names when a grant explicitly scopes a provider.
-    // A wildcard-only key keeps the existing concise model list.
-    allowed.iter().any(|grant| {
-        grant.contains('/')
-            && crate::db::VirtualKeyRow::model_is_allowed(std::slice::from_ref(grant), model)
-    })
 }
 
 fn provider_policy_allows(
@@ -537,7 +528,14 @@ mod tests {
             std::slice::from_ref(&permitted_provider),
         );
         let ids: Vec<_> = visible.into_iter().map(|model| model.id).collect();
-        assert_eq!(ids, ["mixed-route", "permitted-model", "permitted-route"]);
+        let expected = vec![
+            "mixed-route".to_string(),
+            "permitted-model".to_string(),
+            "permitted-route".to_string(),
+            "permitted/permitted-model".to_string(),
+            format!("{permitted_provider}/permitted-model"),
+        ];
+        assert_eq!(ids, expected);
 
         let restricted = client_profile_models(
             &registry,

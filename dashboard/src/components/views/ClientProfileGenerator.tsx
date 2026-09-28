@@ -25,6 +25,19 @@ const clients: Array<{
   { id: 'open_code', name: 'OpenCode', description: 'OpenAI-compatible Chat Completions via Kinetix.' },
 ];
 
+function usageInstruction(file: ClientProfileFile): string {
+  switch (file.usage) {
+    case 'write_to':
+      return file.destination ? `Save this complete file to ${file.destination}.` : 'Save this complete file.';
+    case 'merge_into':
+      return `Merge into ${file.destination ?? 'the existing client configuration'}; do not overwrite the whole file.`;
+    case 'source':
+      return 'Source this helper in the shell that starts your client.';
+    case 'execute':
+      return 'Run this helper with bash; it starts the configured client.';
+  }
+}
+
 const ClientProfileGenerator: React.FC<ClientProfileGeneratorProps> = ({ keys, newlyCreatedKey }) => {
   const activeKeys = useMemo(() => keys.filter((key) => key.status === 'active'), [keys]);
   const [keyId, setKeyId] = useState('');
@@ -277,7 +290,7 @@ const ClientProfileGenerator: React.FC<ClientProfileGeneratorProps> = ({ keys, n
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-2 mb-2 text-xs font-body text-[var(--ink)]/65">
-              <span>{activeFile.destination ? `Suggested location: ${activeFile.destination}` : 'Source this helper in the shell that starts your client.'}</span>
+              <span>{usageInstruction(activeFile)}</span>
               <div className="flex gap-2">
                 <button
                   type="button"

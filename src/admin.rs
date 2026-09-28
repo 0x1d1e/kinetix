@@ -14739,7 +14739,7 @@ mod credential_enrollment_regression_tests {
     mod client_profile_model_grant_tests {
         use super::*;
 
-        async fn state_with_qualified_model_grant(
+        async fn state_with_wildcard_model_grant(
             tag: &str,
         ) -> (AppState, std::path::PathBuf, String) {
             let (state, root) = test_state(tag).await;
@@ -14803,10 +14803,10 @@ mod credential_enrollment_regression_tests {
             let key = db::VirtualKeyRow {
                 id: format!("key_{tag}"),
                 key_hash: "test-hash".into(),
-                name: "qualified model key".into(),
+                name: "wildcard model key".into(),
                 owner: "test".into(),
                 tag: String::new(),
-                allowed_models: json!(["provider-b/model"]).to_string(),
+                allowed_models: json!(["*"]).to_string(),
                 allowed_providers: json!([provider_b]).to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
@@ -14825,20 +14825,46 @@ mod credential_enrollment_regression_tests {
         }
 
         #[tokio::test]
-        async fn model_list_includes_provider_qualified_exact_grant() {
-            let (state, root, key_id) = state_with_qualified_model_grant("qualified-list").await;
-            let Json(body) = client_profile_models(State(state.clone()), auth(), Path(key_id))
-                .await
-                .unwrap();
-            assert_eq!(body["models"], json!([{ "id": "provider-b/model" }]));
+        async fn wildcard_model_grant_exposes_provider_qualified_models() {
+            let (state, root, key_id) = state_with_wildcard_model_grant("wildcard-list").await;
+            let Json(body) =
+                client_profile_models(State(state.clone()), auth(), Path(key_id.clone()))
+                    .await
+                    .unwrap();
+            assert!(body["models"].as_array().unwrap().contains(&json!({
+                "id": "provider-b/model"
+            })));
+
+            let provider_b_id = state
+                .registry
+                .snapshot()
+                .providers
+                .values()
+                .find(|provider| provider.name == "provider-b")
+                .unwrap()
+                .id
+                .clone();
+            let public_models = crate::frontends::models::models_body(
+                crate::frontends::FrontendFormat::OpenAi,
+                &state.registry,
+                &["*".into()],
+                &[provider_b_id],
+            );
+            let qualified_model = public_models["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == "provider-b/model")
+                .expect("provider-qualified model is visible in /v1/models");
+            assert_eq!(qualified_model["context_window"], 200_000);
+            assert_eq!(qualified_model["max_output_tokens"], 8_192);
             drop(state);
             let _ = std::fs::remove_dir_all(root);
         }
 
         #[tokio::test]
-        async fn provider_qualified_model_grant_generates_a_profile() {
-            let (state, root, key_id) =
-                state_with_qualified_model_grant("qualified-generate").await;
+        async fn wildcard_model_grant_generates_provider_qualified_profile() {
+            let (state, root, key_id) = state_with_wildcard_model_grant("wildcard-generate").await;
             let response = generate_client_profile(
                 State(state.clone()),
                 auth(),

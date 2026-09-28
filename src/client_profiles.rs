@@ -19,10 +19,20 @@ pub enum ClientApp {
     OpenCode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileFileUsage {
+    WriteTo,
+    MergeInto,
+    Source,
+    Execute,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileFile {
     pub filename: &'static str,
     pub destination: Option<&'static str>,
+    pub usage: ProfileFileUsage,
     pub content_type: &'static str,
     pub content: String,
 }
@@ -106,6 +116,7 @@ fn json_file(filename: &'static str, destination: &'static str, content: Value) 
     ProfileFile {
         filename,
         destination: Some(destination),
+        usage: ProfileFileUsage::MergeInto,
         content_type: "application/json",
         content: serde_json::to_string_pretty(&content)
             .expect("JSON profile values always serialize"),
@@ -171,6 +182,7 @@ fn claude_code_file(root: &str, model: &str, api_key: &str) -> ProfileFile {
     ProfileFile {
         filename: "kinetix-claude.sh",
         destination: None,
+        usage: ProfileFileUsage::Execute,
         content_type: "text/x-shellscript",
         content,
     }
@@ -211,6 +223,7 @@ fn codex_files(base_url: &str, model: &str, api_key: &str) -> Vec<ProfileFile> {
         ProfileFile {
             filename: "config.toml",
             destination: Some("~/.codex/config.toml"),
+            usage: ProfileFileUsage::MergeInto,
             content_type: "application/toml",
             content: toml::to_string_pretty(&config).expect("Codex config always serializes"),
         },
@@ -249,6 +262,7 @@ fn api_key_file(api_key: &str) -> ProfileFile {
     ProfileFile {
         filename: "kinetix-api-key.sh",
         destination: None,
+        usage: ProfileFileUsage::Source,
         content_type: "text/x-shellscript",
         content: format!(
             "# Source this file in the shell that starts your client.\nexport {KEY_ENV}={}\n",
@@ -413,6 +427,18 @@ mod tests {
     }
 
     #[test]
+    fn profile_file_usage_serializes_for_the_dashboard() {
+        for (usage, expected) in [
+            (ProfileFileUsage::WriteTo, "write_to"),
+            (ProfileFileUsage::MergeInto, "merge_into"),
+            (ProfileFileUsage::Source, "source"),
+            (ProfileFileUsage::Execute, "execute"),
+        ] {
+            assert_eq!(serde_json::to_value(usage).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn pi_profile_omits_unknown_model_metadata_but_enables_session_affinity() {
         let profile = generate(
             ClientApp::Pi,
@@ -495,6 +521,14 @@ mod tests {
         );
         assert_eq!(settings["defaultProvider"], "kinetix");
         assert_eq!(settings["defaultModel"], "coder/route");
+        assert_eq!(
+            file(&profile, "settings.json").usage,
+            ProfileFileUsage::MergeInto
+        );
+        assert_eq!(
+            file(&profile, "kinetix-api-key.sh").usage,
+            ProfileFileUsage::Source
+        );
         assert!(file(&profile, "kinetix-api-key.sh")
             .content
             .contains("export KINETIX_API_KEY='sk-kinetix-test'"));
@@ -508,7 +542,9 @@ mod tests {
             "claude-compatible-route",
             Some("sk-kinetix-test"),
         );
-        let script = &file(&profile, "kinetix-claude.sh").content;
+        let helper = file(&profile, "kinetix-claude.sh");
+        assert_eq!(helper.usage, ProfileFileUsage::Execute);
+        let script = &helper.content;
         assert!(script.contains("export ANTHROPIC_BASE_URL='https://kinetix.example/gateway'"));
         assert!(script.contains("export ANTHROPIC_API_KEY='sk-kinetix-test'"));
         assert!(script.contains("export ANTHROPIC_AUTH_TOKEN=''"));
@@ -528,7 +564,13 @@ mod tests {
             "coder",
             Some("sk-kinetix-test"),
         );
-        let config: toml::Value = toml::from_str(&file(&profile, "config.toml").content).unwrap();
+        let config_file = file(&profile, "config.toml");
+        assert_eq!(config_file.usage, ProfileFileUsage::MergeInto);
+        assert_eq!(
+            file(&profile, "kinetix-api-key.sh").usage,
+            ProfileFileUsage::Source
+        );
+        let config: toml::Value = toml::from_str(&config_file.content).unwrap();
 
         assert_eq!(config["model"].as_str(), Some("coder"));
         assert_eq!(config["model_provider"].as_str(), Some("kinetix"));
@@ -561,7 +603,9 @@ mod tests {
             "coder",
             None,
         );
-        let config: Value = serde_json::from_str(&file(&profile, "opencode.json").content).unwrap();
+        let config_file = file(&profile, "opencode.json");
+        assert_eq!(config_file.usage, ProfileFileUsage::MergeInto);
+        let config: Value = serde_json::from_str(&config_file.content).unwrap();
 
         assert_eq!(config["model"], "kinetix/default");
         assert_eq!(

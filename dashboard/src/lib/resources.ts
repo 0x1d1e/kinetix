@@ -33,9 +33,12 @@ export interface ClientProfileModel {
   id: string;
 }
 
+export type ClientProfileFileUsage = 'write_to' | 'merge_into' | 'source' | 'execute';
+
 export interface ClientProfileFile {
   filename: string;
   destination: string | null;
+  usage: ClientProfileFileUsage;
   content_type: string;
   content: string;
 }
