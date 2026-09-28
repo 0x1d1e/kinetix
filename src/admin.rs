@@ -1036,12 +1036,15 @@ pub async fn generate_client_profile(
         &key.allowed_models(),
         &key.allowed_providers(),
     );
-    if !visible_models.iter().any(|model| model.id == body.model) {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "selected model or Route is not currently available to this key".into(),
-        ));
-    }
+    let selected_model = visible_models
+        .into_iter()
+        .find(|model| model.id == body.model)
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::FORBIDDEN,
+                "selected model or Route is not currently available to this key".into(),
+            )
+        })?;
 
     let api_key = body
         .api_key
@@ -1063,8 +1066,13 @@ pub async fn generate_client_profile(
     }
 
     let public_base_url = effective_public_base_url(&state).await?;
-    let profile =
-        crate::client_profiles::generate(body.client, &public_base_url, &body.model, api_key);
+    let profile = crate::client_profiles::generate_with_metadata(
+        body.client,
+        &public_base_url,
+        &body.model,
+        &selected_model.metadata,
+        api_key,
+    );
     let mut response = Json(profile).into_response();
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
@@ -14751,6 +14759,8 @@ mod credential_enrollment_regression_tests {
                 None,
             )
             .await;
+            // The selected registry row explicitly carries the capabilities
+            // from the Pi acceptance fixture; the other provider has unknowns.
             for provider_id in [&provider_a, &provider_b] {
                 db::insert_model(
                     &state.pool,
@@ -14759,9 +14769,13 @@ mod credential_enrollment_regression_tests {
                         upstream_id: "model",
                         display_name: "Model",
                         enabled: true,
-                        context_window: None,
-                        max_output_tokens: None,
-                        capabilities: json!({}),
+                        context_window: (provider_id == &provider_b).then_some(200_000),
+                        max_output_tokens: (provider_id == &provider_b).then_some(8_192),
+                        capabilities: if provider_id == &provider_b {
+                            json!({"text": true, "vision": true, "reasoning": true})
+                        } else {
+                            json!({})
+                        },
                         prices: json!({}),
                         parameters: json!({}),
                         thinking_map: json!({}),
@@ -14847,6 +14861,27 @@ mod credential_enrollment_regression_tests {
                 .unwrap();
             let profile: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(profile["model"], "provider-b/model");
+            let models_content = profile["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|file| file["filename"] == "models.json")
+                .unwrap()["content"]
+                .as_str()
+                .unwrap();
+            let models: Value = serde_json::from_str(models_content).unwrap();
+            let model = &models["providers"]["kinetix"]["models"][0];
+            assert_eq!(model["reasoning"], true);
+            assert_eq!(model["input"], json!(["text", "image"]));
+            assert_eq!(model["contextWindow"], 200_000);
+            assert_eq!(model["maxTokens"], 8_192);
+            assert_eq!(
+                model["compat"],
+                json!({
+                    "sendSessionAffinityHeaders": true,
+                    "sessionAffinityFormat": "openrouter"
+                })
+            );
             drop(state);
             let _ = std::fs::remove_dir_all(root);
         }

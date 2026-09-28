@@ -27,6 +27,18 @@ pub struct ProfileFile {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ClientModelMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GeneratedProfile {
     pub client: ClientApp,
@@ -41,6 +53,22 @@ pub fn generate(
     model: &str,
     api_key: Option<&str>,
 ) -> GeneratedProfile {
+    generate_with_metadata(
+        client,
+        public_base_url,
+        model,
+        &ClientModelMetadata::default(),
+        api_key,
+    )
+}
+
+pub fn generate_with_metadata(
+    client: ClientApp,
+    public_base_url: &str,
+    model: &str,
+    metadata: &ClientModelMetadata,
+    api_key: Option<&str>,
+) -> GeneratedProfile {
     let root = endpoint_root(public_base_url);
     let openai_base_url = format!("{root}/v1");
     let api_key = api_key
@@ -49,7 +77,7 @@ pub fn generate(
         .unwrap_or(KEY_PLACEHOLDER);
 
     let files = match client {
-        ClientApp::Pi => pi_files(&openai_base_url, model, api_key),
+        ClientApp::Pi => pi_files(&openai_base_url, model, metadata, api_key),
         ClientApp::ClaudeCode => vec![claude_code_file(&root, model, api_key)],
         ClientApp::Codex => codex_files(&openai_base_url, model, api_key),
         ClientApp::OpenCode => open_code_files(&openai_base_url, model, api_key),
@@ -84,14 +112,41 @@ fn json_file(filename: &'static str, destination: &'static str, content: Value) 
     }
 }
 
-fn pi_files(base_url: &str, model: &str, api_key: &str) -> Vec<ProfileFile> {
+fn pi_files(
+    base_url: &str,
+    model: &str,
+    metadata: &ClientModelMetadata,
+    api_key: &str,
+) -> Vec<ProfileFile> {
+    let mut model_config = json!({
+        "id": model,
+        "name": model,
+        // Match the Pi session-affinity configuration exercised by the real
+        // client acceptance fixture and documented in docs/pi-compatibility.md.
+        "compat": {
+            "sendSessionAffinityHeaders": true,
+            "sessionAffinityFormat": "openrouter"
+        }
+    });
+    if let Some(reasoning) = metadata.reasoning {
+        model_config["reasoning"] = json!(reasoning);
+    }
+    if let Some(input) = &metadata.input {
+        model_config["input"] = json!(input);
+    }
+    if let Some(context_window) = metadata.context_window {
+        model_config["contextWindow"] = json!(context_window);
+    }
+    if let Some(max_output_tokens) = metadata.max_output_tokens {
+        model_config["maxTokens"] = json!(max_output_tokens);
+    }
     let models = json!({
         "providers": {
             "kinetix": {
                 "baseUrl": base_url,
                 "apiKey": format!("${KEY_ENV}"),
                 "api": "openai-completions",
-                "models": [{ "id": model, "name": model }],
+                "models": [model_config],
             }
         }
     });
@@ -209,6 +264,11 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn file<'a>(profile: &'a GeneratedProfile, filename: &str) -> &'a ProfileFile {
         profile
@@ -218,12 +278,178 @@ mod tests {
             .unwrap()
     }
 
+    #[derive(Clone)]
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        headers: HashMap<String, String>,
+        body: Value,
+    }
+
+    fn read_stub_request(stream: &mut TcpStream) -> std::io::Result<CapturedRequest> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        let (header_end, content_length) = loop {
+            let count = stream.read(&mut chunk)?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "client closed before completing the request",
+                ));
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>())
+                    .transpose()
+                    .map_err(std::io::Error::other)?
+                    .unwrap_or(0);
+                if bytes.len() >= header_end + 4 + content_length {
+                    break (header_end, content_length);
+                }
+            }
+        };
+        let headers_text = String::from_utf8_lossy(&bytes[..header_end]);
+        let mut lines = headers_text.lines();
+        let mut request_line = lines.next().unwrap_or_default().split_whitespace();
+        let method = request_line.next().unwrap_or_default().to_string();
+        let path = request_line.next().unwrap_or_default().to_string();
+        let headers = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        let body_start = header_end + 4;
+        let body = serde_json::from_slice(&bytes[body_start..body_start + content_length])
+            .unwrap_or(Value::Null);
+        Ok(CapturedRequest {
+            method,
+            path,
+            headers,
+            body,
+        })
+    }
+
+    fn spawn_opencode_stub(listener: TcpListener) -> thread::JoinHandle<Vec<CapturedRequest>> {
+        thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut last_request = Instant::now();
+            let mut requests = Vec::new();
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let request = read_stub_request(&mut stream).unwrap();
+                        let is_completion =
+                            request.method == "POST" && request.path == "/v1/chat/completions";
+                        let (status, content_type, body) = if is_completion {
+                            let chunks = [
+                                json!({
+                                    "id": "chatcmpl-stub",
+                                    "object": "chat.completion.chunk",
+                                    "created": 0,
+                                    "model": "provider-b/model",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"role": "assistant", "content": "stub response"},
+                                        "finish_reason": null
+                                    }]
+                                }),
+                                json!({
+                                    "id": "chatcmpl-stub",
+                                    "object": "chat.completion.chunk",
+                                    "created": 0,
+                                    "model": "provider-b/model",
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "stop"
+                                    }]
+                                }),
+                            ];
+                            let events = chunks
+                                .iter()
+                                .map(|chunk| format!("data: {chunk}\r\n\r\n"))
+                                .collect::<String>()
+                                + "data: [DONE]\r\n\r\n";
+                            ("200 OK", "text/event-stream", events)
+                        } else if request.method == "GET" && request.path.ends_with("/models") {
+                            (
+                                "200 OK",
+                                "application/json",
+                                json!({"data": [{"id": "provider-b/model"}]}).to_string(),
+                            )
+                        } else {
+                            ("404 Not Found", "application/json", "{}".to_string())
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                        stream.flush().unwrap();
+                        requests.push(request);
+                        if is_completion {
+                            last_request = Instant::now();
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if !requests.is_empty() && last_request.elapsed() > Duration::from_secs(2) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("OpenCode stub listener failed: {error}"),
+                }
+            }
+            requests
+        })
+    }
+
+    #[test]
+    fn pi_profile_omits_unknown_model_metadata_but_enables_session_affinity() {
+        let profile = generate(
+            ClientApp::Pi,
+            "https://kinetix.example",
+            "coder/model",
+            None,
+        );
+        let models: Value = serde_json::from_str(&file(&profile, "models.json").content).unwrap();
+        let model = &models["providers"]["kinetix"]["models"][0];
+        for field in ["reasoning", "input", "contextWindow", "maxTokens"] {
+            assert!(
+                model.get(field).is_none(),
+                "unexpected model metadata: {field}"
+            );
+        }
+        assert_eq!(
+            model["compat"],
+            json!({
+                "sendSessionAffinityHeaders": true,
+                "sessionAffinityFormat": "openrouter"
+            })
+        );
+    }
+
     #[test]
     fn pi_profile_uses_chat_completions_and_persists_the_selected_default() {
-        let profile = generate(
+        let metadata = ClientModelMetadata {
+            reasoning: Some(true),
+            input: Some(vec!["text".into(), "image".into()]),
+            context_window: Some(200_000),
+            max_output_tokens: Some(8_192),
+        };
+        let profile = generate_with_metadata(
             ClientApp::Pi,
             "https://kinetix.example/gateway/v1/",
             "coder/route",
+            &metadata,
             Some("sk-kinetix-test"),
         );
         let models: Value = serde_json::from_str(&file(&profile, "models.json").content).unwrap();
@@ -243,6 +469,29 @@ mod tests {
         assert_eq!(
             models["providers"]["kinetix"]["models"][0]["name"],
             "coder/route"
+        );
+        assert_eq!(
+            models["providers"]["kinetix"]["models"][0]["reasoning"],
+            true
+        );
+        assert_eq!(
+            models["providers"]["kinetix"]["models"][0]["input"],
+            json!(["text", "image"])
+        );
+        assert_eq!(
+            models["providers"]["kinetix"]["models"][0]["contextWindow"],
+            200_000
+        );
+        assert_eq!(
+            models["providers"]["kinetix"]["models"][0]["maxTokens"],
+            8_192
+        );
+        assert_eq!(
+            models["providers"]["kinetix"]["models"][0]["compat"],
+            json!({
+                "sendSessionAffinityHeaders": true,
+                "sessionAffinityFormat": "openrouter"
+            })
         );
         assert_eq!(settings["defaultProvider"], "kinetix");
         assert_eq!(settings["defaultModel"], "coder/route");
@@ -344,7 +593,7 @@ mod tests {
 
     #[test]
     #[ignore = "run scripts/test-opencode-v1-profile.sh against stable OpenCode 1.18.33"]
-    fn open_code_v1_profile_is_loaded_by_stable_cli() {
+    fn open_code_v1_profile_sends_selected_model_to_kinetix_stub() {
         const STABLE_VERSION: &str = "1.18.33";
         let executable = std::env::var_os("KINETIX_OPENCODE_V1_BIN")
             .expect("the compatibility script must provide the pinned OpenCode v1 CLI");
@@ -365,19 +614,17 @@ mod tests {
         let home = root.join("home");
         std::fs::create_dir_all(home.join(".config")).unwrap();
         std::fs::create_dir_all(home.join(".local/share")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let stub = spawn_opencode_stub(listener);
 
-        let profile = generate(
-            ClientApp::OpenCode,
-            "https://kinetix.example",
-            "provider-b/model",
-            None,
-        );
+        let profile = generate(ClientApp::OpenCode, &base_url, "provider-b/model", None);
         std::fs::write(
             root.join("opencode.json"),
             &file(&profile, "opencode.json").content,
         )
         .unwrap();
-        let output = std::process::Command::new(executable)
+        let output = std::process::Command::new(&executable)
             .args(["--log-level", "ERROR", "debug", "config"])
             .current_dir(&root)
             .env("HOME", &home)
@@ -399,12 +646,53 @@ mod tests {
         );
         assert_eq!(
             resolved["provider"]["kinetix"]["options"]["baseURL"],
-            "https://kinetix.example/v1"
+            base_url
         );
         assert_eq!(
             resolved["provider"]["kinetix"]["models"]["default"]["id"],
             "provider-b/model"
         );
+
+        let output = std::process::Command::new(&executable)
+            .args([
+                "--print-logs",
+                "--log-level",
+                "DEBUG",
+                "run",
+                "--model",
+                "kinetix/default",
+                "--format",
+                "json",
+                "Reply with the stub response.",
+            ])
+            .current_dir(&root)
+            .env("PWD", &root)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env(KEY_ENV, "test-only-virtual-key")
+            .output()
+            .expect("OpenCode v1 run starts");
+        let requests = stub.join().expect("OpenCode stub completes");
+        assert!(
+            output.status.success(),
+            "OpenCode request failed: {} request(s) captured; stdout={} stderr={}",
+            requests.len(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let request = requests
+            .iter()
+            .find(|request| request.method == "POST" && request.path == "/v1/chat/completions")
+            .expect("OpenCode must POST a completion request to Kinetix");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/chat/completions");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-only-virtual-key")
+        );
+        assert_eq!(request.body["model"], "provider-b/model");
+        assert_eq!(request.body["stream"], true);
 
         let _ = std::fs::remove_dir_all(root);
     }

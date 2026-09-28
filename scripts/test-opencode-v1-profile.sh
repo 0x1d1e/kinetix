@@ -22,5 +22,5 @@ fi
 
 KINETIX_OPENCODE_V1_BIN="$OPENCODE_BIN" \
   cargo test --lib \
-    client_profiles::tests::open_code_v1_profile_is_loaded_by_stable_cli \
+    client_profiles::tests::open_code_v1_profile_sends_selected_model_to_kinetix_stub \
     -- --ignored --exact

@@ -46,7 +46,9 @@ Profiles are previews and downloads only; Kinetix does not edit local files.
 When the full virtual key is available, it is included in the generated
 credential file, not saved by Kinetix. Otherwise, the output contains a
 placeholder. Kinetix cannot recover an existing key from its stored hash.
-Profiles include no upstream credentials or guessed model capabilities.
+Profiles include no upstream credentials or guessed model capabilities. Pi
+profiles carry only registered reasoning, input, and token-limit metadata, and
+enable the session-affinity settings verified by the real-client acceptance.
 
 ## Admin auth
 

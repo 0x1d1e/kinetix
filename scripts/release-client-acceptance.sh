@@ -294,33 +294,14 @@ run_pi() {
   project="$(prepare_project)"
   agent="$WORK/pi-agent-$CASE_ID"
   mkdir -p "$agent"
-  cat >"$agent/models.json" <<EOF
-{
-  "providers": {
-    "kinetix": {
-      "baseUrl": "$PROXY_BASE/v1",
-      "api": "openai-completions",
-      "apiKey": "\$KINETIX_ACCEPT_KEY",
-      "models": [{
-        "id": "$model",
-        "name": "Kinetix release acceptance",
-        "reasoning": true,
-        "input": ["text", "image"],
-        "contextWindow": 200000,
-        "maxTokens": 8192,
-        "compat": {
-          "sendSessionAffinityHeaders": true,
-          "sessionAffinityFormat": "openrouter"
-        }
-      }]
-    }
-  }
-}
-EOF
+  KINETIX_BASE="$BASE" \
+  KINETIX_ADMIN_TOKEN="$ADMIN_TOKEN" \
+  KINETIX_KEY="$KEY" \
+    python3 "$ROOT/scripts/release-client-pi-profile.py" "$model" "$PROXY_BASE" "$agent"
   (
     cd "$project"
     PI_CODING_AGENT_DIR="$agent" \
-    KINETIX_ACCEPT_KEY="$KEY" \
+    KINETIX_API_KEY="$KEY" \
       pi --provider kinetix --model "$model" --thinking high --mode json \
       @pixel.png \
       "Use two separate file-tool calls: first read acceptance-a.txt, then make a second tool call to read acceptance-b.txt. Report alpha-sentinel and beta-sentinel exactly, describe the attached image, then finish normally."

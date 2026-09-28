@@ -48,6 +48,8 @@ impl std::fmt::Display for ErrorKind {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ClientProfileModel {
     pub id: String,
+    #[serde(skip)]
+    pub metadata: crate::client_profiles::ClientModelMetadata,
 }
 
 #[derive(Clone)]
@@ -65,9 +67,13 @@ pub fn client_profile_models(
     key_allowed: &[String],
     key_allowed_providers: &[String],
 ) -> Vec<ClientProfileModel> {
-    model_entries(registry, key_allowed, key_allowed_providers)
+    let snapshot = registry.snapshot();
+    model_entries_in(&snapshot, key_allowed, key_allowed_providers)
         .into_iter()
-        .map(|entry| ClientProfileModel { id: entry.name })
+        .map(|entry| ClientProfileModel {
+            metadata: client_model_metadata(&snapshot, &entry.name, key_allowed_providers),
+            id: entry.name,
+        })
         .collect()
 }
 
@@ -137,7 +143,15 @@ fn model_entries(
     key_allowed: &[String],
     key_allowed_providers: &[String],
 ) -> Vec<ModelEntry> {
-    let snap = registry.snapshot();
+    let snapshot = registry.snapshot();
+    model_entries_in(&snapshot, key_allowed, key_allowed_providers)
+}
+
+fn model_entries_in(
+    snap: &crate::registry::Snapshot,
+    key_allowed: &[String],
+    key_allowed_providers: &[String],
+) -> Vec<ModelEntry> {
     // Client-facing names: aliases and Routes first, then upstream IDs. Add
     // provider-qualified IDs only when a key explicitly grants one.
     let mut entries: Vec<ModelEntry> = Vec::new();
@@ -253,6 +267,85 @@ fn provider_ids_allowed<'a>(
         })
 }
 
+fn client_model_metadata(
+    snapshot: &crate::registry::Snapshot,
+    name: &str,
+    allowed_providers: &[String],
+) -> crate::client_profiles::ClientModelMetadata {
+    use crate::registry::Resolved;
+
+    let Some(resolved) = Registry::resolve_in(snapshot, name) else {
+        return crate::client_profiles::ClientModelMetadata::default();
+    };
+    let models: Vec<ModelRow> = match resolved {
+        Resolved::Single { model_id, .. } => snapshot
+            .models
+            .get(&model_id)
+            .cloned()
+            .into_iter()
+            .collect(),
+        Resolved::Route { targets, .. } => {
+            let mut seen = std::collections::HashSet::new();
+            targets
+                .into_iter()
+                .filter(|target| {
+                    provider_ids_allowed(
+                        std::iter::once(target.provider.id.as_str()),
+                        allowed_providers,
+                    )
+                })
+                .filter(|target| seen.insert(target.model.id.clone()))
+                .map(|target| target.model)
+                .collect()
+        }
+    };
+    if models.is_empty() {
+        return crate::client_profiles::ClientModelMetadata::default();
+    }
+
+    let capabilities: Vec<_> = models.iter().map(declared_caps).collect();
+    let reasoning = capabilities
+        .iter()
+        .map(|caps| caps.as_ref()?.get("reasoning")?.as_bool())
+        .collect::<Option<Vec<_>>>()
+        .and_then(|values| {
+            let first = *values.first()?;
+            values.iter().all(|value| *value == first).then_some(first)
+        });
+    let mut input = Vec::new();
+    if capabilities.iter().all(|caps| {
+        caps.as_ref()
+            .and_then(|caps| caps.get("text"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    }) {
+        input.push("text".to_string());
+    }
+    if capabilities.iter().all(|caps| {
+        caps.as_ref()
+            .and_then(|caps| caps.get("vision"))
+            .and_then(Value::as_bool)
+            == Some(true)
+    }) {
+        input.push("image".to_string());
+    }
+
+    crate::client_profiles::ClientModelMetadata {
+        reasoning,
+        input: (!input.is_empty()).then_some(input),
+        context_window: models
+            .iter()
+            .map(|model| model.context_window)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|limits| limits.into_iter().min()),
+        max_output_tokens: models
+            .iter()
+            .map(|model| model.max_output_tokens)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|limits| limits.into_iter().min()),
+    }
+}
+
 /// The explicitly declared boolean capabilities of a model, or `None` when the
 /// model declares no capability metadata. Unknown metadata is never invented.
 fn declared_caps(m: &ModelRow) -> Option<Value> {
@@ -306,6 +399,17 @@ mod tests {
     }
 
     async fn insert_test_model(pool: &crate::db::Pool, provider_id: &str, name: &str) -> String {
+        insert_test_model_with_metadata(pool, provider_id, name, None, None, json!({})).await
+    }
+
+    async fn insert_test_model_with_metadata(
+        pool: &crate::db::Pool,
+        provider_id: &str,
+        name: &str,
+        context_window: Option<i64>,
+        max_output_tokens: Option<i64>,
+        capabilities: Value,
+    ) -> String {
         crate::db::insert_model(
             pool,
             &crate::db::NewModel {
@@ -313,9 +417,9 @@ mod tests {
                 upstream_id: name,
                 display_name: name,
                 enabled: true,
-                context_window: None,
-                max_output_tokens: None,
-                capabilities: json!({}),
+                context_window,
+                max_output_tokens,
+                capabilities,
                 prices: json!({}),
                 parameters: json!({}),
                 thinking_map: json!({}),
@@ -442,6 +546,84 @@ mod tests {
         );
         let ids: Vec<_> = restricted.into_iter().map(|model| model.id).collect();
         assert_eq!(ids, ["permitted-model", "permitted-route"]);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn client_profile_route_metadata_is_shared_and_conservative_across_targets() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-client-profile-route-metadata-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("kinetix.db");
+        let database_url = format!("sqlite://{}", database.display());
+        let pool = crate::db::connect(&database_url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+
+        let provider_id = insert_test_provider(&pool, "profile-metadata").await;
+        let account_id = crate::db::insert_account(
+            &pool,
+            &provider_id,
+            "profile-metadata-account",
+            "encrypted-test-secret",
+            "masked",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let first_model = insert_test_model_with_metadata(
+            &pool,
+            &provider_id,
+            "vision-model",
+            Some(200_000),
+            Some(8_192),
+            json!({"text": true, "vision": true, "reasoning": true}),
+        )
+        .await;
+        let second_model = insert_test_model_with_metadata(
+            &pool,
+            &provider_id,
+            "text-model",
+            Some(100_000),
+            Some(4_096),
+            json!({"text": true, "vision": false, "reasoning": true}),
+        )
+        .await;
+        insert_test_route(
+            &pool,
+            "profile-route",
+            &[(&account_id, &first_model), (&account_id, &second_model)],
+        )
+        .await;
+
+        let registry = Registry::new();
+        registry.reload(&pool).await.unwrap();
+        let visible = client_profile_models(
+            &registry,
+            &["profile-route".into()],
+            std::slice::from_ref(&provider_id),
+        );
+        let route = visible
+            .iter()
+            .find(|model| model.id == "profile-route")
+            .unwrap();
+        assert_eq!(route.metadata.reasoning, Some(true));
+        assert_eq!(
+            route.metadata.input.as_deref(),
+            Some(["text".to_string()].as_slice())
+        );
+        assert_eq!(route.metadata.context_window, Some(100_000));
+        assert_eq!(route.metadata.max_output_tokens, Some(4_096));
+        assert_eq!(
+            serde_json::to_value(route).unwrap(),
+            json!({"id": "profile-route"})
+        );
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);
