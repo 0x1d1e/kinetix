@@ -46,6 +46,13 @@ fn provenance(source: CatalogSource, kind: CatalogLayerKind) -> &'static str {
     }
 }
 
+pub(crate) fn is_external_catalog_price_source(source: &str) -> bool {
+    source == "models.dev"
+        || source.starts_with("models.dev:")
+        || source == "bundled_catalog"
+        || source.starts_with("bundled_catalog:")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalMatchKind {
     ExplicitHint,
