@@ -3499,10 +3499,7 @@ fn operator_price_provenance(prices: &Prices) -> (String, Value) {
             );
         }
     }
-    (
-        effective_price_source(&fields, prices),
-        json!({ "fields": fields }),
-    )
+    (effective_price_source(&fields, prices), json!({ "fields": fields }))
 }
 
 fn automatic_price_provenance(prices: &Prices, observation: &Value) -> (String, Value) {
