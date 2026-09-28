@@ -192,6 +192,13 @@ struct CachedOpaqueState {
     expires_at: Instant,
 }
 
+#[derive(Debug, Default)]
+struct CachedIdentityEvidence {
+    any: bool,
+    tool_name_match: bool,
+    session_compatible: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Observability counters (§36). No secrets, ids, or tool names — coarse
 // outcome counts only.
@@ -404,10 +411,12 @@ impl OpaqueStateStore {
     /// state exists but this target cannot carry it" (§19 case C, §22): a row
     /// found under a target with no capability is reported as `Incompatible`.
     ///
-    /// RAM is checked first (only possible when the capability is known, since
-    /// the cache key is scoped by provider/family/producer); a miss falls back
-    /// to SQLite, decrypts, and repopulates RAM (§13). Never returns a raw DB
-    /// record — only a caller-safe result (§38).
+    /// RAM is checked first. Exact-target lookup is O(1); after an exact miss,
+    /// RAM is also inspected for same-call state captured under another model
+    /// so immediate cross-model continuation cannot race asynchronous SQLite
+    /// durability. SQLite remains the durable fallback and exact persisted
+    /// target rows remain authoritative (§13). Never returns a raw DB record —
+    /// only a caller-safe result (§38).
     pub async fn resolve_tool_signature(
         &self,
         scope: &OpaqueClientScope,
@@ -419,11 +428,9 @@ impl OpaqueStateStore {
         let scope_hash = scope.hash();
         let call_hash = tool_call_hash(scope, tool_call_id);
 
-        // A live RAM entry answers directly. An *expired* RAM entry is evicted
-        // but must NOT short-circuit to `Missing`: `MEMORY_TTL` (1h) is only the
-        // hot-cache lifetime, while SQLite intentionally retains the row for
-        // `PERSISTENT_TTL` (24h) — a still-valid persistent row must still be
-        // found by falling through to the SQLite path below (§13).
+        // The exact target stays O(1) on the common path. An expired RAM entry
+        // is evicted but must not short-circuit to Missing: MEMORY_TTL (1h) is
+        // only the hot-cache lifetime, while SQLite retains rows for 24h.
         if let Some(target) = capability {
             let key = self.cache_key(target, &scope_hash, &call_hash);
             if let Some(entry) = self.cache.get(&key) {
@@ -439,29 +446,27 @@ impl OpaqueStateStore {
             }
         }
 
-        let rows = self.fetch_rows(&scope_hash, &call_hash).await;
-        if rows.is_empty() {
-            self.counters
-                .lookup_miss
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return OpaqueLookupResult::Missing;
+        // Capture writes RAM synchronously and SQLite asynchronously. An
+        // immediate continuation onto another model therefore cannot rely on
+        // SQLite to notice that state exists. Scan only after the exact-target
+        // O(1) miss and retain identity evidence from every live RAM row for
+        // this client-visible tool-call id. A late exact-target insertion wins.
+        let (late_exact, cached_evidence) = self.cached_identity_evidence(
+            capability,
+            &scope_hash,
+            &call_hash,
+            session,
+            tool_name,
+        );
+        if let Some(entry) = late_exact {
+            return self.evaluate_cached(&entry, session, tool_name);
         }
 
-        // Identity validation runs before target compatibility. A stored row is
-        // bound to the conversation that created it: the same client scope, the
-        // same tool name, and (when both sides carry one) the same session. A
-        // reused tool-call id must be rejected even when the stored row belongs
-        // to a *different model the target cannot carry*; otherwise a
-        // cross-model switch would let `call/read_file/session-B` be continued
-        // as `call/get_weather/session-A` and merely receive a placeholder
-        // (§10, §20).
-        //
-        // A row for the exact target model is authoritative: it is the row this
-        // request would replay, so its identity is validated first and no other
-        // model's row sharing the tool-call id can launder the answer into
-        // `Incompatible` (which would paint a cross-model placeholder onto
-        // malformed history). Only when no exact-model row exists is the
-        // cross-model/non-portable question asked of the remaining rows.
+        let rows = self.fetch_rows(&scope_hash, &call_hash).await;
+
+        // A persistent row for the exact target model remains authoritative,
+        // even if RAM already contains state for another model with the same
+        // client-visible tool-call id.
         if let Some(target) = capability {
             if let Some(row) = rows.iter().find(|row| row.matches(target)) {
                 if let Some(mismatch) = self.identity_mismatch(row, session, tool_name) {
@@ -471,35 +476,42 @@ impl OpaqueStateStore {
             }
         }
 
-        // Cross-model (or capability-less) lookup. Identity is validated against
-        // every surviving row so a reused tool-call id is refused even when the
-        // only stored row belongs to another model. With no capability the
-        // newest identity-matching row is inspected only so the pipeline can
-        // tell "stored but non-portable" apart from "nothing stored" (§19 case
-        // C, §22); it is never decrypted.
+        // Cross-model (or capability-less) lookup. Merge synchronous RAM
+        // evidence with durable rows so correctness never depends on the
+        // background SQLite worker winning a race with the next request.
+        let requested_tool = tool_name_hash(tool_name);
         let incoming_session = session.map(session_hash);
-        let identity_rows: Vec<&StoredRow> = rows
-            .iter()
-            .filter(|row| row.tool_name_hash == tool_name_hash(tool_name))
-            .collect();
-        if identity_rows.is_empty() {
+        let mut saw_any = cached_evidence.any;
+        let mut saw_tool_name = cached_evidence.tool_name_match;
+        let mut saw_compatible_session = cached_evidence.session_compatible;
+
+        for row in &rows {
+            saw_any = true;
+            if row.tool_name_hash != requested_tool {
+                continue;
+            }
+            saw_tool_name = true;
+            if match (&row.session_hash, &incoming_session) {
+                (Some(stored), Some(incoming)) => stored == incoming,
+                _ => true,
+            } {
+                saw_compatible_session = true;
+            }
+        }
+
+        if !saw_any {
+            self.counters
+                .lookup_miss
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return OpaqueLookupResult::Missing;
+        }
+        if !saw_tool_name {
             self.counters
                 .lookup_tool_name_mismatch
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return OpaqueLookupResult::ToolNameMismatch;
         }
-
-        // Session compatibility (§10): a row whose stored session differs from
-        // the incoming one cannot belong to this conversation. An absent
-        // session on either side is compatible.
-        let session_rows: Vec<&StoredRow> = identity_rows
-            .into_iter()
-            .filter(|row| match (&row.session_hash, &incoming_session) {
-                (Some(stored), Some(incoming)) => stored == incoming,
-                _ => true,
-            })
-            .collect();
-        if session_rows.is_empty() {
+        if !saw_compatible_session {
             self.counters
                 .lookup_session_mismatch
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -611,6 +623,65 @@ impl OpaqueStateStore {
                 self.cache.remove(&evicted);
             }
         }
+    }
+
+    /// Summarize live RAM rows for one client-visible tool-call id after the
+    /// exact-target fast path misses. This is the synchronous cross-model
+    /// counterpart to fetch_rows(): it prevents portability decisions from
+    /// depending on asynchronous SQLite durability.
+    fn cached_identity_evidence(
+        &self,
+        capability: Option<&OpaqueStateTarget>,
+        scope_hash: &str,
+        call_hash: &str,
+        session: Option<&str>,
+        tool_name: &str,
+    ) -> (Option<CachedOpaqueState>, CachedIdentityEvidence) {
+        let exact_key = capability.map(|target| self.cache_key(target, scope_hash, call_hash));
+        let requested_tool = tool_name_hash(tool_name);
+        let incoming_session = session.map(session_hash);
+        let now = Instant::now();
+        let mut exact = None;
+        let mut evidence = CachedIdentityEvidence::default();
+        let mut expired = Vec::new();
+
+        for entry in &self.cache {
+            let key = entry.key();
+            if key.scope_hash != scope_hash || key.tool_call_hash != call_hash {
+                continue;
+            }
+            if entry.expires_at < now {
+                expired.push(key.clone());
+                continue;
+            }
+
+            if exact_key.as_ref().is_some_and(|expected| expected == key) {
+                exact = Some(entry.value().clone());
+                continue;
+            }
+
+            evidence.any = true;
+            if entry.tool_name_hash != requested_tool {
+                continue;
+            }
+            evidence.tool_name_match = true;
+            if match (&entry.session_hash, &incoming_session) {
+                (Some(stored), Some(incoming)) => stored == incoming,
+                _ => true,
+            } {
+                evidence.session_compatible = true;
+            }
+        }
+
+        for key in expired {
+            if self.cache.remove(&key).is_some() {
+                self.counters
+                    .lookup_expired
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        (exact, evidence)
     }
 
     fn evaluate_cached(
@@ -1236,9 +1307,22 @@ mod tests {
         let scope = OpaqueClientScope::for_key("key_a");
         let target = gemini_target();
         capture(&store, &scope, &target, None, "call_1", "bash", "SIG_A");
-        store.flush().await;
         let mut other_model = gemini_target();
         other_model.model_id = "gemini-3-pro".into();
+
+        // Do not flush: the next turn must observe the synchronous RAM capture
+        // even if the background durability worker has not persisted it yet.
+        let (_, evidence) = store.cached_identity_evidence(
+            Some(&other_model),
+            &scope.hash(),
+            &tool_call_hash(&scope, "call_1"),
+            None,
+            "bash",
+        );
+        assert!(evidence.any);
+        assert!(evidence.tool_name_match);
+        assert!(evidence.session_compatible);
+
         let result = store
             .resolve_tool_signature(&scope, Some(&other_model), None, "call_1", "bash")
             .await;
