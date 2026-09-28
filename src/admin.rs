@@ -9327,22 +9327,38 @@ fn portable_price_provenance_metadata(value: &Value) -> Value {
     }
 }
 
-fn portable_model_ownership(discovery: &Value) -> Value {
-    let mut ownership = serde_json::Map::new();
-    for key in [
-        "operator_capability_overrides",
-        "operator_parameter_overrides",
-        "operator_reasoning_overrides",
-        "operator_thinking_overrides",
-    ] {
-        ownership.insert(
-            key.to_string(),
-            discovery
-                .get(key)
-                .cloned()
-                .unwrap_or_else(|| json!({})),
-        );
-    }
+fn portable_model_ownership(
+    discovery: &Value,
+    capabilities: &Value,
+    parameters: &Value,
+    thinking_map: &Value,
+    prices: &Prices,
+) -> Value {
+    let capability_overrides = discovery
+        .get("operator_capability_overrides")
+        .cloned()
+        .unwrap_or_else(|| normalize_model_capabilities(capabilities));
+    let parameter_overrides = discovery
+        .get("operator_parameter_overrides")
+        .cloned()
+        .unwrap_or_else(|| operator_parameter_support_overrides(parameters));
+    let reasoning_overrides = discovery
+        .get("operator_reasoning_overrides")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let thinking_overrides = discovery
+        .get("operator_thinking_overrides")
+        .cloned()
+        .unwrap_or_else(|| {
+            if thinking_map
+                .as_object()
+                .is_some_and(|thinking_map| !thinking_map.is_empty())
+            {
+                json!({ "thinking_map": thinking_map })
+            } else {
+                json!({})
+            }
+        });
 
     let effective_pricing = discovery
         .get("effective_pricing")
@@ -9364,9 +9380,24 @@ fn portable_model_ownership(discovery: &Value) -> Value {
                 "metadata": portable_price_provenance_metadata(&metadata),
             }))
         })
+        .or_else(|| {
+            prices.is_configured().then(|| {
+                let (source, metadata) = operator_price_provenance(prices);
+                json!({
+                    "source": source,
+                    "metadata": portable_price_provenance_metadata(&metadata),
+                })
+            })
+        })
         .unwrap_or(Value::Null);
-    ownership.insert("effective_pricing".into(), effective_pricing);
-    Value::Object(ownership)
+
+    json!({
+        "operator_capability_overrides": capability_overrides,
+        "operator_parameter_overrides": parameter_overrides,
+        "operator_reasoning_overrides": reasoning_overrides,
+        "operator_thinking_overrides": thinking_overrides,
+        "effective_pricing": effective_pricing,
+    })
 }
 
 struct ImportedModelOwnership {
@@ -9553,6 +9584,15 @@ pub async fn export_config(
         .map(|m| {
             let discovery =
                 serde_json::from_str::<Value>(&m.discovery).unwrap_or_else(|_| json!({}));
+            let capabilities =
+                serde_json::from_str::<Value>(&m.capabilities).unwrap_or_else(|_| json!({}));
+            let prices_value =
+                serde_json::from_str::<Value>(&m.prices).unwrap_or_else(|_| json!({}));
+            let prices: Prices = serde_json::from_value(prices_value.clone()).unwrap_or_default();
+            let parameters =
+                serde_json::from_str::<Value>(&m.parameters).unwrap_or_else(|_| json!({}));
+            let thinking_map =
+                serde_json::from_str::<Value>(&m.thinking_map).unwrap_or_else(|_| json!({}));
             json!({
                 "provider": provider_name(&m.provider_id),
                 "upstream_id": m.upstream_id,
@@ -9560,13 +9600,19 @@ pub async fn export_config(
                 "enabled": m.enabled != 0,
                 "context_window": m.context_window,
                 "max_output_tokens": m.max_output_tokens,
-                "capabilities": serde_json::from_str::<Value>(&m.capabilities).unwrap_or(json!({})),
-                "prices": serde_json::from_str::<Value>(&m.prices).unwrap_or(json!({})),
-                "parameters": serde_json::from_str::<Value>(&m.parameters).unwrap_or(json!({})),
-                "thinking_map": serde_json::from_str::<Value>(&m.thinking_map).unwrap_or(json!({})),
+                "capabilities": capabilities,
+                "prices": prices_value,
+                "parameters": parameters,
+                "thinking_map": thinking_map,
                 "extra_request": serde_json::from_str::<Value>(&m.extra_request).unwrap_or(json!({})),
                 "transport_override": discovery.get("configured_transport").cloned(),
-                "ownership": portable_model_ownership(&discovery),
+                "ownership": portable_model_ownership(
+                    &discovery,
+                    &capabilities,
+                    &parameters,
+                    &thinking_map,
+                    &prices,
+                ),
             })
         })
         .collect();
