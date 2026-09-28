@@ -165,17 +165,12 @@ fn default_integration_capability_mode() -> String {
     "permissive".into()
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PricingScope {
+    #[default]
     Integration,
     DirectApi,
-}
-
-impl Default for PricingScope {
-    fn default() -> Self {
-        Self::Integration
-    }
 }
 
 impl PricingScope {
