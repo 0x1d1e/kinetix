@@ -6267,8 +6267,7 @@ async fn read_capability_probe_response(mut response: reqwest::Response) -> Resu
         })?;
     }
 
-    String::from_utf8(bytes)
-        .map_err(|_| "upstream probe response was not valid UTF-8".to_string())
+    String::from_utf8(bytes).map_err(|_| "upstream probe response was not valid UTF-8".to_string())
 }
 
 /// Run one explicit, bounded upstream capability probe against the selected
