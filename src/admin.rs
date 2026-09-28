@@ -3505,10 +3505,7 @@ fn operator_price_provenance(prices: &Prices) -> (String, Value) {
     )
 }
 
-fn effective_price_metadata(
-    fields: &serde_json::Map<String, Value>,
-    observation: &Value,
-) -> Value {
+fn effective_price_metadata(fields: &serde_json::Map<String, Value>, observation: &Value) -> Value {
     let catalog_contributes = fields.values().any(|field| {
         field
             .get("source")
@@ -14226,15 +14223,8 @@ mod credential_enrollment_regression_tests {
             (provider_id, provider, model_id)
         }
 
-        let (direct_provider_id, direct_provider, direct_model_id) = insert_google_provider(
-            &state,
-            "google-direct",
-            "manual",
-            None,
-            None,
-            "",
-        )
-        .await;
+        let (direct_provider_id, direct_provider, direct_model_id) =
+            insert_google_provider(&state, "google-direct", "manual", None, None, "").await;
         assert_eq!(
             db::provider_pricing_scope(&state.pool, &direct_provider_id)
                 .await
