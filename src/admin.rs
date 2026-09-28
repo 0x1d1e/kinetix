@@ -987,6 +987,92 @@ fn mask_hash(_hash: &str) -> String {
     "sk-kinetix-•••• (hidden)".to_string()
 }
 
+async fn key_for_client_profile(state: &AppState, id: &str) -> Result<db::VirtualKeyRow, ApiError> {
+    db::get_virtual_key_by_id(&state.pool, id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("virtual key not found"))
+}
+
+fn profile_policy_error(error: crate::types::ProxyError) -> ApiError {
+    ApiError(
+        StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
+        error.message,
+    )
+}
+
+pub async fn client_profile_models(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let key = key_for_client_profile(&state, &id).await?;
+    limits::validate_status(&key).map_err(profile_policy_error)?;
+    let models = crate::frontends::models::client_profile_models(
+        &state.registry,
+        &key.allowed_models(),
+        &key.allowed_providers(),
+    );
+    Ok(Json(json!({ "models": models })))
+}
+
+#[derive(Deserialize)]
+pub struct GenerateClientProfileBody {
+    pub key_id: String,
+    pub client: crate::client_profiles::ClientApp,
+    pub model: String,
+    pub api_key: Option<String>,
+}
+
+pub async fn generate_client_profile(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Json(body): Json<GenerateClientProfileBody>,
+) -> Result<Response, ApiError> {
+    let key = key_for_client_profile(&state, &body.key_id).await?;
+    limits::validate(&key, &body.model).map_err(profile_policy_error)?;
+    let visible_models = crate::frontends::models::client_profile_models(
+        &state.registry,
+        &key.allowed_models(),
+        &key.allowed_providers(),
+    );
+    if !visible_models.iter().any(|model| model.id == body.model) {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "selected model or Route is not currently available to this key".into(),
+        ));
+    }
+
+    let api_key = body
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(api_key) = api_key {
+        if !api_key.starts_with("sk-kinetix-") {
+            return Err(ApiError::bad(
+                "the supplied value is not a Kinetix virtual key",
+            ));
+        }
+        let supplied_hash = crypto::hash_virtual_key(api_key);
+        if !crypto::constant_time_eq(&supplied_hash, &key.key_hash) {
+            return Err(ApiError::bad(
+                "the supplied virtual key does not match the selected key",
+            ));
+        }
+    }
+
+    let public_base_url = effective_public_base_url(&state).await?;
+    let profile =
+        crate::client_profiles::generate(body.client, &public_base_url, &body.model, api_key);
+    let mut response = Json(profile).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
 #[derive(Deserialize)]
 pub struct CreateKeyBody {
     pub name: String,
@@ -13782,7 +13868,7 @@ mod reasoning_discovery_control_plane_tests {
         assert_eq!(before_accept.capabilities.tool_calling, Some(false));
         assert!(before_accept.thinking_map.levels.is_empty());
 
-        update_model_reconciliation(
+        let _ = update_model_reconciliation(
             State(state.clone()),
             AdminAuth {
                 actor: "admin".into(),
@@ -14324,6 +14410,7 @@ mod reasoning_discovery_control_plane_tests {
             FrontendFormat::OpenAi,
             registry.as_ref(),
             &["*".to_string()],
+            &[],
         );
         let listed = body["data"]
             .as_array()
@@ -15090,7 +15177,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
 
-        import_config(
+        let _ = import_config(
             State(state.clone()),
             auth(),
             Json(ImportBody {
@@ -15528,7 +15615,7 @@ mod credential_enrollment_regression_tests {
 
         let mut body = provider_body("endpoint-price-provider", None);
         body.base_url = "http://127.0.0.1:23456".into();
-        update_provider(
+        let _ = update_provider(
             State(state.clone()),
             auth(),
             Path(provider_id.clone()),
@@ -15633,7 +15720,7 @@ mod credential_enrollment_regression_tests {
         .unwrap();
 
         drop(guard);
-        update.await.unwrap().unwrap();
+        let _ = update.await.unwrap().unwrap();
 
         assert_eq!(
             db::provider_pricing_scope(&state.pool, &provider_id)
@@ -16563,7 +16650,7 @@ mod credential_enrollment_regression_tests {
             .unwrap()
             .to_string();
 
-        update_model(
+        let _ = update_model(
             State(state.clone()),
             auth(),
             Path(model_id.clone()),
@@ -16682,7 +16769,7 @@ mod credential_enrollment_regression_tests {
         configured_thinking
             .levels
             .insert("max".into(), json!("vendor-max"));
-        update_model(
+        let _ = update_model(
             State(state.clone()),
             auth(),
             Path(model_id.clone()),
@@ -17029,7 +17116,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
 
-        update_model_reconciliation(
+        let _ = update_model_reconciliation(
             State(state.clone()),
             auth(),
             Path(model_id.clone()),
@@ -17151,7 +17238,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
 
-        update_model_reconciliation(
+        let _ = update_model_reconciliation(
             State(state.clone()),
             auth(),
             Path(model_id.clone()),
@@ -17856,7 +17943,7 @@ mod credential_enrollment_regression_tests {
             "wire_plugin": "",
             "model_source_plugin": "plugin:plugin.test/models"
         });
-        import_config(
+        let _ = import_config(
             State(state.clone()),
             auth(),
             Json(ImportBody {
@@ -18098,7 +18185,7 @@ mod credential_enrollment_regression_tests {
             json!(["input_per_1m"])
         );
 
-        import_config(
+        let _ = import_config(
             State(state.clone()),
             auth(),
             Json(ImportBody {
@@ -18242,7 +18329,7 @@ mod credential_enrollment_regression_tests {
             json!(["input_per_1m"])
         );
 
-        import_config(
+        let _ = import_config(
             State(state.clone()),
             auth(),
             Json(ImportBody {
@@ -18323,7 +18410,7 @@ mod credential_enrollment_regression_tests {
             }]
         });
 
-        import_config(
+        let _ = import_config(
             State(state.clone()),
             auth(),
             Json(ImportBody {
@@ -18476,7 +18563,7 @@ mod credential_enrollment_regression_tests {
             .is_none());
 
         let (target, target_root) = test_state("portable-model-ownership-target").await;
-        import_config(
+        let _ = import_config(
             State(target.clone()),
             auth(),
             Json(ImportBody {

@@ -300,7 +300,12 @@ pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> R
         return error_response(format, &new_request_id(), e);
     }
 
-    let body = frontends::models::models_body(format, &state.registry, &key.allowed_models());
+    let body = frontends::models::models_body(
+        format,
+        &state.registry,
+        &key.allowed_models(),
+        &key.allowed_providers(),
+    );
     Json(body).into_response()
 }
 

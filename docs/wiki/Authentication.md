@@ -33,6 +33,20 @@ sole ingress).
 
 Revocation and limit changes take effect within a few seconds without a restart.
 
+## Client connection profiles
+
+In **Virtual Keys**, select a key, a client, and one of that key's currently
+usable models or Routes to generate configuration for Pi, Claude Code, Codex, or
+OpenCode. The generator uses the effective public base URL and preserves each
+client's endpoint format: Chat Completions for Pi and OpenCode, Responses for
+Codex, and Anthropic Messages for Claude Code.
+
+Profiles are previews and downloads only; Kinetix does not edit local files.
+When the full virtual key is available, it is included in the generated
+credential file, not saved by Kinetix. Otherwise, the output contains a
+placeholder. Kinetix cannot recover an existing key from its stored hash.
+Profiles include no upstream credentials or guessed model capabilities.
+
 ## Admin auth
 
 The dashboard/API uses a **password + in-memory session** model:

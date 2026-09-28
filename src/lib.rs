@@ -28,6 +28,7 @@ pub mod assets;
 pub mod auth;
 pub mod bootstrap;
 pub mod cli;
+pub mod client_profiles;
 pub mod config;
 pub mod cost;
 pub mod credential_refresh;
