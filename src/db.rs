@@ -717,7 +717,11 @@ fn effective_source_after_revocation(
         .filter_map(|field| field.get("source").and_then(Value::as_str))
         .collect();
     match sources.len() {
-        1 => sources.into_iter().next().unwrap_or("untracked").to_string(),
+        1 => sources
+            .into_iter()
+            .next()
+            .unwrap_or("untracked")
+            .to_string(),
         n if n > 1 => "mixed".to_string(),
         _ if prices.is_configured() && !previous_source.starts_with("models.dev") => {
             previous_source.to_string()
@@ -730,12 +734,11 @@ async fn revoke_models_dev_effective_pricing_in_transaction(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     provider_id: &str,
 ) -> Result<()> {
-    let rows = sqlx::query(
-        "SELECT id, prices, discovery FROM models WHERE provider_id=? ORDER BY id",
-    )
-    .bind(provider_id)
-    .fetch_all(&mut **tx)
-    .await?;
+    let rows =
+        sqlx::query("SELECT id, prices, discovery FROM models WHERE provider_id=? ORDER BY id")
+            .bind(provider_id)
+            .fetch_all(&mut **tx)
+            .await?;
 
     for row in rows {
         let model_id: String = row.try_get("id")?;
@@ -743,7 +746,9 @@ async fn revoke_models_dev_effective_pricing_in_transaction(
             serde_json::from_str(&row.try_get::<String, _>("prices")?).unwrap_or_default();
         let discovery: Value = serde_json::from_str(&row.try_get::<String, _>("discovery")?)
             .unwrap_or_else(|_| serde_json::json!({}));
-        let effective = discovery.get("effective_pricing").and_then(Value::as_object);
+        let effective = discovery
+            .get("effective_pricing")
+            .and_then(Value::as_object);
         let previous_source = effective
             .and_then(|value| value.get("source"))
             .and_then(Value::as_str)
@@ -814,10 +819,11 @@ async fn revoke_models_dev_effective_pricing_in_transaction(
 }
 
 pub async fn enforce_provider_pricing_scopes(pool: &Pool) -> Result<()> {
-    let provider_ids: Vec<String> =
-        sqlx::query_scalar("SELECT id FROM providers WHERE pricing_scope='integration' ORDER BY id")
-            .fetch_all(pool)
-            .await?;
+    let provider_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM providers WHERE pricing_scope='integration' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
     for provider_id in provider_ids {
         update_provider_pricing_scope(pool, &provider_id, "integration").await?;
     }
