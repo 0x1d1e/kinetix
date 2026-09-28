@@ -61,7 +61,8 @@ ingress:
 Backups are written to `$KINETIX_DATA_DIR/backups`:
 
 - `kinetix-pre-migration-<ts>-<uuid>.db` — written before startup work that
-  will change an existing database; the newest 3 are retained.
+  will change an existing database. Failed retries reuse and protect the same
+  snapshot; after startup work succeeds, the newest 3 are retained.
 - `kinetix-<ts>.db` — written every 6h via `VACUUM INTO` (consistent while
   live); 14-file retention.
 

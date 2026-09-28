@@ -337,6 +337,192 @@ async fn current_database_is_backed_up_before_pricing_scope_repair() {
 }
 
 #[tokio::test]
+async fn startup_retries_preserve_snapshot_until_pricing_repair_succeeds() {
+    let root = temp_root("failed-pricing-repair");
+    let db_path = root.join("kinetix.db");
+    let url = database_url(&db_path);
+    let pool = db::connect(&url).await.unwrap();
+    migrate_to_prefix(&pool, MIGRATOR.iter().len() - 1).await;
+
+    for (provider_id, model_id) in [("provider-a", "model-a"), ("provider-b", "model-b")] {
+        sqlx::query(
+            "INSERT INTO providers (id, name, base_url, wire_format, auth_scheme, credential_mode, created_at)
+             VALUES (?, ?, 'https://example.invalid/v1', 'openai', 'bearer', 'oauth', '2026-09-28T00:00:00Z')",
+        )
+        .bind(provider_id)
+        .bind(provider_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let discovery = json!({
+            "effective_pricing": {
+                "source": "models.dev:provider",
+                "fields": {
+                    "input_per_1m": {
+                        "source": "models.dev:provider",
+                        "metadata": {}
+                    }
+                },
+                "metadata": {"catalog_source_state": {"source": "models.dev"}}
+            }
+        });
+        sqlx::query(
+            "INSERT INTO models (id, provider_id, upstream_id, display_name, prices, discovery, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, '2026-09-28T00:00:00Z')",
+        )
+        .bind(model_id)
+        .bind(provider_id)
+        .bind(model_id)
+        .bind(model_id)
+        .bind(json!({"input_per_1m": 0.9}).to_string())
+        .bind(discovery.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "CREATE TRIGGER fail_model_b_pricing_repair
+         BEFORE UPDATE ON models WHEN OLD.id = 'model-b'
+         BEGIN SELECT RAISE(ABORT, 'injected pricing repair failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let home = root.join("home");
+    let mut original_snapshot = None;
+    for attempt in 0..5 {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_kinetix"))
+            .arg("--home")
+            .arg(&home)
+            .arg("--database-url")
+            .arg(&url)
+            .arg("--bind")
+            .arg("127.0.0.1:0")
+            .arg("serve")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let status = match timeout(Duration::from_secs(20), child.wait()).await {
+            Ok(result) => result.unwrap(),
+            Err(_) => {
+                child.kill().await.unwrap();
+                panic!("server did not exit after pricing repair failure on attempt {attempt}");
+            }
+        };
+        assert!(
+            !status.success(),
+            "injected pricing repair failure should prevent startup"
+        );
+
+        let backups: Vec<PathBuf> = std::fs::read_dir(home.join("data/backups"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("kinetix-pre-migration-"))
+            })
+            .collect();
+        if attempt == 0 {
+            assert_eq!(backups.len(), 1);
+            original_snapshot = backups.into_iter().next();
+            let current = db::connect(&url).await.unwrap();
+            let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+                .fetch_one(&current)
+                .await
+                .unwrap();
+            assert_eq!(applied, MIGRATOR.iter().len() as i64);
+            assert_eq!(
+                db::get_model(&current, "model-a")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .prices()
+                    .input_per_1m,
+                None,
+                "first provider repair should have committed"
+            );
+            assert_eq!(
+                db::get_model(&current, "model-b")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .prices()
+                    .input_per_1m,
+                Some(0.9),
+                "failing provider repair should remain unapplied"
+            );
+            current.close().await;
+        } else {
+            assert!(
+                backups.contains(original_snapshot.as_ref().unwrap()),
+                "retry {attempt} removed the original pre-upgrade snapshot"
+            );
+        }
+        if attempt < 4 {
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+        }
+    }
+
+    let original_snapshot = original_snapshot.unwrap();
+    let backup = db::connect(&database_url(&original_snapshot))
+        .await
+        .unwrap();
+    let old_schema_migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(&backup)
+        .await
+        .unwrap();
+    assert_eq!(old_schema_migrations, MIGRATOR.iter().len() as i64 - 1);
+    let old_schema_has_pricing_scope: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('providers') WHERE name='pricing_scope'",
+    )
+    .fetch_one(&backup)
+    .await
+    .unwrap();
+    assert_eq!(old_schema_has_pricing_scope, 0);
+    backup.close().await;
+
+    let pool = db::connect(&url).await.unwrap();
+    sqlx::query("DROP TRIGGER fail_model_b_pricing_repair")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    db::open_and_migrate(&url, &root.join("home/data"))
+        .await
+        .unwrap()
+        .close()
+        .await;
+
+    let backup_dir = root.join("home/data/backups");
+    let entries: Vec<String> = std::fs::read_dir(&backup_dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|name| name.starts_with("kinetix-pre-migration-") && name.ends_with(".db"))
+            .count(),
+        1,
+        "successful startup should retain the completed transition snapshot"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|name| !name.ends_with(".ready") && !name.ends_with(".preparing")),
+        "successful startup should clear the pending marker"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn scheduled_backup_is_consistent_and_restores_plugin_kv_after_sidecar_cleanup() {
     let root = temp_root("restore");
     let db_path = root.join("kinetix.db");
@@ -673,6 +859,41 @@ async fn pre_migration_backup_failure_aborts_server_before_migrations() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test]
+async fn doctor_reports_migration_failure_as_startup_failure() {
+    let root = temp_root("doctor-migration-failure");
+    let db_path = root.join("kinetix.db");
+    let url = database_url(&db_path);
+    let pool = db::connect(&url).await.unwrap();
+    migrate_to_prefix(&pool, 2).await;
+    sqlx::query("ALTER TABLE usage_logs ADD COLUMN plugin_id TEXT")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kinetix"))
+        .arg("--home")
+        .arg(root.join("home"))
+        .arg("--database-url")
+        .arg(&url)
+        .arg("doctor")
+        .output()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "doctor failed: {stdout}");
+    assert!(
+        stdout.contains("[fail] database startup failed"),
+        "doctor mislabeled startup failure: {stdout}"
+    );
+    assert!(
+        !stdout.contains("[fail] database connection failed"),
+        "migration error should not be reported as connection failure: {stdout}"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn current_database_starts_when_backup_directory_is_unavailable() {
@@ -811,8 +1032,8 @@ async fn migration_failure_does_not_start_server_or_commit_partial_migration() {
         .collect();
     assert_eq!(
         pre_migration_backups.len(),
-        3,
-        "restart retries must retain a bounded set of pre-migration snapshots"
+        1,
+        "restart retries must reuse the protected pre-migration snapshot"
     );
     let total_backup_bytes: u64 = pre_migration_backups
         .iter()
@@ -821,7 +1042,7 @@ async fn migration_failure_does_not_start_server_or_commit_partial_migration() {
     let max_expected_bytes = (db_path.metadata().unwrap().len() + 1024 * 1024) * 3;
     assert!(
         total_backup_bytes <= max_expected_bytes,
-        "pre-migration snapshots exceeded the three-database size bound"
+        "pre-migration snapshot exceeded the three-database size bound"
     );
     let pre_migration_backup = &pre_migration_backups[0];
     let backup = db::connect(&database_url(pre_migration_backup))

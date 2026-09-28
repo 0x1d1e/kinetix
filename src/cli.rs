@@ -649,8 +649,12 @@ async fn cmd_doctor(cli: &Cli) -> Result<()> {
     }
     match db::open_and_migrate(&config.database_url, &config.data_dir).await {
         Ok(_) => println!("  [ok]   database reachable and migrated"),
-        Err(e) => {
-            println!("  [fail] database unreachable: {e}");
+        Err(db::OpenDatabaseError::Connection(error)) => {
+            println!("  [fail] database connection failed: {error}");
+            problems += 1;
+        }
+        Err(db::OpenDatabaseError::Startup(error)) => {
+            println!("  [fail] database startup failed (backup, migration, or repair): {error}");
             problems += 1;
         }
     }
