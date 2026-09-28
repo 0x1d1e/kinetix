@@ -3499,7 +3499,10 @@ fn operator_price_provenance(prices: &Prices) -> (String, Value) {
             );
         }
     }
-    (effective_price_source(&fields, prices), json!({ "fields": fields }))
+    (
+        effective_price_source(&fields, prices),
+        json!({ "fields": fields }),
+    )
 }
 
 fn automatic_price_provenance(prices: &Prices, observation: &Value) -> (String, Value) {
@@ -4285,11 +4288,8 @@ async fn apply_provider_pricing_sync(
     for row in models {
         let discovery = discovery_object(&row);
         let mut observation = latest_reconciliation_observation(&discovery).clone();
-        let resolution = crate::model_catalog::resolve(
-            &provider.base_url,
-            &row.upstream_id,
-            Some(models_dev),
-        );
+        let resolution =
+            crate::model_catalog::resolve(&provider.base_url, &row.upstream_id, Some(models_dev));
         let pricing_patch = models_dev_pricing_patch(&observation, &resolution);
         apply_top_level_discovery_patch(&mut observation, &pricing_patch);
 
@@ -14197,10 +14197,8 @@ mod credential_enrollment_regression_tests {
             (model_id, version_id)
         }
 
-        let (model_a, version_a) =
-            insert_priced_model(&state, &provider_id, "model-a", 1.0).await;
-        let (model_b, version_b) =
-            insert_priced_model(&state, &provider_id, "model-b", 2.0).await;
+        let (model_a, version_a) = insert_priced_model(&state, &provider_id, "model-a", 1.0).await;
+        let (model_b, version_b) = insert_priced_model(&state, &provider_id, "model-b", 2.0).await;
         state.registry.reload(&state.pool).await.unwrap();
 
         sqlx::query(&format!(
@@ -14240,14 +14238,10 @@ mod credential_enrollment_regression_tests {
         assert!(result.is_err());
 
         state.registry.reload(&state.pool).await.unwrap();
-        for (model_id, expected_price, expected_version) in [
-            (&model_a, 1.0, &version_a),
-            (&model_b, 2.0, &version_b),
-        ] {
-            let row = db::get_model(&state.pool, model_id)
-                .await
-                .unwrap()
-                .unwrap();
+        for (model_id, expected_price, expected_version) in
+            [(&model_a, 1.0, &version_a), (&model_b, 2.0, &version_b)]
+        {
+            let row = db::get_model(&state.pool, model_id).await.unwrap().unwrap();
             assert_eq!(row.prices().input_per_1m, Some(expected_price));
             let discovery = discovery_object(&row);
             assert_eq!(
