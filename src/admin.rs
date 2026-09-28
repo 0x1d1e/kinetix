@@ -3567,7 +3567,7 @@ fn effective_price_metadata(fields: &serde_json::Map<String, Value>, observation
         field
             .get("source")
             .and_then(Value::as_str)
-            .is_some_and(|source| source.starts_with("models.dev"))
+            .is_some_and(crate::model_catalog::is_external_catalog_price_source)
     });
     let mut metadata = json!({ "fields": fields });
     if catalog_contributes {
@@ -3620,7 +3620,7 @@ fn automatic_price_provenance(prices: &Prices, observation: &Value) -> (String, 
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| automatic_price_source(observation));
-        let (observed_at, source_state, catalog_provider) = if source.starts_with("models.dev") {
+        let (observed_at, source_state, catalog_provider) = if crate::model_catalog::is_external_catalog_price_source(&source) {
             (
                 catalog_observed_at.clone(),
                 catalog_source_state.clone(),
@@ -3664,7 +3664,7 @@ fn automatic_prices_for_provider_scope(
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| automatic_price_source(observation));
-        if source.starts_with("models.dev") {
+        if crate::model_catalog::is_external_catalog_price_source(&source) {
             set_price_field(&mut effective, field, None);
         }
     }
@@ -3717,7 +3717,7 @@ fn merge_automatic_price_observation(
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| automatic_price_source(observation));
-        let (observed_at, source_state, catalog_provider) = if source.starts_with("models.dev") {
+        let (observed_at, source_state, catalog_provider) = if crate::model_catalog::is_external_catalog_price_source(&source) {
             (
                 catalog_observed_at.clone(),
                 catalog_source_state.clone(),
