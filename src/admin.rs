@@ -3620,15 +3620,16 @@ fn automatic_price_provenance(prices: &Prices, observation: &Value) -> (String, 
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| automatic_price_source(observation));
-        let (observed_at, source_state, catalog_provider) = if crate::model_catalog::is_external_catalog_price_source(&source) {
-            (
-                catalog_observed_at.clone(),
-                catalog_source_state.clone(),
-                catalog_provider_price_identity(observation),
-            )
-        } else {
-            (provider_observed_at.clone(), Value::Null, Value::Null)
-        };
+        let (observed_at, source_state, catalog_provider) =
+            if crate::model_catalog::is_external_catalog_price_source(&source) {
+                (
+                    catalog_observed_at.clone(),
+                    catalog_source_state.clone(),
+                    catalog_provider_price_identity(observation),
+                )
+            } else {
+                (provider_observed_at.clone(), Value::Null, Value::Null)
+            };
         set_price_field_provenance(
             &mut fields,
             field,
@@ -3717,15 +3718,16 @@ fn merge_automatic_price_observation(
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| automatic_price_source(observation));
-        let (observed_at, source_state, catalog_provider) = if crate::model_catalog::is_external_catalog_price_source(&source) {
-            (
-                catalog_observed_at.clone(),
-                catalog_source_state.clone(),
-                catalog_provider_price_identity(observation),
-            )
-        } else {
-            (provider_observed_at.clone(), Value::Null, Value::Null)
-        };
+        let (observed_at, source_state, catalog_provider) =
+            if crate::model_catalog::is_external_catalog_price_source(&source) {
+                (
+                    catalog_observed_at.clone(),
+                    catalog_source_state.clone(),
+                    catalog_provider_price_identity(observation),
+                )
+            } else {
+                (provider_observed_at.clone(), Value::Null, Value::Null)
+            };
         set_price_field_provenance(
             &mut fields,
             field,
@@ -4428,8 +4430,7 @@ async fn apply_provider_pricing_sync(
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
-        let observed =
-            automatic_prices_for_provider_scope(&observed, &observation, &pricing_scope);
+        let observed = automatic_prices_for_provider_scope(&observed, &observation, &pricing_scope);
 
         if !has_automatic_price_observation(&observed, &observation) {
             staged.push(StagedProviderPricing {
@@ -9531,9 +9532,7 @@ async fn validate_imported_provider_pricing_scope(
         .iter()
         .find(|integration| integration.id == integration_id)
         .ok_or_else(|| {
-            format!(
-                "provider '{name}': source integration '{integration_id}' is unavailable"
-            )
+            format!("provider '{name}': source integration '{integration_id}' is unavailable")
         })?;
     let declared_scope = integration
         .provider
@@ -9948,16 +9947,13 @@ pub async fn import_config(
         let caps = normalize_model_capabilities(&m["capabilities"]);
         let prices: Prices = serde_json::from_value(m["prices"].clone()).unwrap_or_default();
         let parameters = m["parameters"].clone();
-        let thinking: ThinkingMap = serde_json::from_value(
-            m.get("thinking_map")
-                .cloned()
-                .unwrap_or_else(|| json!({})),
-        )
-        .map_err(|error| {
-            ApiError::bad(format!(
-                "model '{provider}/{upstream}' has invalid thinking_map: {error}"
-            ))
-        })?;
+        let thinking: ThinkingMap =
+            serde_json::from_value(m.get("thinking_map").cloned().unwrap_or_else(|| json!({})))
+                .map_err(|error| {
+                    ApiError::bad(format!(
+                        "model '{provider}/{upstream}' has invalid thinking_map: {error}"
+                    ))
+                })?;
         validate_thinking_map(&thinking)?;
         let thinking_map =
             serde_json::to_value(&thinking).expect("ThinkingMap serialization is infallible");
@@ -10014,8 +10010,8 @@ pub async fn import_config(
                 &serde_json::from_str::<Value>(&existing.capabilities)
                     .unwrap_or_else(|_| json!({})),
             );
-            let existing_parameters = serde_json::from_str::<Value>(&existing.parameters)
-                .unwrap_or_else(|_| json!({}));
+            let existing_parameters =
+                serde_json::from_str::<Value>(&existing.parameters).unwrap_or_else(|_| json!({}));
             let existing_thinking_map = serde_json::to_value(existing.thinking())
                 .expect("ThinkingMap serialization is infallible");
             let mut discovery_patch = serde_json::Map::new();
@@ -10089,13 +10085,14 @@ pub async fn import_config(
             let pricing_values = prices
                 .is_configured()
                 .then(|| operator_price_provenance(&prices));
-            let pricing = pricing_values
-                .as_ref()
-                .map(|(source, metadata)| db::ModelPricingMutation {
-                    prices: &prices,
-                    source,
-                    metadata,
-                });
+            let pricing =
+                pricing_values
+                    .as_ref()
+                    .map(|(source, metadata)| db::ModelPricingMutation {
+                        prices: &prices,
+                        source,
+                        metadata,
+                    });
             let (id, _) = db::commit_model_creation(
                 &state.pool,
                 &db::ModelCreation {
@@ -17373,8 +17370,8 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
-    async fn config_import_rejects_untrusted_direct_api_scope_for_new_and_existing_plugin_providers()
-    {
+    async fn config_import_rejects_untrusted_direct_api_scope_for_new_and_existing_plugin_providers(
+    ) {
         let (state, root) = test_state("untrusted-import-pricing-scope").await;
         let provider_config = |name: &str| {
             json!({
@@ -17405,9 +17402,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap_err();
         assert_eq!(new_error.0, StatusCode::BAD_REQUEST);
-        assert!(new_error
-            .1
-            .contains("pricing_scope 'direct_api' requires"));
+        assert!(new_error.1.contains("pricing_scope 'direct_api' requires"));
         assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
 
         let existing_id = insert_provider(
