@@ -6226,10 +6226,7 @@ async fn persist_probe_evidence_observation(
 
 const MAX_CAPABILITY_PROBE_RESPONSE_BYTES: usize = 128 * 1024;
 
-fn append_capability_probe_response_chunk(
-    bytes: &mut Vec<u8>,
-    chunk: &[u8],
-) -> Result<(), ()> {
+fn append_capability_probe_response_chunk(bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<(), ()> {
     if bytes.len().saturating_add(chunk.len()) > MAX_CAPABILITY_PROBE_RESPONSE_BYTES {
         return Err(());
     }
@@ -6237,9 +6234,7 @@ fn append_capability_probe_response_chunk(
     Ok(())
 }
 
-async fn read_capability_probe_response(
-    mut response: reqwest::Response,
-) -> Result<String, String> {
+async fn read_capability_probe_response(mut response: reqwest::Response) -> Result<String, String> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_CAPABILITY_PROBE_RESPONSE_BYTES as u64)
