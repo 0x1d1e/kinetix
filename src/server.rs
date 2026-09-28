@@ -44,10 +44,8 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         eprintln!("Generated admin password (shown once — store it now):\n  {pw}");
     }
 
-    // Database + migrations (with a pre-migration backup, NFR-2.4).
-    let pool = db::connect(&config.database_url).await?;
-    db::backup_before_migration(&pool, &config.database_url, &config.data_dir).await?;
-    db::migrate(&pool).await?;
+    // Open and migrate with a pre-migration backup when existing data will change.
+    let pool = db::open_and_migrate(&config.database_url, &config.data_dir).await?;
 
     let crypto = Arc::new(Crypto::new(&config.master_key));
 

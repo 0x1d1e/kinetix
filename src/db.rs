@@ -15,6 +15,9 @@ use crate::types::{AuthScheme, Capabilities, ParamSpec, Prices, ThinkingMap, Wir
 
 pub type Pool = SqlitePool;
 
+const PRE_MIGRATION_BACKUP_RETAIN: usize = 3;
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339()
 }
@@ -36,15 +39,70 @@ pub async fn connect(database_url: &str) -> Result<Pool> {
     Ok(pool)
 }
 
+pub async fn open_and_migrate(database_url: &str, data_dir: &std::path::Path) -> Result<Pool> {
+    let pool = connect(database_url).await?;
+    if migration_or_repair_will_modify(&pool).await? {
+        backup_before_migration(&pool, database_url, data_dir).await?;
+    }
+    migrate(&pool).await?;
+    Ok(pool)
+}
+
 pub async fn migrate(pool: &Pool) -> Result<()> {
-    sqlx::migrate!("./migrations")
-        .run(pool)
-        .await
-        .context("running migrations")?;
+    MIGRATOR.run(pool).await.context("running migrations")?;
     enforce_provider_pricing_scopes(pool)
         .await
         .context("enforcing provider pricing scopes after migrations")?;
     Ok(())
+}
+
+async fn migration_or_repair_will_modify(pool: &Pool) -> Result<bool> {
+    let migrations_table_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations'
+        )",
+    )
+    .fetch_one(pool)
+    .await?;
+    if migrations_table_exists == 0 {
+        return Ok(true);
+    }
+
+    let dirty_migration: i64 =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE success = 0)")
+            .fetch_one(pool)
+            .await?;
+    if dirty_migration != 0 {
+        return Ok(false);
+    }
+
+    let applied_rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, checksum FROM _sqlx_migrations WHERE success = 1 ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await?;
+    let applied: HashMap<i64, Vec<u8>> = applied_rows.into_iter().collect();
+    if applied
+        .keys()
+        .any(|version| !MIGRATOR.version_exists(*version))
+    {
+        return Ok(false);
+    }
+
+    for migration in MIGRATOR
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+    {
+        match applied.get(&migration.version) {
+            Some(checksum) if checksum.as_slice() != migration.checksum.as_ref() => {
+                return Ok(false);
+            }
+            Some(_) => {}
+            None => return Ok(true),
+        }
+    }
+
+    provider_pricing_scope_repairs_pending(pool).await
 }
 
 /// Write a consistent pre-migration snapshot (NFR-2.4). Existing databases
@@ -78,12 +136,44 @@ pub async fn backup_before_migration(
         uuid::Uuid::new_v4().simple()
     ));
     let sql = vacuum_into_sql(&dst);
-    sqlx::query(&sql)
-        .execute(pool)
-        .await
-        .with_context(|| format!("writing pre-migration backup {}", dst.display()))?;
+    if let Err(error) = sqlx::query(&sql).execute(pool).await {
+        let _ = std::fs::remove_file(&dst);
+        return Err(error)
+            .with_context(|| format!("writing pre-migration backup {}", dst.display()));
+    }
+    if let Err(error) = retain_pre_migration_backups(&backup_dir, &dst) {
+        let _ = std::fs::remove_file(&dst);
+        return Err(error).context("retaining pre-migration backups");
+    }
     tracing::info!(backup = %dst.display(), "wrote pre-migration backup");
     Ok(Some(dst))
+}
+
+fn retain_pre_migration_backups(
+    backup_dir: &std::path::Path,
+    newest: &std::path::Path,
+) -> Result<()> {
+    let entries = std::fs::read_dir(backup_dir)
+        .context("reading pre-migration backup directory")?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("reading pre-migration backup entries")?;
+    let mut files: Vec<PathBuf> = entries
+        .into_iter()
+        .filter(|path| path.as_path() != newest)
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_pre_migration_backup_filename)
+        })
+        .collect();
+    files.sort();
+    while files.len() >= PRE_MIGRATION_BACKUP_RETAIN {
+        let old = files.remove(0);
+        std::fs::remove_file(&old)
+            .with_context(|| format!("removing old pre-migration backup {}", old.display()))?;
+    }
+    Ok(())
 }
 
 fn database_file_path(database_url: &str) -> Option<PathBuf> {
@@ -107,12 +197,30 @@ fn vacuum_into_sql(path: &std::path::Path) -> String {
 }
 
 fn is_scheduled_backup_filename(name: &str) -> bool {
-    let Some(stamp) = name
-        .strip_prefix("kinetix-")
+    name.strip_prefix("kinetix-")
+        .and_then(|name| name.strip_suffix(".db"))
+        .is_some_and(is_backup_timestamp)
+}
+
+fn is_pre_migration_backup_filename(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_prefix("kinetix-pre-migration-")
         .and_then(|name| name.strip_suffix(".db"))
     else {
         return false;
     };
+    if is_backup_timestamp(stem) {
+        return true; // accept snapshots created before UUIDs were added
+    }
+    let Some((stamp, uuid)) = stem.split_once('-') else {
+        return false;
+    };
+    is_backup_timestamp(stamp)
+        && uuid.len() == 32
+        && uuid.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_backup_timestamp(stamp: &str) -> bool {
     let bytes = stamp.as_bytes();
     bytes.len() == 16
         && bytes[..8].iter().all(u8::is_ascii_digit)
@@ -153,7 +261,8 @@ To restore:\n\n\
        cp <snapshot>.db /var/lib/kinetix/kinetix.db\n\
   4. Ensure ownership matches the service user (chown kinetix:kinetix).\n\
   5. Start Kinetix (systemctl start kinetix); migrations re-run automatically.\n\n\
-Retention: the newest 14 scheduled snapshots are kept; older ones are pruned.\n";
+Retention: the newest 14 scheduled snapshots and 3 pre-migration snapshots are\n\
+kept; older snapshots are pruned.\n";
     let _ = std::fs::write(backup_dir.join("RESTORE.txt"), readme);
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let dst = backup_dir.join(format!("kinetix-{stamp}.db"));
@@ -760,6 +869,58 @@ fn effective_source_after_revocation(
     }
 }
 
+fn effective_pricing_needs_scope_repair(
+    effective: Option<&serde_json::Map<String, Value>>,
+) -> bool {
+    let previous_source = effective
+        .and_then(|value| value.get("source"))
+        .and_then(Value::as_str)
+        .unwrap_or("untracked");
+    let fields = effective
+        .and_then(|value| value.get("fields"))
+        .and_then(Value::as_object);
+    let has_external_catalog_field = fields.is_some_and(|fields| {
+        fields.values().any(|field| {
+            field
+                .get("source")
+                .and_then(Value::as_str)
+                .is_some_and(crate::model_catalog::is_external_catalog_price_source)
+        })
+    });
+    let legacy_external_catalog_snapshot = !has_external_catalog_field
+        && crate::model_catalog::is_external_catalog_price_source(previous_source);
+    has_external_catalog_field || legacy_external_catalog_snapshot
+}
+
+async fn providers_needing_pricing_scope_repair(pool: &Pool) -> Result<Vec<String>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT providers.id, models.discovery
+         FROM providers JOIN models ON models.provider_id = providers.id
+         WHERE providers.pricing_scope = 'integration'
+         ORDER BY providers.id, models.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut provider_ids = std::collections::BTreeSet::new();
+    for (provider_id, discovery) in rows {
+        let discovery: Value =
+            serde_json::from_str(&discovery).unwrap_or_else(|_| serde_json::json!({}));
+        let effective = discovery
+            .get("effective_pricing")
+            .and_then(Value::as_object);
+        if effective_pricing_needs_scope_repair(effective) {
+            provider_ids.insert(provider_id);
+        }
+    }
+    Ok(provider_ids.into_iter().collect())
+}
+
+async fn provider_pricing_scope_repairs_pending(pool: &Pool) -> Result<bool> {
+    Ok(!providers_needing_pricing_scope_repair(pool)
+        .await?
+        .is_empty())
+}
+
 async fn revoke_external_catalog_effective_pricing_in_transaction(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     provider_id: &str,
@@ -788,6 +949,9 @@ async fn revoke_external_catalog_effective_pricing_in_transaction(
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
+        if !effective_pricing_needs_scope_repair(effective) {
+            continue;
+        }
 
         let external_catalog_fields: Vec<String> = fields
             .iter()
@@ -801,9 +965,6 @@ async fn revoke_external_catalog_effective_pricing_in_transaction(
             .collect();
         let legacy_external_catalog_snapshot = external_catalog_fields.is_empty()
             && crate::model_catalog::is_external_catalog_price_source(previous_source);
-        if external_catalog_fields.is_empty() && !legacy_external_catalog_snapshot {
-            continue;
-        }
 
         if legacy_external_catalog_snapshot {
             for field in [
@@ -849,12 +1010,7 @@ async fn revoke_external_catalog_effective_pricing_in_transaction(
 }
 
 pub async fn enforce_provider_pricing_scopes(pool: &Pool) -> Result<()> {
-    let provider_ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM providers WHERE pricing_scope='integration' ORDER BY id",
-    )
-    .fetch_all(pool)
-    .await?;
-    for provider_id in provider_ids {
+    for provider_id in providers_needing_pricing_scope_repair(pool).await? {
         update_provider_pricing_scope(pool, &provider_id, "integration").await?;
     }
     Ok(())

@@ -60,9 +60,10 @@ ingress:
 
 Backups are written to `$KINETIX_DATA_DIR/backups`:
 
-- `kinetix-pre-migration-<ts>.db` — taken automatically before a schema migration.
-- `kinetix-<ts>.db` — taken every 6h via `VACUUM INTO` (consistent while live),
-  with 14-file retention.
+- `kinetix-pre-migration-<ts>-<uuid>.db` — written before startup work that
+  will change an existing database; the newest 3 are retained.
+- `kinetix-<ts>.db` — written every 6h via `VACUUM INTO` (consistent while
+  live); 14-file retention.
 
 Restore:
 
@@ -91,8 +92,9 @@ copying the database.
 2. `sudo install -m 0755 target/release/kinetix /usr/local/bin/kinetix`
 3. `sudo systemctl restart kinetix`
 
-Migrations run automatically on start, after a pre-migration backup. If a
-migration was edited in place (as happened during early development), the
+Migrations run automatically on start. A pre-migration snapshot is created
+when pending migrations or pricing repairs will change an existing database;
+current databases start without one. If a migration was edited in place, the
 applied-migration checksum changes and startup aborts; reset the database or
 restore a backup.
 
