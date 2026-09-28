@@ -37,9 +37,22 @@ async fn migrate_to_prefix(pool: &SqlitePool, count: usize) {
 #[tokio::test]
 async fn pre_migration_backup_includes_committed_wal_data() {
     let root = temp_root("pre-migration-backup");
+    let memory_pool = db::connect("sqlite::memory:").await.unwrap();
+    assert!(
+        db::backup_before_migration(&memory_pool, "sqlite::memory:", &root)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    memory_pool.close().await;
+
     let db_path = root.join("kinetix.db");
     let url = database_url(&db_path);
     let pool = db::connect(&url).await.unwrap();
+    assert!(db::backup_before_migration(&pool, &url, &root)
+        .await
+        .unwrap()
+        .is_none());
     db::migrate(&pool).await.unwrap();
 
     // Keep the committed row in the WAL so a main-file-only copy loses it.
@@ -62,6 +75,7 @@ async fn pre_migration_backup_includes_committed_wal_data() {
 
     let backup_path = db::backup_before_migration(&pool, &url, &root)
         .await
+        .unwrap()
         .unwrap();
     let backup = db::connect(&database_url(&backup_path)).await.unwrap();
     let value: Option<String> =
@@ -156,6 +170,8 @@ async fn scheduled_backup_is_consistent_and_restores_plugin_kv_after_sidecar_cle
         .unwrap()
         .unwrap();
     let restore_guide = std::fs::read_to_string(root.join("backups/RESTORE.txt")).unwrap();
+    assert!(restore_guide.contains("VACUUM INTO"));
+    assert!(restore_guide.contains("including pre-migration snapshots"));
     assert!(restore_guide.contains("Stop Kinetix"));
     assert!(restore_guide.contains("kinetix.db-wal"));
     assert!(restore_guide.contains("kinetix.db-shm"));
@@ -189,6 +205,7 @@ async fn scheduled_backup_is_consistent_and_restores_plugin_kv_after_sidecar_cle
             assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         }
     }
+    std::fs::remove_file(&db_path).unwrap();
     std::fs::copy(&backup_path, &db_path).unwrap();
 
     let restored = db::connect(&url).await.unwrap();
@@ -207,6 +224,48 @@ async fn scheduled_backup_is_consistent_and_restores_plugin_kv_after_sidecar_cle
     assert_eq!(restored_kv, b"before");
 
     restored.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn scheduled_retention_does_not_prune_pre_migration_restore_points() {
+    let root = temp_root("retention");
+    let db_path = root.join("kinetix.db");
+    let url = database_url(&db_path);
+    let pool = db::connect(&url).await.unwrap();
+    db::migrate(&pool).await.unwrap();
+
+    let backup_dir = root.join("backups");
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let mut restore_points = Vec::new();
+    for index in 0..14 {
+        let path = backup_dir.join(format!("kinetix-pre-migration-20200101T{index:06}Z.db"));
+        std::fs::write(&path, b"pre-migration restore point").unwrap();
+        restore_points.push(path);
+    }
+
+    let scheduled = db::scheduled_backup(&pool, &url, &root, 14)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        scheduled.exists(),
+        "returned scheduled backup must be retained"
+    );
+    assert!(restore_points.iter().all(|path| path.exists()));
+    let retained_restore_points = std::fs::read_dir(&backup_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("kinetix-pre-migration-"))
+        })
+        .count();
+    assert_eq!(retained_restore_points, 14);
+
+    pool.close().await;
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -273,7 +332,7 @@ async fn read_only_database_rejects_required_migrations() {
     let read_only_url = format!("{url}?mode=ro");
     let result = async {
         let pool = db::connect(&read_only_url).await?;
-        db::backup_before_migration(&pool, &read_only_url, &root).await;
+        db::backup_before_migration(&pool, &read_only_url, &root).await?;
         db::migrate(&pool).await?;
         Ok::<_, anyhow::Error>(())
     }
@@ -341,6 +400,74 @@ async fn sqlite_full_and_unavailable_backup_directory_fail_without_partial_data(
     );
 
     pool.close().await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pre_migration_backup_failure_aborts_server_before_migrations() {
+    let root = temp_root("failed-pre-migration-backup");
+    let db_path = root.join("kinetix.db");
+    let url = database_url(&db_path);
+    let pool = db::connect(&url).await.unwrap();
+    migrate_to_prefix(&pool, 2).await;
+    pool.close().await;
+
+    let home = root.join("home");
+    let backup_dir = home.join("data/backups");
+    std::fs::create_dir_all(backup_dir.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/proc", &backup_dir).unwrap();
+
+    let stderr_path = root.join("server.stderr");
+    let stderr = std::fs::File::create(&stderr_path).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kinetix"))
+        .arg("--home")
+        .arg(&home)
+        .arg("--database-url")
+        .arg(&url)
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("serve")
+        .stderr(Stdio::from(stderr))
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let status = match timeout(Duration::from_secs(20), child.wait()).await {
+        Ok(result) => result.unwrap(),
+        Err(_) => {
+            child.kill().await.unwrap();
+            panic!("server did not exit after pre-migration backup failure");
+        }
+    };
+    assert!(
+        !status.success(),
+        "server must fail closed without a backup"
+    );
+    let stderr = std::fs::read_to_string(stderr_path).unwrap();
+    assert!(stderr.contains("pre-migration backup"), "{stderr}");
+    assert!(!stderr.contains("running migrations"), "{stderr}");
+
+    let unchanged = db::connect(&url).await.unwrap();
+    let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+        .fetch_one(&unchanged)
+        .await
+        .unwrap();
+    assert_eq!(
+        applied, 2,
+        "backup failure must leave migration history intact"
+    );
+    let plugin_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='plugins'",
+    )
+    .fetch_one(&unchanged)
+    .await
+    .unwrap();
+    assert_eq!(
+        plugin_tables, 0,
+        "migrations must not start without a backup"
+    );
+    unchanged.close().await;
+
     std::fs::remove_dir_all(root).unwrap();
 }
 

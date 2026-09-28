@@ -47,35 +47,43 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort pre-migration backup (NFR-2.4). `VACUUM INTO` includes committed
-/// WAL data and produces a consistent snapshot before migrations run.
+/// Write a consistent pre-migration snapshot (NFR-2.4). Existing databases
+/// must be backed up successfully before migrations are allowed to run.
 pub async fn backup_before_migration(
     pool: &Pool,
     database_url: &str,
     data_dir: &std::path::Path,
-) -> Option<PathBuf> {
-    let src = database_file_path(database_url)?;
+) -> Result<Option<PathBuf>> {
+    let Some(src) = database_file_path(database_url) else {
+        return Ok(None);
+    };
     if !src.exists() {
-        return None; // fresh database: nothing to back up
+        return Ok(None);
     }
+    let schema_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    )
+    .fetch_one(pool)
+    .await
+    .context("checking database schema before migration backup")?;
+    if schema_tables == 0 {
+        return Ok(None); // fresh database: no existing schema to preserve
+    }
+
     let backup_dir = data_dir.join("backups");
-    if let Err(e) = std::fs::create_dir_all(&backup_dir) {
-        tracing::warn!(error = %e, "pre-migration backup failed (continuing)");
-        return None;
-    }
+    std::fs::create_dir_all(&backup_dir).context("creating pre-migration backup directory")?;
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let dst = backup_dir.join(format!("kinetix-pre-migration-{stamp}.db"));
+    let dst = backup_dir.join(format!(
+        "kinetix-pre-migration-{stamp}-{}.db",
+        uuid::Uuid::new_v4().simple()
+    ));
     let sql = vacuum_into_sql(&dst);
-    match sqlx::query(&sql).execute(pool).await {
-        Ok(_) => {
-            tracing::info!(backup = %dst.display(), "wrote pre-migration backup");
-            Some(dst)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "pre-migration backup failed (continuing)");
-            None
-        }
-    }
+    sqlx::query(&sql)
+        .execute(pool)
+        .await
+        .with_context(|| format!("writing pre-migration backup {}", dst.display()))?;
+    tracing::info!(backup = %dst.display(), "wrote pre-migration backup");
+    Ok(Some(dst))
 }
 
 fn database_file_path(database_url: &str) -> Option<PathBuf> {
@@ -98,14 +106,26 @@ fn vacuum_into_sql(path: &std::path::Path) -> String {
     )
 }
 
+fn is_scheduled_backup_filename(name: &str) -> bool {
+    let Some(stamp) = name
+        .strip_prefix("kinetix-")
+        .and_then(|name| name.strip_suffix(".db"))
+    else {
+        return false;
+    };
+    let bytes = stamp.as_bytes();
+    bytes.len() == 16
+        && bytes[..8].iter().all(u8::is_ascii_digit)
+        && bytes[8] == b'T'
+        && bytes[9..15].iter().all(u8::is_ascii_digit)
+        && bytes[15] == b'Z'
+}
+
 /// A consistent, WAL-safe scheduled backup using `VACUUM INTO` (NFR-2.4).
 ///
 /// Unlike a raw file copy, `VACUUM INTO` produces a transactionally consistent
-/// snapshot even while the database is live. Returns the written path, or None
-/// for in-memory / unavailable databases.
-/// Run a consistent scheduled backup (NFR-2.4). Returns `Ok(None)` when the
-/// database is in-memory (nothing to back up) and `Err` when the backup failed,
-/// so the caller can distinguish "skipped" from "failed" for alerting.
+/// snapshot even while the database is live. Returns `Ok(None)` for in-memory
+/// databases and `Err` when the backup fails.
 pub async fn scheduled_backup(
     pool: &Pool,
     database_url: &str,
@@ -123,8 +143,8 @@ pub async fn scheduled_backup(
     // not depend on tribal knowledge (overwritten on each run).
     let readme = "Kinetix database backups\n\
 =======================\n\n\
-These files are transactionally-consistent snapshots written by `VACUUM INTO`\n\
-(pre-migration snapshots are plain file copies taken before migrations run).\n\n\
+These files are transactionally-consistent snapshots written by `VACUUM INTO`,\n\
+including pre-migration snapshots taken before migrations run.\n\n\
 To restore:\n\n\
   1. Stop Kinetix (systemctl stop kinetix).\n\
   2. Remove the live database and its WAL sidecars:\n\
@@ -143,16 +163,15 @@ Retention: the newest 14 scheduled snapshots are kept; older ones are pruned.\n"
         return Err(format!("VACUUM INTO failed: {e}"));
     }
     tracing::info!(backup = %dst.display(), "wrote scheduled backup");
-    // Retention: keep the newest `retain` kinetix-*.db files.
+    // Retain scheduled snapshots only; pre-migration restore points are separate.
     if let Ok(entries) = std::fs::read_dir(&backup_dir) {
         let mut files: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("kinetix-") && n.ends_with(".db"))
-                    .unwrap_or(false)
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_scheduled_backup_filename)
             })
             .collect();
         files.sort();

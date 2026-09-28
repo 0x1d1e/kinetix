@@ -46,7 +46,7 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
 
     // Database + migrations (with a pre-migration backup, NFR-2.4).
     let pool = db::connect(&config.database_url).await?;
-    db::backup_before_migration(&pool, &config.database_url, &config.data_dir).await;
+    db::backup_before_migration(&pool, &config.database_url, &config.data_dir).await?;
     db::migrate(&pool).await?;
 
     let crypto = Arc::new(Crypto::new(&config.master_key));
