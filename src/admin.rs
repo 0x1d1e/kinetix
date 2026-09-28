@@ -1690,8 +1690,8 @@ pub async fn update_provider(
         source_integration_id: existing.source_integration_id.as_deref(),
     };
     db::update_provider(&state.pool, &id, &provider, body.pricing_scope.as_deref())
-    .await
-    .map_err(ApiError::internal)?;
+        .await
+        .map_err(ApiError::internal)?;
     if let Some(api_key) = body.api_key.filter(|k| !k.trim().is_empty()) {
         let enc = state.crypto.encrypt(&api_key).map_err(ApiError::internal)?;
         db::insert_account(
@@ -14335,10 +14335,6 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
-        let provider = db::get_provider(&state.pool, &provider_id)
-            .await
-            .unwrap()
-            .unwrap();
         let model_id = db::insert_model(
             &state.pool,
             &db::NewModel {
