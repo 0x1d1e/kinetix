@@ -451,13 +451,8 @@ impl OpaqueStateStore {
         // SQLite to notice that state exists. Scan only after the exact-target
         // O(1) miss and retain identity evidence from every live RAM row for
         // this client-visible tool-call id. A late exact-target insertion wins.
-        let (late_exact, cached_evidence) = self.cached_identity_evidence(
-            capability,
-            &scope_hash,
-            &call_hash,
-            session,
-            tool_name,
-        );
+        let (late_exact, cached_evidence) =
+            self.cached_identity_evidence(capability, &scope_hash, &call_hash, session, tool_name);
         if let Some(entry) = late_exact {
             return self.evaluate_cached(&entry, session, tool_name);
         }
