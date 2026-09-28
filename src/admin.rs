@@ -5350,7 +5350,7 @@ mod model_lifecycle_regression_tests {
                 "freshness": "fresh"
             })),
         };
-        let patch = models_dev_pricing_patch(&discovery, &resolution);
+        let patch = models_dev_pricing_patch(&discovery, &resolution, true);
         assert_eq!(patch["prices"]["input_per_1m"], json!(1.0));
         assert_eq!(
             patch["price_sources"]["input_per_1m"],
