@@ -7195,7 +7195,9 @@ pub async fn create_model(
             .and_then(parse_plugin_opaque_state_capability)
             .is_some()
     {
-        provider.model_source_plugin_ref().map(|reference| reference.plugin_id)
+        provider
+            .model_source_plugin_ref()
+            .map(|reference| reference.plugin_id)
     } else {
         None
     };
