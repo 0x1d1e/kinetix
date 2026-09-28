@@ -18000,8 +18000,7 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
-    async fn config_import_restores_missing_plugin_direct_api_conservatively_then_promotes_normalized_endpoint(
-    ) {
+    async fn config_import_promotes_restored_provider_across_trailing_slash() {
         let (state, root) = test_state_with_plugins("portable-direct-api-import").await;
         let restored_base_url = "https://provider-a.example/v1/";
         let manifest_base_url = "https://provider-a.example/v1";
@@ -18187,7 +18186,7 @@ mod credential_enrollment_regression_tests {
         let config = json!({
             "models": [{
                 "provider": "existing-integration-provider",
-                "upstream_id": "model-only-priced-model",
+                "upstream_id": "model-only-priced",
                 "display_name": "Model-only Priced Model",
                 "enabled": true,
                 "capabilities": {},
@@ -18254,14 +18253,10 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
 
-        let model = db::find_model_by_upstream(
-            &state.pool,
-            &provider_id,
-            "model-only-priced-model",
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let model = db::find_model_by_upstream(&state.pool, &provider_id, "model-only-priced")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(model.prices().input_per_1m, None);
         let discovery = discovery_object(&model);
         assert!(discovery
