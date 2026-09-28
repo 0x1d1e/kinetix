@@ -165,6 +165,28 @@ fn default_integration_capability_mode() -> String {
     "permissive".into()
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingScope {
+    Integration,
+    DirectApi,
+}
+
+impl Default for PricingScope {
+    fn default() -> Self {
+        Self::Integration
+    }
+}
+
+impl PricingScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Integration => "integration",
+            Self::DirectApi => "direct_api",
+        }
+    }
+}
+
 /// Host-owned provider defaults for a user-facing integration. Kinetix derives
 /// plugin capability bindings from the parent Integration; the template cannot
 /// point at capabilities from another plugin.
@@ -191,6 +213,11 @@ pub struct IntegrationProvider {
     pub follow_redirects: bool,
     #[serde(default)]
     pub credential_hosts: Vec<String>,
+    /// Serving-economics contract for catalog pricing. Plugin integrations are
+    /// isolated by default; opt into direct API pricing only when billing is
+    /// contractually identical to the provider's public API.
+    #[serde(default)]
+    pub pricing_scope: PricingScope,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

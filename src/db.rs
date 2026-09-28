@@ -431,14 +431,25 @@ pub struct NewProvider<'a> {
 
 pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String> {
     let id = format!("prov_{}", uuid::Uuid::new_v4().simple());
+    let pricing_scope = if p.source_plugin_id.is_some()
+        || p.source_integration_id.is_some()
+        || p.credential_mode != "manual"
+        || !p.wire_plugin.is_empty()
+        || !p.credential_plugin.is_empty()
+        || !p.model_source_plugin.is_empty()
+    {
+        "integration"
+    } else {
+        "direct_api"
+    };
     sqlx::query(
         "INSERT INTO providers
          (id, name, base_url, wire_format, auth_scheme, custom_header_name, custom_param_name,
           extra_headers, timeout_ms, capability_mode, models_path, rate_limit_rules, enabled,
           follow_redirects, credential_hosts, allow_insecure_tls, created_at,
           wire_plugin, credential_plugin, model_source_plugin, credential_mode,
-          source_plugin_id, source_integration_id)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?)",
+          source_plugin_id, source_integration_id, pricing_scope)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(p.name)
@@ -462,6 +473,7 @@ pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String>
     .bind(p.credential_mode)
     .bind(p.source_plugin_id)
     .bind(p.source_integration_id)
+    .bind(pricing_scope)
     .execute(pool)
     .await?;
     Ok(id)
@@ -533,16 +545,48 @@ pub async fn update_provider_credential_semantics(
     source_plugin_id: Option<&str>,
     source_integration_id: Option<&str>,
 ) -> Result<()> {
+    let pricing_scope = if source_plugin_id.is_some()
+        || source_integration_id.is_some()
+        || credential_mode != "manual"
+    {
+        "integration"
+    } else {
+        "direct_api"
+    };
     sqlx::query(
-        "UPDATE providers SET credential_mode=?, source_plugin_id=?, source_integration_id=? WHERE id=?",
+        "UPDATE providers
+         SET credential_mode=?, source_plugin_id=?, source_integration_id=?, pricing_scope=?
+         WHERE id=?",
     )
     .bind(credential_mode)
     .bind(source_plugin_id)
     .bind(source_integration_id)
+    .bind(pricing_scope)
     .bind(id)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn update_provider_pricing_scope(pool: &Pool, id: &str, pricing_scope: &str) -> Result<()> {
+    if !matches!(pricing_scope, "integration" | "direct_api") {
+        anyhow::bail!("invalid provider pricing scope '{pricing_scope}'");
+    }
+    sqlx::query("UPDATE providers SET pricing_scope=? WHERE id=?")
+        .bind(pricing_scope)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn provider_pricing_scope(pool: &Pool, id: &str) -> Result<String> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT pricing_scope FROM providers WHERE id=?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?)
 }
 
 pub async fn delete_provider(pool: &Pool, id: &str) -> Result<()> {

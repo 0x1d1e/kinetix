@@ -3505,6 +3505,26 @@ fn operator_price_provenance(prices: &Prices) -> (String, Value) {
     )
 }
 
+fn effective_price_metadata(
+    fields: &serde_json::Map<String, Value>,
+    observation: &Value,
+) -> Value {
+    let catalog_contributes = fields.values().any(|field| {
+        field
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|source| source.starts_with("models.dev"))
+    });
+    let mut metadata = json!({ "fields": fields });
+    if catalog_contributes {
+        metadata["catalog_source_state"] = observation
+            .pointer("/catalog/source_state")
+            .cloned()
+            .unwrap_or(Value::Null);
+    }
+    metadata
+}
+
 fn automatic_price_provenance(prices: &Prices, observation: &Value) -> (String, Value) {
     let provider_observed_at = observation.get("last_seen").cloned().unwrap_or(Value::Null);
     let catalog_source_state = observation
@@ -3543,13 +3563,8 @@ fn automatic_price_provenance(prices: &Prices, observation: &Value) -> (String, 
     }
 
     let source = effective_price_source(&fields, prices);
-    (
-        source,
-        json!({
-            "fields": fields,
-            "catalog_source_state": catalog_source_state,
-        }),
-    )
+    let metadata = effective_price_metadata(&fields, observation);
+    (source, metadata)
 }
 
 fn merge_automatic_price_observation(
@@ -4187,6 +4202,7 @@ pub async fn update_model_reconciliation(
 fn models_dev_pricing_patch(
     discovery: &Value,
     resolution: &crate::model_catalog::CatalogResolution,
+    direct_api_pricing_eligible: bool,
 ) -> Value {
     let mut observed: Prices = discovery
         .get("prices")
@@ -4199,9 +4215,9 @@ fn models_dev_pricing_patch(
         .cloned()
         .unwrap_or_default();
 
-    let provider_prices = resolution
-        .provider
-        .as_ref()
+    let provider_prices = direct_api_pricing_eligible
+        .then_some(resolution.provider.as_ref())
+        .flatten()
         .filter(|provider| provider.source == crate::model_catalog::CatalogSource::ModelsDev);
 
     for field in PRICE_FIELDS {
@@ -4281,6 +4297,10 @@ async fn apply_provider_pricing_sync(
     let models = db::models_for_provider(&state.pool, &provider.id)
         .await
         .map_err(ApiError::internal)?;
+    let pricing_scope = db::provider_pricing_scope(&state.pool, &provider.id)
+        .await
+        .map_err(ApiError::internal)?;
+    let direct_api_pricing_eligible = pricing_scope == "direct_api";
     let mut staged = Vec::with_capacity(models.len());
     let mut updated = Vec::new();
     let mut skipped_manual = Vec::new();
@@ -4290,7 +4310,8 @@ async fn apply_provider_pricing_sync(
         let mut observation = latest_reconciliation_observation(&discovery).clone();
         let resolution =
             crate::model_catalog::resolve(&provider.base_url, &row.upstream_id, Some(models_dev));
-        let pricing_patch = models_dev_pricing_patch(&observation, &resolution);
+        let pricing_patch =
+            models_dev_pricing_patch(&observation, &resolution, direct_api_pricing_eligible);
         apply_top_level_discovery_patch(&mut observation, &pricing_patch);
 
         let observed: Prices = observation
@@ -4313,19 +4334,11 @@ async fn apply_provider_pricing_sync(
         let current = row.prices();
         let (effective, fields, preserved_manual) =
             merge_automatic_price_observation(&current, &observed, &observation, &discovery);
-        let catalog_source_state = observation
-            .pointer("/catalog/source_state")
-            .cloned()
-            .unwrap_or(Value::Null);
-
         if preserved_manual {
             skipped_manual.push(row.id.clone());
         }
         let source = effective_price_source(&fields, &effective);
-        let metadata = json!({
-            "fields": fields,
-            "catalog_source_state": catalog_source_state,
-        });
+        let metadata = effective_price_metadata(&fields, &observation);
         updated.push(row.id.clone());
         staged.push(StagedProviderPricing {
             model_id: row.id,
@@ -4356,11 +4369,13 @@ async fn apply_provider_pricing_sync(
         .map_err(ApiError::internal)?;
 
     if !staged.is_empty() {
-        state
-            .registry
-            .reload(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
+        if let Err(error) = state.registry.reload(&state.pool).await {
+            tracing::warn!(
+                provider = %provider.id,
+                %error,
+                "pricing sync committed but immediate registry activation failed; background reload will retry"
+            );
+        }
     }
 
     Ok(json!({
@@ -10083,6 +10098,27 @@ async fn reconcile_provider_credential_semantics(
     reconcile_provider_account_mode(state, provider_id, credential_mode).await
 }
 
+async fn reconcile_provider_integration_semantics(
+    state: &AppState,
+    provider_id: &str,
+    credential_mode: crate::plugins::CredentialMode,
+    source_plugin_id: &str,
+    source_integration_id: &str,
+    pricing_scope: crate::plugins::PricingScope,
+) -> Result<(), ApiError> {
+    reconcile_provider_credential_semantics(
+        state,
+        provider_id,
+        credential_mode,
+        source_plugin_id,
+        source_integration_id,
+    )
+    .await?;
+    db::update_provider_pricing_scope(&state.pool, provider_id, pricing_scope.as_str())
+        .await
+        .map_err(ApiError::internal)
+}
+
 pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) {
     let Some(manager) = state.plugin_manager().cloned() else {
         return;
@@ -10135,12 +10171,13 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                 && provider.model_source_plugin == model_source_plugin
         });
         if let Some(provider) = existing {
-            if let Err(error) = reconcile_provider_credential_semantics(
+            if let Err(error) = reconcile_provider_integration_semantics(
                 state,
                 &provider.id,
                 credential_mode,
                 id,
                 &integration.id,
+                template.pricing_scope,
             )
             .await
             {
@@ -10201,12 +10238,13 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
             )
             .await;
 
-            if let Err(error) = reconcile_provider_credential_semantics(
+            if let Err(error) = reconcile_provider_integration_semantics(
                 state,
                 &id_created,
                 credential_mode,
                 id,
                 &integration.id,
+                template.pricing_scope,
             )
             .await
             {
@@ -10821,12 +10859,13 @@ pub async fn setup_plugin_integration_provider(
                 && provider.model_source_plugin == model_source_plugin
         });
     if let Some(provider) = existing {
-        reconcile_provider_credential_semantics(
+        reconcile_provider_integration_semantics(
             &state,
             &provider.id,
             credential_mode,
             &id,
             &integration.id,
+            template.pricing_scope,
         )
         .await?;
         state
@@ -10871,12 +10910,13 @@ pub async fn setup_plugin_integration_provider(
     .await
     .map_err(ApiError::internal)?;
 
-    reconcile_provider_credential_semantics(
+    reconcile_provider_integration_semantics(
         &state,
         &id_created,
         credential_mode,
         &id,
         &integration.id,
+        template.pricing_scope,
     )
     .await?;
 
@@ -14096,6 +14136,261 @@ mod credential_enrollment_regression_tests {
         assert_eq!(reused_version, original_version);
         let version_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id = ?")
+                .bind(&model_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(version_count, 1);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn models_dev_direct_pricing_respects_provider_pricing_scope() {
+        let (state, root) = test_state("pricing-scope-isolation").await;
+        let catalog = crate::model_catalog::ModelsDevCatalog::from_parts(
+            json!({}),
+            json!({
+                "google": {
+                    "id": "google",
+                    "models": {
+                        "shared-model": {
+                            "id": "shared-model",
+                            "cost": {"input": 0.75, "output": 3.75}
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        async fn insert_google_provider(
+            state: &AppState,
+            name: &str,
+            credential_mode: &str,
+            source_plugin_id: Option<&str>,
+            source_integration_id: Option<&str>,
+            credential_plugin: &str,
+        ) -> (String, db::ProviderRow, String) {
+            let provider_id = db::insert_provider(
+                &state.pool,
+                &db::NewProvider {
+                    name,
+                    base_url: "https://generativelanguage.googleapis.com/v1beta",
+                    wire_format: WireFormat::Openai,
+                    auth_scheme: AuthScheme::Bearer,
+                    custom_header_name: None,
+                    custom_param_name: None,
+                    extra_headers: json!({}),
+                    timeout_ms: 1_000,
+                    capability_mode: "permissive",
+                    models_path: None,
+                    rate_limit_rules: json!({}),
+                    follow_redirects: false,
+                    credential_hosts: "",
+                    allow_insecure_tls: false,
+                    wire_plugin: "",
+                    credential_plugin,
+                    model_source_plugin: "",
+                    credential_mode,
+                    source_plugin_id,
+                    source_integration_id,
+                },
+            )
+            .await
+            .unwrap();
+            let model_id = db::insert_model(
+                &state.pool,
+                &db::NewModel {
+                    provider_id: &provider_id,
+                    upstream_id: "shared-model",
+                    display_name: "Shared Model",
+                    enabled: true,
+                    context_window: None,
+                    max_output_tokens: None,
+                    capabilities: json!({}),
+                    prices: json!({}),
+                    parameters: json!({}),
+                    thinking_map: json!({}),
+                    extra_request: json!({}),
+                    discovery: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+            let provider = db::get_provider(&state.pool, &provider_id)
+                .await
+                .unwrap()
+                .unwrap();
+            (provider_id, provider, model_id)
+        }
+
+        let (direct_provider_id, direct_provider, direct_model_id) = insert_google_provider(
+            &state,
+            "google-direct",
+            "manual",
+            None,
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(
+            db::provider_pricing_scope(&state.pool, &direct_provider_id)
+                .await
+                .unwrap(),
+            "direct_api"
+        );
+        apply_provider_pricing_sync(&state, &direct_provider, &catalog)
+            .await
+            .unwrap();
+        let direct_model = db::get_model(&state.pool, &direct_model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(direct_model.prices().input_per_1m, Some(0.75));
+
+        let (plugin_provider_id, plugin_provider, plugin_model_id) = insert_google_provider(
+            &state,
+            "google-oauth-plugin",
+            "auth_flow",
+            Some("plugin.google-oauth"),
+            Some("oauth"),
+            "plugin:plugin.google-oauth/strategy",
+        )
+        .await;
+        assert_eq!(
+            db::provider_pricing_scope(&state.pool, &plugin_provider_id)
+                .await
+                .unwrap(),
+            "integration"
+        );
+        apply_provider_pricing_sync(&state, &plugin_provider, &catalog)
+            .await
+            .unwrap();
+        let plugin_model = db::get_model(&state.pool, &plugin_model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plugin_model.prices().input_per_1m, None);
+        assert_eq!(plugin_model.prices().output_per_1m, None);
+        let plugin_versions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id=?")
+                .bind(&plugin_model_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(plugin_versions, 0);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn operator_pricing_sync_reuses_version_when_catalog_does_not_contribute() {
+        let (state, root) = test_state("operator-sync-version-reuse").await;
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "google-operator-pricing",
+                base_url: "https://generativelanguage.googleapis.com/v1beta",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let Json(created) = create_model(
+            State(state.clone()),
+            auth(),
+            Path(provider_id),
+            Json(ModelBody {
+                upstream_id: "shared-model".into(),
+                display_name: Some("Operator Priced Model".into()),
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({
+                    "input_per_1m": 1.0,
+                    "output_per_1m": 2.0
+                }),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({}),
+                transport_override: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let model_id = created["id"].as_str().unwrap().to_string();
+        let before = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let before_discovery = discovery_object(&before);
+        let version_id = before_discovery
+            .pointer("/effective_pricing/price_version_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let catalog = crate::model_catalog::ModelsDevCatalog::from_parts(
+            json!({}),
+            json!({
+                "google": {
+                    "id": "google",
+                    "models": {
+                        "shared-model": {
+                            "id": "shared-model",
+                            "cost": {"input": 0.75, "output": 3.75}
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        apply_provider_pricing_sync(&state, &provider, &catalog)
+            .await
+            .unwrap();
+
+        let after = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.prices().input_per_1m, Some(1.0));
+        assert_eq!(after.prices().output_per_1m, Some(2.0));
+        let after_discovery = discovery_object(&after);
+        assert_eq!(
+            after_discovery
+                .pointer("/effective_pricing/price_version_id")
+                .and_then(Value::as_str),
+            Some(version_id.as_str())
+        );
+        let version_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id=?")
                 .bind(&model_id)
                 .fetch_one(&state.pool)
                 .await
