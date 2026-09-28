@@ -1604,6 +1604,100 @@ async fn validate_provider_credential_binding_edit(
     validate_auth_flow_binding_edit(provider, &expected_binding, proposed_binding)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectApiManifestTrust {
+    Trusted,
+    PluginUnavailable,
+}
+
+fn normalize_provider_endpoint_identity(base_url: &str) -> Option<String> {
+    let mut url = url::Url::parse(base_url).ok()?;
+    url.set_query(None);
+    url.set_fragment(None);
+    let trimmed = url.path().trim_end_matches('/').to_string();
+    url.set_path(&trimmed);
+    Some(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn validate_direct_api_integration_endpoint(
+    name: &str,
+    base_url: &str,
+    integration: &crate::plugins::Integration,
+) -> Result<(), String> {
+    let template = integration.provider.as_ref().ok_or_else(|| {
+        format!(
+            "provider '{name}': source integration '{}' has no provider template",
+            integration.id
+        )
+    })?;
+    if template.pricing_scope != crate::plugins::PricingScope::DirectApi {
+        return Err(format!(
+            "provider '{name}': source integration '{}' does not declare pricing_scope 'direct_api'",
+            integration.id
+        ));
+    }
+    let expected = normalize_provider_endpoint_identity(&template.base_url).ok_or_else(|| {
+        format!(
+            "provider '{name}': source integration '{}' has an invalid provider base_url",
+            integration.id
+        )
+    })?;
+    let actual = normalize_provider_endpoint_identity(base_url)
+        .ok_or_else(|| format!("provider '{name}': base_url is invalid"))?;
+    if actual != expected {
+        return Err(format!(
+            "provider '{name}': pricing_scope 'direct_api' is bound to integration '{}' base_url '{}', not '{}'",
+            integration.id, template.base_url, base_url
+        ));
+    }
+    Ok(())
+}
+
+async fn direct_api_manifest_trust(
+    state: &AppState,
+    name: &str,
+    base_url: &str,
+    source_plugin_id: Option<&str>,
+    source_integration_id: Option<&str>,
+) -> Result<DirectApiManifestTrust, String> {
+    let plugin_id = source_plugin_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "provider '{name}': pricing_scope 'direct_api' requires source_plugin_id"
+            )
+        })?;
+    let integration_id = source_integration_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "provider '{name}': pricing_scope 'direct_api' requires source_integration_id"
+            )
+        })?;
+    let Some(manager) = state.plugin_manager() else {
+        return Ok(DirectApiManifestTrust::PluginUnavailable);
+    };
+    let Some(row) = manager
+        .get(plugin_id)
+        .await
+        .map_err(|error| format!("provider '{name}': {error}"))?
+    else {
+        return Ok(DirectApiManifestTrust::PluginUnavailable);
+    };
+    let manifest = row
+        .manifest()
+        .ok_or_else(|| format!("provider '{name}': source plugin manifest is unreadable"))?;
+    let integration = manifest
+        .integrations
+        .iter()
+        .find(|integration| integration.id == integration_id)
+        .ok_or_else(|| {
+            format!("provider '{name}': source integration '{integration_id}' is unavailable")
+        })?;
+    validate_direct_api_integration_endpoint(name, base_url, integration)?;
+    Ok(DirectApiManifestTrust::Trusted)
+}
+
 pub async fn update_provider(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -1660,13 +1754,31 @@ pub async fn update_provider(
         let scope_drivers_unchanged = existing.wire_plugin == body.wire_plugin
             && existing.credential_plugin == body.credential_plugin
             && existing.model_source_plugin == body.model_source_plugin;
-        if scope == "direct_api"
-            && conservative_scope != "direct_api"
-            && !(existing.pricing_scope == "direct_api" && scope_drivers_unchanged)
-        {
-            return Err(ApiError::bad(
-                "pricing_scope 'direct_api' requires an existing trusted integration scope",
-            ));
+        let endpoint_unchanged =
+            normalize_provider_endpoint_identity(&existing.base_url)
+                == normalize_provider_endpoint_identity(&body.base_url);
+        if scope == "direct_api" && conservative_scope != "direct_api" {
+            let reusable_existing_trust = existing.pricing_scope == "direct_api"
+                && scope_drivers_unchanged
+                && endpoint_unchanged;
+            match direct_api_manifest_trust(
+                &state,
+                &body.name,
+                &body.base_url,
+                existing.source_plugin_id.as_deref(),
+                existing.source_integration_id.as_deref(),
+            )
+            .await
+            {
+                Ok(DirectApiManifestTrust::Trusted) => {}
+                Ok(DirectApiManifestTrust::PluginUnavailable) if reusable_existing_trust => {}
+                Ok(DirectApiManifestTrust::PluginUnavailable) => {
+                    return Err(ApiError::bad(
+                        "pricing_scope 'direct_api' requires the source integration plugin to be installed when provider identity changes",
+                    ));
+                }
+                Err(problem) => return Err(ApiError::bad(problem)),
+            }
         }
     }
     let provider = db::NewProvider {
@@ -9190,6 +9302,146 @@ pub use crate::net::is_blocked_ip;
 // without re-entering keys.
 // ===========================================================================
 
+fn portable_price_provenance_metadata(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => {
+            let mut stable = serde_json::Map::new();
+            for (key, value) in fields {
+                if matches!(
+                    key.as_str(),
+                    "observed_at" | "retrieved_at" | "etag" | "last_modified" | "freshness"
+                ) {
+                    continue;
+                }
+                stable.insert(key.clone(), portable_price_provenance_metadata(value));
+            }
+            Value::Object(stable)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(portable_price_provenance_metadata)
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn portable_model_ownership(discovery: &Value) -> Value {
+    let mut ownership = serde_json::Map::new();
+    for key in [
+        "operator_capability_overrides",
+        "operator_parameter_overrides",
+        "operator_reasoning_overrides",
+        "operator_thinking_overrides",
+    ] {
+        ownership.insert(
+            key.to_string(),
+            discovery
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        );
+    }
+
+    let effective_pricing = discovery
+        .get("effective_pricing")
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_object)
+        .and_then(|effective| {
+            let source = effective.get("source")?.as_str()?;
+            let mut metadata = effective
+                .get("metadata")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if metadata.get("fields").is_none() {
+                if let Some(fields) = effective.get("fields") {
+                    metadata["fields"] = fields.clone();
+                }
+            }
+            Some(json!({
+                "source": source,
+                "metadata": portable_price_provenance_metadata(&metadata),
+            }))
+        })
+        .unwrap_or(Value::Null);
+    ownership.insert("effective_pricing".into(), effective_pricing);
+    Value::Object(ownership)
+}
+
+struct ImportedModelOwnership {
+    discovery_patch: Value,
+    pricing: Option<(String, Value)>,
+}
+
+fn parse_imported_model_ownership(model: &Value) -> Result<Option<ImportedModelOwnership>, String> {
+    let Some(raw) = model.get("ownership") else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let ownership = raw
+        .as_object()
+        .ok_or_else(|| "ownership must be an object or null".to_string())?;
+    let mut discovery_patch = serde_json::Map::new();
+    for key in [
+        "operator_capability_overrides",
+        "operator_parameter_overrides",
+        "operator_reasoning_overrides",
+        "operator_thinking_overrides",
+    ] {
+        let value = ownership
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if !value.is_object() {
+            return Err(format!("ownership.{key} must be an object"));
+        }
+        discovery_patch.insert(key.to_string(), value);
+    }
+
+    let prices: Prices = serde_json::from_value(model["prices"].clone()).unwrap_or_default();
+    let pricing = match ownership.get("effective_pricing") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let effective = value
+                .as_object()
+                .ok_or_else(|| "ownership.effective_pricing must be an object or null".to_string())?;
+            let source = effective
+                .get("source")
+                .and_then(Value::as_str)
+                .filter(|source| !source.trim().is_empty())
+                .ok_or_else(|| {
+                    "ownership.effective_pricing.source must be a non-empty string".to_string()
+                })?
+                .to_string();
+            let metadata = effective
+                .get("metadata")
+                .cloned()
+                .ok_or_else(|| {
+                    "ownership.effective_pricing.metadata is required".to_string()
+                })?;
+            if !metadata.is_object() {
+                return Err(
+                    "ownership.effective_pricing.metadata must be an object".to_string(),
+                );
+            }
+            Some((source, metadata))
+        }
+    };
+    if prices.is_configured() && pricing.is_none() {
+        return Err(
+            "configured prices require ownership.effective_pricing provenance".to_string(),
+        );
+    }
+
+    Ok(Some(ImportedModelOwnership {
+        discovery_patch: Value::Object(discovery_patch),
+        pricing,
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct ExportQuery {
     /// Include encrypted credential blobs (still ciphertext, still keyed by the
@@ -9299,6 +9551,8 @@ pub async fn export_config(
     let models_json: Vec<Value> = models
         .iter()
         .map(|m| {
+            let discovery =
+                serde_json::from_str::<Value>(&m.discovery).unwrap_or_else(|_| json!({}));
             json!({
                 "provider": provider_name(&m.provider_id),
                 "upstream_id": m.upstream_id,
@@ -9311,9 +9565,8 @@ pub async fn export_config(
                 "parameters": serde_json::from_str::<Value>(&m.parameters).unwrap_or(json!({})),
                 "thinking_map": serde_json::from_str::<Value>(&m.thinking_map).unwrap_or(json!({})),
                 "extra_request": serde_json::from_str::<Value>(&m.extra_request).unwrap_or(json!({})),
-                "transport_override": serde_json::from_str::<Value>(&m.discovery)
-                    .ok()
-                    .and_then(|discovery| discovery.get("configured_transport").cloned()),
+                "transport_override": discovery.get("configured_transport").cloned(),
+                "ownership": portable_model_ownership(&discovery),
             })
         })
         .collect();
@@ -9469,9 +9722,10 @@ async fn validate_imported_provider_credential_semantics(
     Ok(())
 }
 
-async fn validate_imported_provider_pricing_scope(
+async fn resolve_imported_provider_pricing_scope(
     state: &AppState,
     name: &str,
+    base_url: &str,
     requested_scope: Option<&str>,
     credential_mode: crate::plugins::CredentialMode,
     source_plugin_id: Option<&str>,
@@ -9479,9 +9733,19 @@ async fn validate_imported_provider_pricing_scope(
     wire_plugin: &str,
     credential_plugin: &str,
     model_source_plugin: &str,
-) -> Result<(), String> {
-    if requested_scope != Some("direct_api") {
-        return Ok(());
+) -> Result<String, String> {
+    let requested_scope = requested_scope.unwrap_or_else(|| {
+        db::conservative_provider_pricing_scope(
+            credential_mode.as_str(),
+            source_plugin_id,
+            source_integration_id,
+            wire_plugin,
+            credential_plugin,
+            model_source_plugin,
+        )
+    });
+    if requested_scope != "direct_api" {
+        return Ok(requested_scope.to_string());
     }
 
     let conservative_scope = db::conservative_provider_pricing_scope(
@@ -9493,59 +9757,21 @@ async fn validate_imported_provider_pricing_scope(
         model_source_plugin,
     );
     if conservative_scope == "direct_api" {
-        return Ok(());
+        return Ok("direct_api".to_string());
     }
 
-    let plugin_id = source_plugin_id
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            format!(
-                "provider '{name}': pricing_scope 'direct_api' requires an installed source integration that declares direct_api pricing"
-            )
-        })?;
-    let integration_id = source_integration_id
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            format!(
-                "provider '{name}': pricing_scope 'direct_api' requires an installed source integration that declares direct_api pricing"
-            )
-        })?;
-    let manager = state.plugin_manager().ok_or_else(|| {
-        format!(
-            "provider '{name}': pricing_scope 'direct_api' requires installed source integration '{integration_id}' from plugin '{plugin_id}'"
-        )
-    })?;
-    let row = manager
-        .get(plugin_id)
-        .await
-        .map_err(|error| format!("provider '{name}': {error}"))?
-        .ok_or_else(|| {
-            format!(
-                "provider '{name}': source plugin '{plugin_id}' is not installed for direct_api pricing"
-            )
-        })?;
-    let manifest = row
-        .manifest()
-        .ok_or_else(|| format!("provider '{name}': source plugin manifest is unreadable"))?;
-    let integration = manifest
-        .integrations
-        .iter()
-        .find(|integration| integration.id == integration_id)
-        .ok_or_else(|| {
-            format!("provider '{name}': source integration '{integration_id}' is unavailable")
-        })?;
-    let declared_scope = integration
-        .provider
-        .as_ref()
-        .map(|provider| provider.pricing_scope)
-        .unwrap_or_default();
-    if declared_scope != crate::plugins::PricingScope::DirectApi {
-        return Err(format!(
-            "provider '{name}': source integration '{integration_id}' does not declare pricing_scope 'direct_api'"
-        ));
+    match direct_api_manifest_trust(
+        state,
+        name,
+        base_url,
+        source_plugin_id,
+        source_integration_id,
+    )
+    .await?
+    {
+        DirectApiManifestTrust::Trusted => Ok("direct_api".to_string()),
+        DirectApiManifestTrust::PluginUnavailable => Ok("integration".to_string()),
     }
-
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -9662,9 +9888,10 @@ pub async fn import_config(
         {
             problems.push(problem);
         }
-        if let Err(problem) = validate_imported_provider_pricing_scope(
+        if let Err(problem) = resolve_imported_provider_pricing_scope(
             &state,
             name,
+            base_url,
             p["pricing_scope"].as_str(),
             effective_mode,
             source_plugin_id,
@@ -9702,6 +9929,11 @@ pub async fn import_config(
                     "model '{provider}/{upstream}' transport_override must be a string or null"
                 )),
             }
+        }
+        if let Err(problem) = parse_imported_model_ownership(m) {
+            problems.push(format!(
+                "model '{provider}/{upstream}' has invalid ownership: {problem}"
+            ));
         }
         plan.push(
             json!({"kind": "model", "name": format!("{provider}/{upstream}"), "action": "upsert"}),
@@ -9807,9 +10039,10 @@ pub async fn import_config(
                 source_plugin_id: source_plugin_id.as_deref(),
                 source_integration_id: source_integration_id.as_deref(),
             };
-            validate_imported_provider_pricing_scope(
+            let pricing_scope = resolve_imported_provider_pricing_scope(
                 &state,
                 name,
+                base_url,
                 p["pricing_scope"].as_str(),
                 credential_mode,
                 source_plugin_id.as_deref(),
@@ -9824,16 +10057,17 @@ pub async fn import_config(
                 &state.pool,
                 &existing_id,
                 &provider,
-                p["pricing_scope"].as_str(),
+                Some(&pricing_scope),
             )
             .await
             .map_err(ApiError::internal)?;
             reconcile_provider_account_mode(&state, &existing_id, credential_mode).await?;
         } else {
             let credential_mode = explicit_mode.unwrap_or(crate::plugins::CredentialMode::Manual);
-            validate_imported_provider_pricing_scope(
+            let pricing_scope = resolve_imported_provider_pricing_scope(
                 &state,
                 name,
+                base_url,
                 p["pricing_scope"].as_str(),
                 credential_mode,
                 p["source_plugin_id"].as_str(),
@@ -9871,11 +10105,9 @@ pub async fn import_config(
             )
             .await
             .map_err(ApiError::internal)?;
-            if let Some(scope) = p["pricing_scope"].as_str() {
-                db::update_provider_pricing_scope(&state.pool, &id, scope)
-                    .await
-                    .map_err(ApiError::internal)?;
-            }
+            db::update_provider_pricing_scope(&state.pool, &id, &pricing_scope)
+                .await
+                .map_err(ApiError::internal)?;
             reconcile_provider_account_mode(&state, &id, credential_mode).await?;
             provider_ids.insert(name.to_string(), id);
         }
@@ -9974,6 +10206,8 @@ pub async fn import_config(
             validate_model_transport_override(&provider_row, requested_transport)?;
 
         let model_key = format!("{provider}/{upstream}");
+        let imported_ownership =
+            parse_imported_model_ownership(m).map_err(ApiError::bad)?;
         let existing = db::find_model_by_upstream(&state.pool, pid, upstream)
             .await
             .map_err(ApiError::internal)?;
@@ -9982,58 +10216,73 @@ pub async fn import_config(
             model_ids.insert(model_key.clone(), existing_id.clone());
             let existing_discovery = discovery_object(&existing);
             let previous_prices = existing.prices();
-            let mut price_fields = effective_price_fields(&existing_discovery, &previous_prices);
-            for field in PRICE_FIELDS {
-                let previous = price_field(&previous_prices, field);
-                let next = price_field(&prices, field);
-                if previous != next {
-                    if next.is_some() {
-                        set_price_field_provenance(
-                            &mut price_fields,
-                            field,
-                            "operator",
-                            json!({ "configured_by": "config_import" }),
-                        );
-                    } else {
-                        price_fields.remove(field);
+            let (price_source, price_metadata, discovery_patch) =
+                if let Some(ownership) = imported_ownership.as_ref() {
+                    let (source, metadata) = ownership
+                        .pricing
+                        .clone()
+                        .unwrap_or_else(|| ("untracked".to_string(), json!({ "fields": {} })));
+                    (source, metadata, ownership.discovery_patch.clone())
+                } else {
+                    let mut price_fields =
+                        effective_price_fields(&existing_discovery, &previous_prices);
+                    for field in PRICE_FIELDS {
+                        let previous = price_field(&previous_prices, field);
+                        let next = price_field(&prices, field);
+                        if previous != next {
+                            if next.is_some() {
+                                set_price_field_provenance(
+                                    &mut price_fields,
+                                    field,
+                                    "operator",
+                                    json!({ "configured_by": "config_import" }),
+                                );
+                            } else {
+                                price_fields.remove(field);
+                            }
+                        }
                     }
-                }
-            }
-            let price_source = if prices.is_configured() {
-                effective_price_source(&price_fields, &prices)
-            } else {
-                "operator".to_string()
-            };
-            let price_metadata = json!({ "fields": price_fields });
+                    let price_source = if prices.is_configured() {
+                        effective_price_source(&price_fields, &prices)
+                    } else {
+                        "operator".to_string()
+                    };
+                    let price_metadata = json!({ "fields": price_fields });
 
-            let existing_caps = normalize_model_capabilities(
-                &serde_json::from_str::<Value>(&existing.capabilities)
-                    .unwrap_or_else(|_| json!({})),
-            );
-            let existing_parameters =
-                serde_json::from_str::<Value>(&existing.parameters).unwrap_or_else(|_| json!({}));
-            let existing_thinking_map = serde_json::to_value(existing.thinking())
-                .expect("ThinkingMap serialization is infallible");
-            let mut discovery_patch = serde_json::Map::new();
-            if existing_caps != caps {
-                discovery_patch.insert("operator_capability_overrides".into(), caps.clone());
-            }
-            if existing_parameters != parameters {
-                discovery_patch.insert(
-                    "operator_parameter_overrides".into(),
-                    operator_parameter_support_overrides(&parameters),
-                );
-            }
-            if existing_thinking_map != thinking_map {
-                discovery_patch.insert(
-                    "operator_thinking_overrides".into(),
-                    Value::Object(merge_operator_thinking_map_override(
-                        &existing_discovery,
-                        &thinking_map,
-                    )),
-                );
-            }
-            let discovery_patch = Value::Object(discovery_patch);
+                    let existing_caps = normalize_model_capabilities(
+                        &serde_json::from_str::<Value>(&existing.capabilities)
+                            .unwrap_or_else(|_| json!({})),
+                    );
+                    let existing_parameters = serde_json::from_str::<Value>(&existing.parameters)
+                        .unwrap_or_else(|_| json!({}));
+                    let existing_thinking_map = serde_json::to_value(existing.thinking())
+                        .expect("ThinkingMap serialization is infallible");
+                    let mut discovery_patch = serde_json::Map::new();
+                    if existing_caps != caps {
+                        discovery_patch
+                            .insert("operator_capability_overrides".into(), caps.clone());
+                    }
+                    if existing_parameters != parameters {
+                        discovery_patch.insert(
+                            "operator_parameter_overrides".into(),
+                            operator_parameter_support_overrides(&parameters),
+                        );
+                    }
+                    if existing_thinking_map != thinking_map {
+                        discovery_patch.insert(
+                            "operator_thinking_overrides".into(),
+                            Value::Object(merge_operator_thinking_map_override(
+                                &existing_discovery,
+                                &thinking_map,
+                            )),
+                        );
+                    }
+                    (
+                        price_source,
+                        price_metadata,
+                        Value::Object(discovery_patch),
+                    )
+                };
 
             db::commit_model_operator_mutation(
                 &state.pool,
@@ -10060,31 +10309,41 @@ pub async fn import_config(
             .await
             .map_err(ApiError::internal)?;
         } else {
-            let thinking_map_configured = !thinking.levels.is_empty()
-                || thinking.mode.is_some()
-                || thinking.budget_field.is_some()
-                || thinking.level_field.is_some();
-            let mut discovery_patch = serde_json::Map::new();
-            discovery_patch.insert("operator_capability_overrides".into(), caps.clone());
-            discovery_patch.insert(
-                "operator_parameter_overrides".into(),
-                operator_parameter_support_overrides(&parameters),
-            );
-            discovery_patch.insert(
-                "operator_thinking_overrides".into(),
-                if thinking_map_configured {
-                    json!({ "thinking_map": thinking_map.clone() })
+            let (discovery_patch, pricing_values) =
+                if let Some(ownership) = imported_ownership.as_ref() {
+                    (
+                        ownership.discovery_patch.clone(),
+                        ownership.pricing.clone(),
+                    )
                 } else {
-                    json!({})
-                },
-            );
-            if !prices.is_configured() {
-                discovery_patch.insert("effective_pricing".into(), Value::Null);
-            }
-            let discovery_patch = Value::Object(discovery_patch);
-            let pricing_values = prices
-                .is_configured()
-                .then(|| operator_price_provenance(&prices));
+                    let thinking_map_configured = !thinking.levels.is_empty()
+                        || thinking.mode.is_some()
+                        || thinking.budget_field.is_some()
+                        || thinking.level_field.is_some();
+                    let mut discovery_patch = serde_json::Map::new();
+                    discovery_patch.insert("operator_capability_overrides".into(), caps.clone());
+                    discovery_patch.insert(
+                        "operator_parameter_overrides".into(),
+                        operator_parameter_support_overrides(&parameters),
+                    );
+                    discovery_patch.insert(
+                        "operator_thinking_overrides".into(),
+                        if thinking_map_configured {
+                            json!({ "thinking_map": thinking_map.clone() })
+                        } else {
+                            json!({})
+                        },
+                    );
+                    if !prices.is_configured() {
+                        discovery_patch.insert("effective_pricing".into(), Value::Null);
+                    }
+                    (
+                        Value::Object(discovery_patch),
+                        prices
+                            .is_configured()
+                            .then(|| operator_price_provenance(&prices)),
+                    )
+                };
             let pricing =
                 pricing_values
                     .as_ref()
@@ -10487,13 +10746,45 @@ async fn reconcile_provider_integration_semantics(
 ) -> Result<(), ApiError> {
     let lock = model_reconciliation_lock(provider_id);
     let _guard = lock.lock().await;
+    let effective_pricing_scope = if pricing_scope == crate::plugins::PricingScope::DirectApi {
+        let provider = db::get_provider(&state.pool, provider_id)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("provider not found"))?;
+        match direct_api_manifest_trust(
+            state,
+            &provider.name,
+            &provider.base_url,
+            Some(source_plugin_id),
+            Some(source_integration_id),
+        )
+        .await
+        {
+            Ok(DirectApiManifestTrust::Trusted) => crate::plugins::PricingScope::DirectApi,
+            Ok(DirectApiManifestTrust::PluginUnavailable) => {
+                crate::plugins::PricingScope::Integration
+            }
+            Err(problem) => {
+                tracing::warn!(
+                    provider = %provider.id,
+                    plugin = %source_plugin_id,
+                    integration = %source_integration_id,
+                    %problem,
+                    "direct_api integration trust no longer matches provider identity; demoting pricing scope"
+                );
+                crate::plugins::PricingScope::Integration
+            }
+        }
+    } else {
+        crate::plugins::PricingScope::Integration
+    };
     db::update_provider_credential_semantics_with_scope(
         &state.pool,
         provider_id,
         credential_mode.as_str(),
         Some(source_plugin_id),
         Some(source_integration_id),
-        Some(pricing_scope.as_str()),
+        Some(effective_pricing_scope.as_str()),
     )
     .await
     .map_err(ApiError::internal)?;
