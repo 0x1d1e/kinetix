@@ -27,6 +27,7 @@ impl AccountStatus {
             _ => AccountStatus::Healthy,
         }
     }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             AccountStatus::Healthy => "healthy",
@@ -36,16 +37,34 @@ impl AccountStatus {
             AccountStatus::CircuitOpen => "circuit_open",
         }
     }
+
+    pub fn as_admin_str(&self) -> &'static str {
+        if *self == AccountStatus::CircuitOpen {
+            "degraded"
+        } else {
+            self.as_str()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountLifecycle {
+    pub status: AccountStatus,
+    pub reason_code: String,
+    pub retry_at: Option<String>,
+    pub status_changed_at: Option<String>,
 }
 
 /// Effective status accounting for elapsed cooldown/quota-reset/circuit windows.
 pub fn effective_status(account: &AccountRow) -> AccountStatus {
-    let now = Utc::now();
+    effective_status_at(account, Utc::now())
+}
+
+pub fn effective_status_at(account: &AccountRow, now: DateTime<Utc>) -> AccountStatus {
     let configured = AccountStatus::parse(&account.status);
 
     // Administrative/quota state always wins over circuit state. Half-open
-    // probing is only a circuit-breaker recovery mechanism; it must never make
-    // disabled, cooling-down, or exhausted credentials eligible.
+    // probing must never make disabled, cooling-down, or exhausted credentials eligible.
     match configured {
         AccountStatus::Disabled => return AccountStatus::Disabled,
         AccountStatus::Cooldown => match account.cooldown_until.as_deref().and_then(db::parse_dt) {
@@ -61,12 +80,58 @@ pub fn effective_status(account: &AccountRow) -> AccountStatus {
         AccountStatus::Healthy | AccountStatus::CircuitOpen => {}
     }
 
-    // A circuit remains logically open after its timer elapses until a
-    // half-open probe succeeds and clears it.
+    // An expired circuit remains logically degraded until a half-open probe succeeds.
     if account.circuit_open_until.is_some() || configured == AccountStatus::CircuitOpen {
         AccountStatus::CircuitOpen
     } else {
         AccountStatus::Healthy
+    }
+}
+
+pub fn lifecycle_at(account: &AccountRow, now: DateTime<Utc>) -> AccountLifecycle {
+    let configured = AccountStatus::parse(&account.status);
+    let status = effective_status_at(account, now);
+    let stored_reason = account.status_reason.as_str();
+    let (reason_code, retry_at) = match status {
+        AccountStatus::Disabled => (stored_reason.to_string(), None),
+        AccountStatus::Cooldown => {
+            let until = account.cooldown_until.as_deref().and_then(db::parse_dt);
+            match until {
+                Some(until) if until > now => (stored_reason.to_string(), Some(until.to_rfc3339())),
+                _ => ("cooldown_elapsed".into(), None),
+            }
+        }
+        AccountStatus::Exhausted => {
+            let reset = account.quota_reset_at.as_deref().and_then(db::parse_dt);
+            match reset {
+                Some(reset) if reset > now => (stored_reason.to_string(), Some(reset.to_rfc3339())),
+                _ => ("quota_reset".into(), None),
+            }
+        }
+        AccountStatus::CircuitOpen => {
+            let until = account.circuit_open_until.as_deref().and_then(db::parse_dt);
+            (
+                "circuit_open".into(),
+                until
+                    .filter(|until| *until > now)
+                    .map(|until| until.to_rfc3339()),
+            )
+        }
+        AccountStatus::Healthy => match configured {
+            AccountStatus::Cooldown => ("cooldown_elapsed".into(), None),
+            AccountStatus::Exhausted => ("quota_reset".into(), None),
+            _ => (stored_reason.to_string(), None),
+        },
+    };
+    AccountLifecycle {
+        status,
+        reason_code: if reason_code.is_empty() || reason_code == "unknown" {
+            status.as_admin_str().to_string()
+        } else {
+            reason_code
+        },
+        retry_at,
+        status_changed_at: account.status_changed_at.clone(),
     }
 }
 
@@ -97,6 +162,10 @@ pub const HALF_OPEN_PROBE_MIN_GAP_SECS: i64 = 2;
 /// [`HALF_OPEN_PROBE_MIN_GAP_SECS`] so a still-broken upstream is not hammered
 /// by every concurrent request. Returns `false` while the circuit is still open.
 pub fn should_probe(account: &AccountRow) -> bool {
+    should_probe_at(account, Utc::now())
+}
+
+pub fn should_probe_at(account: &AccountRow, now: DateTime<Utc>) -> bool {
     // Only circuit-breaker state is probeable. Other non-healthy states have
     // their own explicit recovery/reset conditions.
     if matches!(
@@ -109,11 +178,11 @@ pub fn should_probe(account: &AccountRow) -> bool {
     let Some(until) = account.circuit_open_until.as_deref().and_then(db::parse_dt) else {
         return false;
     };
-    if Utc::now() < until {
-        return false; // circuit still open: do not probe
+    if now < until {
+        return false;
     }
     match account.last_probe_at.as_deref().and_then(db::parse_dt) {
-        Some(last) => Utc::now() >= last + Duration::seconds(HALF_OPEN_PROBE_MIN_GAP_SECS),
+        Some(last) => now >= last + Duration::seconds(HALF_OPEN_PROBE_MIN_GAP_SECS),
         None => true,
     }
 }
@@ -177,6 +246,7 @@ pub async fn mark_rate_limited(
         pool,
         account_id,
         "cooldown",
+        "rate_limited",
         Some(&until.to_rfc3339()),
         None,
         Some(&crate::crypto::redact(error)),
@@ -198,6 +268,7 @@ pub async fn mark_exhausted(
         pool,
         account_id,
         "exhausted",
+        "account_quota_exhausted",
         None,
         Some(&reset.to_rfc3339()),
         Some(&crate::crypto::redact(error)),
@@ -207,32 +278,48 @@ pub async fn mark_exhausted(
 }
 
 pub async fn mark_healthy(pool: &Pool, account_id: &str) -> anyhow::Result<()> {
-    db::set_account_status(pool, account_id, "healthy", None, None, None).await
+    db::set_account_status(
+        pool,
+        account_id,
+        "healthy",
+        "operator_reset",
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+pub async fn recover_after_success(pool: &Pool, account_id: &str) -> anyhow::Result<bool> {
+    db::recover_account_after_success(pool, account_id).await
 }
 
 /// Clear a cooldown and put the account back in service.
 pub async fn clear_cooldown(pool: &Pool, account_id: &str) -> anyhow::Result<()> {
-    db::set_account_status(pool, account_id, "healthy", None, None, None).await
+    db::set_account_status(
+        pool,
+        account_id,
+        "healthy",
+        "cooldown_cleared",
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
-/// The soonest recovery time across a set of accounts (for `Retry-After`).
+/// The soonest future recovery time across a set of accounts.
 pub fn soonest_recovery(accounts: &[AccountRow]) -> Option<DateTime<Utc>> {
-    let mut soonest: Option<DateTime<Utc>> = None;
-    for a in accounts {
-        let t = match AccountStatus::parse(&a.status) {
-            AccountStatus::Cooldown => a.cooldown_until.as_deref().and_then(db::parse_dt),
-            AccountStatus::Exhausted => a.quota_reset_at.as_deref().and_then(db::parse_dt),
-            _ => None,
-        }
-        .or_else(|| a.circuit_open_until.as_deref().and_then(db::parse_dt));
-        if let Some(t) = t {
-            soonest = Some(match soonest {
-                Some(cur) if cur < t => cur,
-                _ => t,
-            });
-        }
-    }
-    soonest
+    let now = Utc::now();
+    accounts
+        .iter()
+        .filter_map(|account| {
+            lifecycle_at(account, now)
+                .retry_at
+                .as_deref()
+                .and_then(db::parse_dt)
+        })
+        .min()
 }
 
 /// Whether a soft quota (FR-12.5) is reached for an account.
@@ -289,6 +376,8 @@ mod tests {
             secret_enc: String::new(),
             key_mask: String::new(),
             status: status.into(),
+            status_reason: "healthy".into(),
+            status_changed_at: None,
             cooldown_until: None,
             quota_reset_at: None,
             quota_type: "none".into(),
@@ -360,9 +449,22 @@ mod tests {
     #[test]
     fn expired_cooldown_recovers_without_half_open_probe() {
         let mut a = account("cooldown", None, None);
+        a.status_reason = "rate_limited".into();
         a.cooldown_until = Some((Utc::now() - Duration::seconds(1)).to_rfc3339());
         assert_eq!(effective_status(&a), AccountStatus::Healthy);
+        assert_eq!(lifecycle_at(&a, Utc::now()).reason_code, "cooldown_elapsed");
         assert!(!should_probe(&a));
+    }
+
+    #[test]
+    fn expired_quota_reports_reset_reason() {
+        let mut a = account("exhausted", None, None);
+        a.status_reason = "account_quota_exhausted".into();
+        a.quota_reset_at = Some((Utc::now() - Duration::seconds(1)).to_rfc3339());
+        let lifecycle = lifecycle_at(&a, Utc::now());
+        assert_eq!(lifecycle.status, AccountStatus::Healthy);
+        assert_eq!(lifecycle.reason_code, "quota_reset");
+        assert_eq!(lifecycle.retry_at, None);
     }
 
     #[test]

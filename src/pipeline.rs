@@ -1446,7 +1446,7 @@ pub async fn run(
                         if prepared.is_sse { "sse" } else { "json" },
                     );
                     // Only validated responses clear the circuit-breaker counter.
-                    let _ = pool::clear_circuit(&state.pool, &target.account.id).await;
+                    let _ = pool::recover_after_success(&state.pool, &target.account.id).await;
                     let provider_circuit_transition =
                         mark_provider_probe_validated(&provider_attempt);
                     let attempt = Attempt {
@@ -2007,11 +2007,16 @@ fn traffic_outcome_for_failure(kind: FailureKind) -> crate::upstream_traffic::Tr
     match kind {
         FailureKind::RateLimit => TrafficOutcome::Overload,
         FailureKind::Timeout => TrafficOutcome::Timeout,
-        FailureKind::ServerError | FailureKind::ConnectionError => TrafficOutcome::Error,
+        FailureKind::ServerError
+        | FailureKind::ConnectionError
+        | FailureKind::MalformedUpstream => TrafficOutcome::Error,
+        FailureKind::PluginFailure => TrafficOutcome::Neutral,
+        FailureKind::ClientCancelled => TrafficOutcome::Cancelled,
         FailureKind::QuotaExhausted
         | FailureKind::AuthError
         | FailureKind::TargetError
-        | FailureKind::BadRequest => TrafficOutcome::Neutral,
+        | FailureKind::BadRequest
+        | FailureKind::PolicyRejected => TrafficOutcome::Neutral,
     }
 }
 
@@ -2020,12 +2025,14 @@ fn telemetry_outcome_for_failure(kind: FailureKind) -> crate::target_telemetry::
     match kind {
         FailureKind::RateLimit => TelemetryOutcome::RateLimit,
         FailureKind::QuotaExhausted => TelemetryOutcome::QuotaExhausted,
-        FailureKind::ServerError => TelemetryOutcome::ServerError,
+        FailureKind::ServerError | FailureKind::MalformedUpstream => TelemetryOutcome::ServerError,
+        FailureKind::PluginFailure => TelemetryOutcome::TargetError,
         FailureKind::ConnectionError => TelemetryOutcome::ConnectionError,
         FailureKind::Timeout => TelemetryOutcome::Timeout,
         FailureKind::AuthError => TelemetryOutcome::AuthError,
-        FailureKind::TargetError => TelemetryOutcome::TargetError,
+        FailureKind::TargetError | FailureKind::PolicyRejected => TelemetryOutcome::TargetError,
         FailureKind::BadRequest => TelemetryOutcome::BadRequest,
+        FailureKind::ClientCancelled => TelemetryOutcome::Cancelled,
     }
 }
 
@@ -2084,12 +2091,17 @@ fn route_allows_fallback(route: Option<&db::RouteRow>, kind: FailureKind) -> boo
     match kind {
         FailureKind::RateLimit => enabled("on429"),
         FailureKind::QuotaExhausted => enabled("onQuota"),
-        FailureKind::ServerError | FailureKind::ConnectionError => enabled("on5xx"),
+        FailureKind::ServerError
+        | FailureKind::ConnectionError
+        | FailureKind::MalformedUpstream
+        | FailureKind::PluginFailure => enabled("on5xx"),
         FailureKind::Timeout => enabled("onTimeout"),
         // Credential-global failures should try another account. Target-local
         // failures should try another logical route target.
         FailureKind::AuthError | FailureKind::TargetError => true,
-        FailureKind::BadRequest => false,
+        FailureKind::BadRequest | FailureKind::PolicyRejected | FailureKind::ClientCancelled => {
+            false
+        }
     }
 }
 
@@ -2432,7 +2444,7 @@ async fn prepare_success_response(
             .unwrap_or(false)
         {
             return Err(UpstreamFailure {
-                kind: FailureKind::ServerError,
+                kind: FailureKind::MalformedUpstream,
                 status: Some(502),
                 retry_after_secs: None,
                 message: "upstream JSON response exceeds size limit".into(),
@@ -2452,7 +2464,7 @@ async fn prepare_success_response(
         })?;
         if body.len() > MAX_FULL_RESPONSE_BYTES {
             return Err(UpstreamFailure {
-                kind: FailureKind::ServerError,
+                kind: FailureKind::MalformedUpstream,
                 status: Some(502),
                 retry_after_secs: None,
                 message: "upstream JSON response exceeds size limit".into(),
@@ -2464,7 +2476,7 @@ async fn prepare_success_response(
             return Err(failure);
         }
         let value: Value = serde_json::from_slice(&body).map_err(|error| UpstreamFailure {
-            kind: FailureKind::ServerError,
+            kind: FailureKind::MalformedUpstream,
             status: Some(502),
             retry_after_secs: None,
             message: format!("invalid upstream JSON response: {error}"),
@@ -2473,7 +2485,7 @@ async fn prepare_success_response(
         let events = adapter.parse_full_response(&value)?;
         if !events.iter().any(is_semantic_event) {
             return Err(UpstreamFailure {
-                kind: FailureKind::ServerError,
+                kind: FailureKind::MalformedUpstream,
                 status: Some(502),
                 retry_after_secs: None,
                 message: "upstream JSON response contained no model result".into(),
@@ -2503,7 +2515,7 @@ async fn prepare_success_response(
             Ok(Some(bytes)) => {
                 prefetched.push(bytes.clone());
                 let frames = framer.push(&bytes).map_err(|error| UpstreamFailure {
-                    kind: FailureKind::ServerError,
+                    kind: FailureKind::MalformedUpstream,
                     status: Some(502),
                     retry_after_secs: None,
                     message: error.to_string(),
@@ -2518,7 +2530,7 @@ async fn prepare_success_response(
                     }
                     if payload.trim() == "[DONE]" {
                         return Err(UpstreamFailure {
-                            kind: FailureKind::ServerError,
+                            kind: FailureKind::MalformedUpstream,
                             status: Some(502),
                             retry_after_secs: None,
                             message: "upstream SSE ended before any model event".into(),
@@ -2549,7 +2561,7 @@ async fn prepare_success_response(
                     "upstream SSE ended before any model event"
                 };
                 return Err(UpstreamFailure {
-                    kind: FailureKind::ServerError,
+                    kind: FailureKind::MalformedUpstream,
                     status: Some(502),
                     retry_after_secs: None,
                     message: message.into(),
@@ -2629,6 +2641,7 @@ async fn handle_key_failure(
                 &state.pool,
                 account_id,
                 "disabled",
+                failure.kind.reason_code(),
                 None,
                 None,
                 Some(&failure.message),
@@ -2638,8 +2651,12 @@ async fn handle_key_failure(
             meta.fallback_path.push(d.clone());
             d
         }
-        FailureKind::ServerError | FailureKind::ConnectionError | FailureKind::Timeout => {
-            let d = format!("{label}:transient(request-local)");
+        FailureKind::ServerError
+        | FailureKind::ConnectionError
+        | FailureKind::Timeout
+        | FailureKind::MalformedUpstream
+        | FailureKind::PluginFailure => {
+            let d = format!("{label}:{}", failure.kind.reason_code());
             meta.fallback_path.push(d.clone());
             d
         }
@@ -2648,7 +2665,10 @@ async fn handle_key_failure(
             meta.fallback_path.push(d.clone());
             d
         }
-        FailureKind::BadRequest => format!("{label}:bad_request"),
+        FailureKind::BadRequest | FailureKind::PolicyRejected => {
+            format!("{label}:{}", failure.kind.reason_code())
+        }
+        FailureKind::ClientCancelled => "client_cancelled".into(),
     };
 
     let n = if failure.kind.is_account_scoped() {
@@ -2665,7 +2685,7 @@ async fn handle_key_failure(
     } else {
         0
     };
-    trace.step("attempt", Some(label), detail);
+    trace.failure(Some(label), detail, failure.kind, failure.status);
     if n >= CIRCUIT_THRESHOLD {
         trace.step(
             "skip",
@@ -2761,10 +2781,13 @@ fn apply_header_reset_to_rate_limit(
 
 fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> ProxyError {
     match failure.kind {
-        FailureKind::RateLimit | FailureKind::QuotaExhausted => {
-            ProxyError::rate_limited(failure.message.clone(), failure.retry_after_secs)
+        FailureKind::RateLimit | FailureKind::QuotaExhausted => ProxyError::rate_limited(
+            failure.message.clone(),
+            failure.kind.retry_after_secs(failure),
+        ),
+        FailureKind::BadRequest | FailureKind::PolicyRejected => {
+            ProxyError::bad_request(failure.message.clone())
         }
-        FailureKind::BadRequest => ProxyError::bad_request(failure.message.clone()),
         FailureKind::AuthError => ProxyError::upstream(format!(
             "upstream authentication failed for provider '{}'",
             target.provider.name
@@ -2777,9 +2800,14 @@ fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> Proxy
             _ => ProxyError::upstream(failure.message.clone()),
         },
         FailureKind::Timeout => ProxyError::upstream("upstream request timed out".to_string()),
-        FailureKind::ConnectionError | FailureKind::ServerError => {
-            ProxyError::upstream(failure.message.clone())
-        }
+        FailureKind::ConnectionError
+        | FailureKind::ServerError
+        | FailureKind::MalformedUpstream
+        | FailureKind::PluginFailure => ProxyError::upstream(failure.message.clone()),
+        FailureKind::ClientCancelled => ProxyError::new(
+            crate::types::ErrorKind::ClientCancelled,
+            "client cancelled request",
+        ),
     }
 }
 
@@ -2814,12 +2842,16 @@ fn record_provider_circuit_reject(
 }
 
 fn account_skip_detail(target: &ResolvedTarget, status: pool::AccountStatus) -> String {
+    let lifecycle = pool::lifecycle_at(&target.account, chrono::Utc::now());
     let mut detail = format!(
-        "model={} skipped({}); effective_status={}",
+        "model={} skipped({}); reason_code={}",
         target.model.display_name,
-        status.as_str(),
-        status.as_str()
+        status.as_admin_str(),
+        lifecycle.reason_code
     );
+    if let Some(retry_at) = lifecycle.retry_at {
+        detail.push_str(&format!("; retry_at={retry_at}"));
+    }
     match status {
         pool::AccountStatus::Cooldown => {
             if let Some(until) = target.account.cooldown_until.as_deref() {
@@ -5008,6 +5040,16 @@ async fn finalize_log(
     } else {
         "pre_commit"
     };
+    if status != "success" && status != "client_disconnect" {
+        if let Some((kind, upstream_status)) = provider_failure {
+            trace.failure(
+                Some(attempt.target.account.label.clone()),
+                error_message.as_deref().unwrap_or("upstream stream failed"),
+                kind,
+                upstream_status,
+            );
+        }
+    }
     trace.finish(match status {
         "success" => "success",
         "client_disconnect" => "cancelled",
@@ -5654,6 +5696,8 @@ mod route_policy_tests {
             secret_enc: String::new(),
             key_mask: String::new(),
             status: "healthy".into(),
+            status_reason: "healthy".into(),
+            status_changed_at: None,
             cooldown_until: None,
             quota_reset_at: None,
             quota_type: "none".into(),

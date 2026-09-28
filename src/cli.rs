@@ -1005,7 +1005,8 @@ async fn cmd_account(cli: &Cli, args: AccountArgs) -> Result<()> {
             Ok(())
         }
         AccountAction::Reset { id } => {
-            db::set_account_status(&pool, &id, "healthy", None, None, None).await?;
+            db::set_account_status(&pool, &id, "healthy", "operator_reset", None, None, None)
+                .await?;
             println!("reset account {id}");
             Ok(())
         }

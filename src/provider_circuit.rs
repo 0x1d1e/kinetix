@@ -539,12 +539,17 @@ impl Drop for ProviderAttempt {
 pub fn qualifies(kind: FailureKind, status: Option<u16>) -> bool {
     match kind {
         FailureKind::ConnectionError | FailureKind::Timeout => true,
-        FailureKind::ServerError => matches!(status, Some(502 | 503 | 504)),
+        FailureKind::ServerError | FailureKind::MalformedUpstream => {
+            matches!(status, Some(502 | 503 | 504))
+        }
         FailureKind::RateLimit
         | FailureKind::QuotaExhausted
         | FailureKind::AuthError
         | FailureKind::TargetError
-        | FailureKind::BadRequest => false,
+        | FailureKind::BadRequest
+        | FailureKind::PluginFailure
+        | FailureKind::PolicyRejected
+        | FailureKind::ClientCancelled => false,
     }
 }
 
@@ -884,11 +889,15 @@ mod tests {
     }
 
     #[test]
-    fn only_gateway_style_server_errors_qualify() {
+    fn only_gateway_style_upstream_failures_qualify() {
         assert!(!qualifies(FailureKind::ServerError, Some(500)));
         assert!(qualifies(FailureKind::ServerError, Some(502)));
         assert!(qualifies(FailureKind::ServerError, Some(503)));
         assert!(qualifies(FailureKind::ServerError, Some(504)));
+        assert!(qualifies(FailureKind::MalformedUpstream, Some(502)));
+        assert!(!qualifies(FailureKind::MalformedUpstream, None));
+        assert!(!qualifies(FailureKind::PluginFailure, Some(502)));
+        assert!(!qualifies(FailureKind::ClientCancelled, None));
         assert!(qualifies(FailureKind::Timeout, None));
         assert!(qualifies(FailureKind::ConnectionError, None));
     }

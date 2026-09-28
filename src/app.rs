@@ -305,6 +305,7 @@ impl AppState {
             &self.pool,
             &account.id,
             "disabled",
+            "credential_rejected",
             None,
             None,
             Some(&format!("{context}: {}", error.message)),

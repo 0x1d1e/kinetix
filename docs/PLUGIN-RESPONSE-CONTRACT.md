@@ -30,7 +30,9 @@ The host currently accepts a **legacy bare event array** only as a migration shi
 | `warning` | `code: string`, `message: string` | — | Diagnostic warning. Kinetix validates and redacts it before logging; it is not forwarded as client content. |
 | `error` | `kind: string`, `message: string` | `status: u16\|null`, `retry_after_secs: u64\|null`, `quota_reset_at: RFC3339 string\|null` | Terminal normalized failure. It must be the only event in its envelope. |
 
-Valid `error.kind` values are `rate_limit`, `quota_exhausted`, `auth_error`, `target_error`, `server_error`, `connection_error`, `timeout`, and `bad_request`.
+Valid `error.kind` values are `rate_limit`, `quota_exhausted`, `auth_error`, `target_error`, `server_error`, `connection_error`, `timeout`, `bad_request`, `malformed_upstream`, `plugin_failure`, `policy_rejected`, and `client_cancelled`.
+
+`malformed_upstream` reports invalid upstream JSON, SSE framing, or response structure. `plugin_failure` reports plugin execution or contract failures. `policy_rejected` is a host compatibility/routing rejection. `client_cancelled` records a client disconnect and must not be treated as provider or plugin health failure.
 
 ## Validation
 

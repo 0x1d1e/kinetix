@@ -497,6 +497,8 @@ mod tests {
             secret_enc: String::new(),
             key_mask: "oauth:****".into(),
             status: "healthy".into(),
+            status_reason: "healthy".into(),
+            status_changed_at: None,
             cooldown_until: None,
             quota_reset_at: None,
             quota_type: "none".into(),

@@ -738,7 +738,7 @@ impl Adapter for GeminiAdapter {
 
     fn parse_stream_chunk(&self, data: &str) -> Result<Vec<StreamEvent>, UpstreamFailure> {
         let v: Value = serde_json::from_str(data).map_err(|e| UpstreamFailure {
-            kind: FailureKind::ServerError,
+            kind: FailureKind::MalformedUpstream,
             status: None,
             retry_after_secs: None,
             message: format!("invalid upstream chunk: {e}"),

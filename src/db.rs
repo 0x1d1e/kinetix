@@ -857,6 +857,8 @@ pub struct AccountRow {
     pub secret_enc: String,
     pub key_mask: String,
     pub status: String,
+    pub status_reason: String,
+    pub status_changed_at: Option<String>,
     pub cooldown_until: Option<String>,
     pub quota_reset_at: Option<String>,
     pub quota_type: String,
@@ -888,6 +890,16 @@ pub async fn accounts_for_provider(pool: &Pool, provider_id: &str) -> Result<Vec
     .await?)
 }
 
+/// List all accounts for an admin view, including disabled accounts.
+pub async fn list_accounts_for_provider(pool: &Pool, provider_id: &str) -> Result<Vec<AccountRow>> {
+    Ok(sqlx::query_as::<_, AccountRow>(
+        "SELECT * FROM accounts WHERE provider_id = ? ORDER BY priority, created_at",
+    )
+    .bind(provider_id)
+    .fetch_all(pool)
+    .await?)
+}
+
 pub async fn get_account(pool: &Pool, id: &str) -> Result<Option<AccountRow>> {
     Ok(
         sqlx::query_as::<_, AccountRow>("SELECT * FROM accounts WHERE id = ?")
@@ -911,14 +923,15 @@ pub async fn insert_account(
     let id = format!("acc_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
         "INSERT INTO accounts
-         (id, provider_id, label, secret_enc, key_mask, status, quota_type, soft_quota_usd, priority, weight, created_at)
-         VALUES (?,?,?,?,?,'healthy',?,?,?,?,?)",
+         (id, provider_id, label, secret_enc, key_mask, status, status_reason, status_changed_at, quota_type, soft_quota_usd, priority, weight, created_at)
+         VALUES (?,?,?,?,?,'healthy','account_created',?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(provider_id)
     .bind(label)
     .bind(secret_enc)
     .bind(key_mask)
+    .bind(now_iso())
     .bind(quota_type)
     .bind(soft_quota_usd)
     .bind(priority)
@@ -933,24 +946,51 @@ pub async fn update_account(
     pool: &Pool,
     id: &str,
     label: &str,
-    status: &str,
+    status: Option<&str>,
     priority: i64,
     weight: i64,
     soft_quota_usd: Option<f64>,
     quota_type: &str,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE accounts SET label=?, status=?, priority=?, weight=?, soft_quota_usd=?, quota_type=? WHERE id=?",
-    )
-    .bind(label)
-    .bind(status)
-    .bind(priority)
-    .bind(weight)
-    .bind(soft_quota_usd)
-    .bind(quota_type)
-    .bind(id)
-    .execute(pool)
-    .await?;
+    if let Some(status) = status {
+        let reason = if status == "disabled" {
+            "operator_disabled"
+        } else {
+            "operator_enabled"
+        };
+        sqlx::query(
+            "UPDATE accounts SET label=?, status=?, status_reason=?, \
+             status_changed_at=CASE WHEN status=? AND status_reason=? THEN status_changed_at ELSE ? END, \
+             priority=?, weight=?, soft_quota_usd=?, quota_type=?, cooldown_until=NULL, \
+             quota_reset_at=NULL, last_error=NULL, circuit_open_until=NULL, \
+             consecutive_failures=0 WHERE id=?",
+        )
+        .bind(label)
+        .bind(status)
+        .bind(reason)
+        .bind(status)
+        .bind(reason)
+        .bind(now_iso())
+        .bind(priority)
+        .bind(weight)
+        .bind(soft_quota_usd)
+        .bind(quota_type)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE accounts SET label=?, priority=?, weight=?, soft_quota_usd=?, quota_type=? WHERE id=?",
+        )
+        .bind(label)
+        .bind(priority)
+        .bind(weight)
+        .bind(soft_quota_usd)
+        .bind(quota_type)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -958,37 +998,52 @@ pub async fn set_account_status(
     pool: &Pool,
     id: &str,
     status: &str,
+    reason_code: &str,
     cooldown_until: Option<&str>,
     quota_reset_at: Option<&str>,
     last_error: Option<&str>,
 ) -> Result<()> {
-    // A healthy status is a recovery: clear any lingering circuit window so
-    // `effective_status` reports Healthy again (FR-4.7).
-    if status == "healthy" {
-        sqlx::query(
-            "UPDATE accounts SET status=?, cooldown_until=?, quota_reset_at=?, last_error=?, \
-             circuit_open_until=NULL, consecutive_failures=0 WHERE id=?",
-        )
-        .bind(status)
-        .bind(cooldown_until)
-        .bind(quota_reset_at)
-        .bind(last_error)
-        .bind(id)
-        .execute(pool)
-        .await?;
-        return Ok(());
-    }
+    // Runtime and probe updates cannot re-enable an operator-disabled account.
+    let clears_circuit = status == "healthy";
     sqlx::query(
-        "UPDATE accounts SET status=?, cooldown_until=?, quota_reset_at=?, last_error=? WHERE id=?",
+        "UPDATE accounts SET status=?, status_reason=?, \
+         status_changed_at=CASE WHEN status=? AND status_reason=? THEN status_changed_at ELSE ? END, \
+         cooldown_until=?, quota_reset_at=?, last_error=?, \
+         circuit_open_until=CASE WHEN ? THEN NULL ELSE circuit_open_until END, \
+         consecutive_failures=CASE WHEN ? THEN 0 ELSE consecutive_failures END \
+         WHERE id=? AND status != 'disabled'",
     )
     .bind(status)
+    .bind(reason_code)
+    .bind(status)
+    .bind(reason_code)
+    .bind(now_iso())
     .bind(cooldown_until)
     .bind(quota_reset_at)
     .bind(last_error)
+    .bind(clears_circuit)
+    .bind(clears_circuit)
     .bind(id)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Recover cooldown, quota, and circuit state after a valid upstream response.
+/// Disabled credentials remain disabled; the caller does not own that state.
+pub async fn recover_account_after_success(pool: &Pool, id: &str) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE accounts SET status='healthy', status_reason='recovered', status_changed_at=?, \
+         cooldown_until=NULL, quota_reset_at=NULL, last_error=NULL, \
+         circuit_open_until=NULL, consecutive_failures=0 \
+         WHERE id=? AND status != 'disabled' \
+         AND (status != 'healthy' OR circuit_open_until IS NOT NULL)",
+    )
+    .bind(now_iso())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn delete_account(pool: &Pool, id: &str) -> Result<()> {
@@ -1007,10 +1062,13 @@ pub async fn record_account_failure(
     circuit_threshold: i64,
     open_secs: i64,
 ) -> Result<i64> {
-    sqlx::query("UPDATE accounts SET consecutive_failures = consecutive_failures + 1 WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE accounts SET consecutive_failures = consecutive_failures + 1 \
+         WHERE id = ? AND status != 'disabled'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
     let row = sqlx::query("SELECT consecutive_failures FROM accounts WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
@@ -1020,8 +1078,14 @@ pub async fn record_account_failure(
         .unwrap_or(0);
     if n >= circuit_threshold {
         let until = (Utc::now() + chrono::Duration::seconds(open_secs)).to_rfc3339();
-        sqlx::query("UPDATE accounts SET circuit_open_until = ? WHERE id = ?")
+        sqlx::query(
+            "UPDATE accounts SET circuit_open_until = ?, \
+             status_reason = CASE WHEN status = 'healthy' THEN 'circuit_open' ELSE status_reason END, \
+             status_changed_at = CASE WHEN status = 'healthy' AND circuit_open_until IS NULL THEN ? ELSE status_changed_at END \
+             WHERE id = ? AND status != 'disabled'",
+        )
             .bind(until)
+            .bind(now_iso())
             .bind(id)
             .execute(pool)
             .await?;

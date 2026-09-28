@@ -7818,7 +7818,7 @@ pub async fn list_accounts(
     Query(query): Query<AccountListQuery>,
 ) -> ApiResult {
     let accounts = if let Some(provider_id) = query.provider_id.as_deref() {
-        db::accounts_for_provider(&state.pool, provider_id)
+        db::list_accounts_for_provider(&state.pool, provider_id)
             .await
             .map_err(ApiError::internal)?
     } else {
@@ -7860,13 +7860,17 @@ fn account_json(
         .find(|p| p.id == a.provider_id)
         .map(|p| p.name.clone())
         .unwrap_or_default();
+    let lifecycle = crate::pool::lifecycle_at(a, chrono::Utc::now());
     json!({
         "id": a.id,
         "provider_id": a.provider_id,
         "provider_name": provider_name,
         "label": a.label,
         "key_mask": a.key_mask,
-        "status": a.status,
+        "status": lifecycle.status.as_admin_str(),
+        "status_reason": lifecycle.reason_code,
+        "status_changed_at": lifecycle.status_changed_at,
+        "retry_at": lifecycle.retry_at,
         "cooldown_until": a.cooldown_until,
         "quota_reset_at": a.quota_reset_at,
         "quota_type": a.quota_type,
@@ -7970,7 +7974,7 @@ pub async fn update_account(
         &state.pool,
         &id,
         &body.label,
-        body.status.as_deref().unwrap_or("healthy"),
+        body.status.as_deref(),
         body.priority,
         body.weight,
         body.soft_quota_usd,
@@ -17748,6 +17752,199 @@ mod credential_enrollment_regression_tests {
         assert!(!audit.iter().any(|entry| {
             entry.action == "plugin_account_authorized" && entry.target_id == account_id
         }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reset_endpoint_keeps_manually_disabled_accounts_disabled() {
+        let (state, root) = test_state("reset-manually-disabled").await;
+        let provider_id = insert_provider(
+            &state,
+            "manual-disable",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("test-key").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "disabled-account",
+            &encrypted,
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        db::update_account(
+            &state.pool,
+            &account_id,
+            "disabled-account",
+            Some("disabled"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+
+        let _response = reset_account(
+            State(state.clone()),
+            crate::auth::AdminAuth {
+                actor: "admin".into(),
+                token: "test-admin".into(),
+            },
+            Path(account_id.clone()),
+        )
+        .await
+        .unwrap();
+
+        let account = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.status, "disabled");
+        db::set_account_status(
+            &state.pool,
+            &account_id,
+            "healthy",
+            "probe_healthy",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!db::recover_account_after_success(&state.pool, &account_id)
+            .await
+            .unwrap());
+        let account = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.status, "disabled");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn account_edits_preserve_disabled_state_and_admin_lists_its_lifecycle() {
+        let (state, root) = test_state("disabled-lifecycle-api").await;
+        let provider_id = insert_provider(
+            &state,
+            "disabled-lifecycle",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("test-key").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "disabled-account",
+            &encrypted,
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        db::update_account(
+            &state.pool,
+            &account_id,
+            "disabled-account",
+            Some("disabled"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+
+        let _response = update_account(
+            State(state.clone()),
+            auth(),
+            Path(account_id.clone()),
+            Json(AccountBody {
+                provider_id: provider_id.clone(),
+                label: "renamed-disabled-account".into(),
+                api_key: None,
+                priority: 1,
+                weight: 1,
+                soft_quota_usd: None,
+                quota_type: "none".into(),
+                status: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let account = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.status, "disabled");
+        assert_eq!(account.status_reason, "operator_disabled");
+        assert!(account.status_changed_at.is_some());
+
+        let fixed_timestamp = "2000-01-01T00:00:00Z";
+        sqlx::query("UPDATE accounts SET status_changed_at=? WHERE id=?")
+            .bind(fixed_timestamp)
+            .bind(&account_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let _response = update_account(
+            State(state.clone()),
+            auth(),
+            Path(account_id.clone()),
+            Json(AccountBody {
+                provider_id: provider_id.clone(),
+                label: "renamed-disabled-account".into(),
+                api_key: None,
+                priority: 1,
+                weight: 1,
+                soft_quota_usd: None,
+                quota_type: "none".into(),
+                status: Some("disabled".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let account = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.status_changed_at.as_deref(), Some(fixed_timestamp));
+
+        let Json(body) = list_accounts(
+            State(state.clone()),
+            auth(),
+            Query(AccountListQuery {
+                provider_id: Some(provider_id),
+            }),
+        )
+        .await
+        .unwrap();
+        let listed = body["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|listed| listed["id"] == account_id)
+            .unwrap();
+        assert_eq!(listed["status"], "disabled");
+        assert_eq!(listed["status_reason"], "operator_disabled");
+        assert!(listed["status_changed_at"].is_string());
 
         let _ = std::fs::remove_dir_all(root);
     }

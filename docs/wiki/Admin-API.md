@@ -56,11 +56,13 @@ expose it behind Cloudflare Access plus the in-Kinetix password/session check.
 
 | Method & path | Purpose |
 | --- | --- |
-| `GET /admin/api/accounts` | List (label, `key_mask`, status, quotas, totals). |
+| `GET /admin/api/accounts` | List (label, `key_mask`, effective status, lifecycle reason/timestamp, retry time, quotas, totals); accepts optional `provider_id` and includes disabled accounts. |
 | `POST /admin/api/accounts` | Create (requires `api_key`). |
-| `PUT /admin/api/accounts/{id}` | Update fields; a non-empty `api_key` rotates the credential. |
-| `POST /admin/api/accounts/{id}/reset` | Clear cooldown/exhaustion/circuit state. |
+| `PUT /admin/api/accounts/{id}` | Update fields; a non-empty `api_key` rotates the credential. Omitted `status` preserves lifecycle state; send a status only for an intentional status change. |
+| `POST /admin/api/accounts/{id}/reset` | Clear cooldown/exhaustion/circuit state; does not re-enable a manually disabled account. |
 | `DELETE /admin/api/accounts/{id}` | Delete. |
+
+Account responses include `status_reason`, `status_changed_at`, and `retry_at`. Effective `status` is one of `healthy`, `cooldown`, `exhausted`, `disabled`, or `degraded` (`degraded` is a circuit-open account). Expired cooldown and quota windows are reported as healthy with reason `cooldown_elapsed` or `quota_reset`; `retry_at` is `null` when no future recovery time is known. The reason code describes the latest lifecycle transition. `status_changed_at` records when persisted status/reason last changed; cooldown or quota expiry can alter the effective status without writing to the account row.
 
 ## Routes
 
