@@ -1,9 +1,9 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Server, Plus, RefreshCw, CheckCircle2, Globe, Cpu, Sliders, ExternalLink, HelpCircle, Trash2, X, Pencil, Search } from 'lucide-react';
-import { Provider, ModelConfig } from '../../types';
+import { Provider, ModelConfig, Account } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { DESIGN_TOKENS } from '../../lib/designSystem';
-import { Kinetix, DiscoveredModel } from '../../lib/resources';
+import { Kinetix, DiscoveredModel, ProviderLifecycleStatus } from '../../lib/resources';
 
 /**
  * Defaults for newly configured manual models. Imported/discovered sparse
@@ -11,6 +11,8 @@ import { Kinetix, DiscoveredModel } from '../../lib/resources';
  */
 const DEFAULT_CONTEXT_WINDOW = 200000;
 const DEFAULT_MAX_OUTPUT = 8192;
+const PROBE_MAX_REQUESTS = 1;
+const PROBE_MAX_COST_USD = 0.05;
 const CANONICAL_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 type CanonicalThinkingLevel = (typeof CANONICAL_THINKING_LEVELS)[number];
 
@@ -53,6 +55,212 @@ const pluginManagedReasoning = (model: ModelConfig) => {
   };
 };
 
+const modelReconciliation = (model: ModelConfig) =>
+  (model.discovery as {
+    reconciliation?: {
+      status?: string;
+      checked_at?: string | null;
+      last_success_at?: string | null;
+      diff?: Array<{ field?: string; configured?: unknown; observed?: unknown; source?: unknown }>;
+      pinned_fields?: string[];
+      deprecation?: {
+        source?: string;
+        end_date?: unknown;
+        effective_date?: unknown;
+        replacement?: unknown;
+      } | null;
+    } | null;
+  } | undefined)?.reconciliation || null;
+
+type PricingField =
+  | 'input_per_1m'
+  | 'output_per_1m'
+  | 'cached_per_1m'
+  | 'cache_write_per_1m'
+  | 'thinking_per_1m';
+
+type PricingObservation = {
+  prices?: Partial<Record<PricingField, number | null>> | null;
+  price_sources?: Partial<Record<PricingField, string | null>> | null;
+  catalog?: {
+    source_state?: {
+      source?: string | null;
+      retrieved_at?: string | null;
+      freshness?: string | null;
+    } | null;
+  } | null;
+};
+
+const modelPricingDetails = (model: ModelConfig) => {
+  const discovery = model.discovery as {
+    effective_pricing?: {
+      source?: string | null;
+      fields?: Partial<Record<PricingField, { source?: string | null }>> | null;
+      updated_at?: string | null;
+    } | null;
+    latest_observation?: PricingObservation | null;
+    prices?: PricingObservation['prices'];
+    price_sources?: PricingObservation['price_sources'];
+    catalog?: PricingObservation['catalog'];
+  } | undefined;
+  const observation: PricingObservation = discovery?.latest_observation || {
+    prices: discovery?.prices,
+    price_sources: discovery?.price_sources,
+    catalog: discovery?.catalog,
+  };
+  return {
+    effectiveSource: discovery?.effective_pricing?.source || 'untracked',
+    effectiveFields: discovery?.effective_pricing?.fields || {},
+    observation,
+  };
+};
+
+const formatPricingValue = (value: number | null | undefined) =>
+  value == null ? 'unknown' : `${value} / 1M`;
+
+const effectivePricingCell = (
+  model: ModelConfig,
+  pricing: ReturnType<typeof modelPricingDetails>,
+  field: PricingField,
+) => {
+  const values: Record<PricingField, number | null> = {
+    input_per_1m: model.prices.inputPer1M,
+    output_per_1m: model.prices.outputPer1M,
+    cached_per_1m: model.prices.cachedPer1M,
+    cache_write_per_1m: model.prices.cacheWritePer1M,
+    thinking_per_1m: model.prices.thinkingPer1M,
+  };
+  const direct = values[field];
+  if (direct != null) {
+    return {
+      value: direct,
+      source: pricing.effectiveFields[field]?.source || pricing.effectiveSource,
+      fallback: null as string | null,
+    };
+  }
+
+  const fallbackField =
+    field === 'cached_per_1m' || field === 'cache_write_per_1m'
+      ? 'input_per_1m'
+      : field === 'thinking_per_1m'
+        ? 'output_per_1m'
+        : null;
+  const fallbackValue = fallbackField ? values[fallbackField] : null;
+  if (fallbackField && fallbackValue != null) {
+    return {
+      value: fallbackValue,
+      source: pricing.effectiveFields[fallbackField]?.source || pricing.effectiveSource,
+      fallback:
+        fallbackField === 'input_per_1m'
+          ? 'input-rate fallback'
+          : 'output-rate fallback',
+    };
+  }
+
+  return {
+    value: null,
+    source: pricing.effectiveFields[field]?.source || pricing.effectiveSource,
+    fallback: null as string | null,
+  };
+};
+
+const formatPricingTimestamp = (value: string | null | undefined) => {
+  if (!value) return '—';
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+};
+
+type ProbeEvidenceEntry = {
+  status?: string;
+  verified_at?: string;
+  fresh_until?: string;
+  estimated_max_cost_usd?: number;
+  scope?: {
+    provider_id?: string;
+    account_id?: string;
+    model_id?: string;
+    transport?: string;
+  };
+};
+
+const modelProbeEvidence = (model: ModelConfig) =>
+  (model.discovery as {
+    probe_evidence?: Record<string, ProbeEvidenceEntry | ProbeEvidenceEntry[]> | null;
+  } | undefined)?.probe_evidence || {};
+
+const probeEvidenceEntries = (model: ModelConfig, key: string): ProbeEvidenceEntry[] => {
+  const evidence = modelProbeEvidence(model)[key];
+  if (!evidence) return [];
+  return Array.isArray(evidence) ? evidence : [evidence];
+};
+
+const probeEvidenceSummary = (model: ModelConfig, key: string, accountId: string) => {
+  const entries = probeEvidenceEntries(model, key).filter(
+    (entry) => !accountId || entry.scope?.account_id === accountId,
+  );
+  if (!entries.length) return '—';
+  return entries
+    .map((entry) => {
+      const verifiedAt = entry.verified_at ? new Date(entry.verified_at) : null;
+      const verifiedLabel =
+        verifiedAt && !Number.isNaN(verifiedAt.getTime())
+          ? verifiedAt.toLocaleString()
+          : entry.verified_at || 'unknown';
+      const freshUntil = entry.fresh_until ? new Date(entry.fresh_until) : null;
+      const freshness =
+        freshUntil && !Number.isNaN(freshUntil.getTime())
+          ? freshUntil.getTime() > Date.now()
+            ? 'fresh'
+            : 'expired'
+          : 'freshness unknown';
+      const cost =
+        typeof entry.estimated_max_cost_usd === 'number'
+          ? ` · ≤ USD ${entry.estimated_max_cost_usd.toFixed(6)}`
+          : '';
+      return `${entry.scope?.transport || 'unknown'}:${entry.status || '—'} · verified ${verifiedLabel} · ${freshness}${cost}`;
+    })
+    .join(' / ');
+};
+
+const modelProbeTransport = (model: ModelConfig, provider: Provider) => {
+  const discovery = model.discovery as {
+    transport?: { format?: string } | null;
+  } | undefined;
+  // Plugin binding is the actual runtime target transport. Discovered transport
+  // is descriptive metadata and must not make the probe target label lie.
+  if (provider.wireFormat === 'plugin') return provider.wirePlugin || 'plugin';
+  if (model.transportOverride) return model.transportOverride;
+  if (discovery?.transport?.format) return discovery.transport.format;
+  return provider.wireFormat;
+};
+
+const modelReasoningLevels = (model: ModelConfig) => {
+  const discovery = model.discovery as {
+    reasoning_capability?: { levels?: string[]; can_disable?: boolean } | null;
+    latest_observation?: {
+      reasoning_capability?: { levels?: string[]; can_disable?: boolean } | null;
+    } | null;
+  } | undefined;
+  const discovered =
+    discovery?.latest_observation?.reasoning_capability?.levels
+    || discovery?.reasoning_capability?.levels
+    || [];
+  const mapped = Object.keys(model.thinkingMap?.levels || {});
+  return Array.from(new Set([...discovered, ...mapped])).filter((level) => level && level !== 'off' && level !== 'default');
+};
+
+const formatDriftValue = (value: unknown) => {
+  if (value === undefined) return 'undefined';
+  const serialized = JSON.stringify(value, null, 2);
+  return serialized === undefined ? String(value) : serialized;
+};
+
+const modelCanProbeReasoningDisable = (model: ModelConfig, provider: Provider) => {
+  const transport = modelProbeTransport(model, provider);
+  return transport === 'openai' || transport === 'openai-responses';
+};
+
+
 interface ProvidersViewProps {
   providers: Provider[];
   models: ModelConfig[];
@@ -86,6 +294,34 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [discoverySearch, setDiscoverySearch] = useState('');
   const [providerSearch, setProviderSearch] = useState('');
   const [pingStatus, setPingStatus] = useState<Record<string, { ok: boolean; pingMs: number; error?: string }>>({});
+  const [lifecycleBusy, setLifecycleBusy] = useState<string | null>(null);
+  const [lifecycleNotice, setLifecycleNotice] = useState<string | null>(null);
+  const [probeStatus, setProbeStatus] = useState<Record<string, string>>({});
+  const [lifecycleSettings, setLifecycleSettings] = useState<{
+    reconciliation_interval_secs: number;
+    pricing_sync_interval_secs: number;
+    jitter_secs: number;
+    probe_freshness_secs: number;
+  } | null>(null);
+  const [savingLifecycleSettings, setSavingLifecycleSettings] = useState(false);
+  const [providerLifecycle, setProviderLifecycle] = useState<ProviderLifecycleStatus | null>(null);
+  const [reconciliationSelections, setReconciliationSelections] = useState<Record<string, string[]>>({});
+  const [probeAccounts, setProbeAccounts] = useState<Account[]>([]);
+  const [probeAccountByProvider, setProbeAccountByProvider] = useState<Record<string, string>>({});
+  const [probeTransportByModel, setProbeTransportByModel] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    Kinetix.modelLifecycleSettings()
+      .then(setLifecycleSettings)
+      .catch(() => setLifecycleSettings(null));
+  }, []);
+
+  useEffect(() => {
+    Kinetix.accounts()
+      .then(setProbeAccounts)
+      .catch(() => setProbeAccounts([]));
+  }, []);
+
 
   // New Provider Form State
   const [name, setName] = useState('');
@@ -166,6 +402,57 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     filteredProviders.find((p) => p.id === selectedProviderId) ||
     filteredProviders[0];
   const providerModels = models.filter((m) => m.providerId === activeProvider?.id);
+  const probeAccountsForProvider = (providerId: string) =>
+    probeAccounts.filter((account) => account.providerId === providerId);
+  const selectedProbeAccountId = (providerId: string) => {
+    const accounts = probeAccountsForProvider(providerId);
+    const selected = probeAccountByProvider[providerId];
+    if (selected && accounts.some((account) => account.id === selected)) return selected;
+    return accounts.find((account) => account.status === 'healthy')?.id || accounts[0]?.id || '';
+  };
+  const selectedProbeAccount = (providerId: string) => {
+    const accountId = selectedProbeAccountId(providerId);
+    return probeAccounts.find((account) => account.id === accountId);
+  };
+  const probeTransportInputValue = (model: ModelConfig) => {
+    if (Object.prototype.hasOwnProperty.call(probeTransportByModel, model.id)) {
+      return probeTransportByModel[model.id];
+    }
+    const provider = providers.find((candidate) => candidate.id === model.providerId);
+    return provider ? modelProbeTransport(model, provider) : '';
+  };
+  const selectedProbeTransport = (model: ModelConfig) => {
+    const provider = providers.find((candidate) => candidate.id === model.providerId);
+    const fallback = provider ? modelProbeTransport(model, provider) : '';
+    return probeTransportInputValue(model).trim() || fallback;
+  };
+  const probeStatusKey = (
+    model: ModelConfig,
+    capability: string,
+    value?: string,
+  ) =>
+    `${model.id}:${capability}${value ? `:${value}` : ''}:transport:${selectedProbeTransport(model)}`;
+
+  useEffect(() => {
+    if (!activeProvider) {
+      setDiscoveryResults(null);
+      setProviderLifecycle(null);
+      return;
+    }
+    let cancelled = false;
+    Kinetix.cachedDiscovery(activeProvider.id)
+      .then((cached) => {
+        if (cancelled) return;
+        setDiscoveryResults(cached.models);
+        setProviderLifecycle(cached.lifecycle);
+      })
+      .catch(() => {
+        if (!cancelled) setProviderLifecycle(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeProvider?.id]);
 
   // Fuzzy search over the discovered model list: case-insensitive, and every
   // whitespace-separated term must match as a subsequence of the model id.
@@ -202,6 +489,107 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         ...prev,
         [providerId]: { ok: false, pingMs: 0, error: e instanceof Error ? e.message : String(e) },
       }));
+    }
+  };
+
+  const handleReconcileProvider = async () => {
+    if (!activeProvider) return;
+    setLifecycleBusy('reconcile');
+    setLifecycleNotice(null);
+    try {
+      const result = await Kinetix.reconcileProvider(activeProvider.id);
+      setDiscoveryResults(result.models);
+      setProviderLifecycle(result.lifecycle);
+      setLifecycleNotice(`Reconciled ${result.models.length} upstream model observations.`);
+      onRefresh?.();
+    } catch (error) {
+      setLifecycleNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const handleSyncPricing = async () => {
+    if (!activeProvider) return;
+    setLifecycleBusy('pricing');
+    setLifecycleNotice(null);
+    try {
+      const result = await Kinetix.syncProviderPricing(activeProvider.id);
+      setProviderLifecycle(result.lifecycle);
+      setLifecycleNotice(
+        `Pricing sync updated ${result.updated.length}; preserved ${result.skipped_manual.length} manual models.`,
+      );
+      onRefresh?.();
+    } catch (error) {
+      setLifecycleNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const handleReconciliationAction = async (
+    modelId: string,
+    action: 'accept' | 'ignore' | 'pin',
+    fields: string[] = [],
+  ) => {
+    setLifecycleBusy(`${action}:${modelId}`);
+    try {
+      await Kinetix.reconcileModel(modelId, action, fields);
+      setLifecycleNotice(`Model drift ${action} completed.`);
+      setReconciliationSelections((current) => ({ ...current, [modelId]: [] }));
+      onRefresh?.();
+    } catch (error) {
+      setLifecycleNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const handleProbeModel = async (
+    model: ModelConfig,
+    capability: 'transport' | 'reasoning' | 'reasoning_disable' | 'tool_calling' | 'structured_output',
+    value?: string,
+  ) => {
+    const key = probeStatusKey(model, capability, value);
+    const accountId = selectedProbeAccountId(model.providerId);
+    const transport = selectedProbeTransport(model);
+    if (!accountId) {
+      setProbeStatus((prev) => ({ ...prev, [key]: 'select an account' }));
+      return;
+    }
+    setLifecycleBusy(`probe:${key}`);
+    try {
+      const result = await Kinetix.probeModel(
+        model.id,
+        capability,
+        value,
+        PROBE_MAX_COST_USD,
+        accountId,
+        transport,
+      );
+      setProbeStatus((prev) => ({ ...prev, [key]: result.status }));
+      onRefresh?.();
+    } catch (error) {
+      setProbeStatus((prev) => ({
+        ...prev,
+        [key]: error instanceof Error ? error.message : String(error),
+      }));
+    } finally {
+      setLifecycleBusy(null);
+    }
+  };
+
+  const handleSaveLifecycleSettings = async () => {
+    if (!lifecycleSettings) return;
+    setSavingLifecycleSettings(true);
+    try {
+      const saved = await Kinetix.updateModelLifecycleSettings(lifecycleSettings);
+      setLifecycleSettings(saved);
+      setLifecycleNotice('Lifecycle schedule saved.');
+    } catch (error) {
+      setLifecycleNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSavingLifecycleSettings(false);
     }
   };
 
@@ -836,6 +1224,25 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     <SketchButton
                       variant="secondary"
                       size="sm"
+                      disabled={lifecycleBusy === 'reconcile'}
+                      onClick={handleReconcileProvider}
+                      className="gap-1.5 font-heading"
+                    >
+                      <RefreshCw className={`w-4 h-4 ${lifecycleBusy === 'reconcile' ? 'animate-spin' : ''}`} />
+                      Reconcile
+                    </SketchButton>
+                    <SketchButton
+                      variant="secondary"
+                      size="sm"
+                      disabled={lifecycleBusy === 'pricing'}
+                      onClick={handleSyncPricing}
+                      className="gap-1.5 font-heading"
+                    >
+                      Sync Pricing
+                    </SketchButton>
+                    <SketchButton
+                      variant="secondary"
+                      size="sm"
                       onClick={() => openEditProvider(activeProvider)}
                       className="gap-1.5 font-heading"
                     >
@@ -880,6 +1287,90 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                         <Trash2 className="w-3.5 h-3.5" />
                         <span>Delete Provider</span>
                       </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="mb-5 grid grid-cols-1 xl:grid-cols-2 gap-3">
+                  <div className="p-3 bg-[var(--paper)] border border-[var(--ink)] rounded text-xs font-mono">
+                    <strong className="font-heading text-sm block mb-2">Model lifecycle</strong>
+                    <div className="grid grid-cols-2 gap-2">
+                      <label>
+                        Reconcile interval (sec)
+                        <input
+                          type="number"
+                          min={0}
+                          value={lifecycleSettings?.reconciliation_interval_secs ?? 0}
+                          onChange={(e) =>
+                            setLifecycleSettings((current) =>
+                              current
+                                ? { ...current, reconciliation_interval_secs: Number(e.target.value) }
+                                : current,
+                            )
+                          }
+                          className="mt-1 w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded"
+                        />
+                      </label>
+                      <label>
+                        Pricing sync interval (sec)
+                        <input
+                          type="number"
+                          min={0}
+                          value={lifecycleSettings?.pricing_sync_interval_secs ?? 0}
+                          onChange={(e) =>
+                            setLifecycleSettings((current) =>
+                              current
+                                ? { ...current, pricing_sync_interval_secs: Number(e.target.value) }
+                                : current,
+                            )
+                          }
+                          className="mt-1 w-full bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded"
+                        />
+                      </label>
+                    </div>
+                    <div className="mt-2 flex items-center justify-between gap-2">
+                      <span className="text-[var(--ink)]/60">0 disables scheduling; minimum enabled interval is 300s.</span>
+                      <button
+                        type="button"
+                        disabled={!lifecycleSettings || savingLifecycleSettings}
+                        onClick={handleSaveLifecycleSettings}
+                        className="px-2 py-1 border border-[var(--ink)] rounded font-heading font-bold hover:bg-[var(--erased)] disabled:opacity-50"
+                      >
+                        {savingLifecycleSettings ? 'Saving…' : 'Save schedule'}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="p-3 bg-[var(--paper)] border border-[var(--ink)] rounded text-xs font-mono">
+                    <strong className="font-heading text-sm block mb-1">Lifecycle policy</strong>
+                    <div>Metadata reconciliation observes drift; it never silently changes configured model fields.</div>
+                    <div>Pricing sync preserves operator-owned prices and only adopts known upstream/catalog price fields.</div>
+                    <div>Capability probes are explicit, bounded, scoped, and expire after the configured freshness window.</div>
+                    {providerLifecycle && (
+                      <div className="mt-2 pt-2 border-t border-[var(--ink)]/20 space-y-1">
+                        <div>
+                          Reconcile · attempt {providerLifecycle.reconciliation.last_attempt ? new Date(providerLifecycle.reconciliation.last_attempt).toLocaleString() : '—'}
+                          {' · '}success {providerLifecycle.reconciliation.last_success ? new Date(providerLifecycle.reconciliation.last_success).toLocaleString() : '—'}
+                        </div>
+                        {providerLifecycle.reconciliation.last_error && (
+                          <div className="text-[var(--danger-text)]">
+                            Last reconciliation failure: {providerLifecycle.reconciliation.last_error}
+                          </div>
+                        )}
+                        <div>
+                          Pricing · attempt {providerLifecycle.pricing_sync.last_attempt ? new Date(providerLifecycle.pricing_sync.last_attempt).toLocaleString() : '—'}
+                          {' · '}success {providerLifecycle.pricing_sync.last_success ? new Date(providerLifecycle.pricing_sync.last_success).toLocaleString() : '—'}
+                        </div>
+                        {providerLifecycle.pricing_sync.last_error && (
+                          <div className="text-[var(--danger-text)]">
+                            Last pricing failure: {providerLifecycle.pricing_sync.last_error}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {lifecycleNotice && (
+                      <div className="mt-2 pt-2 border-t border-[var(--ink)]/20 text-[var(--pen-blue)]">
+                        {lifecycleNotice}
+                      </div>
                     )}
                   </div>
                 </div>
@@ -1092,19 +1583,329 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                           </div>
                         </div>
 
+                        {modelReconciliation(m) && (
+                          <div className="mb-3 p-3 bg-[var(--erased-soft)] border border-[var(--ink)]/40 rounded text-xs font-mono">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <strong className="font-heading text-sm">Reconciliation</strong>
+                                <SketchBadge
+                                  variant={
+                                    modelReconciliation(m)?.status === 'changed' ||
+                                    modelReconciliation(m)?.status === 'missing' ||
+                                    modelReconciliation(m)?.status === 'deprecated'
+                                      ? 'yellow'
+                                      : modelReconciliation(m)?.status === 'unchanged' ||
+                                          modelReconciliation(m)?.status === 'accepted'
+                                        ? 'green'
+                                        : 'default'
+                                  }
+                                >
+                                  {modelReconciliation(m)?.status || 'unknown'}
+                                </SketchBadge>
+                                <span>
+                                  {modelReconciliation(m)?.diff?.length || 0} field(s) changed
+                                </span>
+                                {modelReconciliation(m)?.last_success_at && (
+                                  <span className="text-[var(--ink)]/60">
+                                    last success {new Date(modelReconciliation(m)!.last_success_at!).toLocaleString()}
+                                  </span>
+                                )}
+                              </div>
+                              {!!modelReconciliation(m)?.diff?.length && (
+                                <div className="flex flex-wrap gap-1">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setReconciliationSelections((current) => ({
+                                        ...current,
+                                        [m.id]: modelReconciliation(m)?.diff?.map((diff) => diff.field || '').filter(Boolean) || [],
+                                      }))
+                                    }
+                                    className="px-2 py-1 border border-[var(--ink)] rounded"
+                                  >
+                                    Select all
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `accept:${m.id}`
+                                      || !(reconciliationSelections[m.id]?.length)
+                                    }
+                                    onClick={() =>
+                                      handleReconciliationAction(
+                                        m.id,
+                                        'accept',
+                                        reconciliationSelections[m.id] || [],
+                                      )
+                                    }
+                                    className="px-2 py-1 border border-[var(--pen-green)] text-[var(--pen-green)] rounded font-bold disabled:opacity-40"
+                                  >
+                                    Accept selected
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={lifecycleBusy === `ignore:${m.id}`}
+                                    onClick={() => handleReconciliationAction(m.id, 'ignore')}
+                                    className="px-2 py-1 border border-[var(--ink)] rounded font-bold"
+                                  >
+                                    Ignore
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `pin:${m.id}`
+                                      || !(reconciliationSelections[m.id]?.length)
+                                    }
+                                    onClick={() =>
+                                      handleReconciliationAction(
+                                        m.id,
+                                        'pin',
+                                        reconciliationSelections[m.id] || [],
+                                      )
+                                    }
+                                    className="px-2 py-1 border border-[var(--pen-blue)] text-[var(--pen-blue)] rounded font-bold disabled:opacity-40"
+                                  >
+                                    Pin selected
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                            {modelReconciliation(m)?.deprecation && (
+                              <div className="mt-2 text-[var(--marker-red)]">
+                                deprecated via {modelReconciliation(m)?.deprecation?.source || 'unknown source'}
+                                {modelReconciliation(m)?.deprecation?.effective_date !== undefined
+                                  ? ` · effective ${formatDriftValue(modelReconciliation(m)?.deprecation?.effective_date)}`
+                                  : ''}
+                                {modelReconciliation(m)?.deprecation?.end_date !== undefined
+                                  ? ` · end ${formatDriftValue(modelReconciliation(m)?.deprecation?.end_date)}`
+                                  : ''}
+                                {modelReconciliation(m)?.deprecation?.replacement !== undefined
+                                  ? ` · replacement ${formatDriftValue(modelReconciliation(m)?.deprecation?.replacement)}`
+                                  : ''}
+                              </div>
+                            )}
+                            {!!modelReconciliation(m)?.diff?.length && (
+                              <div className="mt-3 space-y-2">
+                                {modelReconciliation(m)?.diff?.map((diff) => {
+                                  const selected = reconciliationSelections[m.id]?.includes(diff.field || '') || false;
+                                  return (
+                                    <label
+                                      key={diff.field}
+                                      className="block p-2 bg-[var(--surface)] border border-[var(--ink)]/30 rounded cursor-pointer"
+                                    >
+                                      <div className="flex items-center gap-2 font-bold">
+                                        <input
+                                          type="checkbox"
+                                          checked={selected}
+                                          onChange={() =>
+                                            setReconciliationSelections((current) => {
+                                              const existing = current[m.id] || [];
+                                              const field = diff.field || '';
+                                              const next = existing.includes(field)
+                                                ? existing.filter((candidate) => candidate !== field)
+                                                : [...existing, field];
+                                              return { ...current, [m.id]: next };
+                                            })
+                                          }
+                                        />
+                                        <span>Δ {diff.field}</span>
+                                      </div>
+                                      <div className="mt-1 grid grid-cols-1 lg:grid-cols-3 gap-2 text-[var(--ink)]/70">
+                                        <div>
+                                          <strong>Configured</strong>
+                                          <pre className="whitespace-pre-wrap break-all">{formatDriftValue(diff.configured)}</pre>
+                                        </div>
+                                        <div>
+                                          <strong>Observed</strong>
+                                          <pre className="whitespace-pre-wrap break-all">{formatDriftValue(diff.observed)}</pre>
+                                        </div>
+                                        <div>
+                                          <strong>Source</strong>
+                                          <pre className="whitespace-pre-wrap break-all">{formatDriftValue(diff.source)}</pre>
+                                        </div>
+                                      </div>
+                                    </label>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        <div className="mb-3 p-3 bg-[var(--paper)] border border-[var(--ink)]/40 rounded text-xs font-mono">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <strong className="font-heading text-sm">Verified capability probes</strong>
+                              <span className="ml-2 text-[var(--ink)]/60">
+                                transport {probeEvidenceSummary(m, 'transport', selectedProbeAccountId(m.providerId))} ·
+                                reasoning efforts {
+                                  Object.keys(modelProbeEvidence(m))
+                                    .filter((key) => key.startsWith('reasoning_effort_'))
+                                    .map((key) =>
+                                      `${key.replace('reasoning_effort_', '')}:${probeEvidenceSummary(
+                                        m,
+                                        key,
+                                        selectedProbeAccountId(m.providerId),
+                                      )}`,
+                                    )
+                                    .join(', ') || '—'
+                                } ·
+                                tools {probeEvidenceSummary(m, 'tool_calling', selectedProbeAccountId(m.providerId))} ·
+                                structured {probeEvidenceSummary(m, 'structured_output', selectedProbeAccountId(m.providerId))}
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2 text-[var(--ink)]/70">
+                              <label className="flex items-center gap-1">
+                                Probe account
+                                <select
+                                  value={selectedProbeAccountId(m.providerId)}
+                                  onChange={(event) =>
+                                    setProbeAccountByProvider((current) => ({
+                                      ...current,
+                                      [m.providerId]: event.target.value,
+                                    }))
+                                  }
+                                  className="bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded"
+                                >
+                                  {probeAccountsForProvider(m.providerId).map((account) => (
+                                    <option key={account.id} value={account.id}>
+                                      {account.label} · {account.status}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                              <label className="flex items-center gap-1">
+                                Probe transport
+                                <input
+                                  type="text"
+                                  value={probeTransportInputValue(m)}
+                                  onChange={(event) =>
+                                    setProbeTransportByModel((current) => ({
+                                      ...current,
+                                      [m.id]: event.target.value,
+                                    }))
+                                  }
+                                  placeholder={modelProbeTransport(m, activeProvider)}
+                                  className="w-44 bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded font-mono"
+                                />
+                              </label>
+                              <span>
+                                Target: {activeProvider.name} / {selectedProbeAccount(m.providerId)?.label || 'no account'} / {m.upstreamModelId} / {selectedProbeTransport(m)}
+                              </span>
+                              <span>
+                                Safety: {PROBE_MAX_REQUESTS} request · max cost ${PROBE_MAX_COST_USD.toFixed(2)}
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap gap-1">
+                              {(['transport', 'tool_calling', 'structured_output'] as const).map((capability) => {
+                                const key = probeStatusKey(m, capability);
+                                return (
+                                  <button
+                                    key={key}
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `probe:${key}`
+                                      || !selectedProbeAccountId(m.providerId)
+                                    }
+                                    onClick={() => handleProbeModel(m, capability)}
+                                    className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
+                                  >
+                                    Probe {capability.replace('_', ' ')}
+                                    {probeStatus[key] ? ` · ${probeStatus[key]}` : ''}
+                                  </button>
+                                );
+                              })}
+                              {modelReasoningLevels(m).map((level) => {
+                                const key = probeStatusKey(m, 'reasoning', level);
+                                return (
+                                  <button
+                                    key={key}
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `probe:${key}`
+                                      || !selectedProbeAccountId(m.providerId)
+                                    }
+                                    onClick={() => handleProbeModel(m, 'reasoning', level)}
+                                    className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
+                                  >
+                                    Probe reasoning {level}
+                                    {probeStatus[key] ? ` · ${probeStatus[key]}` : ''}
+                                  </button>
+                                );
+                              })}
+                              {modelCanProbeReasoningDisable(m, activeProvider) && (() => {
+                                const key = probeStatusKey(m, 'reasoning_disable', 'off');
+                                return (
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      lifecycleBusy === `probe:${key}`
+                                      || !selectedProbeAccountId(m.providerId)
+                                    }
+                                    onClick={() => handleProbeModel(m, 'reasoning_disable', 'off')}
+                                    className="px-2 py-1 border border-[var(--ink)] rounded hover:bg-[var(--erased)]"
+                                  >
+                                    Probe reasoning off
+                                    {probeStatus[key] ? ` · ${probeStatus[key]}` : ''}
+                                  </button>
+                                );
+                              })()}
+                            </div>
+                          </div>
+                        </div>
+
                         {/* Prices & Parameter policies */}
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs font-mono">
                           <div className="bg-[var(--paper)] p-2 border border-[var(--ink)] rounded">
-                            <strong className="font-heading text-sm text-[var(--ink)] block mb-1">
-                              💵 Token Pricing (Admin Defined)
-                            </strong>
-                            <div>Input: {m.prices.inputPer1M == null ? 'unknown' : `${m.prices.inputPer1M} / 1M`}</div>
-                            <div>Output: {m.prices.outputPer1M == null ? 'unknown' : `${m.prices.outputPer1M} / 1M`}</div>
-                            <div>Cache read: {m.prices.cachedPer1M == null ? 'unknown' : `${m.prices.cachedPer1M} / 1M`}</div>
-                            <div>Cache write: {m.prices.cacheWritePer1M == null ? 'unknown' : `${m.prices.cacheWritePer1M} / 1M`}</div>
-                            {m.capabilities.reasoning && (
-                              <div>Thinking: {m.prices.thinkingPer1M == null ? 'output-rate fallback' : `${m.prices.thinkingPer1M} / 1M`}</div>
-                            )}
+                            {(() => {
+                              const pricing = modelPricingDetails(m);
+                              const rows: Array<{ field: PricingField; label: string }> = [
+                                { field: 'input_per_1m', label: 'Input' },
+                                { field: 'output_per_1m', label: 'Output' },
+                                { field: 'cached_per_1m', label: 'Cache read' },
+                                { field: 'cache_write_per_1m', label: 'Cache write' },
+                                { field: 'thinking_per_1m', label: 'Thinking' },
+                              ];
+                              const sourceState = pricing.observation.catalog?.source_state;
+                              return (
+                                <>
+                                  <strong className="font-heading text-sm text-[var(--ink)] block mb-2">
+                                    💵 Token Pricing
+                                  </strong>
+                                  <div className="grid grid-cols-[minmax(5rem,0.8fr)_minmax(0,1fr)_minmax(0,1fr)] gap-x-2 gap-y-1">
+                                    <div className="font-bold">Field</div>
+                                    <div className="font-bold">Effective</div>
+                                    <div className="font-bold">Latest observed</div>
+                                    {rows.map((row) => {
+                                      const effective = effectivePricingCell(m, pricing, row.field);
+                                      return (
+                                        <React.Fragment key={row.field}>
+                                          <div>{row.label}</div>
+                                          <div>
+                                            {formatPricingValue(effective.value)}
+                                            {effective.fallback ? ` · ${effective.fallback}` : ''}
+                                            <span className="block text-[var(--ink)]/55">
+                                              {effective.source}
+                                            </span>
+                                          </div>
+                                          <div>
+                                            {formatPricingValue(pricing.observation.prices?.[row.field])}
+                                            <span className="block text-[var(--ink)]/55">
+                                              {pricing.observation.price_sources?.[row.field] || 'untracked'}
+                                            </span>
+                                          </div>
+                                        </React.Fragment>
+                                      );
+                                    })}
+                                  </div>
+                                  <div className="mt-2 pt-2 border-t border-[var(--ink)]/20 text-[var(--ink)]/70">
+                                    Catalog: {sourceState?.freshness || 'unknown'}
+                                    {' · '}retrieved {formatPricingTimestamp(sourceState?.retrieved_at)}
+                                    {sourceState?.source ? ` · ${sourceState.source}` : ''}
+                                  </div>
+                                </>
+                              );
+                            })()}
                           </div>
 
                           <div className="bg-[var(--paper)] p-2 border border-[var(--ink)] rounded">

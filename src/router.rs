@@ -50,6 +50,10 @@ pub fn build(state: AppState) -> Router {
             "/settings/public-base-url",
             get(admin::get_public_base_url).put(admin::update_public_base_url),
         )
+        .route(
+            "/settings/model-lifecycle",
+            get(admin::get_model_lifecycle_settings).put(admin::update_model_lifecycle_settings),
+        )
         .route("/overview", get(admin::overview))
         .route("/test-stream", post(admin::test_stream))
         // keys
@@ -69,7 +73,15 @@ pub fn build(state: AppState) -> Router {
                 .put(admin::update_provider)
                 .delete(admin::delete_provider),
         )
-        .route("/providers/{id}/discover", post(admin::discover_models))
+        .route(
+            "/providers/{id}/discover",
+            get(admin::cached_model_discovery).post(admin::discover_models),
+        )
+        .route("/providers/{id}/reconcile", post(admin::reconcile_models))
+        .route(
+            "/providers/{id}/pricing/sync",
+            post(admin::sync_provider_pricing),
+        )
         .route("/providers/{id}/test", post(admin::test_provider))
         .route(
             "/providers/{id}/credential-enrollment/start",
@@ -82,6 +94,11 @@ pub fn build(state: AppState) -> Router {
             "/models/{id}",
             put(admin::update_model).delete(admin::delete_model),
         )
+        .route(
+            "/models/{id}/reconciliation",
+            put(admin::update_model_reconciliation),
+        )
+        .route("/models/{id}/probe", post(admin::probe_model_capability))
         // accounts
         .route(
             "/accounts",

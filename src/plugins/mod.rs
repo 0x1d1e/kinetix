@@ -19,5 +19,5 @@ pub use manager::PluginManager;
 pub use manifest::{HostPolicy, ValidatedManifest};
 pub use types::{
     Capability, CircuitState, CredentialMode, Integration, Limits, Manifest, Permissions,
-    PluginRef, PluginStatus, Provided, MANIFEST_VERSION, PLUGIN_API_MAJOR,
+    PluginRef, PluginStatus, PricingScope, Provided, MANIFEST_VERSION, PLUGIN_API_MAJOR,
 };

@@ -118,7 +118,73 @@ export interface DiscoveredModel {
       metadata?: unknown;
     } | null;
   } | null;
+  reconciliation?: ModelReconciliation | null;
   already_imported: boolean;
+}
+
+export interface ReconciliationDiff {
+  field: string;
+  configured: unknown;
+  observed: unknown;
+  source?: unknown;
+}
+
+export interface ModelReconciliation {
+  status: 'new' | 'unchanged' | 'changed' | 'ignored' | 'missing' | 'deprecated' | 'accepted' | string;
+  checked_at?: string | null;
+  last_success_at?: string | null;
+  diff?: ReconciliationDiff[];
+  pinned_fields?: string[];
+}
+
+export interface ModelLifecycleSettings {
+  reconciliation_interval_secs: number;
+  pricing_sync_interval_secs: number;
+  jitter_secs: number;
+  probe_freshness_secs: number;
+}
+
+export interface LifecycleLaneStatus {
+  last_attempt?: string | null;
+  last_success?: string | null;
+  last_failure?: string | null;
+  last_error?: string | null;
+}
+
+export interface ProviderLifecycleStatus {
+  reconciliation: LifecycleLaneStatus;
+  pricing_sync: LifecycleLaneStatus;
+}
+
+export interface CachedDiscoveryResponse {
+  models: DiscoveredModel[];
+  disappeared: unknown[];
+  lifecycle: ProviderLifecycleStatus;
+}
+
+export interface CapabilityProbeResult {
+  status: 'supported' | 'unsupported' | 'inconclusive';
+  reason?: string;
+  transport?: string;
+  scope?: {
+    provider_id: string;
+    account_id: string;
+    model_id: string;
+    transport: string;
+  };
+  evidence?: {
+    status: string;
+    verified_at?: string;
+    fresh_until?: string;
+    estimated_max_cost_usd?: number;
+    detail?: string | null;
+    scope?: {
+      provider_id: string;
+      account_id: string;
+      model_id: string;
+      transport: string;
+    };
+  };
 }
 
 export interface TestResult {
@@ -374,6 +440,11 @@ export const Kinetix = {
       { public_base_url },
     ),
 
+  modelLifecycleSettings: () =>
+    api.get<ModelLifecycleSettings>('/admin/api/settings/model-lifecycle'),
+  updateModelLifecycleSettings: (body: Partial<ModelLifecycleSettings>) =>
+    api.put<ModelLifecycleSettings & { ok: boolean }>('/admin/api/settings/model-lifecycle', body),
+
   // --- usage exports -------------------------------------------------------
   async exports(): Promise<{ dir: string; retention_days: number; files: ExportFile[]; days: UsageDay[] }> {
     return api.get('/admin/api/exports');
@@ -414,10 +485,22 @@ export const Kinetix = {
       '/admin/api/validate/provider',
       body,
     ),
+  cachedDiscovery: (providerId: string) =>
+    api.get<CachedDiscoveryResponse>(`/admin/api/providers/${providerId}/discover`),
   async discover(providerId: string): Promise<DiscoveredModel[]> {
     const r = await api.post<{ models: DiscoveredModel[] }>(`/admin/api/providers/${providerId}/discover`);
     return r.models;
   },
+  reconcileProvider: (providerId: string) =>
+    api.post<{ models: DiscoveredModel[]; disappeared: unknown[]; lifecycle: ProviderLifecycleStatus }>(
+      `/admin/api/providers/${providerId}/reconcile`,
+      {},
+    ),
+  syncProviderPricing: (providerId: string) =>
+    api.post<{ ok: boolean; updated: string[]; skipped_manual: string[]; lifecycle: ProviderLifecycleStatus }>(
+      `/admin/api/providers/${providerId}/pricing/sync`,
+      {},
+    ),
   test: (providerId: string, model: string) =>
     api.post<TestResult>(`/admin/api/providers/${providerId}/test`, { model }),
 
@@ -429,6 +512,23 @@ export const Kinetix = {
   createModel: (providerId: string, body: Record<string, unknown>) =>
     api.post(`/admin/api/providers/${providerId}/models`, body),
   updateModel: (id: string, body: Record<string, unknown>) => api.put(`/admin/api/models/${id}`, body),
+  reconcileModel: (id: string, action: 'accept' | 'ignore' | 'pin', fields: string[] = []) =>
+    api.put<{ ok: boolean }>(`/admin/api/models/${id}/reconciliation`, { action, fields }),
+  probeModel: (
+    id: string,
+    capability: string,
+    value?: unknown,
+    max_cost_usd?: number,
+    account_id?: string,
+    transport?: string,
+  ) =>
+    api.post<CapabilityProbeResult>(`/admin/api/models/${id}/probe`, {
+      capability,
+      ...(value === undefined ? {} : { value }),
+      ...(max_cost_usd === undefined ? {} : { max_cost_usd }),
+      ...(account_id === undefined ? {} : { account_id }),
+      ...(transport === undefined ? {} : { transport }),
+    }),
   deleteModel: (id: string) => api.del(`/admin/api/models/${id}`),
 
   // --- accounts ------------------------------------------------------------

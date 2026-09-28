@@ -41,6 +41,9 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         .run(pool)
         .await
         .context("running migrations")?;
+    enforce_provider_pricing_scopes(pool)
+        .await
+        .context("enforcing provider pricing scopes after migrations")?;
     Ok(())
 }
 
@@ -321,6 +324,7 @@ pub struct ProviderRow {
     pub source_plugin_id: Option<String>,
     #[serde(default)]
     pub source_integration_id: Option<String>,
+    pub pricing_scope: String,
 }
 
 impl ProviderRow {
@@ -429,16 +433,45 @@ pub struct NewProvider<'a> {
     pub source_integration_id: Option<&'a str>,
 }
 
+pub fn conservative_provider_pricing_scope(
+    credential_mode: &str,
+    source_plugin_id: Option<&str>,
+    source_integration_id: Option<&str>,
+    wire_plugin: &str,
+    credential_plugin: &str,
+    model_source_plugin: &str,
+) -> &'static str {
+    if source_plugin_id.is_some()
+        || source_integration_id.is_some()
+        || credential_mode != "manual"
+        || !wire_plugin.is_empty()
+        || !credential_plugin.is_empty()
+        || !model_source_plugin.is_empty()
+    {
+        "integration"
+    } else {
+        "direct_api"
+    }
+}
+
 pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String> {
     let id = format!("prov_{}", uuid::Uuid::new_v4().simple());
+    let pricing_scope = conservative_provider_pricing_scope(
+        p.credential_mode,
+        p.source_plugin_id,
+        p.source_integration_id,
+        p.wire_plugin,
+        p.credential_plugin,
+        p.model_source_plugin,
+    );
     sqlx::query(
         "INSERT INTO providers
          (id, name, base_url, wire_format, auth_scheme, custom_header_name, custom_param_name,
           extra_headers, timeout_ms, capability_mode, models_path, rate_limit_rules, enabled,
           follow_redirects, credential_hosts, allow_insecure_tls, created_at,
           wire_plugin, credential_plugin, model_source_plugin, credential_mode,
-          source_plugin_id, source_integration_id)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?)",
+          source_plugin_id, source_integration_id, pricing_scope)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(p.name)
@@ -462,6 +495,7 @@ pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String>
     .bind(p.credential_mode)
     .bind(p.source_plugin_id)
     .bind(p.source_integration_id)
+    .bind(pricing_scope)
     .execute(pool)
     .await?;
     Ok(id)
@@ -479,50 +513,72 @@ pub fn auth_scheme_str(s: AuthScheme) -> &'static str {
 pub async fn update_provider(
     pool: &Pool,
     id: &str,
-    name: &str,
-    base_url: &str,
-    wire_format: WireFormat,
-    auth_scheme: AuthScheme,
-    custom_header_name: Option<&str>,
-    custom_param_name: Option<&str>,
-    extra_headers: Value,
-    timeout_ms: i64,
-    capability_mode: &str,
-    models_path: Option<&str>,
-    rate_limit_rules: Value,
-    follow_redirects: bool,
-    credential_hosts: &str,
-    allow_insecure_tls: bool,
-    wire_plugin: &str,
-    credential_plugin: &str,
-    model_source_plugin: &str,
+    p: &NewProvider<'_>,
+    explicit_pricing_scope: Option<&str>,
 ) -> Result<()> {
+    let existing = get_provider(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?;
+    let drivers_changed = existing.credential_mode != p.credential_mode
+        || existing.source_plugin_id.as_deref() != p.source_plugin_id
+        || existing.source_integration_id.as_deref() != p.source_integration_id
+        || existing.wire_plugin != p.wire_plugin
+        || existing.credential_plugin != p.credential_plugin
+        || existing.model_source_plugin != p.model_source_plugin;
+    let catalog_identity_changed = existing.base_url != p.base_url || drivers_changed;
+    let conservative = conservative_provider_pricing_scope(
+        p.credential_mode,
+        p.source_plugin_id,
+        p.source_integration_id,
+        p.wire_plugin,
+        p.credential_plugin,
+        p.model_source_plugin,
+    );
+    let pricing_scope = match explicit_pricing_scope {
+        Some(scope @ ("direct_api" | "integration")) => scope.to_string(),
+        Some(scope) => anyhow::bail!("invalid provider pricing scope '{scope}'"),
+        None if !drivers_changed => existing.pricing_scope.clone(),
+        None => conservative.to_string(),
+    };
+
+    let _guards = provider_price_guards(pool, id).await?;
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE providers SET name=?, base_url=?, wire_format=?, auth_scheme=?, custom_header_name=?,
          custom_param_name=?, extra_headers=?, timeout_ms=?, capability_mode=?, models_path=?,
          rate_limit_rules=?, follow_redirects=?, credential_hosts=?, allow_insecure_tls=?,
-         wire_plugin=?, credential_plugin=?, model_source_plugin=? WHERE id=?",
+         wire_plugin=?, credential_plugin=?, model_source_plugin=?, credential_mode=?,
+         source_plugin_id=?, source_integration_id=?, pricing_scope=? WHERE id=?",
     )
-    .bind(name)
-    .bind(base_url)
-    .bind(wire_format.as_str())
-    .bind(auth_scheme_str(auth_scheme))
-    .bind(custom_header_name)
-    .bind(custom_param_name)
-    .bind(extra_headers.to_string())
-    .bind(timeout_ms)
-    .bind(capability_mode)
-    .bind(models_path)
-    .bind(rate_limit_rules.to_string())
-    .bind(follow_redirects as i64)
-    .bind(credential_hosts)
-    .bind(allow_insecure_tls as i64)
-    .bind(wire_plugin)
-    .bind(credential_plugin)
-    .bind(model_source_plugin)
+    .bind(p.name)
+    .bind(p.base_url)
+    .bind(p.wire_format.as_str())
+    .bind(auth_scheme_str(p.auth_scheme))
+    .bind(p.custom_header_name)
+    .bind(p.custom_param_name)
+    .bind(p.extra_headers.to_string())
+    .bind(p.timeout_ms)
+    .bind(p.capability_mode)
+    .bind(p.models_path)
+    .bind(p.rate_limit_rules.to_string())
+    .bind(p.follow_redirects as i64)
+    .bind(p.credential_hosts)
+    .bind(p.allow_insecure_tls as i64)
+    .bind(p.wire_plugin)
+    .bind(p.credential_plugin)
+    .bind(p.model_source_plugin)
+    .bind(p.credential_mode)
+    .bind(p.source_plugin_id)
+    .bind(p.source_integration_id)
+    .bind(&pricing_scope)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+
+    if pricing_scope == "integration" || catalog_identity_changed {
+        revoke_external_catalog_effective_pricing_in_transaction(&mut tx, id).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -533,15 +589,247 @@ pub async fn update_provider_credential_semantics(
     source_plugin_id: Option<&str>,
     source_integration_id: Option<&str>,
 ) -> Result<()> {
+    update_provider_credential_semantics_with_scope(
+        pool,
+        id,
+        credential_mode,
+        source_plugin_id,
+        source_integration_id,
+        None,
+    )
+    .await
+}
+
+pub async fn update_provider_credential_semantics_with_scope(
+    pool: &Pool,
+    id: &str,
+    credential_mode: &str,
+    source_plugin_id: Option<&str>,
+    source_integration_id: Option<&str>,
+    explicit_pricing_scope: Option<&str>,
+) -> Result<()> {
+    let existing = get_provider(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?;
+    let drivers_changed = existing.credential_mode != credential_mode
+        || existing.source_plugin_id.as_deref() != source_plugin_id
+        || existing.source_integration_id.as_deref() != source_integration_id;
+    let conservative = conservative_provider_pricing_scope(
+        credential_mode,
+        source_plugin_id,
+        source_integration_id,
+        &existing.wire_plugin,
+        &existing.credential_plugin,
+        &existing.model_source_plugin,
+    );
+    let pricing_scope = match explicit_pricing_scope {
+        Some(scope @ ("direct_api" | "integration")) => scope.to_string(),
+        Some(scope) => anyhow::bail!("invalid provider pricing scope '{scope}'"),
+        None if !drivers_changed => existing.pricing_scope.clone(),
+        None => conservative.to_string(),
+    };
+
+    let _guards = provider_price_guards(pool, id).await?;
+    let mut tx = pool.begin().await?;
     sqlx::query(
-        "UPDATE providers SET credential_mode=?, source_plugin_id=?, source_integration_id=? WHERE id=?",
+        "UPDATE providers
+         SET credential_mode=?, source_plugin_id=?, source_integration_id=?, pricing_scope=?
+         WHERE id=?",
     )
     .bind(credential_mode)
     .bind(source_plugin_id)
     .bind(source_integration_id)
+    .bind(&pricing_scope)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    if pricing_scope == "integration" || drivers_changed {
+        revoke_external_catalog_effective_pricing_in_transaction(&mut tx, id).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn update_provider_pricing_scope(
+    pool: &Pool,
+    id: &str,
+    pricing_scope: &str,
+) -> Result<()> {
+    if !matches!(pricing_scope, "integration" | "direct_api") {
+        anyhow::bail!("invalid provider pricing scope '{pricing_scope}'");
+    }
+    let _guards = provider_price_guards(pool, id).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE providers SET pricing_scope=? WHERE id=?")
+        .bind(pricing_scope)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    if pricing_scope == "integration" {
+        revoke_external_catalog_effective_pricing_in_transaction(&mut tx, id).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn provider_pricing_scope(pool: &Pool, id: &str) -> Result<String> {
+    Ok(
+        sqlx::query_scalar::<_, String>("SELECT pricing_scope FROM providers WHERE id=?")
+            .bind(id)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+async fn provider_price_guards(
+    pool: &Pool,
+    provider_id: &str,
+) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+    let model_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM models WHERE provider_id=? ORDER BY id")
+            .bind(provider_id)
+            .fetch_all(pool)
+            .await?;
+    let mut guards = Vec::with_capacity(model_ids.len());
+    for model_id in model_ids {
+        guards.push(price_version_lock(&model_id).lock_owned().await);
+    }
+    Ok(guards)
+}
+
+fn clear_price_field(prices: &mut Prices, field: &str) {
+    match field {
+        "input_per_1m" => prices.input_per_1m = None,
+        "output_per_1m" => prices.output_per_1m = None,
+        "cached_per_1m" => prices.cached_per_1m = None,
+        "cache_write_per_1m" => prices.cache_write_per_1m = None,
+        "thinking_per_1m" => prices.thinking_per_1m = None,
+        _ => {}
+    }
+}
+
+fn effective_source_after_revocation(
+    fields: &serde_json::Map<String, Value>,
+    previous_source: &str,
+    prices: &Prices,
+) -> String {
+    let sources: std::collections::BTreeSet<&str> = fields
+        .values()
+        .filter_map(|field| field.get("source").and_then(Value::as_str))
+        .collect();
+    match sources.len() {
+        1 => sources
+            .into_iter()
+            .next()
+            .unwrap_or("untracked")
+            .to_string(),
+        n if n > 1 => "mixed".to_string(),
+        _ if prices.is_configured()
+            && !crate::model_catalog::is_external_catalog_price_source(previous_source) =>
+        {
+            previous_source.to_string()
+        }
+        _ => "untracked".to_string(),
+    }
+}
+
+async fn revoke_external_catalog_effective_pricing_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    provider_id: &str,
+) -> Result<()> {
+    let rows =
+        sqlx::query("SELECT id, prices, discovery FROM models WHERE provider_id=? ORDER BY id")
+            .bind(provider_id)
+            .fetch_all(&mut **tx)
+            .await?;
+
+    for row in rows {
+        let model_id: String = row.try_get("id")?;
+        let mut prices: Prices =
+            serde_json::from_str(&row.try_get::<String, _>("prices")?).unwrap_or_default();
+        let discovery: Value = serde_json::from_str(&row.try_get::<String, _>("discovery")?)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let effective = discovery
+            .get("effective_pricing")
+            .and_then(Value::as_object);
+        let previous_source = effective
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str)
+            .unwrap_or("untracked");
+        let mut fields = effective
+            .and_then(|value| value.get("fields"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+
+        let external_catalog_fields: Vec<String> = fields
+            .iter()
+            .filter_map(|(field, provenance)| {
+                provenance
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .is_some_and(crate::model_catalog::is_external_catalog_price_source)
+                    .then_some(field.clone())
+            })
+            .collect();
+        let legacy_external_catalog_snapshot = external_catalog_fields.is_empty()
+            && crate::model_catalog::is_external_catalog_price_source(previous_source);
+        if external_catalog_fields.is_empty() && !legacy_external_catalog_snapshot {
+            continue;
+        }
+
+        if legacy_external_catalog_snapshot {
+            for field in [
+                "input_per_1m",
+                "output_per_1m",
+                "cached_per_1m",
+                "cache_write_per_1m",
+                "thinking_per_1m",
+            ] {
+                clear_price_field(&mut prices, field);
+            }
+            fields.clear();
+        } else {
+            for field in external_catalog_fields {
+                clear_price_field(&mut prices, &field);
+                fields.remove(&field);
+            }
+        }
+
+        let mut metadata = effective
+            .and_then(|value| value.get("metadata"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !metadata.is_object() {
+            metadata = serde_json::json!({});
+        }
+        metadata["fields"] = Value::Object(fields.clone());
+        if !fields.values().any(|field| {
+            field
+                .get("source")
+                .and_then(Value::as_str)
+                .is_some_and(crate::model_catalog::is_external_catalog_price_source)
+        }) {
+            if let Some(object) = metadata.as_object_mut() {
+                object.remove("catalog_source_state");
+            }
+        }
+        let source = effective_source_after_revocation(&fields, previous_source, &prices);
+        apply_effective_model_pricing_transaction(tx, &model_id, &prices, &source, &metadata)
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn enforce_provider_pricing_scopes(pool: &Pool) -> Result<()> {
+    let provider_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM providers WHERE pricing_scope='integration' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    for provider_id in provider_ids {
+        update_provider_pricing_scope(pool, &provider_id, "integration").await?;
+    }
     Ok(())
 }
 
@@ -794,6 +1082,22 @@ impl ModelRow {
     pub fn prices(&self) -> Prices {
         serde_json::from_str(&self.prices).unwrap_or_default()
     }
+    pub fn price_provenance(&self) -> (String, Value) {
+        let discovery = serde_json::from_str::<Value>(&self.discovery)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let effective = discovery.get("effective_pricing");
+        let source = effective
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("operator")
+            .to_string();
+        let metadata = effective
+            .and_then(|value| value.get("metadata"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        (source, metadata)
+    }
     pub fn params(&self) -> HashMap<String, ParamSpec> {
         serde_json::from_str(&self.parameters).unwrap_or_default()
     }
@@ -860,7 +1164,46 @@ pub struct NewModel<'a> {
     pub discovery: Value,
 }
 
-pub async fn insert_model(pool: &Pool, m: &NewModel<'_>) -> Result<String> {
+pub struct ModelPricingMutation<'a> {
+    pub prices: &'a Prices,
+    pub source: &'a str,
+    pub metadata: &'a Value,
+}
+
+pub struct ProviderPricingMutation<'a> {
+    pub model_id: &'a str,
+    pub latest_observation: &'a Value,
+    pub pricing: Option<ModelPricingMutation<'a>>,
+}
+
+pub struct ModelOperatorMutation<'a> {
+    pub id: &'a str,
+    pub display_name: &'a str,
+    pub enabled: bool,
+    pub context_window: Option<i64>,
+    pub max_output_tokens: Option<i64>,
+    pub capabilities: &'a Value,
+    pub parameters: &'a Value,
+    pub thinking_map: &'a Value,
+    pub extra_request: &'a Value,
+    pub update_transport: bool,
+    pub transport: Option<&'a str>,
+    pub discovery_patch: &'a Value,
+    pub pricing: Option<ModelPricingMutation<'a>>,
+}
+
+pub struct ModelCreation<'a> {
+    pub model: NewModel<'a>,
+    pub transport: Option<&'a str>,
+    pub discovery_patch: &'a Value,
+    pub opaque_state_plugin: Option<&'a str>,
+    pub pricing: Option<ModelPricingMutation<'a>>,
+}
+
+async fn insert_model_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    m: &NewModel<'_>,
+) -> Result<String> {
     let id = format!("model_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
         "INSERT INTO models
@@ -882,8 +1225,15 @@ pub async fn insert_model(pool: &Pool, m: &NewModel<'_>) -> Result<String> {
     .bind(m.extra_request.to_string())
     .bind(m.discovery.to_string())
     .bind(now_iso())
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
+    Ok(id)
+}
+
+pub async fn insert_model(pool: &Pool, m: &NewModel<'_>) -> Result<String> {
+    let mut tx = pool.begin().await?;
+    let id = insert_model_in_transaction(&mut tx, m).await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -1011,6 +1361,195 @@ pub async fn update_model(
     Ok(())
 }
 
+async fn update_model_configuration_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    mutation: &ModelOperatorMutation<'_>,
+) -> Result<()> {
+    let result = sqlx::query(
+        "UPDATE models SET display_name=?, enabled=?, context_window=?, max_output_tokens=?,
+         capabilities=?, parameters=?, thinking_map=?, extra_request=? WHERE id=?",
+    )
+    .bind(mutation.display_name)
+    .bind(mutation.enabled as i64)
+    .bind(mutation.context_window)
+    .bind(mutation.max_output_tokens)
+    .bind(mutation.capabilities.to_string())
+    .bind(mutation.parameters.to_string())
+    .bind(mutation.thinking_map.to_string())
+    .bind(mutation.extra_request.to_string())
+    .bind(mutation.id)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!(
+            "model '{}' disappeared while applying operator mutation",
+            mutation.id
+        );
+    }
+    Ok(())
+}
+
+async fn set_model_transport_override_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    transport: Option<&str>,
+) -> Result<()> {
+    match transport {
+        Some(transport) => {
+            sqlx::query(
+                "UPDATE models SET discovery = json_set(
+                    CASE WHEN json_valid(discovery) THEN
+                        CASE WHEN json_type(discovery) = 'object' THEN discovery ELSE '{}' END
+                    ELSE '{}' END, '$.configured_transport', ?) WHERE id = ?",
+            )
+            .bind(transport)
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "UPDATE models SET discovery = json_remove(
+                    CASE WHEN json_valid(discovery) THEN
+                        CASE WHEN json_type(discovery) = 'object' THEN discovery ELSE '{}' END
+                    ELSE '{}' END, '$.configured_transport') WHERE id = ?",
+            )
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn set_model_opaque_state_plugin_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    plugin_id: &str,
+) -> Result<()> {
+    let result = sqlx::query("UPDATE models SET opaque_state_plugin=? WHERE id=?")
+        .bind(plugin_id)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!("model '{id}' disappeared while binding opaque-state plugin");
+    }
+    Ok(())
+}
+
+async fn merge_model_discovery_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    fresh: &Value,
+) -> Result<()> {
+    let Some(fields) = fresh.as_object() else {
+        return Ok(());
+    };
+    if fields.is_empty() {
+        return Ok(());
+    }
+
+    let base = "CASE WHEN json_valid(discovery) THEN CASE \
+        WHEN json_type(discovery) = 'object' THEN discovery ELSE '{}' END \
+        ELSE '{}' END";
+    let mut expression = format!("json_set({base}");
+    for _ in fields {
+        expression.push_str(", '$.' || ?, json(?)");
+    }
+    expression.push(')');
+    if fresh.get("disappeared").and_then(Value::as_bool) == Some(false) {
+        expression = format!("json_remove({expression}, '$.flagged_at')");
+    }
+    let sql = format!("UPDATE models SET discovery = {expression} WHERE id = ?");
+    let mut query = sqlx::query(&sql);
+    for (key, value) in fields {
+        query = query.bind(key).bind(value.to_string());
+    }
+    let result = query.bind(id).execute(&mut **tx).await?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!("model '{id}' disappeared while merging discovery metadata");
+    }
+    Ok(())
+}
+
+/// Create one complete runtime-visible model state as a single database
+/// transaction. A registry reload can only observe the model after transport,
+/// ownership metadata, opaque-state binding, and immutable pricing are complete.
+pub async fn commit_model_creation(
+    pool: &Pool,
+    creation: &ModelCreation<'_>,
+) -> Result<(String, Option<String>)> {
+    let mut tx = pool.begin().await?;
+    let id = insert_model_in_transaction(&mut tx, &creation.model).await?;
+
+    set_model_transport_override_in_transaction(&mut tx, &id, creation.transport).await?;
+    merge_model_discovery_in_transaction(&mut tx, &id, creation.discovery_patch).await?;
+    if let Some(plugin_id) = creation.opaque_state_plugin {
+        set_model_opaque_state_plugin_in_transaction(&mut tx, &id, plugin_id).await?;
+    }
+
+    let version_id = if let Some(pricing) = creation.pricing.as_ref() {
+        apply_effective_model_pricing_transaction(
+            &mut tx,
+            &id,
+            pricing.prices,
+            pricing.source,
+            pricing.metadata,
+        )
+        .await?
+    } else {
+        None
+    };
+
+    tx.commit().await?;
+    Ok((id, version_id))
+}
+
+/// Apply one operator-owned model mutation as a single database transaction.
+/// Runtime-visible fields, ownership metadata, transport, reconciliation state,
+/// and immutable/effective pricing either all commit or all roll back.
+pub async fn commit_model_operator_mutation(
+    pool: &Pool,
+    mutation: &ModelOperatorMutation<'_>,
+) -> Result<Option<String>> {
+    let lock = price_version_lock(mutation.id);
+    let _guard = lock.lock().await;
+    let mut tx = pool.begin().await?;
+
+    update_model_configuration_in_transaction(&mut tx, mutation).await?;
+    if mutation.update_transport {
+        set_model_transport_override_in_transaction(&mut tx, mutation.id, mutation.transport)
+            .await?;
+    }
+    merge_model_discovery_in_transaction(&mut tx, mutation.id, mutation.discovery_patch).await?;
+
+    let version_id = if let Some(pricing) = mutation.pricing.as_ref() {
+        apply_effective_model_pricing_transaction(
+            &mut tx,
+            mutation.id,
+            pricing.prices,
+            pricing.source,
+            pricing.metadata,
+        )
+        .await?
+    } else {
+        None
+    };
+
+    tx.commit().await?;
+    Ok(version_id)
+}
+
+pub async fn update_model_prices(pool: &Pool, id: &str, prices: &Prices) -> Result<()> {
+    sqlx::query("UPDATE models SET prices = ? WHERE id = ?")
+        .bind(serde_json::to_string(prices)?)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn delete_model(pool: &Pool, id: &str) -> Result<()> {
     sqlx::query("DELETE FROM models WHERE id = ?")
         .bind(id)
@@ -1019,12 +1558,20 @@ pub async fn delete_model(pool: &Pool, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Record a price version snapshot (FR-6.3).
-pub async fn insert_price_version(pool: &Pool, model_id: &str, p: &Prices) -> Result<String> {
+/// Record an immutable price snapshot with provenance (FR-6.3).
+pub async fn insert_price_version_with_source(
+    pool: &Pool,
+    model_id: &str,
+    p: &Prices,
+    source: &str,
+    source_metadata: &Value,
+) -> Result<String> {
     let id = format!("price_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
-        "INSERT INTO price_versions (id, model_id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m, thinking_per_1m, created_at)
-         VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO price_versions
+         (id, model_id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m,
+          thinking_per_1m, created_at, source, source_metadata)
+         VALUES (?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(model_id)
@@ -1034,9 +1581,325 @@ pub async fn insert_price_version(pool: &Pool, model_id: &str, p: &Prices) -> Re
     .bind(p.cache_write_per_1m)
     .bind(p.thinking_per_1m)
     .bind(now_iso())
+    .bind(source)
+    .bind(source_metadata.to_string())
     .execute(pool)
     .await?;
     Ok(id)
+}
+
+/// Backwards-compatible operator-owned price version insertion.
+pub async fn insert_price_version(pool: &Pool, model_id: &str, p: &Prices) -> Result<String> {
+    insert_price_version_with_source(pool, model_id, p, "operator", &serde_json::json!({})).await
+}
+
+fn stable_price_provenance_metadata(value: &Value) -> Value {
+    match value {
+        Value::Object(fields) => {
+            let mut stable = serde_json::Map::new();
+            for (key, value) in fields {
+                if matches!(
+                    key.as_str(),
+                    "observed_at" | "retrieved_at" | "etag" | "last_modified" | "freshness"
+                ) {
+                    continue;
+                }
+                stable.insert(key.clone(), stable_price_provenance_metadata(value));
+            }
+            Value::Object(stable)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(stable_price_provenance_metadata)
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn price_provenance_matches(
+    stored_source: &str,
+    stored_metadata: &str,
+    source: &str,
+    source_metadata: &Value,
+) -> bool {
+    if stored_source != source {
+        return false;
+    }
+    serde_json::from_str::<Value>(stored_metadata).is_ok_and(|stored| {
+        stable_price_provenance_metadata(&stored)
+            == stable_price_provenance_metadata(source_metadata)
+    })
+}
+
+fn price_snapshot_matches(
+    row: &sqlx::sqlite::SqliteRow,
+    p: &Prices,
+    source: &str,
+    source_metadata: &Value,
+) -> Result<bool> {
+    Ok(
+        row.try_get::<Option<f64>, _>("input_per_1m")? == p.input_per_1m
+            && row.try_get::<Option<f64>, _>("output_per_1m")? == p.output_per_1m
+            && row.try_get::<Option<f64>, _>("cached_per_1m")? == p.cached_per_1m
+            && row.try_get::<Option<f64>, _>("cache_write_per_1m")? == p.cache_write_per_1m
+            && row.try_get::<Option<f64>, _>("thinking_per_1m")? == p.thinking_per_1m
+            && price_provenance_matches(
+                &row.try_get::<String, _>("source")?,
+                &row.try_get::<String, _>("source_metadata")?,
+                source,
+                source_metadata,
+            ),
+    )
+}
+
+fn price_version_lock(model_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(dashmap::DashMap::new)
+        .entry(model_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Resolve the immutable snapshot backing an effective price.
+///
+/// Snapshot identity is global within a model's price history, not merely
+/// consecutive. A request that finishes after pricing changed can therefore
+/// reuse the immutable version it started with instead of re-inserting it.
+pub async fn ensure_price_version(
+    pool: &Pool,
+    model_id: &str,
+    p: &Prices,
+    source: &str,
+    source_metadata: &Value,
+) -> Result<Option<String>> {
+    if !p.is_configured() {
+        return Ok(None);
+    }
+
+    // Request finalization, pricing sync, and admin edits can all resolve the
+    // same immutable snapshot concurrently. Serialize identity resolution per
+    // model so the SELECT -> INSERT sequence cannot create duplicate versions.
+    let lock = price_version_lock(model_id);
+    let _guard = lock.lock().await;
+
+    let candidates = sqlx::query(
+        "SELECT id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m,
+                thinking_per_1m, source, source_metadata
+         FROM price_versions
+         WHERE model_id = ?
+           AND input_per_1m IS ?
+           AND output_per_1m IS ?
+           AND cached_per_1m IS ?
+           AND cache_write_per_1m IS ?
+           AND thinking_per_1m IS ?
+           AND source = ?
+         ORDER BY created_at DESC, rowid DESC",
+    )
+    .bind(model_id)
+    .bind(p.input_per_1m)
+    .bind(p.output_per_1m)
+    .bind(p.cached_per_1m)
+    .bind(p.cache_write_per_1m)
+    .bind(p.thinking_per_1m)
+    .bind(source)
+    .fetch_all(pool)
+    .await?;
+
+    for row in candidates {
+        if price_snapshot_matches(&row, p, source, source_metadata)? {
+            return Ok(Some(row.try_get::<String, _>("id")?));
+        }
+    }
+
+    Ok(Some(
+        insert_price_version_with_source(pool, model_id, p, source, source_metadata).await?,
+    ))
+}
+
+async fn ensure_price_version_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    model_id: &str,
+    p: &Prices,
+    source: &str,
+    source_metadata: &Value,
+) -> Result<Option<String>> {
+    if !p.is_configured() {
+        return Ok(None);
+    }
+
+    let candidates = sqlx::query(
+        "SELECT id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m,
+                thinking_per_1m, source, source_metadata
+         FROM price_versions
+         WHERE model_id = ?
+           AND input_per_1m IS ?
+           AND output_per_1m IS ?
+           AND cached_per_1m IS ?
+           AND cache_write_per_1m IS ?
+           AND thinking_per_1m IS ?
+           AND source = ?
+         ORDER BY created_at DESC, rowid DESC",
+    )
+    .bind(model_id)
+    .bind(p.input_per_1m)
+    .bind(p.output_per_1m)
+    .bind(p.cached_per_1m)
+    .bind(p.cache_write_per_1m)
+    .bind(p.thinking_per_1m)
+    .bind(source)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for row in candidates {
+        if price_snapshot_matches(&row, p, source, source_metadata)? {
+            return Ok(Some(row.try_get::<String, _>("id")?));
+        }
+    }
+
+    let id = format!("price_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO price_versions
+         (id, model_id, input_per_1m, output_per_1m, cached_per_1m, cache_write_per_1m,
+          thinking_per_1m, created_at, source, source_metadata)
+         VALUES (?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&id)
+    .bind(model_id)
+    .bind(p.input_per_1m)
+    .bind(p.output_per_1m)
+    .bind(p.cached_per_1m)
+    .bind(p.cache_write_per_1m)
+    .bind(p.thinking_per_1m)
+    .bind(now_iso())
+    .bind(source)
+    .bind(source_metadata.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(Some(id))
+}
+
+async fn apply_effective_model_pricing_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    model_id: &str,
+    prices: &Prices,
+    source: &str,
+    source_metadata: &Value,
+) -> Result<Option<String>> {
+    let version_id =
+        ensure_price_version_in_transaction(tx, model_id, prices, source, source_metadata).await?;
+    let fields = source_metadata
+        .get("fields")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let has_owned_fields = fields.as_object().is_some_and(|fields| !fields.is_empty());
+    let effective_pricing = if prices.is_configured() || has_owned_fields {
+        serde_json::json!({
+            "source": source,
+            "fields": fields,
+            "metadata": source_metadata,
+            "price_version_id": version_id,
+            "updated_at": now_iso(),
+        })
+    } else {
+        Value::Null
+    };
+    let result = sqlx::query(
+        "UPDATE models
+         SET prices = ?,
+             discovery = json_set(
+                 CASE WHEN json_valid(discovery) THEN
+                     CASE WHEN json_type(discovery) = 'object' THEN discovery ELSE '{}' END
+                 ELSE '{}' END,
+                 '$.effective_pricing',
+                 json(?)
+             )
+         WHERE id = ?",
+    )
+    .bind(serde_json::to_string(prices)?)
+    .bind(effective_pricing.to_string())
+    .bind(model_id)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!("model '{model_id}' disappeared while committing effective pricing");
+    }
+    Ok(version_id)
+}
+
+/// Commit one provider-wide pricing synchronization atomically. New discovery
+/// observations and effective immutable pricing become visible together, or all
+/// staged model changes are rolled back.
+pub async fn commit_provider_pricing_batch(
+    pool: &Pool,
+    mutations: &[ProviderPricingMutation<'_>],
+) -> Result<Vec<Option<String>>> {
+    if mutations.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut model_ids: Vec<&str> = mutations.iter().map(|mutation| mutation.model_id).collect();
+    model_ids.sort_unstable();
+    model_ids.dedup();
+    let mut price_guards = Vec::with_capacity(model_ids.len());
+    for model_id in model_ids {
+        price_guards.push(price_version_lock(model_id).lock_owned().await);
+    }
+
+    let mut tx = pool.begin().await?;
+    let mut version_ids = Vec::with_capacity(mutations.len());
+    for mutation in mutations {
+        let discovery_patch = serde_json::json!({
+            "latest_observation": mutation.latest_observation,
+        });
+        merge_model_discovery_in_transaction(&mut tx, mutation.model_id, &discovery_patch).await?;
+
+        let version_id = if let Some(pricing) = mutation.pricing.as_ref() {
+            apply_effective_model_pricing_transaction(
+                &mut tx,
+                mutation.model_id,
+                pricing.prices,
+                pricing.source,
+                pricing.metadata,
+            )
+            .await?
+        } else {
+            None
+        };
+        version_ids.push(version_id);
+    }
+
+    tx.commit().await?;
+    drop(price_guards);
+    Ok(version_ids)
+}
+
+/// Atomically bind the effective model prices to the immutable price version and
+/// the provenance used by request accounting.
+pub async fn commit_effective_model_pricing(
+    pool: &Pool,
+    model_id: &str,
+    prices: &Prices,
+    source: &str,
+    source_metadata: &Value,
+) -> Result<Option<String>> {
+    let lock = price_version_lock(model_id);
+    let _guard = lock.lock().await;
+    let mut tx = pool.begin().await?;
+    let version_id = apply_effective_model_pricing_transaction(
+        &mut tx,
+        model_id,
+        prices,
+        source,
+        source_metadata,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(version_id)
 }
 
 // ===========================================================================
@@ -1845,4 +2708,676 @@ pub async fn purge_old_route_traces(pool: &Pool, retain_days: i64) -> Result<u64
         .execute(pool)
         .await?;
     Ok(res.rows_affected())
+}
+
+#[cfg(test)]
+mod price_version_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn pricing_test_model(tag: &str) -> (Pool, String, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-price-version-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}", root.join("kinetix.db").display());
+        let pool = connect(&database_url).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let provider_id = insert_provider(
+            &pool,
+            &NewProvider {
+                name: "pricing-test",
+                base_url: "https://example.invalid/v1",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let model_id = insert_model(
+            &pool,
+            &NewModel {
+                provider_id: &provider_id,
+                upstream_id: "priced-model",
+                display_name: "Priced Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({
+                    "input_per_1m": 1.0,
+                    "output_per_1m": 2.0
+                }),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        (pool, model_id, root)
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_price_resolution_reuses_one_version() {
+        let (pool, model_id, root) = pricing_test_model("concurrent").await;
+        let prices = Prices {
+            input_per_1m: Some(1.25),
+            output_per_1m: Some(2.5),
+            ..Prices::default()
+        };
+        let metadata = json!({"configured_by": "test"});
+        let (left, right) = tokio::join!(
+            ensure_price_version(&pool, &model_id, &prices, "operator", &metadata),
+            ensure_price_version(&pool, &model_id, &prices, "operator", &metadata),
+        );
+        let left = left.unwrap().unwrap();
+        let right = right.unwrap().unwrap();
+        assert_eq!(left, right);
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id = ?")
+                .bind(&model_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn effective_price_rolls_back_when_version_persistence_fails() {
+        let (pool, model_id, root) = pricing_test_model("rollback").await;
+        sqlx::query(
+            "CREATE TRIGGER reject_price_version_insert
+             BEFORE INSERT ON price_versions
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected price version failure');
+             END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let next = Prices {
+            input_per_1m: Some(9.0),
+            output_per_1m: Some(18.0),
+            ..Prices::default()
+        };
+        let result = commit_effective_model_pricing(
+            &pool,
+            &model_id,
+            &next,
+            "operator",
+            &json!({"configured_by": "test"}),
+        )
+        .await;
+        assert!(result.is_err());
+
+        let row = get_model(&pool, &model_id).await.unwrap().unwrap();
+        assert_eq!(row.prices().input_per_1m, Some(1.0));
+        assert_eq!(row.prices().output_per_1m, Some(2.0));
+        let discovery: Value = serde_json::from_str(&row.discovery).unwrap();
+        assert!(discovery.get("effective_pricing").is_none());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn operator_mutation_rolls_back_model_reconciliation_and_pricing_together() {
+        let (pool, model_id, root) = pricing_test_model("operator-mutation-rollback").await;
+        let old_prices = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(2.0),
+            ..Prices::default()
+        };
+        let old_version = commit_effective_model_pricing(
+            &pool,
+            &model_id,
+            &old_prices,
+            "operator",
+            &json!({
+                "fields": {
+                    "input_per_1m": {"source": "operator", "metadata": {}},
+                    "output_per_1m": {"source": "operator", "metadata": {}}
+                }
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let original_reconciliation = json!({
+            "status": "changed",
+            "diff": [
+                {"field": "context_window", "configured": null, "observed": 200000},
+                {"field": "prices.output_per_1m", "configured": 2.0, "observed": 18.0}
+            ]
+        });
+        merge_model_discovery(
+            &pool,
+            &model_id,
+            &json!({"reconciliation": original_reconciliation.clone()}),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE TRIGGER reject_operator_price_version_insert
+             BEFORE INSERT ON price_versions
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected operator price version failure');
+             END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let capabilities = json!({"tool_calling": true});
+        let parameters = json!({});
+        let thinking_map = json!({});
+        let extra_request = json!({});
+        let discovery_patch = json!({
+            "reconciliation": {
+                "status": "accepted",
+                "diff": []
+            },
+            "operator_capability_overrides": {
+                "tool_calling": true
+            }
+        });
+        let next_prices = Prices {
+            input_per_1m: Some(9.0),
+            output_per_1m: Some(18.0),
+            ..Prices::default()
+        };
+        let price_metadata = json!({
+            "fields": {
+                "input_per_1m": {"source": "operator_accept", "metadata": {}},
+                "output_per_1m": {"source": "operator_accept", "metadata": {}}
+            }
+        });
+        let result = commit_model_operator_mutation(
+            &pool,
+            &ModelOperatorMutation {
+                id: &model_id,
+                display_name: "Changed Name",
+                enabled: true,
+                context_window: Some(200000),
+                max_output_tokens: Some(8192),
+                capabilities: &capabilities,
+                parameters: &parameters,
+                thinking_map: &thinking_map,
+                extra_request: &extra_request,
+                update_transport: false,
+                transport: None,
+                discovery_patch: &discovery_patch,
+                pricing: Some(ModelPricingMutation {
+                    prices: &next_prices,
+                    source: "operator_accept",
+                    metadata: &price_metadata,
+                }),
+            },
+        )
+        .await;
+        assert!(result.is_err());
+
+        let row = get_model(&pool, &model_id).await.unwrap().unwrap();
+        assert_eq!(row.display_name, "Priced Model");
+        assert_eq!(row.context_window, None);
+        assert_eq!(row.max_output_tokens, None);
+        assert_eq!(row.prices().input_per_1m, Some(1.0));
+        assert_eq!(row.prices().output_per_1m, Some(2.0));
+        assert_eq!(
+            serde_json::from_str::<Value>(&row.capabilities).unwrap(),
+            json!({})
+        );
+        let discovery: Value = serde_json::from_str(&row.discovery).unwrap();
+        assert_eq!(
+            discovery.get("reconciliation"),
+            Some(&original_reconciliation)
+        );
+        assert_eq!(
+            discovery
+                .pointer("/effective_pricing/price_version_id")
+                .and_then(Value::as_str),
+            Some(old_version.as_str())
+        );
+        assert!(discovery.get("operator_capability_overrides").is_none());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn volatile_catalog_metadata_does_not_change_price_identity() {
+        let stored = json!({
+            "fields": {
+                "input_per_1m": {
+                    "source": "models.dev:provider",
+                    "metadata": {
+                        "observed_at": "2026-09-27T00:00:00Z",
+                        "catalog_source_state": {
+                            "source": "models.dev",
+                            "retrieved_at": "2026-09-27T00:00:00Z",
+                            "freshness": "fresh",
+                            "etag": "etag-1",
+                            "last_modified": "Sun, 27 Sep 2026 00:00:00 GMT"
+                        }
+                    }
+                }
+            },
+            "catalog_source_state": {
+                "source": "models.dev",
+                "retrieved_at": "2026-09-27T00:00:00Z",
+                "freshness": "fresh",
+                "etag": "etag-1"
+            }
+        });
+        let refreshed = json!({
+            "fields": {
+                "input_per_1m": {
+                    "source": "models.dev:provider",
+                    "metadata": {
+                        "observed_at": "2026-09-28T00:00:00Z",
+                        "catalog_source_state": {
+                            "source": "models.dev",
+                            "retrieved_at": "2026-09-28T00:00:00Z",
+                            "freshness": "stale",
+                            "etag": "etag-2",
+                            "last_modified": "Mon, 28 Sep 2026 00:00:00 GMT"
+                        }
+                    }
+                }
+            },
+            "catalog_source_state": {
+                "source": "models.dev",
+                "retrieved_at": "2026-09-28T00:00:00Z",
+                "freshness": "stale",
+                "etag": "etag-2"
+            }
+        });
+
+        assert!(price_provenance_matches(
+            "models.dev",
+            &stored.to_string(),
+            "models.dev",
+            &refreshed,
+        ));
+    }
+
+    #[test]
+    fn stable_price_ownership_change_changes_identity() {
+        assert!(!price_provenance_matches(
+            "mixed",
+            r#"{"fields":{"input_per_1m":{"source":"models.dev:provider","metadata":{}}}}"#,
+            "mixed",
+            &json!({
+                "fields": {
+                    "input_per_1m": {
+                        "source": "operator",
+                        "metadata": {"configured_by": "admin"}
+                    }
+                }
+            }),
+        ));
+        assert!(!price_provenance_matches(
+            "models.dev",
+            r#"{"reference":"models.dev:provider/openai/gpt"}"#,
+            "operator_accept",
+            &json!({"accepted_from":"models.dev"}),
+        ));
+        assert!(!price_provenance_matches(
+            "models.dev",
+            r#"{"reference":"old"}"#,
+            "models.dev",
+            &json!({"reference":"new"}),
+        ));
+    }
+
+    #[tokio::test]
+    async fn unchanged_prices_reuse_version_across_catalog_refresh_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-price-version-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("test.db").display());
+        let pool = connect(&url).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        let provider_id = insert_provider(
+            &pool,
+            &NewProvider {
+                name: "Provider",
+                base_url: "https://example.test",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 120_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "example.test",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let prices = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(5.0),
+            ..Default::default()
+        };
+        let model_id = insert_model(
+            &pool,
+            &NewModel {
+                provider_id: &provider_id,
+                upstream_id: "model",
+                display_name: "Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: serde_json::to_value(&prices).unwrap(),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+
+        let first_metadata = json!({
+            "fields": {
+                "input_per_1m": {
+                    "source": "models.dev:provider",
+                    "metadata": {"observed_at": "2026-09-27T00:00:00Z"}
+                }
+            },
+            "catalog_source_state": {
+                "source": "models.dev",
+                "retrieved_at": "2026-09-27T00:00:00Z",
+                "etag": "etag-1",
+                "freshness": "fresh"
+            }
+        });
+        let second_metadata = json!({
+            "fields": {
+                "input_per_1m": {
+                    "source": "models.dev:provider",
+                    "metadata": {"observed_at": "2026-09-28T00:00:00Z"}
+                }
+            },
+            "catalog_source_state": {
+                "source": "models.dev",
+                "retrieved_at": "2026-09-28T00:00:00Z",
+                "etag": "etag-2",
+                "freshness": "fresh"
+            }
+        });
+
+        let first = ensure_price_version(&pool, &model_id, &prices, "models.dev", &first_metadata)
+            .await
+            .unwrap()
+            .unwrap();
+        let second =
+            ensure_price_version(&pool, &model_id, &prices, "models.dev", &second_metadata)
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(first, second);
+        drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn in_flight_price_versions_reuse_historical_snapshots() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-price-version-race-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("test.db").display());
+        let pool = connect(&url).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        let provider_id = insert_provider(
+            &pool,
+            &NewProvider {
+                name: "Provider",
+                base_url: "https://example.test",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 120_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "example.test",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let model_id = insert_model(
+            &pool,
+            &NewModel {
+                provider_id: &provider_id,
+                upstream_id: "model",
+                display_name: "Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let v1 = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(2.0),
+            ..Default::default()
+        };
+        let v2 = Prices {
+            input_per_1m: Some(3.0),
+            output_per_1m: Some(4.0),
+            ..Default::default()
+        };
+        let metadata = json!({"reference": "operator"});
+
+        let v1_id = ensure_price_version(&pool, &model_id, &v1, "operator", &metadata)
+            .await
+            .unwrap()
+            .unwrap();
+        let v2_id = ensure_price_version(&pool, &model_id, &v2, "operator", &metadata)
+            .await
+            .unwrap()
+            .unwrap();
+        let late_v1_id = ensure_price_version(&pool, &model_id, &v1, "operator", &metadata)
+            .await
+            .unwrap()
+            .unwrap();
+        let current_v2_id = ensure_price_version(&pool, &model_id, &v2, "operator", &metadata)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(late_v1_id, v1_id);
+        assert_eq!(current_v2_id, v2_id);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id = ?")
+                .bind(&model_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 2);
+
+        drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn effective_pricing_transaction_rolls_back_price_version_and_model_state() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-effective-pricing-rollback-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("test.db").display());
+        let pool = connect(&url).await.unwrap();
+        migrate(&pool).await.unwrap();
+
+        let provider_id = insert_provider(
+            &pool,
+            &NewProvider {
+                name: "Provider",
+                base_url: "https://example.test",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 120_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "example.test",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let old_prices = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(2.0),
+            ..Default::default()
+        };
+        let old_effective = json!({
+            "source": "operator",
+            "fields": {
+                "input_per_1m": {"source": "operator"},
+                "output_per_1m": {"source": "operator"}
+            },
+            "metadata": {},
+            "price_version_id": null,
+            "updated_at": "2026-09-27T00:00:00Z"
+        });
+        let model_id = insert_model(
+            &pool,
+            &NewModel {
+                provider_id: &provider_id,
+                upstream_id: "model",
+                display_name: "Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: serde_json::to_value(&old_prices).unwrap(),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({"effective_pricing": old_effective}),
+            },
+        )
+        .await
+        .unwrap();
+
+        let new_prices = Prices {
+            input_per_1m: Some(3.0),
+            output_per_1m: Some(4.0),
+            ..Default::default()
+        };
+        let metadata = json!({
+            "fields": {
+                "input_per_1m": {"source": "models.dev:provider"},
+                "output_per_1m": {"source": "models.dev:provider"}
+            }
+        });
+        let mut tx = pool.begin().await.unwrap();
+        apply_effective_model_pricing_transaction(
+            &mut tx,
+            &model_id,
+            &new_prices,
+            "models.dev",
+            &metadata,
+        )
+        .await
+        .unwrap();
+
+        let forced_failure = sqlx::query("INSERT INTO definitely_missing_table(value) VALUES (?)")
+            .bind("fail")
+            .execute(&mut *tx)
+            .await;
+        assert!(forced_failure.is_err());
+        tx.rollback().await.unwrap();
+
+        let row = get_model(&pool, &model_id).await.unwrap().unwrap();
+        assert_eq!(row.prices().input_per_1m, old_prices.input_per_1m);
+        assert_eq!(row.prices().output_per_1m, old_prices.output_per_1m);
+        let discovery: Value = serde_json::from_str(&row.discovery).unwrap();
+        assert_eq!(discovery["effective_pricing"], old_effective);
+        let versions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id = ?")
+                .bind(&model_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(versions, 0);
+
+        drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

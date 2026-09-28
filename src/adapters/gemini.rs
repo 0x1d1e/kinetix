@@ -1294,6 +1294,7 @@ mod schema_tests {
             credential_mode: "manual".into(),
             source_plugin_id: None,
             source_integration_id: None,
+            pricing_scope: "direct_api".into(),
         };
         let model = crate::db::ModelRow {
             id: "m".into(),

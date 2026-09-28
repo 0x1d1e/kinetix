@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -42,6 +44,13 @@ fn provenance(source: CatalogSource, kind: CatalogLayerKind) -> &'static str {
         (CatalogSource::ModelsDev, CatalogLayerKind::Provider) => "models.dev:provider",
         (CatalogSource::BundledCatalog, _) => "bundled_catalog",
     }
+}
+
+pub(crate) fn is_external_catalog_price_source(source: &str) -> bool {
+    source == "models.dev"
+        || source.starts_with("models.dev:")
+        || source == "bundled_catalog"
+        || source.starts_with("bundled_catalog:")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +188,7 @@ pub struct CatalogResolution {
     pub provider: Option<ProviderModelMatch>,
     pub fallback_canonical: Option<CanonicalModelMatch>,
     pub fallback_provider: Option<ProviderModelMatch>,
+    pub catalog_provenance: Option<Value>,
 }
 
 pub struct CatalogLayer<'a> {
@@ -207,6 +217,7 @@ impl CatalogResolution {
             provider: None,
             fallback_canonical: None,
             fallback_provider: None,
+            catalog_provenance: None,
         }
     }
 
@@ -350,6 +361,7 @@ impl CatalogResolution {
                 "canonical": self.fallback_canonical.as_ref().map(canonical_json),
                 "provider": self.fallback_provider.as_ref().map(provider_json),
             },
+            "source_state": self.catalog_provenance,
         })
     }
 }
@@ -399,6 +411,53 @@ pub struct ModelsDevCatalog {
     models: Value,
     providers: Value,
     canonical_index: CanonicalModelIndex,
+    provenance: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelsDevRefreshOutcome {
+    Fresh,
+    NotModified,
+    StaleFallback,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelsDevFetch {
+    pub catalog: ModelsDevCatalog,
+    pub outcome: ModelsDevRefreshOutcome,
+}
+
+#[derive(Debug, Clone)]
+struct ModelsDevCacheEntry {
+    catalog: ModelsDevCatalog,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    fetched_at: Instant,
+}
+
+impl ModelsDevCacheEntry {
+    fn mark_validated(mut self) -> Self {
+        self.fetched_at = Instant::now();
+        self.catalog = self.catalog.with_freshness("fresh");
+        self
+    }
+}
+
+const MODELS_DEV_FRESH_TTL: Duration = Duration::from_secs(15 * 60);
+const MODELS_DEV_STALE_IF_ERROR_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+fn models_dev_cache() -> &'static tokio::sync::RwLock<Option<ModelsDevCacheEntry>> {
+    static CACHE: OnceLock<tokio::sync::RwLock<Option<ModelsDevCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::RwLock::new(None))
+}
+
+fn models_dev_stale_fallback(cached: Option<ModelsDevCacheEntry>) -> Option<ModelsDevFetch> {
+    cached
+        .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
+        .map(|entry| ModelsDevFetch {
+            catalog: entry.catalog.with_freshness("stale"),
+            outcome: ModelsDevRefreshOutcome::StaleFallback,
+        })
 }
 
 impl ModelsDevCatalog {
@@ -416,39 +475,159 @@ impl ModelsDevCatalog {
             canonical_index: CanonicalModelIndex::from_models(models_object),
             models,
             providers,
+            provenance: None,
         })
     }
 
     #[cfg(test)]
-    fn from_parts(models: Value, providers: Value) -> Option<Self> {
+    pub(crate) fn from_parts(models: Value, providers: Value) -> Option<Self> {
         Self::from_catalog_value(json!({
             "models": models,
             "providers": providers,
         }))
     }
 
-    pub async fn fetch(client: &reqwest::Client, _base_url: &str) -> Option<Self> {
+    fn with_source_state(
+        mut self,
+        retrieved_at: String,
+        freshness: &str,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    ) -> Self {
+        self.provenance = Some(json!({
+            "source": "models.dev",
+            "retrieved_at": retrieved_at,
+            "freshness": freshness,
+            "etag": etag,
+            "last_modified": last_modified,
+        }));
+        self
+    }
+
+    fn with_freshness(mut self, freshness: &str) -> Self {
+        if let Some(state) = self.provenance.as_mut().and_then(Value::as_object_mut) {
+            state.insert("freshness".into(), Value::String(freshness.to_string()));
+        }
+        self
+    }
+
+    pub async fn fetch(client: &reqwest::Client, base_url: &str) -> Option<Self> {
+        Self::fetch_with_outcome(client, base_url)
+            .await
+            .map(|fetch| fetch.catalog)
+    }
+
+    pub async fn fetch_with_outcome(
+        client: &reqwest::Client,
+        _base_url: &str,
+    ) -> Option<ModelsDevFetch> {
         // The catalog destination is fixed and never derived from provider input.
         // Apply the existing SSRF/private-network guard to the actual outbound
         // destination rather than suppressing enrichment for private gateways.
         if should_skip_external_lookup(MODELS_DEV_CATALOG_URL) {
             return None;
         }
-        let response = client
+
+        let cached = models_dev_cache().read().await.clone();
+        if let Some(entry) = cached.as_ref() {
+            if entry.fetched_at.elapsed() <= MODELS_DEV_FRESH_TTL {
+                return Some(ModelsDevFetch {
+                    catalog: entry.catalog.clone().with_freshness("fresh"),
+                    outcome: ModelsDevRefreshOutcome::Fresh,
+                });
+            }
+        }
+
+        let mut request = client
             .get(MODELS_DEV_CATALOG_URL)
             .header(reqwest::header::ACCEPT, "application/json")
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
-            .await
-            .ok()?;
+            .timeout(Duration::from_secs(3));
+        if let Some(entry) = cached.as_ref() {
+            if let Some(etag) = entry.etag.as_deref() {
+                request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+            }
+            if let Some(last_modified) = entry.last_modified.as_deref() {
+                request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+            }
+        }
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_) => return models_dev_stale_fallback(cached),
+        };
+
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if let Some(entry) = cached {
+                let entry = entry.mark_validated();
+                let catalog = entry.catalog.clone();
+                *models_dev_cache().write().await = Some(entry);
+                return Some(ModelsDevFetch {
+                    catalog,
+                    outcome: ModelsDevRefreshOutcome::NotModified,
+                });
+            }
+            return None;
+        }
+
         if !response.status().is_success() {
-            return None;
+            return models_dev_stale_fallback(cached);
         }
-        let bytes = response.bytes().await.ok()?;
-        if bytes.len() > MAX_MODELS_DEV_BYTES {
-            return None;
+
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let last_modified = response
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_MODELS_DEV_BYTES as u64)
+        {
+            return models_dev_stale_fallback(cached);
         }
-        Self::from_slice(&bytes)
+
+        let mut response = response;
+        let mut bytes = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or_default()
+                .min(MAX_MODELS_DEV_BYTES as u64) as usize,
+        );
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(_) => return models_dev_stale_fallback(cached),
+            };
+            if bytes.len().saturating_add(chunk.len()) > MAX_MODELS_DEV_BYTES {
+                return models_dev_stale_fallback(cached);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let catalog = match Self::from_slice(&bytes) {
+            Some(catalog) => catalog,
+            None => return models_dev_stale_fallback(cached),
+        };
+        let catalog = catalog.with_source_state(
+            chrono::Utc::now().to_rfc3339(),
+            "fresh",
+            etag.clone(),
+            last_modified.clone(),
+        );
+        *models_dev_cache().write().await = Some(ModelsDevCacheEntry {
+            catalog: catalog.clone(),
+            etag,
+            last_modified,
+            fetched_at: Instant::now(),
+        });
+        Some(ModelsDevFetch {
+            catalog,
+            outcome: ModelsDevRefreshOutcome::Fresh,
+        })
     }
 
     fn provider_id_for_base(&self, base_url: &str) -> Option<String> {
@@ -1234,12 +1413,38 @@ fn resolve_with_bundled(
         provider,
         fallback_canonical,
         fallback_provider,
+        catalog_provenance: models_dev.and_then(|catalog| catalog.provenance.clone()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_fallback_exposes_failed_refresh_without_dropping_catalog() {
+        let catalog = ModelsDevCatalog::from_parts(json!({}), json!({}))
+            .unwrap()
+            .with_source_state("2026-09-26T00:00:00Z".to_string(), "fresh", None, None);
+        let fetch = models_dev_stale_fallback(Some(ModelsDevCacheEntry {
+            catalog,
+            etag: None,
+            last_modified: None,
+            fetched_at: Instant::now(),
+        }))
+        .unwrap();
+
+        assert_eq!(fetch.outcome, ModelsDevRefreshOutcome::StaleFallback);
+        assert_eq!(
+            fetch
+                .catalog
+                .provenance
+                .as_ref()
+                .and_then(|value| value.get("freshness"))
+                .and_then(Value::as_str),
+            Some("stale")
+        );
+    }
 
     fn models_dev_fixture() -> ModelsDevCatalog {
         ModelsDevCatalog::from_parts(
@@ -1840,6 +2045,44 @@ mod tests {
             canonical.capabilities_json["structured_output"]["supported"],
             true
         );
+    }
+
+    #[test]
+    fn stale_catalog_keeps_original_retrieval_provenance() {
+        let catalog = models_dev_fixture().with_source_state(
+            "2026-09-20T00:00:00Z".into(),
+            "fresh",
+            Some("etag-1".into()),
+            Some("Sun, 20 Sep 2026 00:00:00 GMT".into()),
+        );
+        let stale = catalog.with_freshness("stale");
+        let state = stale.provenance.as_ref().unwrap();
+        assert_eq!(state["retrieved_at"], "2026-09-20T00:00:00Z");
+        assert_eq!(state["freshness"], "stale");
+        assert_eq!(state["etag"], "etag-1");
+    }
+
+    #[test]
+    fn not_modified_validation_keeps_price_provenance_stable() {
+        let catalog = models_dev_fixture().with_source_state(
+            "2026-09-20T00:00:00Z".into(),
+            "fresh",
+            Some("etag-1".into()),
+            Some("Sun, 20 Sep 2026 00:00:00 GMT".into()),
+        );
+        let expected_provenance = catalog.provenance.clone();
+        let entry = ModelsDevCacheEntry {
+            catalog,
+            etag: Some("etag-1".into()),
+            last_modified: Some("Sun, 20 Sep 2026 00:00:00 GMT".into()),
+            fetched_at: Instant::now(),
+        }
+        .mark_validated();
+
+        assert_eq!(entry.catalog.provenance, expected_provenance);
+        let state = entry.catalog.provenance.as_ref().unwrap();
+        assert_eq!(state["retrieved_at"], "2026-09-20T00:00:00Z");
+        assert_eq!(state["freshness"], "fresh");
     }
 
     #[test]

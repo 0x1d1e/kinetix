@@ -173,9 +173,13 @@ fn token_count_exact_target(
 
     let eligible = |target: &ResolvedTarget| {
         let capabilities_match = !target.provider.strict()
-            || crate::adapters::resolve_execution_profile(&target.provider, &target.model)
-                .map(|profile| profile_satisfies_needs(&profile.capabilities, &needs))
-                .unwrap_or(false);
+            || crate::adapters::resolve_execution_profile_for_target(
+                &target.provider,
+                &target.model,
+                Some(target.account.id.as_str()),
+            )
+            .map(|profile| profile_satisfies_needs(&profile.capabilities, &needs))
+            .unwrap_or(false);
         (allowed_providers.is_empty() || allowed_providers.contains(&target.provider.id))
             && capabilities_match
     };
@@ -201,13 +205,6 @@ fn token_count_exact_target(
                     "this key is not allowed to use the resolved provider",
                 ));
             }
-            let profile = crate::adapters::resolve_execution_profile(&provider, &model)?;
-            if provider.strict() && !profile_satisfies_needs(&profile.capabilities, &needs) {
-                return Err(ProxyError::unsupported(
-                    "resolved model cannot satisfy this token-count request",
-                ));
-            }
-
             let account = select_accounts(&snap, &provider_id, None)?
                 .into_iter()
                 .find(|account| {
@@ -216,7 +213,21 @@ fn token_count_exact_target(
                         pool::AccountStatus::Healthy
                     )
                 });
-            Ok(account.map(|account| ResolvedTarget {
+            let Some(account) = account else {
+                return Ok(None);
+            };
+            let profile = crate::adapters::resolve_execution_profile_for_target(
+                &provider,
+                &model,
+                Some(account.id.as_str()),
+            )?;
+            if provider.strict() && !profile_satisfies_needs(&profile.capabilities, &needs) {
+                return Err(ProxyError::unsupported(
+                    "resolved model cannot satisfy this token-count request",
+                ));
+            }
+
+            Ok(Some(ResolvedTarget {
                 account,
                 model,
                 provider,
@@ -273,7 +284,11 @@ pub async fn count_tokens(
     let Some(target) = token_count_exact_target(state, key, req)? else {
         return Ok(estimate());
     };
-    let profile = crate::adapters::resolve_execution_profile(&target.provider, &target.model)?;
+    let profile = crate::adapters::resolve_execution_profile_for_target(
+        &target.provider,
+        &target.model,
+        Some(target.account.id.as_str()),
+    )?;
     let adapter = state.adapters.for_transport(&profile.transport)?;
     if !adapter.supports_count_tokens() {
         return Ok(estimate());
@@ -891,19 +906,22 @@ pub async fn run(
 
         // Resolve target transport and its execution metadata before any
         // target-specific credential lookup or network dispatch.
-        let profile =
-            match crate::adapters::resolve_execution_profile(&target.provider, &target.model) {
-                Ok(profile) => profile,
-                Err(error) => {
-                    trace.step(
-                        "skip",
-                        Some(target.model.display_name.clone()),
-                        format!("invalid execution profile: {}", error.message),
-                    );
-                    last_error = Some(error);
-                    continue;
-                }
-            };
+        let profile = match crate::adapters::resolve_execution_profile_for_target(
+            &target.provider,
+            &target.model,
+            Some(target.account.id.as_str()),
+        ) {
+            Ok(profile) => profile,
+            Err(error) => {
+                trace.step(
+                    "skip",
+                    Some(target.model.display_name.clone()),
+                    format!("invalid execution profile: {}", error.message),
+                );
+                last_error = Some(error);
+                continue;
+            }
+        };
         trace.resolved_transport(
             target.model.display_name.clone(),
             profile.transport.as_str(),
@@ -3551,11 +3569,15 @@ fn target_profile_supports_request(
     target: &ResolvedTarget,
     needs: &crate::types::CapabilityNeeds,
 ) -> bool {
-    crate::adapters::resolve_execution_profile(&target.provider, &target.model)
-        .map(|profile| {
-            !target.provider.strict() || profile_satisfies_needs(&profile.capabilities, needs)
-        })
-        .unwrap_or(false)
+    crate::adapters::resolve_execution_profile_for_target(
+        &target.provider,
+        &target.model,
+        Some(target.account.id.as_str()),
+    )
+    .map(|profile| {
+        !target.provider.strict() || profile_satisfies_needs(&profile.capabilities, needs)
+    })
+    .unwrap_or(false)
 }
 
 fn profile_satisfies_needs(
@@ -4917,7 +4939,35 @@ async fn finalize_log(
     );
 
     let prices = attempt.target.model.prices();
-    let cost = cost::compute_cost(&prices, &usage);
+    let computed_cost = cost::compute_cost(&prices, &usage);
+    let (cost, price_version_id) = if let Some(computed_cost) = computed_cost {
+        let (source, source_metadata) = attempt.target.model.price_provenance();
+        match db::ensure_price_version(
+            &state.pool,
+            &attempt.target.model.id,
+            &prices,
+            &source,
+            &source_metadata,
+        )
+        .await
+        {
+            Ok(Some(version_id)) => (Some(computed_cost), Some(version_id)),
+            Ok(None) => (None, None),
+            Err(error) => {
+                // A known cost without the exact immutable rate snapshot is not
+                // auditable. Prefer unknown cost over silently mis-attributing
+                // historical usage to a later price.
+                tracing::warn!(
+                    model = %attempt.target.model.id,
+                    %error,
+                    "failed to resolve price version; persisting usage with unknown cost"
+                );
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
     let cost_known = cost.is_some();
 
     // Reconcile only when both canonical token totals are complete. The
@@ -4993,7 +5043,7 @@ async fn finalize_log(
         thinking_tokens: usage.thinking.map(|v| v as i64),
         cost_usd: cost,
         cost_known: cost_known as i64,
-        price_version_id: None,
+        price_version_id,
         cache_status: meta.cache_status.to_string(),
         serving_account_id: Some(attempt.target.account.id.clone()),
         serving_account: Some(attempt.target.account.label.clone()),
@@ -5555,6 +5605,7 @@ mod route_policy_tests {
             credential_mode: "manual".into(),
             source_plugin_id: None,
             source_integration_id: None,
+            pricing_scope: "direct_api".into(),
         }
     }
 
