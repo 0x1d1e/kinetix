@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
-import { Key, Plus, Copy, Check, ShieldAlert, Sparkles, Terminal, Trash2, Power, Search, X } from 'lucide-react';
+import { Key, Plus, Copy, Check, ShieldAlert, Sparkles, Trash2, Power, Search, X } from 'lucide-react';
 import { VirtualKey } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { formatCurrency, formatTokens } from '../../lib/designSystem';
 import { useConfirm } from '../../lib/useConfirm';
+import ClientProfileGenerator from './ClientProfileGenerator';
 
 interface KeysViewProps {
   keys: VirtualKey[];
@@ -83,7 +84,7 @@ export const KeysView: React.FC<KeysViewProps> = ({
   const { confirm, confirmNode } = useConfirm();
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
-  const [newlyCreatedKey, setNewlyCreatedKey] = useState<{ name: string; key: string } | null>(null);
+  const [newlyCreatedKey, setNewlyCreatedKey] = useState<{ id: string; name: string; key: string } | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -140,7 +141,7 @@ export const KeysView: React.FC<KeysViewProps> = ({
       return;
     }
     // The server returns the full key exactly once (FR-3.1).
-    setNewlyCreatedKey({ name: result.key.name, key: result.fullKey });
+    setNewlyCreatedKey({ id: result.key.id, name: result.key.name, key: result.fullKey });
     setShowCreateModal(false);
     setName('');
     setOwner('');
@@ -417,32 +418,7 @@ export const KeysView: React.FC<KeysViewProps> = ({
         })}
       </div>
 
-      {/* Pi Agent Integration Helper Card */}
-      <WobblyCard decoration="tack" variant="muted" className="p-5">
-        <div className="flex items-center gap-2 mb-2">
-          <Terminal className="w-6 h-6 text-[var(--pen-blue)]" />
-          <h3 className="text-2xl font-heading font-bold text-[var(--ink)]">
-            How to configure Pi Coding Agent with Kinetix
-          </h3>
-        </div>
-        <p className="text-base font-body text-[var(--ink)]/80 mb-3">
-          Configure Pi to speak to Kinetix using standard OpenAI or Anthropic provider settings. Point the base URL at your Kinetix proxy:
-        </p>
-
-        <div className="bg-[var(--code-bg)] text-[var(--code-fg)] p-4 rounded-lg font-mono text-sm overflow-x-auto sketch-shadow-sm border-2 border-[var(--ink)]">
-          <pre>{`// ~/.pi/config.json
-{
-  "providers": {
-    "kinetix": {
-      "baseUrl": "${window.location.origin}/v1",
-      "apiKey": "<paste the sk-kinetix-... key shown at creation>",
-      "api": "openai-completions",
-      "models": ["coder", "free"]
-    }
-  }
-}`}</pre>
-        </div>
-      </WobblyCard>
+      <ClientProfileGenerator keys={keys} newlyCreatedKey={newlyCreatedKey} />
 
       {/* Create Modal */}
       {showCreateModal && (

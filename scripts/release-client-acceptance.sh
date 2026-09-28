@@ -294,33 +294,14 @@ run_pi() {
   project="$(prepare_project)"
   agent="$WORK/pi-agent-$CASE_ID"
   mkdir -p "$agent"
-  cat >"$agent/models.json" <<EOF
-{
-  "providers": {
-    "kinetix": {
-      "baseUrl": "$PROXY_BASE/v1",
-      "api": "openai-completions",
-      "apiKey": "\$KINETIX_ACCEPT_KEY",
-      "models": [{
-        "id": "$model",
-        "name": "Kinetix release acceptance",
-        "reasoning": true,
-        "input": ["text", "image"],
-        "contextWindow": 200000,
-        "maxTokens": 8192,
-        "compat": {
-          "sendSessionAffinityHeaders": true,
-          "sessionAffinityFormat": "openrouter"
-        }
-      }]
-    }
-  }
-}
-EOF
+  KINETIX_BASE="$BASE" \
+  KINETIX_ADMIN_TOKEN="$ADMIN_TOKEN" \
+  KINETIX_KEY="$KEY" \
+    python3 "$ROOT/scripts/release-client-profile.py" pi "$model" "$PROXY_BASE" "$agent"
   (
     cd "$project"
     PI_CODING_AGENT_DIR="$agent" \
-    KINETIX_ACCEPT_KEY="$KEY" \
+    KINETIX_API_KEY="$KEY" \
       pi --provider kinetix --model "$model" --thinking high --mode json \
       @pixel.png \
       "Use two separate file-tool calls: first read acceptance-a.txt, then make a second tool call to read acceptance-b.txt. Report alpha-sentinel and beta-sentinel exactly, describe the attached image, then finish normally."
@@ -330,15 +311,18 @@ EOF
 run_claude() {
   local model="$1"
   command -v claude >/dev/null || return 127
-  local project
+  local project profile
   project="$(prepare_project)"
+  profile="$WORK/claude-profile-$CASE_ID"
+  mkdir -p "$profile"
+  KINETIX_BASE="$BASE" \
+  KINETIX_ADMIN_TOKEN="$ADMIN_TOKEN" \
+  KINETIX_KEY="$KEY" \
+    python3 "$ROOT/scripts/release-client-profile.py" claude_code "$model" "$PROXY_BASE" "$profile"
   (
     cd "$project"
-    ANTHROPIC_BASE_URL="$PROXY_BASE" \
-    ANTHROPIC_API_KEY="$KEY" \
-    ANTHROPIC_AUTH_TOKEN="" \
-      claude -p \
-      --model "$model" \
+    bash "$profile/kinetix-claude.sh" \
+      -p \
       --output-format stream-json \
       --verbose \
       "Use two separate file-tool calls: first read acceptance-a.txt, then make a second tool call to read acceptance-b.txt. Report alpha-sentinel and beta-sentinel exactly, then finish normally."
@@ -353,26 +337,41 @@ run_responses() {
   home="$WORK/codex-home-$CASE_ID"
   session="kinetix-release-$STAMP-$CASE_ID"
   mkdir -p "$home"
-  cat >"$home/config.toml" <<EOF
-model = "$model"
-model_provider = "kinetix"
-model_reasoning_effort = "high"
-approval_policy = "never"
-sandbox_mode = "workspace-write"
+  KINETIX_BASE="$BASE" \
+  KINETIX_ADMIN_TOKEN="$ADMIN_TOKEN" \
+  KINETIX_KEY="$KEY" \
+    python3 "$ROOT/scripts/release-client-profile.py" codex "$model" "$PROXY_BASE" "$home"
+  python3 - "$home/config.toml" "$session" <<'PY'
+import json
+import pathlib
+import sys
 
-[model_providers.kinetix]
-name = "Kinetix"
-base_url = "$PROXY_BASE/v1"
-env_key = "KINETIX_ACCEPT_KEY"
-wire_api = "responses"
-requires_openai_auth = false
-http_headers = { "X-Kinetix-Session" = "$session" }
-EOF
+config_path = pathlib.Path(sys.argv[1])
+session = sys.argv[2]
+config = config_path.read_text()
+provider_table = "[model_providers.kinetix]"
+if provider_table not in config:
+    raise SystemExit("generated Codex profile is missing its Kinetix provider")
+config = config.replace(
+    provider_table,
+    "\n".join(
+        [
+            'model_reasoning_effort = "high"',
+            'approval_policy = "never"',
+            'sandbox_mode = "workspace-write"',
+            "",
+            provider_table,
+        ]
+    ),
+    1,
+)
+config += f'http_headers = {{ "X-Kinetix-Session" = {json.dumps(session)} }}\n'
+config_path.write_text(config)
+PY
   (
     cd "$project"
-    CODEX_HOME="$home" \
-    KINETIX_ACCEPT_KEY="$KEY" \
-      codex exec --json --skip-git-repo-check \
+    source "$home/kinetix-api-key.sh"
+    CODEX_HOME="$home" codex exec --json --skip-git-repo-check \
       "Use two separate file-tool calls: first read acceptance-a.txt, then make a second tool call to read acceptance-b.txt. Report alpha-sentinel and beta-sentinel exactly, then finish normally."
   )
 }

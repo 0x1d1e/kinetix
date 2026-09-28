@@ -27,6 +27,29 @@ export interface CreateKeyInput {
   monthly_budget?: number | null;
 }
 
+export type ClientProfileClient = 'pi' | 'claude_code' | 'codex' | 'open_code';
+
+export interface ClientProfileModel {
+  id: string;
+}
+
+export type ClientProfileFileUsage = 'write_to' | 'merge_into' | 'source' | 'execute';
+
+export interface ClientProfileFile {
+  filename: string;
+  destination: string | null;
+  usage: ClientProfileFileUsage;
+  content_type: string;
+  content: string;
+}
+
+export interface GeneratedClientProfile {
+  client: ClientProfileClient;
+  model: string;
+  public_base_url: string;
+  files: ClientProfileFile[];
+}
+
 export interface DiscoveredReasoningCapability {
   mode?: 'toggle' | 'manual_budget' | 'level' | 'adaptive' | null;
   levels: string[];
@@ -468,6 +491,14 @@ export const Kinetix = {
   },
   updateKey: (id: string, body: Record<string, unknown>) => api.put(`/admin/api/keys/${id}`, body),
   deleteKey: (id: string) => api.del(`/admin/api/keys/${id}`),
+  clientProfileModels: (keyId: string) =>
+    api.get<{ models: ClientProfileModel[] }>(`/admin/api/keys/${encodeURIComponent(keyId)}/client-profile-models`),
+  generateClientProfile: (body: {
+    key_id: string;
+    client: ClientProfileClient;
+    model: string;
+    api_key?: string;
+  }) => api.post<GeneratedClientProfile>('/admin/api/client-profiles/generate', body),
 
   // --- providers -----------------------------------------------------------
   async providers(): Promise<Provider[]> {

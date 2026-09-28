@@ -200,6 +200,11 @@ export KINETIX_ACCEPT_RESPONSES_AFFINITY_MODEL=sticky-route
 bash scripts/release-client-acceptance.sh all
 ```
 
+The Pi, Claude Code, and Codex runners get their configuration from Kinetix's
+client-profile endpoint, so the active key supplied as `KINETIX_KEY` must grant each
+selected model. This keeps real-client acceptance on the same renderer used by the
+dashboard.
+
 For the fallback selectors, configure a Route whose first eligible target fails and a
 later target succeeds. For affinity selectors, use a sticky Route with multiple
 eligible targets. Responses has no native Responses upstream passthrough in v1, so its

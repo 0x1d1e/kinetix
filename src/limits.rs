@@ -9,8 +9,8 @@ use crate::types::ProxyError;
 
 pub struct KeyLimits;
 
-/// Validate immutable per-key policy before admission.
-pub fn validate(key: &VirtualKeyRow, requested_model: &str) -> Result<(), ProxyError> {
+/// Validate key lifecycle state and expiry without requiring a requested model.
+pub fn validate_status(key: &VirtualKeyRow) -> Result<(), ProxyError> {
     match key.status.as_str() {
         "revoked" => {
             return Err(ProxyError::unauthorized(
@@ -34,6 +34,13 @@ pub fn validate(key: &VirtualKeyRow, requested_model: &str) -> Result<(), ProxyE
             )));
         }
     }
+
+    Ok(())
+}
+
+/// Validate immutable per-key policy before admission.
+pub fn validate(key: &VirtualKeyRow, requested_model: &str) -> Result<(), ProxyError> {
+    validate_status(key)?;
 
     if !key.permits_model(requested_model) {
         return Err(ProxyError::new(

@@ -56,8 +56,15 @@ pub fn build(state: AppState) -> Router {
         )
         .route("/overview", get(admin::overview))
         .route("/test-stream", post(admin::test_stream))
-        // keys
         .route("/keys", get(admin::list_keys).post(admin::create_key))
+        .route(
+            "/keys/{id}/client-profile-models",
+            get(admin::client_profile_models),
+        )
+        .route(
+            "/client-profiles/generate",
+            post(admin::generate_client_profile),
+        )
         .route(
             "/keys/{id}",
             put(admin::update_key).delete(admin::delete_key),

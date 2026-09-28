@@ -987,6 +987,100 @@ fn mask_hash(_hash: &str) -> String {
     "sk-kinetix-•••• (hidden)".to_string()
 }
 
+async fn key_for_client_profile(state: &AppState, id: &str) -> Result<db::VirtualKeyRow, ApiError> {
+    db::get_virtual_key_by_id(&state.pool, id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("virtual key not found"))
+}
+
+fn profile_policy_error(error: crate::types::ProxyError) -> ApiError {
+    ApiError(
+        StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
+        error.message,
+    )
+}
+
+pub async fn client_profile_models(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let key = key_for_client_profile(&state, &id).await?;
+    limits::validate_status(&key).map_err(profile_policy_error)?;
+    let models = crate::frontends::models::client_profile_models(
+        &state.registry,
+        &key.allowed_models(),
+        &key.allowed_providers(),
+    );
+    Ok(Json(json!({ "models": models })))
+}
+
+#[derive(Deserialize)]
+pub struct GenerateClientProfileBody {
+    pub key_id: String,
+    pub client: crate::client_profiles::ClientApp,
+    pub model: String,
+    pub api_key: Option<String>,
+}
+
+pub async fn generate_client_profile(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Json(body): Json<GenerateClientProfileBody>,
+) -> Result<Response, ApiError> {
+    let key = key_for_client_profile(&state, &body.key_id).await?;
+    limits::validate(&key, &body.model).map_err(profile_policy_error)?;
+    let visible_models = crate::frontends::models::client_profile_models(
+        &state.registry,
+        &key.allowed_models(),
+        &key.allowed_providers(),
+    );
+    let selected_model = visible_models
+        .into_iter()
+        .find(|model| model.id == body.model)
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::FORBIDDEN,
+                "selected model or Route is not currently available to this key".into(),
+            )
+        })?;
+
+    let api_key = body
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(api_key) = api_key {
+        if !api_key.starts_with("sk-kinetix-") {
+            return Err(ApiError::bad(
+                "the supplied value is not a Kinetix virtual key",
+            ));
+        }
+        let supplied_hash = crypto::hash_virtual_key(api_key);
+        if !crypto::constant_time_eq(&supplied_hash, &key.key_hash) {
+            return Err(ApiError::bad(
+                "the supplied virtual key does not match the selected key",
+            ));
+        }
+    }
+
+    let public_base_url = effective_public_base_url(&state).await?;
+    let profile = crate::client_profiles::generate_with_metadata(
+        body.client,
+        &public_base_url,
+        &body.model,
+        &selected_model.metadata,
+        api_key,
+    );
+    let mut response = Json(profile).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
 #[derive(Deserialize)]
 pub struct CreateKeyBody {
     pub name: String,
@@ -13782,7 +13876,7 @@ mod reasoning_discovery_control_plane_tests {
         assert_eq!(before_accept.capabilities.tool_calling, Some(false));
         assert!(before_accept.thinking_map.levels.is_empty());
 
-        update_model_reconciliation(
+        let _ = update_model_reconciliation(
             State(state.clone()),
             AdminAuth {
                 actor: "admin".into(),
@@ -14324,6 +14418,7 @@ mod reasoning_discovery_control_plane_tests {
             FrontendFormat::OpenAi,
             registry.as_ref(),
             &["*".to_string()],
+            &[],
         );
         let listed = body["data"]
             .as_array()
@@ -14638,6 +14733,183 @@ mod credential_enrollment_regression_tests {
         AdminAuth {
             actor: "test".into(),
             token: "test-admin".into(),
+        }
+    }
+
+    mod client_profile_model_grant_tests {
+        use super::*;
+
+        async fn state_with_wildcard_model_grant(
+            tag: &str,
+        ) -> (AppState, std::path::PathBuf, String) {
+            let (state, root) = test_state(tag).await;
+            let provider_a = insert_provider(
+                &state,
+                "provider-a",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let provider_b = insert_provider(
+                &state,
+                "provider-b",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            // The selected registry row explicitly carries the capabilities
+            // from the Pi acceptance fixture; the other provider has unknowns.
+            for provider_id in [&provider_a, &provider_b] {
+                db::insert_model(
+                    &state.pool,
+                    &db::NewModel {
+                        provider_id,
+                        upstream_id: "model",
+                        display_name: "Model",
+                        enabled: true,
+                        context_window: (provider_id == &provider_b).then_some(200_000),
+                        max_output_tokens: (provider_id == &provider_b).then_some(8_192),
+                        capabilities: if provider_id == &provider_b {
+                            json!({"text": true, "vision": true, "reasoning": true})
+                        } else {
+                            json!({})
+                        },
+                        prices: json!({}),
+                        parameters: json!({}),
+                        thinking_map: json!({}),
+                        extra_request: json!({}),
+                        discovery: json!({}),
+                    },
+                )
+                .await
+                .unwrap();
+                db::insert_account(
+                    &state.pool,
+                    provider_id,
+                    "profile-test-account",
+                    "encrypted-test-secret",
+                    "masked",
+                    1,
+                    1,
+                    None,
+                    "none",
+                )
+                .await
+                .unwrap();
+            }
+
+            let key = db::VirtualKeyRow {
+                id: format!("key_{tag}"),
+                key_hash: "test-hash".into(),
+                name: "wildcard model key".into(),
+                owner: "test".into(),
+                tag: String::new(),
+                allowed_models: json!(["*"]).to_string(),
+                allowed_providers: json!([provider_b]).to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                daily_budget: None,
+                monthly_budget: None,
+                expires_at: None,
+                status: "active".into(),
+                allowed_ips: json!([]).to_string(),
+                body_logging: 0,
+                created_at: db::now_iso(),
+                revoked_at: None,
+            };
+            db::insert_virtual_key(&state.pool, &key).await.unwrap();
+            state.registry.reload(&state.pool).await.unwrap();
+            (state, root, key.id)
+        }
+
+        #[tokio::test]
+        async fn wildcard_model_grant_exposes_provider_qualified_models() {
+            let (state, root, key_id) = state_with_wildcard_model_grant("wildcard-list").await;
+            let Json(body) =
+                client_profile_models(State(state.clone()), auth(), Path(key_id.clone()))
+                    .await
+                    .unwrap();
+            assert!(body["models"].as_array().unwrap().contains(&json!({
+                "id": "provider-b/model"
+            })));
+
+            let provider_b_id = state
+                .registry
+                .snapshot()
+                .providers
+                .values()
+                .find(|provider| provider.name == "provider-b")
+                .unwrap()
+                .id
+                .clone();
+            let public_models = crate::frontends::models::models_body(
+                crate::frontends::FrontendFormat::OpenAi,
+                &state.registry,
+                &["*".into()],
+                &[provider_b_id],
+            );
+            let qualified_model = public_models["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == "provider-b/model")
+                .expect("provider-qualified model is visible in /v1/models");
+            assert_eq!(qualified_model["context_window"], 200_000);
+            assert_eq!(qualified_model["max_output_tokens"], 8_192);
+            drop(state);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[tokio::test]
+        async fn wildcard_model_grant_generates_provider_qualified_profile() {
+            let (state, root, key_id) = state_with_wildcard_model_grant("wildcard-generate").await;
+            let response = generate_client_profile(
+                State(state.clone()),
+                auth(),
+                Json(GenerateClientProfileBody {
+                    key_id,
+                    client: crate::client_profiles::ClientApp::Pi,
+                    model: "provider-b/model".into(),
+                    api_key: None,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(axum::http::header::CACHE_CONTROL),
+                Some(&axum::http::HeaderValue::from_static("no-store"))
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let profile: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(profile["model"], "provider-b/model");
+            let models_content = profile["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|file| file["filename"] == "models.json")
+                .unwrap()["content"]
+                .as_str()
+                .unwrap();
+            let models: Value = serde_json::from_str(models_content).unwrap();
+            let model = &models["providers"]["kinetix"]["models"][0];
+            assert_eq!(model["reasoning"], true);
+            assert_eq!(model["input"], json!(["text", "image"]));
+            assert_eq!(model["contextWindow"], 200_000);
+            assert_eq!(model["maxTokens"], 8_192);
+            assert_eq!(
+                model["compat"],
+                json!({
+                    "sendSessionAffinityHeaders": true,
+                    "sessionAffinityFormat": "openrouter"
+                })
+            );
+            drop(state);
+            let _ = std::fs::remove_dir_all(root);
         }
     }
 
@@ -15090,7 +15362,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
 
-        import_config(
+        let _ = import_config(
             State(state.clone()),
             auth(),
             Json(ImportBody {
@@ -15528,7 +15800,7 @@ mod credential_enrollment_regression_tests {
 
         let mut body = provider_body("endpoint-price-provider", None);
         body.base_url = "http://127.0.0.1:23456".into();
-        update_provider(
+        let _ = update_provider(
             State(state.clone()),
             auth(),
             Path(provider_id.clone()),
@@ -15633,7 +15905,7 @@ mod credential_enrollment_regression_tests {
         .unwrap();
 
         drop(guard);
-        update.await.unwrap().unwrap();
+        let _ = update.await.unwrap().unwrap();
 
         assert_eq!(
             db::provider_pricing_scope(&state.pool, &provider_id)
@@ -16563,7 +16835,7 @@ mod credential_enrollment_regression_tests {
             .unwrap()
             .to_string();
 
-        update_model(
+        let _ = update_model(
             State(state.clone()),
             auth(),
             Path(model_id.clone()),
@@ -16682,7 +16954,7 @@ mod credential_enrollment_regression_tests {
         configured_thinking
             .levels
             .insert("max".into(), json!("vendor-max"));
-        update_model(
+        let _ = update_model(
             State(state.clone()),
             auth(),
             Path(model_id.clone()),
@@ -17029,7 +17301,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
 
-        update_model_reconciliation(
+        let _ = update_model_reconciliation(
             State(state.clone()),
             auth(),
             Path(model_id.clone()),
@@ -17151,7 +17423,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
 
-        update_model_reconciliation(
+        let _ = update_model_reconciliation(
             State(state.clone()),
             auth(),
             Path(model_id.clone()),
@@ -17856,7 +18128,7 @@ mod credential_enrollment_regression_tests {
             "wire_plugin": "",
             "model_source_plugin": "plugin:plugin.test/models"
         });
-        import_config(
+        let _ = import_config(
             State(state.clone()),
             auth(),
             Json(ImportBody {
@@ -18098,7 +18370,7 @@ mod credential_enrollment_regression_tests {
             json!(["input_per_1m"])
         );
 
-        import_config(
+        let _ = import_config(
             State(state.clone()),
             auth(),
             Json(ImportBody {
@@ -18242,7 +18514,7 @@ mod credential_enrollment_regression_tests {
             json!(["input_per_1m"])
         );
 
-        import_config(
+        let _ = import_config(
             State(state.clone()),
             auth(),
             Json(ImportBody {
@@ -18323,7 +18595,7 @@ mod credential_enrollment_regression_tests {
             }]
         });
 
-        import_config(
+        let _ = import_config(
             State(state.clone()),
             auth(),
             Json(ImportBody {
@@ -18476,7 +18748,7 @@ mod credential_enrollment_regression_tests {
             .is_none());
 
         let (target, target_root) = test_state("portable-model-ownership-target").await;
-        import_config(
+        let _ = import_config(
             State(target.clone()),
             auth(),
             Json(ImportBody {

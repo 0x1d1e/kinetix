@@ -196,15 +196,18 @@ impl VirtualKeyRow {
     }
     /// Whether a requested model name (alias/route/model) is permitted.
     pub fn permits_model(&self, model: &str) -> bool {
-        let allowed = self.allowed_models();
-        if allowed.iter().any(|m| m == "*") {
-            return true;
-        }
-        allowed.iter().any(|m| {
-            if let Some(prefix) = m.strip_suffix('*') {
+        Self::model_is_allowed(&self.allowed_models(), model)
+    }
+
+    /// Apply the same model-grant policy to a parsed allowlist.
+    pub(crate) fn model_is_allowed(allowed: &[String], model: &str) -> bool {
+        allowed.iter().any(|grant| {
+            if grant == "*" {
+                true
+            } else if let Some(prefix) = grant.strip_suffix('*') {
                 model.starts_with(prefix)
             } else {
-                m == model
+                grant == model
             }
         })
     }
