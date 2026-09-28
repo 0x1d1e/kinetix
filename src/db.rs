@@ -525,6 +525,7 @@ pub async fn update_provider(
         || existing.wire_plugin != p.wire_plugin
         || existing.credential_plugin != p.credential_plugin
         || existing.model_source_plugin != p.model_source_plugin;
+    let catalog_identity_changed = existing.base_url != p.base_url || drivers_changed;
     let conservative = conservative_provider_pricing_scope(
         p.credential_mode,
         p.source_plugin_id,
@@ -574,7 +575,7 @@ pub async fn update_provider(
     .execute(&mut *tx)
     .await?;
 
-    if pricing_scope == "integration" {
+    if pricing_scope == "integration" || catalog_identity_changed {
         revoke_models_dev_effective_pricing_in_transaction(&mut tx, id).await?;
     }
     tx.commit().await?;
@@ -642,7 +643,7 @@ pub async fn update_provider_credential_semantics_with_scope(
     .bind(id)
     .execute(&mut *tx)
     .await?;
-    if pricing_scope == "integration" {
+    if pricing_scope == "integration" || drivers_changed {
         revoke_models_dev_effective_pricing_in_transaction(&mut tx, id).await?;
     }
     tx.commit().await?;
