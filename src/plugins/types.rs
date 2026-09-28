@@ -96,6 +96,7 @@ impl PluginRef {
 
 /// Declared permissions (§5, §8, §9).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Permissions {
     #[serde(default)]
     pub network_hosts: Vec<String>,
@@ -108,6 +109,7 @@ pub struct Permissions {
 
 /// Manifest `[limits]` (§5, §14). These are *requests*; host policy wins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     #[serde(default = "default_memory")]
     pub memory: String,
@@ -186,6 +188,7 @@ impl PricingScope {
 /// plugin capability bindings from the parent Integration; the template cannot
 /// point at capabilities from another plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IntegrationProvider {
     pub base_url: String,
     #[serde(default = "default_integration_wire_format")]
@@ -246,6 +249,7 @@ impl CredentialMode {
 /// by the same plugin. This metadata is declarative only: it grants no
 /// authority and contains no browser-executable code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Integration {
     pub id: String,
     pub name: String,
@@ -283,6 +287,7 @@ impl Integration {
 /// the dashboard renders host-owned controls and invokes an already-authorized
 /// Kinetix operation. No plugin JavaScript is loaded into the admin origin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UiAction {
     pub id: String,
     pub label: String,
@@ -297,6 +302,7 @@ pub struct UiAction {
 /// encrypted under the reserved `_config:` plugin-KV namespace. Guests may
 /// read that namespace but cannot mutate it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UiSetting {
     pub key: String,
     pub label: String,
@@ -314,6 +320,7 @@ pub struct UiSetting {
 
 /// Declarative dashboard metadata. Empty by default for backward compatibility.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginUi {
     #[serde(default)]
     pub actions: Vec<UiAction>,
@@ -321,14 +328,27 @@ pub struct PluginUi {
     pub settings: Vec<UiSetting>,
 }
 
+/// Host-version bounds declared by a plugin package.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostCompatibility {
+    #[serde(default)]
+    pub min_host_version: Option<String>,
+    #[serde(default)]
+    pub max_host_version: Option<String>,
+}
+
 /// A parsed `plugin.toml` (§5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub manifest_version: u32,
     pub id: String,
     pub name: String,
     pub version: String,
     pub plugin_api: String,
+    #[serde(default)]
+    pub compatibility: HostCompatibility,
     #[serde(default)]
     pub provides: Provides,
     #[serde(default)]
@@ -358,6 +378,7 @@ fn default_routing_refresh_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provides {
     #[serde(default)]
     pub credential_strategies: Vec<String>,
@@ -405,17 +426,60 @@ impl Provides {
 }
 
 impl Manifest {
-    /// The declared API major, e.g. `"1"` or `"1.2"` -> `1`.
+    /// The declared API major, e.g. `"1"` or `"1.2.0"` -> `1`.
     pub fn api_major(&self) -> Option<u32> {
-        self.plugin_api
-            .split('.')
-            .next()
-            .and_then(|s| s.parse::<u32>().ok())
+        let mut parts = self.plugin_api.split('.');
+        let major = parts.next()?;
+        if !major.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let major = major.parse::<u32>().ok()?;
+        let mut count = 1;
+        for part in parts {
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            count += 1;
+        }
+        (count <= 3).then_some(major)
+    }
+
+    /// Whether the manifest is compatible with a specific Kinetix host.
+    pub fn compatible_with_host_version(&self, host_version: &semver::Version) -> bool {
+        if self.manifest_version != MANIFEST_VERSION || self.api_major() != Some(PLUGIN_API_MAJOR) {
+            return false;
+        }
+        let min_host = self
+            .compatibility
+            .min_host_version
+            .as_deref()
+            .map(semver::Version::parse)
+            .transpose();
+        let max_host = self
+            .compatibility
+            .max_host_version
+            .as_deref()
+            .map(semver::Version::parse)
+            .transpose();
+        let (Ok(min_host), Ok(max_host)) = (min_host, max_host) else {
+            return false;
+        };
+        if matches!((&min_host, &max_host), (Some(min), Some(max)) if min > max) {
+            return false;
+        }
+        min_host
+            .map(|version| host_version >= &version)
+            .unwrap_or(true)
+            && max_host
+                .map(|version| host_version <= &version)
+                .unwrap_or(true)
     }
 
     /// Whether the manifest is compatible with this host build.
     pub fn compatible(&self) -> bool {
-        self.manifest_version == MANIFEST_VERSION && self.api_major() == Some(PLUGIN_API_MAJOR)
+        semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .map(|host_version| self.compatible_with_host_version(&host_version))
+            .unwrap_or(false)
     }
 }
 
