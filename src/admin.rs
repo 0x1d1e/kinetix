@@ -9466,6 +9466,87 @@ async fn validate_imported_provider_credential_semantics(
     Ok(())
 }
 
+async fn validate_imported_provider_pricing_scope(
+    state: &AppState,
+    name: &str,
+    requested_scope: Option<&str>,
+    credential_mode: crate::plugins::CredentialMode,
+    source_plugin_id: Option<&str>,
+    source_integration_id: Option<&str>,
+    wire_plugin: &str,
+    credential_plugin: &str,
+    model_source_plugin: &str,
+) -> Result<(), String> {
+    if requested_scope != Some("direct_api") {
+        return Ok(());
+    }
+
+    let conservative_scope = db::conservative_provider_pricing_scope(
+        credential_mode.as_str(),
+        source_plugin_id,
+        source_integration_id,
+        wire_plugin,
+        credential_plugin,
+        model_source_plugin,
+    );
+    if conservative_scope == "direct_api" {
+        return Ok(());
+    }
+
+    let plugin_id = source_plugin_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "provider '{name}': pricing_scope 'direct_api' requires an installed source integration that declares direct_api pricing"
+            )
+        })?;
+    let integration_id = source_integration_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "provider '{name}': pricing_scope 'direct_api' requires an installed source integration that declares direct_api pricing"
+            )
+        })?;
+    let manager = state.plugin_manager().ok_or_else(|| {
+        format!(
+            "provider '{name}': pricing_scope 'direct_api' requires installed source integration '{integration_id}' from plugin '{plugin_id}'"
+        )
+    })?;
+    let row = manager
+        .get(plugin_id)
+        .await
+        .map_err(|error| format!("provider '{name}': {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "provider '{name}': source plugin '{plugin_id}' is not installed for direct_api pricing"
+            )
+        })?;
+    let manifest = row
+        .manifest()
+        .ok_or_else(|| format!("provider '{name}': source plugin manifest is unreadable"))?;
+    let integration = manifest
+        .integrations
+        .iter()
+        .find(|integration| integration.id == integration_id)
+        .ok_or_else(|| {
+            format!(
+                "provider '{name}': source integration '{integration_id}' is unavailable"
+            )
+        })?;
+    let declared_scope = integration
+        .provider
+        .as_ref()
+        .map(|provider| provider.pricing_scope)
+        .unwrap_or_default();
+    if declared_scope != crate::plugins::PricingScope::DirectApi {
+        return Err(format!(
+            "provider '{name}': source integration '{integration_id}' does not declare pricing_scope 'direct_api'"
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub struct ImportBody {
     pub config: Value,
@@ -9565,13 +9646,31 @@ pub async fn import_config(
                 .as_ref()
                 .and_then(|provider| provider.source_integration_id.as_deref())
         };
+        let wire_plugin = p["wire_plugin"].as_str().unwrap_or("");
+        let credential_plugin = p["credential_plugin"].as_str().unwrap_or("");
+        let model_source_plugin = p["model_source_plugin"].as_str().unwrap_or("");
         if let Err(problem) = validate_imported_provider_credential_semantics(
             &state,
             name,
             effective_mode,
-            p["credential_plugin"].as_str().unwrap_or(""),
+            credential_plugin,
             source_plugin_id,
             source_integration_id,
+        )
+        .await
+        {
+            problems.push(problem);
+        }
+        if let Err(problem) = validate_imported_provider_pricing_scope(
+            &state,
+            name,
+            p["pricing_scope"].as_str(),
+            effective_mode,
+            source_plugin_id,
+            source_integration_id,
+            wire_plugin,
+            credential_plugin,
+            model_source_plugin,
         )
         .await
         {
@@ -9707,6 +9806,19 @@ pub async fn import_config(
             };
             let lock = model_reconciliation_lock(&existing_id);
             let _guard = lock.lock().await;
+            validate_imported_provider_pricing_scope(
+                &state,
+                name,
+                p["pricing_scope"].as_str(),
+                credential_mode,
+                source_plugin_id.as_deref(),
+                source_integration_id.as_deref(),
+                p["wire_plugin"].as_str().unwrap_or(""),
+                p["credential_plugin"].as_str().unwrap_or(""),
+                p["model_source_plugin"].as_str().unwrap_or(""),
+            )
+            .await
+            .map_err(ApiError::bad)?;
             db::update_provider(
                 &state.pool,
                 &existing_id,
@@ -9718,6 +9830,19 @@ pub async fn import_config(
             reconcile_provider_account_mode(&state, &existing_id, credential_mode).await?;
         } else {
             let credential_mode = explicit_mode.unwrap_or(crate::plugins::CredentialMode::Manual);
+            validate_imported_provider_pricing_scope(
+                &state,
+                name,
+                p["pricing_scope"].as_str(),
+                credential_mode,
+                p["source_plugin_id"].as_str(),
+                p["source_integration_id"].as_str(),
+                p["wire_plugin"].as_str().unwrap_or(""),
+                p["credential_plugin"].as_str().unwrap_or(""),
+                p["model_source_plugin"].as_str().unwrap_or(""),
+            )
+            .await
+            .map_err(ApiError::bad)?;
             let id = db::insert_provider(
                 &state.pool,
                 &db::NewProvider {
