@@ -47,33 +47,26 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort pre-migration backup (NFR-2.4): copy the SQLite file aside before
-/// migrations run so a failed upgrade can be rolled back. WAL sidecars are
-/// checkpointed first. Returns the backup path when a backup was written.
-pub fn backup_before_migration(database_url: &str, data_dir: &std::path::Path) -> Option<PathBuf> {
-    // Only meaningful for file-backed SQLite.
-    let path = database_url
-        .strip_prefix("sqlite://")
-        .or_else(|| database_url.strip_prefix("sqlite:"))?
-        .split('?')
-        .next()
-        .unwrap_or("");
-    if path.is_empty() || path == ":memory:" {
-        return None;
-    }
-    let src = std::path::Path::new(path);
+/// Best-effort pre-migration backup (NFR-2.4). `VACUUM INTO` includes committed
+/// WAL data and produces a consistent snapshot before migrations run.
+pub async fn backup_before_migration(
+    pool: &Pool,
+    database_url: &str,
+    data_dir: &std::path::Path,
+) -> Option<PathBuf> {
+    let src = database_file_path(database_url)?;
     if !src.exists() {
         return None; // fresh database: nothing to back up
     }
     let backup_dir = data_dir.join("backups");
-    if std::fs::create_dir_all(&backup_dir).is_err() {
+    if let Err(e) = std::fs::create_dir_all(&backup_dir) {
+        tracing::warn!(error = %e, "pre-migration backup failed (continuing)");
         return None;
     }
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let dst = backup_dir.join(format!("kinetix-pre-migration-{stamp}.db"));
-    // Copy the main file; a WAL-checkpointed copy is best-effort (the backup is
-    // a safety net, not the primary durability mechanism).
-    match std::fs::copy(src, &dst) {
+    let sql = vacuum_into_sql(&dst);
+    match sqlx::query(&sql).execute(pool).await {
         Ok(_) => {
             tracing::info!(backup = %dst.display(), "wrote pre-migration backup");
             Some(dst)
@@ -83,6 +76,26 @@ pub fn backup_before_migration(database_url: &str, data_dir: &std::path::Path) -
             None
         }
     }
+}
+
+fn database_file_path(database_url: &str) -> Option<PathBuf> {
+    let path = database_url
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.strip_prefix("sqlite:"))?
+        .split('?')
+        .next()
+        .unwrap_or("");
+    if path.is_empty() || path == ":memory:" {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+fn vacuum_into_sql(path: &std::path::Path) -> String {
+    format!(
+        "VACUUM INTO '{}'",
+        path.display().to_string().replace('\'', "''")
+    )
 }
 
 /// A consistent, WAL-safe scheduled backup using `VACUUM INTO` (NFR-2.4).
@@ -99,14 +112,9 @@ pub async fn scheduled_backup(
     data_dir: &std::path::Path,
     retain: usize,
 ) -> Result<Option<PathBuf>, String> {
-    let _path = match database_url
-        .strip_prefix("sqlite://")
-        .or_else(|| database_url.strip_prefix("sqlite:"))
-        .map(|p| p.split('?').next().unwrap_or("").to_string())
-    {
-        Some(p) if !p.is_empty() && p != ":memory:" => p,
-        _ => return Ok(None),
-    };
+    if database_file_path(database_url).is_none() {
+        return Ok(None);
+    }
     let backup_dir = data_dir.join("backups");
     if let Err(e) = std::fs::create_dir_all(&backup_dir) {
         return Err(format!("cannot create backup dir: {e}"));
@@ -129,10 +137,7 @@ Retention: the newest 14 scheduled snapshots are kept; older ones are pruned.\n"
     let _ = std::fs::write(backup_dir.join("RESTORE.txt"), readme);
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let dst = backup_dir.join(format!("kinetix-{stamp}.db"));
-    let sql = format!(
-        "VACUUM INTO '{}'",
-        dst.display().to_string().replace('\'', "''")
-    );
+    let sql = vacuum_into_sql(&dst);
     if let Err(e) = sqlx::query(&sql).execute(pool).await {
         tracing::warn!(error = %e, "scheduled backup failed");
         return Err(format!("VACUUM INTO failed: {e}"));
