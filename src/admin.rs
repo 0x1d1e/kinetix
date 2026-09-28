@@ -3633,6 +3633,19 @@ fn merge_selected_reasoning_overrides(
     overrides
 }
 
+fn merge_operator_thinking_map_override(
+    discovery: &Value,
+    thinking_map: &Value,
+) -> serde_json::Map<String, Value> {
+    let mut overrides = discovery
+        .get("operator_thinking_overrides")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    overrides.insert("thinking_map".into(), thinking_map.clone());
+    overrides
+}
+
 fn pin_selected_price_fields(
     discovery: &Value,
     current: &Prices,
@@ -3780,6 +3793,7 @@ pub async fn update_model_reconciliation(
             let current_prices = row.prices();
             let has_capability_pins = pins.iter().any(|field| field.starts_with("capabilities."));
             let has_reasoning_pins = pins.iter().any(|field| field == "reasoning_capability");
+            let has_thinking_map_pin = pins.iter().any(|field| field == "thinking_map");
             let has_price_pins = pins.iter().any(|field| field.starts_with("prices."));
 
             let mut discovery_patch = serde_json::Map::new();
@@ -3800,6 +3814,15 @@ pub async fn update_model_reconciliation(
                 discovery_patch.insert(
                     "operator_reasoning_overrides".into(),
                     Value::Object(overrides),
+                );
+            }
+            if has_thinking_map_pin {
+                discovery_patch.insert(
+                    "operator_thinking_overrides".into(),
+                    Value::Object(merge_operator_thinking_map_override(
+                        &discovery,
+                        &thinking_map,
+                    )),
                 );
             }
 
@@ -3981,6 +4004,17 @@ pub async fn update_model_reconciliation(
                 accepted_discovery.insert(
                     "operator_reasoning_overrides".into(),
                     Value::Object(reasoning_overrides),
+                );
+            }
+            if selected.iter().any(|field| field == "thinking_map") {
+                let accepted_thinking_map =
+                    serde_json::to_value(&thinking_map).map_err(ApiError::internal)?;
+                accepted_discovery.insert(
+                    "operator_thinking_overrides".into(),
+                    Value::Object(merge_operator_thinking_map_override(
+                        &discovery,
+                        &accepted_thinking_map,
+                    )),
                 );
             }
 
@@ -5882,6 +5916,31 @@ mod probe_cost_regression_tests {
     }
 }
 
+fn merge_probe_extra_request(base: &Value, overlay: &Value) -> Value {
+    fn merge(target: &mut Value, overlay: &Value) {
+        match (target, overlay) {
+            (Value::Object(target), Value::Object(overlay)) => {
+                for (key, value) in overlay {
+                    if let Some(existing) = target.get_mut(key) {
+                        merge(existing, value);
+                    } else {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            (target, overlay) => *target = overlay.clone(),
+        }
+    }
+
+    let mut merged = if base.is_object() {
+        base.clone()
+    } else {
+        json!({})
+    };
+    merge(&mut merged, overlay);
+    merged
+}
+
 fn structured_output_probe_contract(value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;
@@ -5993,6 +6052,67 @@ mod probe_rejection_regression_tests {
     }
 
     #[test]
+    fn transport_probe_requires_explicit_endpoint_or_transport_rejection() {
+        for (status, body) in [
+            (400, "transport is unsupported"),
+            (404, "unsupported endpoint for this transport"),
+            (405, "endpoint is not supported"),
+        ] {
+            assert!(deterministic_probe_rejection(
+                "transport",
+                None,
+                status,
+                body,
+            ));
+        }
+
+        for (status, body) in [
+            (400, "bad request"),
+            (404, "not found"),
+            (405, "method not allowed"),
+            (502, "unsupported endpoint"),
+            (503, "transport is unsupported"),
+            (504, "transport is unsupported"),
+        ] {
+            assert!(!deterministic_probe_rejection(
+                "transport",
+                None,
+                status,
+                body,
+            ));
+        }
+    }
+
+    #[test]
+    fn structured_output_probe_merges_configured_extra_request() {
+        let base = json!({
+            "metadata": {"trace_id": "keep-me"},
+            "generationConfig": {
+                "temperature": 0.25,
+                "responseMimeType": "text/plain"
+            }
+        });
+        let probe = json!({
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseJsonSchema": {"type": "object"}
+            }
+        });
+
+        let merged = merge_probe_extra_request(&base, &probe);
+        assert_eq!(merged["metadata"]["trace_id"], "keep-me");
+        assert_eq!(merged["generationConfig"]["temperature"], 0.25);
+        assert_eq!(
+            merged["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(
+            merged["generationConfig"]["responseJsonSchema"]["type"],
+            "object"
+        );
+    }
+
+    #[test]
     fn structured_output_probe_requires_exact_object_shape() {
         assert!(structured_output_probe_contract(&json!({"ok": "yes"})));
         assert!(!structured_output_probe_contract(
@@ -6039,6 +6159,28 @@ fn deterministic_probe_rejection(
     status: u16,
     body: &str,
 ) -> bool {
+    if capability == "transport" {
+        if !matches!(status, 400 | 404 | 405 | 422) {
+            return false;
+        }
+        let body = body.to_ascii_lowercase();
+        return [
+            "transport is unsupported",
+            "transport is not supported",
+            "transport not supported",
+            "unsupported transport",
+            "endpoint is unsupported",
+            "endpoint is not supported",
+            "endpoint not supported",
+            "unsupported endpoint",
+            "api endpoint is unsupported",
+            "api endpoint is not supported",
+            "this endpoint does not support this transport",
+        ]
+        .iter()
+        .any(|pattern| body.contains(pattern));
+    }
+
     if !matches!(status, 400 | 422) {
         return false;
     }
@@ -6444,7 +6586,9 @@ pub async fn probe_model_capability(
                     })))
                 }
             };
-            execution_model.extra_request = extra.to_string();
+            let merged_extra =
+                merge_probe_extra_request(&execution_model.extra_request_value(), &extra);
+            execution_model.extra_request = merged_extra.to_string();
         }
         capability if capability.starts_with("parameter.") => {
             let parameter = capability.trim_start_matches("parameter.");
@@ -6960,6 +7104,12 @@ pub async fn create_model(
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     validate_thinking_map(&body.thinking_map)?;
     validate_discovery_execution(&body.discovery)?;
+    let thinking_map =
+        serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible");
+    let thinking_map_configured = !body.thinking_map.levels.is_empty()
+        || body.thinking_map.mode.is_some()
+        || body.thinking_map.budget_field.is_some()
+        || body.thinking_map.level_field.is_some();
 
     let id = db::insert_model(
         &state.pool,
@@ -6973,8 +7123,7 @@ pub async fn create_model(
             capabilities: caps.clone(),
             prices: serde_json::to_value(&prices).unwrap(),
             parameters: body.parameters.clone(),
-            thinking_map: serde_json::to_value(&body.thinking_map)
-                .expect("ThinkingMap serialization is infallible"),
+            thinking_map: thinking_map.clone(),
             extra_request: body.extra_request.clone(),
             discovery: body.discovery.clone(),
         },
@@ -6998,6 +7147,11 @@ pub async fn create_model(
                 "operator_parameter_overrides": operator_parameter_support_overrides(
                     &body.parameters
                 ),
+                "operator_thinking_overrides": if thinking_map_configured {
+                    json!({ "thinking_map": thinking_map.clone() })
+                } else {
+                    json!({})
+                },
             }),
         )
         .await
@@ -7010,7 +7164,8 @@ pub async fn create_model(
             &id,
             &json!({
                 "operator_capability_overrides": {},
-                "operator_parameter_overrides": {}
+                "operator_parameter_overrides": {},
+                "operator_thinking_overrides": {}
             }),
         )
         .await
@@ -7139,6 +7294,10 @@ pub async fn update_model(
     );
     let existing_parameters =
         serde_json::from_str::<Value>(&model.parameters).unwrap_or_else(|_| json!({}));
+    let existing_thinking_map =
+        serde_json::to_value(model.thinking()).expect("ThinkingMap serialization is infallible");
+    let thinking_map =
+        serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible");
     let mut discovery_patch = serde_json::Map::new();
     if existing_caps != caps {
         discovery_patch.insert("operator_capability_overrides".into(), caps.clone());
@@ -7149,9 +7308,16 @@ pub async fn update_model(
             operator_parameter_support_overrides(&body.parameters),
         );
     }
+    if existing_thinking_map != thinking_map {
+        discovery_patch.insert(
+            "operator_thinking_overrides".into(),
+            Value::Object(merge_operator_thinking_map_override(
+                &existing_discovery,
+                &thinking_map,
+            )),
+        );
+    }
     let display_name = body.display_name.as_deref().unwrap_or(&body.upstream_id);
-    let thinking_map =
-        serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible");
     let discovery_patch = Value::Object(discovery_patch);
     db::commit_model_operator_mutation(
         &state.pool,
@@ -13689,6 +13855,117 @@ mod credential_enrollment_regression_tests {
                 .pointer("/effective_pricing/price_version_id")
                 .and_then(Value::as_str),
             Some(old_version.as_str())
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn imported_thinking_map_is_unowned_until_operator_changes_it() {
+        let (state, root) = test_state("imported-thinking-ownership").await;
+        let provider_id = insert_provider(
+            &state,
+            "imported-thinking-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let discovered_thinking = ThinkingMap {
+            levels: [
+                ("low".to_string(), json!("low")),
+                ("high".to_string(), json!("high")),
+                ("max".to_string(), json!("max")),
+            ]
+            .into_iter()
+            .collect(),
+            mode: Some(crate::types::ThinkingMode::Level),
+            budget_field: None,
+            level_field: Some("reasoning_effort".into()),
+        };
+
+        let Json(created) = create_model(
+            State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+            Json(ModelBody {
+                upstream_id: "imported-thinking-model".into(),
+                display_name: Some("Imported Thinking Model".into()),
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({"reasoning": true}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: discovered_thinking.clone(),
+                extra_request: json!({}),
+                discovery: json!({
+                    "thinking_map": serde_json::to_value(&discovered_thinking).unwrap(),
+                    "reasoning_capability": {
+                        "mode": "level",
+                        "levels": ["low", "high", "max"],
+                        "can_disable": false,
+                        "upstream_format": "openai_effort"
+                    },
+                    "execution_supported": true,
+                    "imported_from_discovery": true
+                }),
+                transport_override: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let model_id = created["id"].as_str().unwrap().to_string();
+
+        let imported = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let imported_discovery = discovery_object(&imported);
+        assert_eq!(
+            imported_discovery
+                .get("operator_thinking_overrides")
+                .and_then(Value::as_object)
+                .map(|value| value.len()),
+            Some(0)
+        );
+
+        let mut configured_thinking = discovered_thinking.clone();
+        configured_thinking
+            .levels
+            .insert("max".into(), json!("vendor-max"));
+        update_model(
+            State(state.clone()),
+            auth(),
+            Path(model_id.clone()),
+            Json(ModelBody {
+                upstream_id: imported.upstream_id.clone(),
+                display_name: Some(imported.display_name.clone()),
+                enabled: imported.enabled != 0,
+                context_window: imported.context_window,
+                max_output_tokens: imported.max_output_tokens,
+                capabilities: serde_json::from_str(&imported.capabilities).unwrap(),
+                prices: serde_json::from_str(&imported.prices).unwrap(),
+                parameters: serde_json::from_str(&imported.parameters).unwrap(),
+                thinking_map: configured_thinking,
+                extra_request: imported.extra_request_value(),
+                discovery: imported_discovery,
+                transport_override: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let configured = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let configured_discovery = discovery_object(&configured);
+        assert_eq!(
+            configured_discovery
+                .pointer("/operator_thinking_overrides/thinking_map/levels/max"),
+            Some(&json!("vendor-max"))
         );
 
         drop(state);

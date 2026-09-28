@@ -266,11 +266,20 @@ pub fn resolve_execution_profile_for_target(
         || admin_thinking.mode.is_some()
         || admin_thinking.budget_field.is_some()
         || admin_thinking.level_field.is_some();
+    let thinking_ownership = discovery.get("operator_thinking_overrides");
+    let owned_thinking_map_value = thinking_ownership
+        .and_then(serde_json::Value::as_object)
+        .and_then(|overrides| overrides.get("thinking_map"));
+    let explicitly_owned_thinking_map = owned_thinking_map_value.is_some();
+    let owned_thinking_map = owned_thinking_map_value
+        .and_then(|value| serde_json::from_value::<ThinkingMap>(value.clone()).ok());
+    let thinking_map_owned =
+        explicitly_owned_thinking_map || (thinking_ownership.is_none() && admin_thinking_configured);
 
     // A reasoning-disable probe changes runtime executability, not just
     // descriptive capability metadata. Apply it before deriving the effective
     // map, while keeping an explicit operator thinking map authoritative.
-    let reasoning_disable_status = if admin_thinking_configured || reasoning_capability_owned {
+    let reasoning_disable_status = if thinking_map_owned || reasoning_capability_owned {
         None
     } else {
         discovery
@@ -289,8 +298,8 @@ pub fn resolve_execution_profile_for_target(
         }
     }
 
-    let mut thinking_map = if admin_thinking_configured {
-        admin_thinking
+    let mut thinking_map = if thinking_map_owned {
+        owned_thinking_map.unwrap_or(admin_thinking)
     } else {
         discovery
             .get("thinking_map")
@@ -301,6 +310,7 @@ pub fn resolve_execution_profile_for_target(
                     || map.budget_field.is_some()
                     || map.level_field.is_some()
             })
+            .or_else(|| admin_thinking_configured.then_some(admin_thinking))
             .or_else(|| {
                 reasoning
                     .as_ref()
@@ -309,7 +319,7 @@ pub fn resolve_execution_profile_for_target(
             .unwrap_or_default()
     };
 
-    if !admin_thinking_configured {
+    if !thinking_map_owned {
         match reasoning_disable_status {
             Some("unsupported") => {
                 thinking_map.levels.remove("off");
@@ -359,7 +369,7 @@ pub fn resolve_execution_profile_for_target(
                         }
                     }
                     Some("unsupported")
-                        if !admin_thinking_configured && !reasoning_capability_owned =>
+                        if !thinking_map_owned && !reasoning_capability_owned =>
                     {
                         thinking_map.levels.remove(level);
                         if let Some(capability) = reasoning.as_mut() {
@@ -2525,6 +2535,118 @@ mod execution_profile_tests {
             configured.thinking_map.levels.get("high"),
             Some(&serde_json::json!("vendor_high"))
         );
+    }
+
+    #[test]
+    fn imported_thinking_map_is_refined_by_scoped_reasoning_probes() {
+        let provider = provider();
+        let mut model = model();
+        let imported_map = serde_json::json!({
+            "mode": "level",
+            "levels": {"low": "low", "high": "high", "max": "max"},
+            "level_field": "reasoning_effort"
+        });
+        model.thinking_map = imported_map.to_string();
+        model.discovery = serde_json::json!({
+            "operator_thinking_overrides": {},
+            "reasoning_capability": {
+                "mode": "level",
+                "levels": ["low", "high", "max"],
+                "can_disable": false,
+                "upstream_format": "openai_effort"
+            },
+            "thinking_map": imported_map,
+            "probe_evidence": {
+                "reasoning_effort_max": {
+                    "status": "unsupported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                },
+                "reasoning_disable": {
+                    "status": "supported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+
+        assert!(profile.thinking_map.level_is_executable("low"));
+        assert!(profile.thinking_map.level_is_executable("high"));
+        assert!(!profile.thinking_map.level_is_executable("max"));
+        assert!(profile.thinking_map.level_is_executable("off"));
+        let reasoning = profile.reasoning.as_ref().unwrap();
+        assert!(!reasoning.levels.iter().any(|level| level == "max"));
+        assert!(reasoning.can_disable);
+    }
+
+    #[test]
+    fn operator_owned_thinking_map_beats_reasoning_probes() {
+        let provider = provider();
+        let mut model = model();
+        let owned_map = serde_json::json!({
+            "mode": "level",
+            "levels": {"low": "low", "high": "high", "max": "vendor-max"},
+            "level_field": "reasoning_effort"
+        });
+        model.thinking_map = owned_map.to_string();
+        model.discovery = serde_json::json!({
+            "operator_thinking_overrides": {
+                "thinking_map": owned_map
+            },
+            "reasoning_capability": {
+                "mode": "level",
+                "levels": ["low", "high", "max"],
+                "can_disable": false,
+                "upstream_format": "openai_effort"
+            },
+            "probe_evidence": {
+                "reasoning_effort_max": {
+                    "status": "unsupported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                },
+                "reasoning_disable": {
+                    "status": "supported",
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": {
+                        "provider_id": "provider",
+                        "account_id": "account-a",
+                        "model_id": "model",
+                        "transport": "openai"
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account-a")).unwrap();
+
+        assert_eq!(
+            profile.thinking_map.levels.get("max"),
+            Some(&serde_json::json!("vendor-max"))
+        );
+        assert!(!profile.thinking_map.level_is_executable("off"));
+        assert!(!profile.reasoning.as_ref().unwrap().can_disable);
     }
 
     #[test]
