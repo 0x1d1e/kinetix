@@ -17928,6 +17928,27 @@ mod credential_enrollment_regression_tests {
         assert_eq!(provider.base_url, base_url);
         assert_eq!(provider.pricing_scope, "direct_api");
 
+        let mut omitted_scope = provider_body("trusted-direct-provider", None);
+        omitted_scope.base_url = "https://provider-b.example/v1".into();
+        omitted_scope.allow_insecure_tls = false;
+        omitted_scope.pricing_scope = None;
+        let error = update_provider(
+            State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+            Json(omitted_scope),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("pricing_scope 'direct_api' is bound"));
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.base_url, base_url);
+        assert_eq!(provider.pricing_scope, "direct_api");
+
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -17975,27 +17996,105 @@ mod credential_enrollment_regression_tests {
     async fn config_import_restores_missing_plugin_direct_api_conservatively_then_promotes() {
         let (state, root) = test_state_with_plugins("portable-direct-api-import").await;
         let base_url = "https://provider-a.example/v1";
+        let config = json!({
+            "providers": [{
+                "name": "portable-direct-provider",
+                "base_url": base_url,
+                "wire_format": "openai",
+                "auth_scheme": "bearer",
+                "extra_headers": {},
+                "rate_limit_rules": {},
+                "credential_mode": "manual",
+                "credential_plugin": "",
+                "wire_plugin": "",
+                "model_source_plugin": "",
+                "source_plugin_id": "plugin.test",
+                "source_integration_id": "direct",
+                "pricing_scope": "direct_api"
+            }],
+            "models": [{
+                "provider": "portable-direct-provider",
+                "upstream_id": "portable-priced-model",
+                "display_name": "Portable Priced Model",
+                "enabled": true,
+                "capabilities": {},
+                "prices": {
+                    "input_per_1m": 1.25
+                },
+                "parameters": {},
+                "thinking_map": {},
+                "extra_request": {},
+                "ownership": {
+                    "operator_capability_overrides": {},
+                    "operator_parameter_overrides": {},
+                    "operator_reasoning_overrides": {},
+                    "operator_thinking_overrides": {},
+                    "effective_pricing": {
+                        "source": "models.dev:provider",
+                        "metadata": {
+                            "fields": {
+                                "input_per_1m": {
+                                    "source": "models.dev:provider",
+                                    "metadata": {
+                                        "catalog_provider": {
+                                            "provider_id": "provider-a",
+                                            "model_id": "portable-priced-model"
+                                        }
+                                    }
+                                }
+                            },
+                            "catalog_source_state": {
+                                "source": "models.dev"
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+
+        let dry_run = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: config.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true);
+        let provider_plan = dry_run["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["kind"] == "provider")
+            .unwrap();
+        assert_eq!(provider_plan["requested_pricing_scope"], "direct_api");
+        assert_eq!(provider_plan["effective_pricing_scope"], "integration");
+        assert!(dry_run["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("will be restored as 'integration'"))));
+        let model_plan = dry_run["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["kind"] == "model")
+            .unwrap();
+        assert_eq!(
+            model_plan["suppressed_external_price_fields"],
+            json!(["input_per_1m"])
+        );
+
         import_config(
             State(state.clone()),
             auth(),
             Json(ImportBody {
-                config: json!({
-                    "providers": [{
-                        "name": "portable-direct-provider",
-                        "base_url": base_url,
-                        "wire_format": "openai",
-                        "auth_scheme": "bearer",
-                        "extra_headers": {},
-                        "rate_limit_rules": {},
-                        "credential_mode": "manual",
-                        "credential_plugin": "",
-                        "wire_plugin": "",
-                        "model_source_plugin": "",
-                        "source_plugin_id": "plugin.test",
-                        "source_integration_id": "direct",
-                        "pricing_scope": "direct_api"
-                    }]
-                }),
+                config,
                 apply: true,
             }),
         )
@@ -18009,6 +18108,26 @@ mod credential_enrollment_regression_tests {
             .find(|provider| provider.name == "portable-direct-provider")
             .unwrap();
         assert_eq!(provider.pricing_scope, "integration");
+        let model = db::find_model_by_upstream(
+            &state.pool,
+            &provider.id,
+            "portable-priced-model",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(model.prices().input_per_1m, None);
+        let discovery = discovery_object(&model);
+        assert!(discovery
+            .get("effective_pricing")
+            .is_none_or(Value::is_null));
+        let version_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id = ?")
+                .bind(&model.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(version_count, 0);
 
         install_direct_api_test_plugin(&state, base_url).await;
         auto_provision_plugin_providers(&state, "plugin.test").await;
@@ -18017,6 +18136,107 @@ mod credential_enrollment_regression_tests {
             .unwrap()
             .unwrap();
         assert_eq!(provider.pricing_scope, "direct_api");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_import_cannot_inject_external_catalog_pricing_into_integration_provider() {
+        let (state, root) = test_state("integration-import-catalog-price").await;
+        let config = json!({
+            "providers": [{
+                "name": "integration-provider",
+                "base_url": "https://integration.example/v1",
+                "wire_format": "openai",
+                "auth_scheme": "bearer",
+                "extra_headers": {},
+                "rate_limit_rules": {},
+                "credential_mode": "manual",
+                "credential_plugin": "",
+                "wire_plugin": "",
+                "model_source_plugin": "",
+                "pricing_scope": "integration"
+            }],
+            "models": [{
+                "provider": "integration-provider",
+                "upstream_id": "crafted-model",
+                "display_name": "Crafted Model",
+                "enabled": true,
+                "capabilities": {},
+                "prices": {
+                    "input_per_1m": 9.99,
+                    "output_per_1m": 3.0
+                },
+                "parameters": {},
+                "thinking_map": {},
+                "extra_request": {},
+                "ownership": {
+                    "operator_capability_overrides": {},
+                    "operator_parameter_overrides": {},
+                    "operator_reasoning_overrides": {},
+                    "operator_thinking_overrides": {},
+                    "effective_pricing": {
+                        "source": "mixed",
+                        "metadata": {
+                            "fields": {
+                                "input_per_1m": {
+                                    "source": "models.dev:provider",
+                                    "metadata": {}
+                                },
+                                "output_per_1m": {
+                                    "source": "operator",
+                                    "metadata": {
+                                        "configured_by": "config_import"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+
+        import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let provider = db::list_providers(&state.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "integration-provider")
+            .unwrap();
+        assert_eq!(provider.pricing_scope, "integration");
+        let model = db::find_model_by_upstream(&state.pool, &provider.id, "crafted-model")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.prices().input_per_1m, None);
+        assert_eq!(model.prices().output_per_1m, Some(3.0));
+        let discovery = discovery_object(&model);
+        assert_eq!(
+            discovery
+                .pointer("/effective_pricing/fields/output_per_1m/source")
+                .and_then(Value::as_str),
+            Some("operator")
+        );
+        assert!(discovery
+            .pointer("/effective_pricing/fields/input_per_1m")
+            .is_none());
+        assert_eq!(
+            discovery
+                .pointer("/effective_pricing/source")
+                .and_then(Value::as_str),
+            Some("operator")
+        );
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);
