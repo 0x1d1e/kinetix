@@ -118,6 +118,28 @@ async fn set_persisted_manifest_version(pool: &Pool, id: &str, version: &str) {
 }
 
 #[tokio::test]
+async fn plugin_summary_exposes_host_version_bounds() {
+    let (m, _pool) = manager().await;
+    let manifest = GOOD_MANIFEST.replace(
+        "plugin_api = \"1\"",
+        "plugin_api = \"1\"\n\n[compatibility]\nmin_host_version = \"0.1.0\"\nmax_host_version = \"99.0.0\"",
+    );
+    m.install(&build_kxp(&manifest, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+
+    let row = m.get("dev.example.foo").await.unwrap().unwrap();
+    let summary = kinetix::plugins::manager::manifest_summary(&row);
+    assert_eq!(
+        summary["compatibility"],
+        serde_json::json!({
+            "min_host_version": "0.1.0",
+            "max_host_version": "99.0.0",
+        })
+    );
+}
+
+#[tokio::test]
 async fn install_is_disabled_and_records_provenance() {
     let (m, pool) = manager().await;
     let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);

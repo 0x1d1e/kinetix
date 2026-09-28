@@ -2663,6 +2663,10 @@ pub fn manifest_summary(row: &PluginRow) -> serde_json::Value {
         "name": manifest.as_ref().map(|m| m.name.clone()).unwrap_or_else(|| row.id.clone()),
         "version": row.version,
         "plugin_api_major": row.plugin_api_major,
+        "compatibility": manifest
+            .as_ref()
+            .map(|m| m.compatibility.clone())
+            .unwrap_or_default(),
         "sha256": row.package_sha256,
         "signature": row.signature,
         "status": row.status().as_str(),
