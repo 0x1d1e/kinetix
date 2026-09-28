@@ -14482,6 +14482,61 @@ mod credential_enrollment_regression_tests {
         (state, root)
     }
 
+    async fn test_state_with_plugins(tag: &str) -> (AppState, std::path::PathBuf) {
+        let (state, root) = test_state(tag).await;
+        let manager = crate::plugins::PluginManager::new(
+            state.pool.clone(),
+            state.crypto.clone(),
+            crate::plugins::HostPolicy {
+                allow_private_network: true,
+                ..Default::default()
+            },
+            state.config.paths.plugin_packages_dir(),
+        )
+        .unwrap();
+        (state.with_plugins(Arc::new(manager)), root)
+    }
+
+    async fn install_direct_api_test_plugin(state: &AppState, base_url: &str) {
+        let manifest = json!({
+            "manifest_version": crate::plugins::MANIFEST_VERSION,
+            "id": "plugin.test",
+            "name": "Test Plugin",
+            "version": "0.1.0",
+            "plugin_api": format!("{}.0.0", crate::plugins::PLUGIN_API_MAJOR),
+            "integrations": [{
+                "id": "direct",
+                "name": "Direct Provider",
+                "credential_mode": "manual",
+                "provider": {
+                    "base_url": base_url,
+                    "wire_format": "openai",
+                    "auth_scheme": "bearer",
+                    "pricing_scope": "direct_api"
+                }
+            }]
+        });
+        let now = db::now_iso();
+        sqlx::query(
+            "INSERT OR REPLACE INTO plugins
+             (id, version, plugin_api_major, package_sha256, enabled, signature,
+              manifest_json, component, installed_at, updated_at)
+             VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+        )
+        .bind("plugin.test")
+        .bind("0.1.0")
+        .bind(crate::plugins::PLUGIN_API_MAJOR as i64)
+        .bind("test-package")
+        .bind("test")
+        .bind(manifest.to_string())
+        .bind(Vec::<u8>::new())
+        .bind(&now)
+        .bind(&now)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
     fn auth() -> AdminAuth {
         AdminAuth {
             actor: "test".into(),
@@ -15673,22 +15728,43 @@ mod credential_enrollment_regression_tests {
 
     #[tokio::test]
     async fn explicit_integration_manifest_direct_api_scope_is_preserved() {
-        let (state, root) = test_state("manifest-direct-pricing-scope").await;
-        let provider_id = insert_provider(
-            &state,
-            "manifest-direct-provider",
-            crate::plugins::CredentialMode::Manual,
-            None,
-            None,
+        let (state, root) = test_state_with_plugins("manifest-direct-pricing-scope").await;
+        let base_url = "https://provider-a.example/v1";
+        install_direct_api_test_plugin(&state, base_url).await;
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "manifest-direct-provider",
+                base_url,
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: Some("plugin.test"),
+                source_integration_id: Some("direct"),
+            },
         )
-        .await;
+        .await
+        .unwrap();
 
         reconcile_provider_integration_semantics(
             &state,
             &provider_id,
-            crate::plugins::CredentialMode::AuthFlow,
+            crate::plugins::CredentialMode::Manual,
             "plugin.test",
-            "oauth",
+            "direct",
             crate::plugins::PricingScope::DirectApi,
         )
         .await
@@ -15698,7 +15774,6 @@ mod credential_enrollment_regression_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(provider.credential_mode, "auth_flow");
         assert_eq!(provider.pricing_scope, "direct_api");
 
         drop(state);
@@ -17707,79 +17782,352 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
-    async fn config_import_rejects_untrusted_direct_api_scope_for_new_and_existing_plugin_providers(
-    ) {
-        let (state, root) = test_state("untrusted-import-pricing-scope").await;
-        let provider_config = |name: &str| {
-            json!({
-                "name": name,
-                "base_url": "http://127.0.0.1:12345",
-                "wire_format": "openai",
-                "auth_scheme": "bearer",
-                "extra_headers": {},
-                "rate_limit_rules": {},
-                "credential_mode": "manual",
-                "credential_plugin": "",
-                "wire_plugin": "",
-                "model_source_plugin": "",
-                "source_plugin_id": "plugin.test",
-                "source_integration_id": "direct",
-                "pricing_scope": "direct_api"
-            })
-        };
+    async fn provider_update_rejects_direct_api_endpoint_drift_from_manifest() {
+        let (state, root) = test_state_with_plugins("direct-api-endpoint-drift").await;
+        let base_url = "https://provider-a.example/v1";
+        install_direct_api_test_plugin(&state, base_url).await;
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "trusted-direct-provider",
+                base_url,
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: Some("plugin.test"),
+                source_integration_id: Some("direct"),
+            },
+        )
+        .await
+        .unwrap();
+        db::update_provider_pricing_scope(&state.pool, &provider_id, "direct_api")
+            .await
+            .unwrap();
 
-        let new_error = import_config(
+        let mut body = provider_body("trusted-direct-provider", None);
+        body.base_url = "https://provider-b.example/v1".into();
+        body.allow_insecure_tls = false;
+        body.pricing_scope = Some("direct_api".into());
+        let error = update_provider(
             State(state.clone()),
             auth(),
-            Json(ImportBody {
-                config: json!({"providers": [provider_config("new-plugin-provider")]}),
-                apply: true,
-            }),
+            Path(provider_id.clone()),
+            Json(body),
         )
         .await
         .unwrap_err();
-        assert_eq!(new_error.0, StatusCode::BAD_REQUEST);
-        assert!(new_error.1.contains("pricing_scope 'direct_api' requires"));
-        assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
-
-        let existing_id = insert_provider(
-            &state,
-            "existing-plugin-provider",
-            crate::plugins::CredentialMode::Manual,
-            Some("plugin.test"),
-            Some("direct"),
-        )
-        .await;
-        assert_eq!(
-            db::provider_pricing_scope(&state.pool, &existing_id)
-                .await
-                .unwrap(),
-            "integration"
-        );
-
-        let existing_error = import_config(
-            State(state.clone()),
-            auth(),
-            Json(ImportBody {
-                config: json!({"providers": [provider_config("existing-plugin-provider")]}),
-                apply: true,
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(existing_error.0, StatusCode::BAD_REQUEST);
-        assert!(existing_error
-            .1
-            .contains("pricing_scope 'direct_api' requires"));
-        assert_eq!(
-            db::provider_pricing_scope(&state.pool, &existing_id)
-                .await
-                .unwrap(),
-            "integration"
-        );
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("pricing_scope 'direct_api' is bound"));
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.base_url, base_url);
+        assert_eq!(provider.pricing_scope, "direct_api");
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_import_rejects_direct_api_endpoint_not_matching_installed_manifest() {
+        let (state, root) = test_state_with_plugins("direct-api-import-endpoint").await;
+        install_direct_api_test_plugin(&state, "https://provider-a.example/v1").await;
+
+        let error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({
+                    "providers": [{
+                        "name": "mismatched-direct-provider",
+                        "base_url": "https://provider-b.example/v1",
+                        "wire_format": "openai",
+                        "auth_scheme": "bearer",
+                        "extra_headers": {},
+                        "rate_limit_rules": {},
+                        "credential_mode": "manual",
+                        "credential_plugin": "",
+                        "wire_plugin": "",
+                        "model_source_plugin": "",
+                        "source_plugin_id": "plugin.test",
+                        "source_integration_id": "direct",
+                        "pricing_scope": "direct_api"
+                    }]
+                }),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("pricing_scope 'direct_api' is bound"));
+        assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_import_restores_missing_plugin_direct_api_conservatively_then_promotes() {
+        let (state, root) = test_state_with_plugins("portable-direct-api-import").await;
+        let base_url = "https://provider-a.example/v1";
+        import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({
+                    "providers": [{
+                        "name": "portable-direct-provider",
+                        "base_url": base_url,
+                        "wire_format": "openai",
+                        "auth_scheme": "bearer",
+                        "extra_headers": {},
+                        "rate_limit_rules": {},
+                        "credential_mode": "manual",
+                        "credential_plugin": "",
+                        "wire_plugin": "",
+                        "model_source_plugin": "",
+                        "source_plugin_id": "plugin.test",
+                        "source_integration_id": "direct",
+                        "pricing_scope": "direct_api"
+                    }]
+                }),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let provider = db::list_providers(&state.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "portable-direct-provider")
+            .unwrap();
+        assert_eq!(provider.pricing_scope, "integration");
+
+        install_direct_api_test_plugin(&state, base_url).await;
+        auto_provision_plugin_providers(&state, "plugin.test").await;
+        let provider = db::get_provider(&state.pool, &provider.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.pricing_scope, "direct_api");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_export_import_preserves_automatic_model_ownership() {
+        let (source, source_root) = test_state("portable-model-ownership-source").await;
+        let provider_id = db::insert_provider(
+            &source.pool,
+            &db::NewProvider {
+                name: "portable-google",
+                base_url: "https://generativelanguage.googleapis.com/v1beta",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let model_id = db::insert_model(
+            &source.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "portable-model",
+                display_name: "Portable Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({"tool_calling": false}),
+                prices: json!({}),
+                parameters: json!({"temperature": {"supported": true}}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({
+                    "operator_capability_overrides": {},
+                    "operator_parameter_overrides": {},
+                    "operator_reasoning_overrides": {},
+                    "operator_thinking_overrides": {}
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let source_prices = Prices {
+            input_per_1m: Some(1.0),
+            ..Prices::default()
+        };
+        db::commit_effective_model_pricing(
+            &source.pool,
+            &model_id,
+            &source_prices,
+            "models.dev:provider",
+            &json!({
+                "fields": {
+                    "input_per_1m": {
+                        "source": "models.dev:provider",
+                        "metadata": {
+                            "observed_at": "2026-09-28T01:00:00Z",
+                            "catalog_provider": {
+                                "provider_id": "google",
+                                "model_id": "portable-model"
+                            }
+                        }
+                    }
+                },
+                "catalog_source_state": {
+                    "source": "models.dev",
+                    "retrieved_at": "2026-09-28T01:00:00Z"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let exported = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let exported_model = &exported["models"][0];
+        assert_eq!(
+            exported_model["ownership"]["effective_pricing"]["source"],
+            "models.dev:provider"
+        );
+        assert!(exported_model["ownership"]["effective_pricing"]
+            .get("price_version_id")
+            .is_none());
+        assert!(exported_model["ownership"]["effective_pricing"]["metadata"]
+            .pointer("/fields/input_per_1m/metadata/observed_at")
+            .is_none());
+
+        let (target, target_root) = test_state("portable-model-ownership-target").await;
+        import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let target_provider = db::list_providers(&target.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "portable-google")
+            .unwrap();
+        let imported = db::find_model_by_upstream(
+            &target.pool,
+            &target_provider.id,
+            "portable-model",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let discovery = discovery_object(&imported);
+        assert_eq!(
+            discovery
+                .pointer("/effective_pricing/source")
+                .and_then(Value::as_str),
+            Some("models.dev:provider")
+        );
+        assert_eq!(
+            discovery["operator_capability_overrides"],
+            json!({})
+        );
+        assert_eq!(
+            discovery["operator_parameter_overrides"],
+            json!({})
+        );
+        assert_eq!(
+            discovery["operator_thinking_overrides"],
+            json!({})
+        );
+
+        let catalog = crate::model_catalog::ModelsDevCatalog::from_parts(
+            json!({}),
+            json!({
+                "google": {
+                    "id": "google",
+                    "models": {
+                        "portable-model": {
+                            "id": "portable-model",
+                            "cost": {"input": 2.0}
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        apply_provider_pricing_sync(&target, &target_provider, &catalog)
+            .await
+            .unwrap();
+        let imported = db::get_model(&target.pool, &imported.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported.prices().input_per_1m, Some(2.0));
+
+        db::merge_model_discovery(
+            &target.pool,
+            &imported.id,
+            &json!({"capabilities": {"tool_calling": true}}),
+        )
+        .await
+        .unwrap();
+        target.registry.reload(&target.pool).await.unwrap();
+        let snapshot = target.registry.snapshot();
+        let runtime_provider = snapshot.providers.get(&target_provider.id).unwrap();
+        let runtime_model = snapshot.models.get(&imported.id).unwrap();
+        let profile =
+            crate::adapters::resolve_execution_profile(runtime_provider, runtime_model).unwrap();
+        assert_eq!(profile.capabilities.tool_calling, Some(true));
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
     }
 
     #[tokio::test]
