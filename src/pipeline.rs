@@ -5605,6 +5605,7 @@ mod route_policy_tests {
             credential_mode: "manual".into(),
             source_plugin_id: None,
             source_integration_id: None,
+            pricing_scope: "direct_api".into(),
         }
     }
 
