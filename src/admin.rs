@@ -14372,9 +14372,16 @@ mod credential_enrollment_regression_tests {
             },
             "catalog_source_state": {"source": "models.dev"}
         });
-        db::commit_effective_model_pricing(&state.pool, &model_id, &prices, "mixed", &metadata)
-            .await
-            .unwrap();
+        let original_version = db::commit_effective_model_pricing(
+            &state.pool,
+            &model_id,
+            &prices,
+            "mixed",
+            &metadata,
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         db::update_provider_pricing_scope(&state.pool, &provider_id, "integration")
             .await
@@ -14388,9 +14395,36 @@ mod credential_enrollment_regression_tests {
         assert_eq!(model.prices().input_per_1m, None);
         assert_eq!(model.prices().output_per_1m, Some(9.0));
         let discovery = discovery_object(&model);
-        assert!(discovery
+        let replacement_version = discovery
             .pointer("/effective_pricing/price_version_id")
-            .is_none_or(Value::is_null));
+            .and_then(Value::as_str)
+            .expect("surviving operator price must remain version-backed");
+        assert_ne!(replacement_version, original_version);
+        assert_eq!(
+            discovery
+                .pointer("/effective_pricing/source")
+                .and_then(Value::as_str),
+            Some("operator")
+        );
+        assert_eq!(
+            discovery
+                .pointer("/effective_pricing/fields/output_per_1m/source")
+                .and_then(Value::as_str),
+            Some("operator")
+        );
+        assert!(discovery
+            .pointer("/effective_pricing/fields/input_per_1m")
+            .is_none());
+        assert!(discovery
+            .pointer("/effective_pricing/metadata/catalog_source_state")
+            .is_none());
+        let version_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id=?")
+                .bind(&model_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(version_count, 2);
         assert_eq!(
             state
                 .registry
