@@ -14372,16 +14372,11 @@ mod credential_enrollment_regression_tests {
             },
             "catalog_source_state": {"source": "models.dev"}
         });
-        let original_version = db::commit_effective_model_pricing(
-            &state.pool,
-            &model_id,
-            &prices,
-            "mixed",
-            &metadata,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let original_version =
+            db::commit_effective_model_pricing(&state.pool, &model_id, &prices, "mixed", &metadata)
+                .await
+                .unwrap()
+                .unwrap();
 
         db::update_provider_pricing_scope(&state.pool, &provider_id, "integration")
             .await
