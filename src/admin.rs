@@ -968,6 +968,7 @@ fn key_json(
         "allowed_providers": k.allowed_providers(),
         "rpm_limit": k.rpm_limit,
         "tpm_limit": k.tpm_limit,
+        "max_concurrent_requests": k.max_concurrent_requests,
         "daily_budget": k.daily_budget,
         "monthly_budget": k.monthly_budget,
         "current_daily_spend": daily_spend,
@@ -1093,6 +1094,7 @@ pub struct CreateKeyBody {
     pub allowed_providers: Vec<String>,
     pub rpm_limit: Option<i64>,
     pub tpm_limit: Option<i64>,
+    pub max_concurrent_requests: Option<i64>,
     pub daily_budget: Option<f64>,
     pub monthly_budget: Option<f64>,
     pub expires_at: Option<String>,
@@ -1107,6 +1109,11 @@ pub async fn create_key(
     _auth: AdminAuth,
     Json(body): Json<CreateKeyBody>,
 ) -> ApiResult {
+    if body.max_concurrent_requests.is_some_and(|limit| limit < 0) {
+        return Err(ApiError::bad(
+            "max_concurrent_requests must be positive or zero for unlimited",
+        ));
+    }
     let full_key = crypto::generate_virtual_key();
     let hash = crypto::hash_virtual_key(&full_key);
     let allowed = if body.allowed_models.is_empty() {
@@ -1124,6 +1131,7 @@ pub async fn create_key(
         allowed_providers: serde_json::to_string(&body.allowed_providers).unwrap(),
         rpm_limit: body.rpm_limit,
         tpm_limit: body.tpm_limit,
+        max_concurrent_requests: body.max_concurrent_requests.filter(|limit| *limit > 0),
         daily_budget: body.daily_budget,
         monthly_budget: body.monthly_budget,
         expires_at: body.expires_at.clone(),
@@ -1163,6 +1171,7 @@ pub struct UpdateKeyBody {
     pub allowed_providers: Option<Vec<String>>,
     pub rpm_limit: Option<i64>,
     pub tpm_limit: Option<i64>,
+    pub max_concurrent_requests: Option<i64>,
     pub daily_budget: Option<f64>,
     pub monthly_budget: Option<f64>,
     pub expires_at: Option<String>,
@@ -1177,6 +1186,11 @@ pub async fn update_key(
     Path(id): Path<String>,
     Json(body): Json<UpdateKeyBody>,
 ) -> ApiResult {
+    if body.max_concurrent_requests.is_some_and(|limit| limit < 0) {
+        return Err(ApiError::bad(
+            "max_concurrent_requests must be positive or zero for unlimited",
+        ));
+    }
     if let Some(status) = &body.status {
         db::set_virtual_key_status(&state.pool, &id, status)
             .await
@@ -1224,7 +1238,7 @@ pub async fn update_key(
 
     sqlx::query(
         "UPDATE virtual_keys SET name=?, owner=?, tag=?, allowed_models=?, allowed_providers=?,
-         rpm_limit=?, tpm_limit=?, daily_budget=?, monthly_budget=?, expires_at=?, body_logging=?, allowed_ips=? WHERE id=?",
+         rpm_limit=?, tpm_limit=?, max_concurrent_requests=?, daily_budget=?, monthly_budget=?, expires_at=?, body_logging=?, allowed_ips=? WHERE id=?",
     )
     .bind(name)
     .bind(owner)
@@ -1233,6 +1247,7 @@ pub async fn update_key(
     .bind(allowed_providers)
     .bind(body.rpm_limit.or(existing.rpm_limit))
     .bind(body.tpm_limit.or(existing.tpm_limit))
+    .bind(body.max_concurrent_requests.map(|limit| (limit > 0).then_some(limit)).unwrap_or(existing.max_concurrent_requests))
     .bind(body.daily_budget.or(existing.daily_budget))
     .bind(body.monthly_budget.or(existing.monthly_budget))
     .bind(body.expires_at.or(existing.expires_at))
@@ -8120,6 +8135,7 @@ pub async fn list_routes(State(state): State<AppState>, _auth: AdminAuth) -> Api
             "sticky_routing": c.sticky_routing != 0,
             "cache_affinity": c.cache_affinity != 0,
             "max_attempts": c.max_attempts,
+            "max_concurrent_requests": c.max_concurrent_requests,
             "enabled": c.enabled != 0,
             "targets": targets_json,
         }));
@@ -8145,6 +8161,7 @@ pub struct RouteBody {
     #[serde(default)]
     pub cache_affinity: bool,
     pub max_attempts: Option<i64>,
+    pub max_concurrent_requests: Option<i64>,
     #[serde(default)]
     pub targets: Vec<RouteTargetBody>,
 }
@@ -8162,6 +8179,11 @@ fn validate_route_body(body: &RouteBody) -> Result<(), ApiError> {
         "priority" | "round-robin" | "weighted" | "least-used" | "adaptive"
     ) {
         return Err(ApiError::bad("invalid route strategy"));
+    }
+    if body.max_concurrent_requests.is_some_and(|limit| limit < 0) {
+        return Err(ApiError::bad(
+            "max_concurrent_requests must be positive or zero for unlimited",
+        ));
     }
     if !matches!(
         body.portability_policy.as_str(),
@@ -8232,6 +8254,7 @@ pub async fn create_route(
             sticky_routing: body.sticky_routing,
             cache_affinity: body.cache_affinity,
             max_attempts: body.max_attempts,
+            max_concurrent_requests: body.max_concurrent_requests.filter(|limit| *limit > 0),
         },
     )
     .await
@@ -8272,6 +8295,7 @@ pub async fn update_route(
         body.sticky_routing,
         body.cache_affinity,
         body.max_attempts,
+        body.max_concurrent_requests.filter(|limit| *limit > 0),
     )
     .await
     .map_err(ApiError::internal)?;
@@ -9020,6 +9044,91 @@ pub async fn metrics(State(state): State<AppState>, _auth: AdminAuth) -> Respons
         body.push_str(&format!(
             "kinetix_error_rate {}\n",
             errs as f64 / reqs as f64
+        ));
+    }
+    let admission = state.admission.metrics_snapshot();
+    body.push_str("# HELP kinetix_admission_reservations_active Active per-key rate and budget reservations\n");
+    body.push_str("# TYPE kinetix_admission_reservations_active gauge\n");
+    body.push_str(&format!(
+        "kinetix_admission_reservations_active {}\n",
+        admission.active_reservations
+    ));
+    body.push_str("# HELP kinetix_admission_reserved_tokens_active Estimated tokens held by active reservations\n");
+    body.push_str("# TYPE kinetix_admission_reserved_tokens_active gauge\n");
+    body.push_str(&format!(
+        "kinetix_admission_reserved_tokens_active {}\n",
+        admission.active_reserved_tokens
+    ));
+    body.push_str(
+        "# HELP kinetix_admission_reservations_total Per-key admission reservations created\n",
+    );
+    body.push_str("# TYPE kinetix_admission_reservations_total counter\n");
+    body.push_str(&format!(
+        "kinetix_admission_reservations_total {}\n",
+        admission.reservations_total
+    ));
+    body.push_str(
+        "# HELP kinetix_admission_reserved_tokens_total Conservative token estimates reserved\n",
+    );
+    body.push_str("# TYPE kinetix_admission_reserved_tokens_total counter\n");
+    body.push_str(&format!(
+        "kinetix_admission_reserved_tokens_total {}\n",
+        admission.reserved_tokens_total
+    ));
+    body.push_str(
+        "# HELP kinetix_admission_reconciliations_total Reservations reconciled with token usage\n",
+    );
+    body.push_str("# TYPE kinetix_admission_reconciliations_total counter\n");
+    body.push_str(&format!(
+        "kinetix_admission_reconciliations_total{{usage=\"complete\"}} {}\n",
+        admission.reconciled_complete_total
+    ));
+    body.push_str(&format!(
+        "kinetix_admission_reconciliations_total{{usage=\"incomplete\"}} {}\n",
+        admission.reconciled_incomplete_total
+    ));
+    body.push_str("# HELP kinetix_admission_reservations_dropped_total Reservations dropped before reconciliation\n");
+    body.push_str("# TYPE kinetix_admission_reservations_dropped_total counter\n");
+    body.push_str(&format!(
+        "kinetix_admission_reservations_dropped_total {}\n",
+        admission.dropped_total
+    ));
+    body.push_str("# HELP kinetix_admission_reconciled_tokens_total Final provider-reported tokens with complete usage\n");
+    body.push_str("# TYPE kinetix_admission_reconciled_tokens_total counter\n");
+    body.push_str(&format!(
+        "kinetix_admission_reconciled_tokens_total {}\n",
+        admission.reconciled_tokens_total
+    ));
+    body.push_str("# HELP kinetix_admission_token_adjustment_total Token reservation adjustment at reconciliation\n");
+    body.push_str("# TYPE kinetix_admission_token_adjustment_total counter\n");
+    body.push_str(&format!(
+        "kinetix_admission_token_adjustment_total{{direction=\"decrease\"}} {}\n",
+        admission.reduced_tokens_total
+    ));
+    body.push_str(&format!(
+        "kinetix_admission_token_adjustment_total{{direction=\"increase\"}} {}\n",
+        admission.increased_tokens_total
+    ));
+    body.push_str("# HELP kinetix_admission_inflight_inferences Active inference requests including anonymous requests\n");
+    body.push_str("# TYPE kinetix_admission_inflight_inferences gauge\n");
+    body.push_str(&format!(
+        "kinetix_admission_inflight_inferences {}\n",
+        admission.inflight_inferences
+    ));
+    body.push_str("# HELP kinetix_admission_reservation_oldest_age_seconds Age of the oldest active admission reservation\n");
+    body.push_str("# TYPE kinetix_admission_reservation_oldest_age_seconds gauge\n");
+    body.push_str(&format!(
+        "kinetix_admission_reservation_oldest_age_seconds {}\n",
+        admission.oldest_reservation_age_secs
+    ));
+    body.push_str("# HELP kinetix_admission_rejections_total Requests rejected by a bounded admission policy\n");
+    body.push_str("# TYPE kinetix_admission_rejections_total counter\n");
+    for (reason, count) in crate::admission::REJECTION_REASONS
+        .iter()
+        .zip(admission.rejected)
+    {
+        body.push_str(&format!(
+            "kinetix_admission_rejections_total{{reason=\"{reason}\"}} {count}\n"
         ));
     }
     body.push_str(
@@ -10636,8 +10745,10 @@ pub async fn import_config(
             sticky_routing: r["sticky_routing"].as_bool().unwrap_or(false),
             cache_affinity: r["cache_affinity"].as_bool().unwrap_or(false),
             max_attempts: r["max_attempts"].as_i64(),
+            max_concurrent_requests: r["max_concurrent_requests"].as_i64(),
             targets: Vec::new(),
         };
+        validate_route_body(&body)?;
         let mut target_bodies = Vec::new();
         for t in r["targets"].as_array().unwrap_or(&empty) {
             let model_key = t["model"].as_str().unwrap_or("");
@@ -10670,6 +10781,7 @@ pub async fn import_config(
                     body.sticky_routing,
                     body.cache_affinity,
                     body.max_attempts,
+                    body.max_concurrent_requests.filter(|limit| *limit > 0),
                 )
                 .await
                 .map_err(ApiError::internal)?;
@@ -10695,6 +10807,7 @@ pub async fn import_config(
                         sticky_routing: body.sticky_routing,
                         cache_affinity: body.cache_affinity,
                         max_attempts: body.max_attempts,
+                        max_concurrent_requests: body.max_concurrent_requests.filter(|limit| *limit > 0),
                     },
                 )
                 .await
@@ -14648,6 +14761,7 @@ mod credential_enrollment_regression_tests {
             allow_insecure_tls: true,
             data_dir: paths.data_dir.clone(),
             shutdown_grace_secs: 1,
+            max_inflight_inferences: crate::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
             alert_webhook_url: None,
             alert_fallback_rate: 1.0,
             alert_error_rate: 1.0,
@@ -14810,6 +14924,7 @@ mod credential_enrollment_regression_tests {
                 allowed_providers: json!([provider_b]).to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                max_concurrent_requests: None,
                 daily_budget: None,
                 monthly_budget: None,
                 expires_at: None,

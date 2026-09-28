@@ -10,6 +10,7 @@ export interface VirtualKey {
   allowedProviders: string[]; // [] = no provider restriction (FR-12.19)
   rpmLimit: number;
   tpmLimit: number;
+  maxConcurrentRequests: number | null;
   dailyBudget: number; // USD
   monthlyBudget: number; // USD
   currentDailySpend: number;
@@ -145,6 +146,7 @@ export interface Route {
   portabilityPolicy: 'reject' | 'strip_with_warning';
   cacheAffinity: boolean;
   stickyRouting: boolean;
+  maxConcurrentRequests: number | null;
   totalHops: number;
   status: 'active' | 'degraded' | 'all_exhausted';
 }

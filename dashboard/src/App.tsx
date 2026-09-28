@@ -230,6 +230,7 @@ export default function App() {
         allowed_models: newKey.allowedModels,
         rpm_limit: newKey.rpmLimit || null,
         tpm_limit: newKey.tpmLimit || null,
+        max_concurrent_requests: newKey.maxConcurrentRequests,
         daily_budget: newKey.dailyBudget || null,
         monthly_budget: newKey.monthlyBudget || null,
       });
@@ -259,6 +260,7 @@ export default function App() {
         portability_policy: newRoute.portabilityPolicy,
         cache_affinity: newRoute.cacheAffinity,
         sticky_routing: newRoute.stickyRouting,
+        max_concurrent_requests: newRoute.maxConcurrentRequests,
         targets: newRoute.targets.map((t) => ({
           account_id: t.accountId || null,
           model_id: t.modelId,
@@ -278,6 +280,7 @@ export default function App() {
         portability_policy: updated.portabilityPolicy,
         cache_affinity: updated.cacheAffinity,
         sticky_routing: updated.stickyRouting,
+        max_concurrent_requests: updated.maxConcurrentRequests,
         targets: updated.targets.map((t) => ({
           account_id: t.accountId || null,
           model_id: t.modelId,

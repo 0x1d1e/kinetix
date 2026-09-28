@@ -9,6 +9,9 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// NFR-1.4 reference workload supports 200 concurrent streams.
+pub const DEFAULT_MAX_INFLIGHT_INFERENCES: u64 = 200;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: String,
@@ -36,6 +39,9 @@ pub struct Config {
     /// Graceful-shutdown drain window before in-flight streams are dropped
     /// (NFR-2.3). Default 30s.
     pub shutdown_grace_secs: u64,
+    /// Maximum simultaneous inference requests across the instance. Excess
+    /// requests fail fast with 429; the limit is never disabled.
+    pub max_inflight_inferences: u64,
     /// Optional webhook URL for alerts (FR-6.6). When set, alert-worthy events
     /// are POSTed as JSON. Unset means alerting is disabled.
     pub alert_webhook_url: Option<String>,
@@ -78,6 +84,7 @@ pub struct CliOverrides {
     pub allow_private_upstreams: Option<bool>,
     pub allow_insecure_tls: Option<bool>,
     pub shutdown_grace_secs: Option<u64>,
+    pub max_inflight_inferences: Option<u64>,
     pub ip_rate_limit_per_min: Option<u64>,
     pub session_ttl_minutes: Option<u64>,
     pub export_retention_days: Option<u64>,
@@ -190,6 +197,15 @@ impl Config {
             file.as_ref().and_then(|f| f.shutdown_grace_secs),
             30,
         );
+        let max_inflight_inferences = pick_u64(
+            ov.max_inflight_inferences,
+            "KINETIX_MAX_INFLIGHT_INFERENCES",
+            file.as_ref().and_then(|f| f.max_inflight_inferences),
+            DEFAULT_MAX_INFLIGHT_INFERENCES,
+        );
+        if max_inflight_inferences == 0 {
+            bail!("KINETIX_MAX_INFLIGHT_INFERENCES must be greater than zero");
+        }
         let alert_webhook_url = std::env::var("KINETIX_ALERT_WEBHOOK_URL")
             .ok()
             .filter(|u| !u.trim().is_empty())
@@ -246,6 +262,7 @@ impl Config {
             allow_insecure_tls,
             data_dir: paths.data_dir.clone(),
             shutdown_grace_secs,
+            max_inflight_inferences,
             alert_webhook_url,
             alert_fallback_rate,
             alert_error_rate,
@@ -410,6 +427,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub shutdown_grace_secs: Option<u64>,
     #[serde(default)]
+    pub max_inflight_inferences: Option<u64>,
+    #[serde(default)]
     pub ip_rate_limit_per_min: Option<u64>,
     #[serde(default)]
     pub session_ttl_minutes: Option<u64>,
@@ -472,6 +491,8 @@ pub struct BootstrapKey {
     pub daily_budget: Option<f64>,
     #[serde(default)]
     pub monthly_budget: Option<f64>,
+    #[serde(default)]
+    pub max_concurrent_requests: Option<u32>,
 }
 
 fn default_wildcard() -> Vec<String> {
@@ -628,6 +649,8 @@ pub struct BootstrapRoute {
     pub sticky_routing: bool,
     #[serde(default)]
     pub max_attempts: Option<i64>,
+    #[serde(default)]
+    pub max_concurrent_requests: Option<i64>,
     #[serde(default)]
     pub targets: Vec<BootstrapRouteTarget>,
 }

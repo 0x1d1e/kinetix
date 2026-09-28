@@ -174,6 +174,7 @@ pub struct VirtualKeyRow {
     pub allowed_providers: String,
     pub rpm_limit: Option<i64>,
     pub tpm_limit: Option<i64>,
+    pub max_concurrent_requests: Option<i64>,
     pub daily_budget: Option<f64>,
     pub monthly_budget: Option<f64>,
     pub expires_at: Option<String>,
@@ -217,8 +218,8 @@ pub async fn insert_virtual_key(pool: &Pool, k: &VirtualKeyRow) -> Result<()> {
     sqlx::query(
         "INSERT INTO virtual_keys
          (id, key_hash, name, owner, tag, allowed_models, allowed_providers, rpm_limit, tpm_limit,
-          daily_budget, monthly_budget, expires_at, status, allowed_ips, body_logging, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          max_concurrent_requests, daily_budget, monthly_budget, expires_at, status, allowed_ips, body_logging, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&k.id)
     .bind(&k.key_hash)
@@ -229,6 +230,7 @@ pub async fn insert_virtual_key(pool: &Pool, k: &VirtualKeyRow) -> Result<()> {
     .bind(&k.allowed_providers)
     .bind(k.rpm_limit)
     .bind(k.tpm_limit)
+    .bind(k.max_concurrent_requests)
     .bind(k.daily_budget)
     .bind(k.monthly_budget)
     .bind(&k.expires_at)
@@ -1993,6 +1995,7 @@ pub struct RouteRow {
     pub sticky_routing: i64,
     pub cache_affinity: i64,
     pub max_attempts: Option<i64>,
+    pub max_concurrent_requests: Option<i64>,
     pub enabled: i64,
     pub created_at: String,
 }
@@ -2064,13 +2067,14 @@ pub struct NewRoute<'a> {
     pub sticky_routing: bool,
     pub cache_affinity: bool,
     pub max_attempts: Option<i64>,
+    pub max_concurrent_requests: Option<i64>,
 }
 
 pub async fn insert_route(pool: &Pool, c: &NewRoute<'_>) -> Result<String> {
     let id = format!("route_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
-        "INSERT INTO routes (id, name, description, strategy, fallback_triggers, continuity_policy, portability_policy, sticky_routing, cache_affinity, max_attempts, enabled, created_at)
-         VALUES (?,?,?,?,?,'strip',?,?,?,?,1,?)",
+        "INSERT INTO routes (id, name, description, strategy, fallback_triggers, continuity_policy, portability_policy, sticky_routing, cache_affinity, max_attempts, max_concurrent_requests, enabled, created_at)
+         VALUES (?,?,?,?,?,'strip',?,?,?,?,?,1,?)",
     )
     .bind(&id)
     .bind(c.name)
@@ -2081,6 +2085,7 @@ pub async fn insert_route(pool: &Pool, c: &NewRoute<'_>) -> Result<String> {
     .bind(c.sticky_routing as i64)
     .bind(c.cache_affinity as i64)
     .bind(c.max_attempts)
+    .bind(c.max_concurrent_requests)
     .bind(now_iso())
     .execute(pool)
     .await?;
@@ -2097,9 +2102,10 @@ pub async fn update_route(
     sticky_routing: bool,
     cache_affinity: bool,
     max_attempts: Option<i64>,
+    max_concurrent_requests: Option<i64>,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE routes SET description=?, strategy=?, fallback_triggers=?, continuity_policy='strip', portability_policy=?, sticky_routing=?, cache_affinity=?, max_attempts=? WHERE id=?",
+        "UPDATE routes SET description=?, strategy=?, fallback_triggers=?, continuity_policy='strip', portability_policy=?, sticky_routing=?, cache_affinity=?, max_attempts=?, max_concurrent_requests=? WHERE id=?",
     )
     .bind(description)
     .bind(strategy)
@@ -2108,6 +2114,7 @@ pub async fn update_route(
     .bind(sticky_routing as i64)
     .bind(cache_affinity as i64)
     .bind(max_attempts)
+    .bind(max_concurrent_requests)
     .bind(id)
     .execute(pool)
     .await?;

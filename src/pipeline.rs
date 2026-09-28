@@ -100,6 +100,8 @@ pub struct RequestMeta {
     /// Atomic RPM/TPM/budget reservation owned by this request. Dropping it
     /// before finalization cancels the reservation.
     pub admission: Option<crate::admission::AdmissionReservation>,
+    /// Bounded global, key, and Route in-flight admission held through stream completion.
+    pub concurrency: Option<crate::admission::ConcurrencyReservation>,
     /// Set by a watchdog when the client disconnects, so an in-flight upstream
     /// response can be aborted even if the write channel still looks open.
     pub disconnected: Arc<std::sync::atomic::AtomicBool>,
@@ -126,6 +128,7 @@ impl RequestMeta {
             commit_state: "",
             session: None,
             admission: None,
+            concurrency: None,
             disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             disconnect_at: Arc::new(parking_lot::Mutex::new(None)),
         }
@@ -467,6 +470,17 @@ pub async fn run(
 ) -> Result<Response, ProxyError> {
     let started = Instant::now();
     let snap = state.registry.snapshot();
+    let resolved_route = match crate::registry::Registry::resolve_in(&snap, &req.requested_model) {
+        Some(Resolved::Route { route, .. }) => Some(route),
+        _ => None,
+    };
+    let concurrency = state.admission.reserve_concurrency(
+        key.as_ref()
+            .map(|key| (key.id.as_str(), key.max_concurrent_requests)),
+        resolved_route
+            .as_ref()
+            .map(|route| (route.id.as_str(), route.max_concurrent_requests)),
+    )?;
     let admission = match &key {
         Some(key) => {
             Some(crate::limits::reserve(&state.admission, &state.pool, &snap, key, &req).await?)
@@ -477,6 +491,7 @@ pub async fn run(
     let mut meta = RequestMeta::new(request_id.clone(), format, req.requested_model.clone());
     meta.session = session.clone();
     meta.admission = admission;
+    meta.concurrency = Some(concurrency);
     if let Some(k) = &key {
         meta.key_id = Some(k.id.clone());
         meta.key_name = Some(k.name.clone());
@@ -5575,6 +5590,7 @@ mod route_policy_tests {
             sticky_routing: 0,
             cache_affinity: 0,
             max_attempts: None,
+            max_concurrent_requests: None,
             enabled: 1,
             created_at: "2026-01-01T00:00:00Z".into(),
         }
@@ -6281,6 +6297,7 @@ mod route_policy_tests {
             allow_insecure_tls: true,
             data_dir: paths.data_dir.clone(),
             shutdown_grace_secs: 1,
+            max_inflight_inferences: crate::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
             alert_webhook_url: None,
             alert_fallback_rate: 1.0,
             alert_error_rate: 1.0,
@@ -6372,6 +6389,7 @@ mod route_policy_tests {
                 sticky_routing: false,
                 cache_affinity: false,
                 max_attempts: None,
+                max_concurrent_requests: None,
             },
         )
         .await

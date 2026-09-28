@@ -434,6 +434,7 @@ mod tests {
                 sticky_routing: false,
                 cache_affinity: false,
                 max_attempts: None,
+                max_concurrent_requests: None,
             },
         )
         .await

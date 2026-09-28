@@ -311,6 +311,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
             sticky_routing: false,
             cache_affinity: false,
             max_attempts: Some(1),
+            max_concurrent_requests: None,
         },
     )
     .await
@@ -340,6 +341,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
                 sticky_routing: false,
                 cache_affinity: false,
                 max_attempts: Some(1),
+                max_concurrent_requests: None,
             },
         )
         .await
@@ -387,6 +389,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
             sticky_routing: false,
             cache_affinity: false,
             max_attempts: Some(1),
+            max_concurrent_requests: None,
         },
     )
     .await
@@ -416,6 +419,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
             allowed_providers: json!([]).to_string(),
             rpm_limit: None,
             tpm_limit: None,
+            max_concurrent_requests: None,
             daily_budget: None,
             monthly_budget: None,
             expires_at: None,
@@ -446,6 +450,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
             allow_insecure_tls: true,
             data_dir: paths.data_dir.clone(),
             shutdown_grace_secs: 1,
+            max_inflight_inferences: kinetix::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
             alert_webhook_url: None,
             alert_fallback_rate: 1.0,
             alert_error_rate: 1.0,

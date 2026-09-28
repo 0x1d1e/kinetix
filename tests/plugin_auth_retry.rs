@@ -407,6 +407,7 @@ async fn setup(
             sticky_routing: false,
             cache_affinity: false,
             max_attempts: Some(max_attempts),
+            max_concurrent_requests: None,
         },
     )
     .await
@@ -432,6 +433,7 @@ async fn setup(
         allow_insecure_tls: true,
         data_dir: paths.data_dir.clone(),
         shutdown_grace_secs: 1,
+        max_inflight_inferences: kinetix::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
         alert_webhook_url: None,
         alert_fallback_rate: 1.0,
         alert_error_rate: 1.0,
@@ -873,6 +875,7 @@ async fn token_count_terminal_resolve_disables_account() {
         allowed_providers: "[]".into(),
         rpm_limit: None,
         tpm_limit: None,
+        max_concurrent_requests: None,
         daily_budget: None,
         monthly_budget: None,
         expires_at: None,
@@ -946,6 +949,7 @@ async fn disable_write_failure_keeps_existing_refresh_schedule() {
         allowed_providers: "[]".into(),
         rpm_limit: None,
         tpm_limit: None,
+        max_concurrent_requests: None,
         daily_budget: None,
         monthly_budget: None,
         expires_at: None,

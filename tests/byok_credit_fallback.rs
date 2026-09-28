@@ -201,6 +201,7 @@ async fn insufficient_credit_falls_back_to_second_account() {
             sticky_routing: false,
             cache_affinity: false,
             max_attempts: Some(2),
+            max_concurrent_requests: None,
         },
     )
     .await
@@ -226,6 +227,7 @@ async fn insufficient_credit_falls_back_to_second_account() {
         allow_insecure_tls: true,
         data_dir: paths.data_dir.clone(),
         shutdown_grace_secs: 1,
+        max_inflight_inferences: kinetix::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
         alert_webhook_url: None,
         alert_fallback_rate: 1.0,
         alert_error_rate: 1.0,

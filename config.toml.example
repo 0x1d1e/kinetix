@@ -19,6 +19,7 @@ allowed_ips = []               # CIDRs; empty = any client IP
 body_logging = false           # opt-in short-retention request/response logging
 rpm_limit = 600               # requests per minute (omit for unlimited)
 tpm_limit = 1000000           # tokens per minute
+# max_concurrent_requests = 8  # per-key simultaneous requests; omit or use 0 for unlimited
 daily_budget = 50.0           # USD
 monthly_budget = 200.0        # USD
 
@@ -75,6 +76,7 @@ target = "Google Gemini/gemini-3.6-flash"
 # cache_affinity = false               # FR-7.3 prompt-cache-aware sticky routing
 # sticky_routing = false               # FR-7.5 prefer the same target per session
 # max_attempts = 3
+# max_concurrent_requests = 8  # per-Route simultaneous requests; omit or use 0 for unlimited
 # [[routes.targets]]
 # model = "Google Gemini/gemini-3.6-flash"
 # # account = "Gemini Key 1"            # omit to use the provider account pool
