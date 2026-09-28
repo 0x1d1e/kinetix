@@ -3487,10 +3487,7 @@ fn effective_price_source(fields: &serde_json::Map<String, Value>, prices: &Pric
     }
 }
 
-fn automatic_price_provenance(
-    prices: &Prices,
-    observation: &Value,
-) -> (String, Value) {
+fn automatic_price_provenance(prices: &Prices, observation: &Value) -> (String, Value) {
     let provider_observed_at = observation.get("last_seen").cloned().unwrap_or(Value::Null);
     let catalog_source_state = observation
         .pointer("/catalog/source_state")
@@ -14019,8 +14016,7 @@ mod credential_enrollment_regression_tests {
             .unwrap()
             .to_string();
         let observation = latest_reconciliation_observation(&discovery);
-        let observed: Prices =
-            serde_json::from_value(observation["prices"].clone()).unwrap();
+        let observed: Prices = serde_json::from_value(observation["prices"].clone()).unwrap();
         let (effective, fields, preserved_manual) = merge_automatic_price_observation(
             &imported.prices(),
             &observed,
