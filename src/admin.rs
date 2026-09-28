@@ -7200,24 +7200,22 @@ pub async fn create_model(
         None
     };
 
-    let mut pricing_source = String::new();
-    let mut pricing_metadata = Value::Null;
-    let pricing = if prices.is_configured() {
-        if imported_from_discovery {
-            (pricing_source, pricing_metadata) =
-                automatic_price_provenance(&prices, &body.discovery);
+    let pricing_values = if prices.is_configured() {
+        Some(if imported_from_discovery {
+            automatic_price_provenance(&prices, &body.discovery)
         } else {
-            pricing_source = "operator".to_string();
-            pricing_metadata = json!({ "configured_by": "admin" });
-        }
-        Some(db::ModelPricingMutation {
-            prices: &prices,
-            source: &pricing_source,
-            metadata: &pricing_metadata,
+            ("operator".to_string(), json!({ "configured_by": "admin" }))
         })
     } else {
         None
     };
+    let pricing = pricing_values
+        .as_ref()
+        .map(|(source, metadata)| db::ModelPricingMutation {
+            prices: &prices,
+            source,
+            metadata,
+        });
 
     let (id, _) = db::commit_model_creation(
         &state.pool,
