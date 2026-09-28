@@ -4428,6 +4428,8 @@ async fn apply_provider_pricing_sync(
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default();
+        let observed =
+            automatic_prices_for_provider_scope(&observed, &observation, &pricing_scope);
 
         if !has_automatic_price_observation(&observed, &observation) {
             staged.push(StagedProviderPricing {
