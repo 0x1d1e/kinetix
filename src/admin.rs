@@ -14272,6 +14272,40 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn explicit_integration_manifest_direct_api_scope_is_preserved() {
+        let (state, root) = test_state("manifest-direct-pricing-scope").await;
+        let provider_id = insert_provider(
+            &state,
+            "manifest-direct-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+
+        reconcile_provider_integration_semantics(
+            &state,
+            &provider_id,
+            crate::plugins::CredentialMode::AuthFlow,
+            "plugin.test",
+            "oauth",
+            crate::plugins::PricingScope::DirectApi,
+        )
+        .await
+        .unwrap();
+
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.credential_mode, "auth_flow");
+        assert_eq!(provider.pricing_scope, "direct_api");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn scope_transition_revokes_models_dev_effective_pricing_without_sync() {
         let (state, root) = test_state("scope-transition-price-revoke").await;
         let provider_id = db::insert_provider(
@@ -14324,24 +14358,33 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
-        let catalog = crate::model_catalog::ModelsDevCatalog::from_parts(
-            json!({}),
-            json!({
-                "google": {
-                    "id": "google",
-                    "models": {
-                        "shared-model": {
-                            "id": "shared-model",
-                            "cost": {"input": 0.75, "output": 3.75}
-                        }
-                    }
+        let prices = Prices {
+            input_per_1m: Some(0.75),
+            output_per_1m: Some(9.0),
+            ..Prices::default()
+        };
+        let metadata = json!({
+            "fields": {
+                "input_per_1m": {
+                    "source": "models.dev:provider",
+                    "metadata": {}
+                },
+                "output_per_1m": {
+                    "source": "operator",
+                    "metadata": {"configured_by": "admin"}
                 }
-            }),
+            },
+            "catalog_source_state": {"source": "models.dev"}
+        });
+        db::commit_effective_model_pricing(
+            &state.pool,
+            &model_id,
+            &prices,
+            "mixed",
+            &metadata,
         )
+        .await
         .unwrap();
-        apply_provider_pricing_sync(&state, &provider, &catalog)
-            .await
-            .unwrap();
 
         db::update_provider_pricing_scope(&state.pool, &provider_id, "integration")
             .await
@@ -14353,7 +14396,7 @@ mod credential_enrollment_regression_tests {
             .unwrap()
             .unwrap();
         assert_eq!(model.prices().input_per_1m, None);
-        assert_eq!(model.prices().output_per_1m, None);
+        assert_eq!(model.prices().output_per_1m, Some(9.0));
         let discovery = discovery_object(&model);
         assert!(discovery
             .pointer("/effective_pricing/price_version_id")
@@ -14368,6 +14411,17 @@ mod credential_enrollment_regression_tests {
                 .prices()
                 .input_per_1m,
             None
+        );
+        assert_eq!(
+            state
+                .registry
+                .snapshot()
+                .models
+                .get(&model_id)
+                .unwrap()
+                .prices()
+                .output_per_1m,
+            Some(9.0)
         );
 
         drop(state);
@@ -16189,6 +16243,14 @@ mod credential_enrollment_regression_tests {
         assert_eq!(existing.credential_mode, "auth_flow");
         assert_eq!(existing.credential_plugin, "plugin:plugin.test/strategy");
 
+        let existing_manual_plugin = insert_provider(
+            &state,
+            "manual-plugin-bound",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
         let plugin_bound_manual = json!({
             "name": "manual-plugin-bound",
             "base_url": "http://127.0.0.1:12345",
@@ -16217,6 +16279,7 @@ mod credential_enrollment_regression_tests {
             .into_iter()
             .find(|provider| provider.name == "manual-plugin-bound")
             .unwrap();
+        assert_eq!(imported.id, existing_manual_plugin);
         assert_eq!(imported.pricing_scope, "integration");
 
         let _ = std::fs::remove_dir_all(root);
