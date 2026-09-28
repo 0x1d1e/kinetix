@@ -492,12 +492,12 @@ export const Kinetix = {
     return r.models;
   },
   reconcileProvider: (providerId: string) =>
-    api.post<{ models: DiscoveredModel[]; disappeared: unknown[] }>(
+    api.post<{ models: DiscoveredModel[]; disappeared: unknown[]; lifecycle: ProviderLifecycleStatus }>(
       `/admin/api/providers/${providerId}/reconcile`,
       {},
     ),
   syncProviderPricing: (providerId: string) =>
-    api.post<{ ok: boolean; updated: string[]; skipped_manual: string[] }>(
+    api.post<{ ok: boolean; updated: string[]; skipped_manual: string[]; lifecycle: ProviderLifecycleStatus }>(
       `/admin/api/providers/${providerId}/pricing/sync`,
       {},
     ),

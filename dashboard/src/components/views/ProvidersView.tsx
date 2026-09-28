@@ -406,6 +406,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     try {
       const result = await Kinetix.reconcileProvider(activeProvider.id);
       setDiscoveryResults(result.models);
+      setProviderLifecycle(result.lifecycle);
       setLifecycleNotice(`Reconciled ${result.models.length} upstream model observations.`);
       onRefresh?.();
     } catch (error) {
@@ -421,6 +422,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setLifecycleNotice(null);
     try {
       const result = await Kinetix.syncProviderPricing(activeProvider.id);
+      setProviderLifecycle(result.lifecycle);
       setLifecycleNotice(
         `Pricing sync updated ${result.updated.length}; preserved ${result.skipped_manual.length} manual models.`,
       );

@@ -4147,6 +4147,21 @@ fn apply_top_level_discovery_patch(discovery: &mut Value, patch: &Value) {
     }
 }
 
+async fn run_if_pricing_refresh_committable<T>(
+    outcome: crate::model_catalog::ModelsDevRefreshOutcome,
+    operation: impl std::future::Future<Output = Result<T, ApiError>>,
+) -> Result<T, ApiError> {
+    if matches!(
+        outcome,
+        crate::model_catalog::ModelsDevRefreshOutcome::StaleFallback
+    ) {
+        return Err(ApiError::bad(
+            "models.dev pricing refresh failed; stale cached catalog preserved last-known observations and effective prices",
+        ));
+    }
+    operation.await
+}
+
 /// Explicit pricing synchronization. This lane refreshes models.dev pricing
 /// independently of provider/plugin discovery and never runs reconciliation.
 /// Existing provider/plugin observations retain precedence; manual/operator-owned
@@ -4170,81 +4185,85 @@ pub(crate) async fn sync_provider_pricing_id(
                     "models.dev pricing refresh unavailable; preserving last-known observations and effective prices",
                 )
             })?;
-    let stale_fallback = matches!(
-        models_dev_fetch.outcome,
-        crate::model_catalog::ModelsDevRefreshOutcome::StaleFallback
-    );
+    let outcome = models_dev_fetch.outcome;
     let models_dev = models_dev_fetch.catalog;
 
-    let models = db::models_for_provider(&state.pool, id)
-        .await
-        .map_err(ApiError::internal)?;
-    let mut updated = Vec::new();
-    let mut skipped_manual = Vec::new();
-
-    for row in models {
-        let discovery = discovery_object(&row);
-        let mut observation = latest_reconciliation_observation(&discovery).clone();
-        let resolution =
-            crate::model_catalog::resolve(&provider.base_url, &row.upstream_id, Some(&models_dev));
-        let pricing_patch = models_dev_pricing_patch(&observation, &resolution);
-        apply_top_level_discovery_patch(&mut observation, &pricing_patch);
-        db::merge_model_discovery(
-            &state.pool,
-            &row.id,
-            &json!({ "latest_observation": observation.clone() }),
-        )
-        .await
-        .map_err(ApiError::internal)?;
-
-        let observed: Prices = observation
-            .get("prices")
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_default();
-        if !has_automatic_price_observation(&observed, &observation) {
-            continue;
-        }
-
-        let current = row.prices();
-        let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &observation, &discovery);
-        let catalog_source_state = observation
-            .pointer("/catalog/source_state")
-            .cloned()
-            .unwrap_or(Value::Null);
-
-        if preserved_manual {
-            skipped_manual.push(row.id.clone());
-        }
-        let source = effective_price_source(&fields, &effective);
-        let metadata = json!({
-            "fields": fields,
-            "catalog_source_state": catalog_source_state,
-        });
-        db::commit_effective_model_pricing(&state.pool, &row.id, &effective, &source, &metadata)
+    run_if_pricing_refresh_committable(outcome, async {
+        let models = db::models_for_provider(&state.pool, id)
             .await
             .map_err(ApiError::internal)?;
-        updated.push(row.id);
-    }
+        let mut updated = Vec::new();
+        let mut skipped_manual = Vec::new();
 
-    if !updated.is_empty() {
-        state
-            .registry
-            .reload(&state.pool)
+        for row in models {
+            let discovery = discovery_object(&row);
+            let mut observation = latest_reconciliation_observation(&discovery).clone();
+            let resolution = crate::model_catalog::resolve(
+                &provider.base_url,
+                &row.upstream_id,
+                Some(&models_dev),
+            );
+            let pricing_patch = models_dev_pricing_patch(&observation, &resolution);
+            apply_top_level_discovery_patch(&mut observation, &pricing_patch);
+            db::merge_model_discovery(
+                &state.pool,
+                &row.id,
+                &json!({ "latest_observation": observation.clone() }),
+            )
             .await
             .map_err(ApiError::internal)?;
-    }
-    if stale_fallback {
-        return Err(ApiError::bad(
-            "models.dev pricing refresh failed; stale cached catalog preserved last-known observations and effective prices",
-        ));
-    }
-    Ok(json!({
-        "ok": true,
-        "updated": updated,
-        "skipped_manual": skipped_manual,
-    }))
+
+            let observed: Prices = observation
+                .get("prices")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default();
+            if !has_automatic_price_observation(&observed, &observation) {
+                continue;
+            }
+
+            let current = row.prices();
+            let (effective, fields, preserved_manual) =
+                merge_automatic_price_observation(&current, &observed, &observation, &discovery);
+            let catalog_source_state = observation
+                .pointer("/catalog/source_state")
+                .cloned()
+                .unwrap_or(Value::Null);
+
+            if preserved_manual {
+                skipped_manual.push(row.id.clone());
+            }
+            let source = effective_price_source(&fields, &effective);
+            let metadata = json!({
+                "fields": fields,
+                "catalog_source_state": catalog_source_state,
+            });
+            db::commit_effective_model_pricing(
+                &state.pool,
+                &row.id,
+                &effective,
+                &source,
+                &metadata,
+            )
+            .await
+            .map_err(ApiError::internal)?;
+            updated.push(row.id);
+        }
+
+        if !updated.is_empty() {
+            state
+                .registry
+                .reload(&state.pool)
+                .await
+                .map_err(ApiError::internal)?;
+        }
+        Ok(json!({
+            "ok": true,
+            "updated": updated,
+            "skipped_manual": skipped_manual,
+        }))
+    })
+    .await
 }
 
 pub async fn sync_provider_pricing(
@@ -4902,6 +4921,38 @@ mod model_lifecycle_regression_tests {
 
         drop(pool);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stale_pricing_refresh_does_not_poll_any_price_mutation() {
+        let cases = [
+            ("unset", Value::Null, "unset"),
+            ("automatic", json!(4.0), "models.dev:provider"),
+            ("manual", json!(4.0), "operator"),
+        ];
+
+        for (label, effective_price, ownership) in cases {
+            let mut state = json!({
+                "effective_price": effective_price,
+                "ownership": ownership,
+                "observation_marker": "cached",
+            });
+            let before = state.clone();
+
+            let result = run_if_pricing_refresh_committable(
+                crate::model_catalog::ModelsDevRefreshOutcome::StaleFallback,
+                async {
+                    state["effective_price"] = json!(5.0);
+                    state["ownership"] = json!("models.dev:provider");
+                    state["observation_marker"] = json!("sync-write");
+                    Ok::<(), ApiError>(())
+                },
+            )
+            .await;
+
+            assert!(result.is_err(), "{label}");
+            assert_eq!(state, before, "{label}");
+        }
     }
 
     #[test]
@@ -5970,6 +6021,16 @@ mod probe_rejection_regression_tests {
         )];
         assert_eq!(reasoning_disable_probe_contract(&missing), None);
     }
+
+    #[test]
+    fn capability_probe_response_body_enforces_hard_byte_limit() {
+        let mut bytes = vec![b'x'; MAX_CAPABILITY_PROBE_RESPONSE_BYTES - 1];
+        assert!(append_capability_probe_response_chunk(&mut bytes, b"x").is_ok());
+        assert_eq!(bytes.len(), MAX_CAPABILITY_PROBE_RESPONSE_BYTES);
+
+        assert!(append_capability_probe_response_chunk(&mut bytes, b"x").is_err());
+        assert_eq!(bytes.len(), MAX_CAPABILITY_PROBE_RESPONSE_BYTES);
+    }
 }
 
 fn deterministic_probe_rejection(
@@ -6161,6 +6222,58 @@ async fn persist_probe_evidence_observation(
         &json!({ "probe_evidence": Value::Object(evidence) }),
     )
     .await
+}
+
+const MAX_CAPABILITY_PROBE_RESPONSE_BYTES: usize = 128 * 1024;
+
+fn append_capability_probe_response_chunk(
+    bytes: &mut Vec<u8>,
+    chunk: &[u8],
+) -> Result<(), ()> {
+    if bytes.len().saturating_add(chunk.len()) > MAX_CAPABILITY_PROBE_RESPONSE_BYTES {
+        return Err(());
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn read_capability_probe_response(
+    mut response: reqwest::Response,
+) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CAPABILITY_PROBE_RESPONSE_BYTES as u64)
+    {
+        return Err(format!(
+            "upstream probe response exceeded the {} byte limit",
+            MAX_CAPABILITY_PROBE_RESPONSE_BYTES
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(MAX_CAPABILITY_PROBE_RESPONSE_BYTES as u64) as usize,
+    );
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|error| format!("failed to read upstream probe response: {error}"))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        append_capability_probe_response_chunk(&mut bytes, &chunk).map_err(|()| {
+            format!(
+                "upstream probe response exceeded the {} byte limit",
+                MAX_CAPABILITY_PROBE_RESPONSE_BYTES
+            )
+        })?;
+    }
+
+    String::from_utf8(bytes)
+        .map_err(|_| "upstream probe response was not valid UTF-8".to_string())
 }
 
 /// Run one explicit, bounded upstream capability probe against the selected
@@ -6476,8 +6589,17 @@ pub async fn probe_model_capability(
     let (status, status_code, detail) = match response {
         Ok(response) => {
             let status_code = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
-            if (200..300).contains(&status_code) {
+            let (text, body_read_error) = match read_capability_probe_response(response).await {
+                Ok(text) => (text, None),
+                Err(error) => (String::new(), Some(error)),
+            };
+            if let Some(error) = body_read_error {
+                (
+                    "inconclusive",
+                    status_code,
+                    Some(truncate(&crypto::redact(&error), 400)),
+                )
+            } else if (200..300).contains(&status_code) {
                 if body.capability == "reasoning_disable" {
                     let verified = serde_json::from_str::<Value>(&text)
                         .ok()
