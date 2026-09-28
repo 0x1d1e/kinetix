@@ -13939,6 +13939,7 @@ mod credential_enrollment_regression_tests {
             wire_plugin: String::new(),
             credential_plugin: String::new(),
             model_source_plugin: String::new(),
+            pricing_scope: None,
             api_key: api_key.map(str::to_string),
             account_label: Some("manual-key".into()),
         }
