@@ -1747,33 +1747,36 @@ pub async fn update_provider(
                 "pricing_scope must be 'direct_api' or 'integration'",
             ));
         }
-        let scope_drivers_unchanged = existing.wire_plugin == body.wire_plugin
-            && existing.credential_plugin == body.credential_plugin
-            && existing.model_source_plugin == body.model_source_plugin;
-        let endpoint_unchanged = normalize_provider_endpoint_identity(&existing.base_url)
-            == normalize_provider_endpoint_identity(&body.base_url);
-        if scope == "direct_api" && conservative_scope != "direct_api" {
-            let reusable_existing_trust = existing.pricing_scope == "direct_api"
-                && scope_drivers_unchanged
-                && endpoint_unchanged;
-            match direct_api_manifest_trust(
-                &state,
-                &body.name,
-                &body.base_url,
-                existing.source_plugin_id.as_deref(),
-                existing.source_integration_id.as_deref(),
-            )
-            .await
-            {
-                Ok(DirectApiManifestTrust::Trusted) => {}
-                Ok(DirectApiManifestTrust::PluginUnavailable) if reusable_existing_trust => {}
-                Ok(DirectApiManifestTrust::PluginUnavailable) => {
-                    return Err(ApiError::bad(
-                        "pricing_scope 'direct_api' requires the source integration plugin to be installed when provider identity changes",
-                    ));
-                }
-                Err(problem) => return Err(ApiError::bad(problem)),
+    }
+    let effective_scope = body
+        .pricing_scope
+        .as_deref()
+        .unwrap_or(existing.pricing_scope.as_str());
+    let scope_drivers_unchanged = existing.wire_plugin == body.wire_plugin
+        && existing.credential_plugin == body.credential_plugin
+        && existing.model_source_plugin == body.model_source_plugin;
+    let endpoint_unchanged = normalize_provider_endpoint_identity(&existing.base_url)
+        == normalize_provider_endpoint_identity(&body.base_url);
+    if effective_scope == "direct_api" && conservative_scope != "direct_api" {
+        let reusable_existing_trust =
+            existing.pricing_scope == "direct_api" && scope_drivers_unchanged && endpoint_unchanged;
+        match direct_api_manifest_trust(
+            &state,
+            &body.name,
+            &body.base_url,
+            existing.source_plugin_id.as_deref(),
+            existing.source_integration_id.as_deref(),
+        )
+        .await
+        {
+            Ok(DirectApiManifestTrust::Trusted) => {}
+            Ok(DirectApiManifestTrust::PluginUnavailable) if reusable_existing_trust => {}
+            Ok(DirectApiManifestTrust::PluginUnavailable) => {
+                return Err(ApiError::bad(
+                    "pricing_scope 'direct_api' requires the source integration plugin to be installed when provider identity changes",
+                ));
             }
+            Err(problem) => return Err(ApiError::bad(problem)),
         }
     }
     let provider = db::NewProvider {
@@ -9395,6 +9398,7 @@ fn portable_model_ownership(
     })
 }
 
+#[derive(Clone)]
 struct ImportedModelOwnership {
     discovery_patch: Value,
     pricing: Option<(String, Value)>,
@@ -9457,6 +9461,65 @@ fn parse_imported_model_ownership(model: &Value) -> Result<Option<ImportedModelO
         discovery_patch: Value::Object(discovery_patch),
         pricing,
     }))
+}
+
+fn filter_imported_ownership_pricing_for_scope(
+    prices: &Prices,
+    ownership: &ImportedModelOwnership,
+    pricing_scope: &str,
+) -> (Prices, ImportedModelOwnership, Vec<String>) {
+    if pricing_scope != "integration" {
+        return (prices.clone(), ownership.clone(), Vec::new());
+    }
+    let Some((fallback_source, metadata)) = ownership.pricing.as_ref() else {
+        return (prices.clone(), ownership.clone(), Vec::new());
+    };
+
+    let mut effective = prices.clone();
+    let mut filtered_metadata = metadata.clone();
+    let mut fields = filtered_metadata
+        .get("fields")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut suppressed = Vec::new();
+
+    for field in PRICE_FIELDS {
+        if price_field(&effective, field).is_none() {
+            continue;
+        }
+        let source = fields
+            .get(field)
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str)
+            .unwrap_or(fallback_source);
+        if crate::model_catalog::is_external_catalog_price_source(source) {
+            set_price_field(&mut effective, field, None);
+            fields.remove(field);
+            suppressed.push(field.to_string());
+        }
+    }
+
+    filtered_metadata["fields"] = Value::Object(fields.clone());
+    let catalog_still_contributes = fields.values().any(|field| {
+        field
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(crate::model_catalog::is_external_catalog_price_source)
+    });
+    if !catalog_still_contributes {
+        if let Some(metadata) = filtered_metadata.as_object_mut() {
+            metadata.remove("catalog_source_state");
+            metadata.remove("catalog_provider");
+        }
+    }
+
+    let mut filtered = ownership.clone();
+    filtered.pricing = Some((
+        effective_price_source(&fields, &effective),
+        filtered_metadata,
+    ));
+    (effective, filtered, suppressed)
 }
 
 #[derive(Deserialize)]
@@ -9822,6 +9885,9 @@ pub async fn import_config(
     let cfg = &body.config;
     let mut plan: Vec<Value> = Vec::new();
     let mut problems: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut effective_provider_scopes: std::collections::HashMap<String, String> =
+        Default::default();
 
     let empty = Vec::new();
     let providers = cfg["providers"].as_array().unwrap_or(&empty);
@@ -9920,7 +9986,8 @@ pub async fn import_config(
         {
             problems.push(problem);
         }
-        if let Err(problem) = resolve_imported_provider_pricing_scope(
+        let requested_pricing_scope = p["pricing_scope"].as_str().map(str::to_string);
+        let effective_pricing_scope = match resolve_imported_provider_pricing_scope(
             &state,
             name,
             base_url,
@@ -9934,13 +10001,29 @@ pub async fn import_config(
         )
         .await
         {
-            problems.push(problem);
-        }
+            Ok(scope) => {
+                if requested_pricing_scope.as_deref() == Some("direct_api")
+                    && scope == "integration"
+                {
+                    warnings.push(format!(
+                        "provider '{name}': requested pricing_scope 'direct_api' will be restored as 'integration' until the source plugin can attest the provider endpoint"
+                    ));
+                }
+                effective_provider_scopes.insert(name.to_string(), scope.clone());
+                Some(scope)
+            }
+            Err(problem) => {
+                problems.push(problem);
+                None
+            }
+        };
 
         plan.push(json!({
             "kind": "provider",
             "name": name,
             "action": if existing_provider.is_some() { "update" } else { "create" },
+            "requested_pricing_scope": requested_pricing_scope,
+            "effective_pricing_scope": effective_pricing_scope,
         }));
     }
     for m in models {
@@ -9962,14 +10045,36 @@ pub async fn import_config(
                 )),
             }
         }
-        if let Err(problem) = parse_imported_model_ownership(m) {
-            problems.push(format!(
-                "model '{provider}/{upstream}' has invalid ownership: {problem}"
-            ));
+        let mut suppressed_external_price_fields = Vec::new();
+        match parse_imported_model_ownership(m) {
+            Ok(Some(ownership)) => {
+                if let Some(scope) = effective_provider_scopes.get(provider) {
+                    let prices: Prices =
+                        serde_json::from_value(m["prices"].clone()).unwrap_or_default();
+                    let (_, _, suppressed) =
+                        filter_imported_ownership_pricing_for_scope(&prices, &ownership, scope);
+                    if !suppressed.is_empty() {
+                        warnings.push(format!(
+                            "model '{provider}/{upstream}': external catalog price fields will not be restored while provider pricing_scope is 'integration': {}",
+                            suppressed.join(", ")
+                        ));
+                        suppressed_external_price_fields = suppressed;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(problem) => {
+                problems.push(format!(
+                    "model '{provider}/{upstream}' has invalid ownership: {problem}"
+                ));
+            }
         }
-        plan.push(
-            json!({"kind": "model", "name": format!("{provider}/{upstream}"), "action": "upsert"}),
-        );
+        plan.push(json!({
+            "kind": "model",
+            "name": format!("{provider}/{upstream}"),
+            "action": "upsert",
+            "suppressed_external_price_fields": suppressed_external_price_fields,
+        }));
     }
     for r in routes {
         let name = r["name"].as_str().unwrap_or("");
@@ -9987,6 +10092,7 @@ pub async fn import_config(
         return Ok(Json(json!({
             "valid": problems.is_empty(),
             "problems": problems,
+            "warnings": warnings,
             "plan": plan,
             "note": "dry run: no changes were applied",
         })));
@@ -10234,6 +10340,17 @@ pub async fn import_config(
 
         let model_key = format!("{provider}/{upstream}");
         let imported_ownership = parse_imported_model_ownership(m).map_err(ApiError::bad)?;
+        let (prices, imported_ownership) = if let Some(ownership) = imported_ownership {
+            let (filtered_prices, filtered_ownership, _) =
+                filter_imported_ownership_pricing_for_scope(
+                    &prices,
+                    &ownership,
+                    &provider_row.pricing_scope,
+                );
+            (filtered_prices, Some(filtered_ownership))
+        } else {
+            (prices, None)
+        };
         let existing = db::find_model_by_upstream(&state.pool, pid, upstream)
             .await
             .map_err(ApiError::internal)?;
