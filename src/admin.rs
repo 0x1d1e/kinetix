@@ -9766,6 +9766,8 @@ pub async fn import_config(
             .and_then(crate::plugins::CredentialMode::parse);
 
         if let Some(existing_id) = provider_ids.get(name).cloned() {
+            let lock = model_reconciliation_lock(&existing_id);
+            let _guard = lock.lock().await;
             let existing = db::get_provider(&state.pool, &existing_id)
                 .await
                 .map_err(ApiError::internal)?
@@ -9806,8 +9808,6 @@ pub async fn import_config(
                 source_plugin_id: source_plugin_id.as_deref(),
                 source_integration_id: source_integration_id.as_deref(),
             };
-            let lock = model_reconciliation_lock(&existing_id);
-            let _guard = lock.lock().await;
             validate_imported_provider_pricing_scope(
                 &state,
                 name,
@@ -9977,11 +9977,13 @@ pub async fn import_config(
         let transport_override =
             validate_model_transport_override(&provider_row, requested_transport)?;
 
-        if let Some(existing_id) = model_ids.get(&format!("{provider}/{upstream}")).cloned() {
-            let existing = db::get_model(&state.pool, &existing_id)
-                .await
-                .map_err(ApiError::internal)?
-                .ok_or_else(|| ApiError::not_found("model not found"))?;
+        let model_key = format!("{provider}/{upstream}");
+        let existing = db::find_model_by_upstream(&state.pool, pid, upstream)
+            .await
+            .map_err(ApiError::internal)?;
+        if let Some(existing) = existing {
+            let existing_id = existing.id.clone();
+            model_ids.insert(model_key.clone(), existing_id.clone());
             let existing_discovery = discovery_object(&existing);
             let previous_prices = existing.prices();
             let mut price_fields = effective_price_fields(&existing_discovery, &previous_prices);
@@ -10119,7 +10121,7 @@ pub async fn import_config(
             )
             .await
             .map_err(ApiError::internal)?;
-            model_ids.insert(format!("{provider}/{upstream}"), id);
+            model_ids.insert(model_key, id);
         }
     }
 
