@@ -21,7 +21,7 @@ import { HealthView } from './components/views/HealthView';
 import { LiveRequest } from './types';
 import { AliasesView } from './components/views/AliasesView';
 import { AuditView } from './components/views/AuditView';
-import { SquiggleDivider, SketchButton, SketchBadge } from './components/HandDrawnElements';
+import { SquiggleDivider } from './components/HandDrawnElements';
 import { EMPTY_METRICS } from './lib/mappers';
 import { Kinetix, ExportFile, UsageDay } from './lib/resources';
 import { SettingsView } from './components/views/SettingsView';
@@ -39,7 +39,7 @@ import {
   RequestLog,
   ProxyMetrics,
 } from './types';
-import { Play, AlertTriangle } from 'lucide-react';
+import { AlertTriangle } from 'lucide-react';
 
 type AuthState = 'checking' | 'signed-out' | 'signed-in';
 
@@ -606,18 +606,6 @@ export default function App() {
             OpenAI &amp; Anthropic streaming in • Gemini, OpenAI, &amp; Anthropic upstream out • SQLite WAL at rest
           </p>
         </footer>
-      </div>
-
-      <div className="fixed bottom-6 right-6 z-40">
-        <SketchButton
-          variant="danger"
-          size="lg"
-          onClick={() => setIsTesterOpen(true)}
-          className="gap-2 font-heading font-bold shadow-lg shadow-black/10"
-        >
-          <Play className="w-5 h-5 fill-[var(--surface)]" />
-          Test Proxy Live
-        </SketchButton>
       </div>
 
       <LiveTesterModal

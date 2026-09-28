@@ -246,8 +246,10 @@ const ClientProfileGenerator: React.FC<ClientProfileGeneratorProps> = ({ keys, n
             <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
               <div>
                 <h4 className="font-heading font-bold text-lg text-[var(--ink)]">Profile preview</h4>
-                <p className="text-xs font-mono text-[var(--ink)]/65 mt-1">
-                  {profile.public_base_url} / {profile.model}
+                <p className="flex flex-wrap items-center gap-x-2 text-xs font-mono text-[var(--ink)]/65 mt-1">
+                  <span><span className="font-body">Endpoint:</span> {profile.public_base_url}</span>
+                  <span aria-hidden="true">·</span>
+                  <span><span className="font-body">Model:</span> {profile.model}</span>
                 </p>
               </div>
               <p className="max-w-lg text-xs font-body text-[var(--marker-red)]">
