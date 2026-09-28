@@ -568,7 +568,11 @@ pub async fn update_provider_credential_semantics(
     Ok(())
 }
 
-pub async fn update_provider_pricing_scope(pool: &Pool, id: &str, pricing_scope: &str) -> Result<()> {
+pub async fn update_provider_pricing_scope(
+    pool: &Pool,
+    id: &str,
+    pricing_scope: &str,
+) -> Result<()> {
     if !matches!(pricing_scope, "integration" | "direct_api") {
         anyhow::bail!("invalid provider pricing scope '{pricing_scope}'");
     }
