@@ -3487,6 +3487,24 @@ fn effective_price_source(fields: &serde_json::Map<String, Value>, prices: &Pric
     }
 }
 
+fn operator_price_provenance(prices: &Prices) -> (String, Value) {
+    let mut fields = serde_json::Map::new();
+    for field in PRICE_FIELDS {
+        if price_field(prices, field).is_some() {
+            set_price_field_provenance(
+                &mut fields,
+                field,
+                "operator",
+                json!({ "configured_by": "admin" }),
+            );
+        }
+    }
+    (
+        effective_price_source(&fields, prices),
+        json!({ "fields": fields }),
+    )
+}
+
 fn automatic_price_provenance(prices: &Prices, observation: &Value) -> (String, Value) {
     let provider_observed_at = observation.get("last_seen").cloned().unwrap_or(Value::Null);
     let catalog_source_state = observation
@@ -4247,6 +4265,114 @@ async fn run_if_pricing_refresh_committable<T>(
 /// independently of provider/plugin discovery and never runs reconciliation.
 /// Existing provider/plugin observations retain precedence; manual/operator-owned
 /// effective fields always win.
+struct StagedProviderPricing {
+    model_id: String,
+    latest_observation: Value,
+    effective: Option<Prices>,
+    source: String,
+    metadata: Value,
+}
+
+async fn apply_provider_pricing_sync(
+    state: &AppState,
+    provider: &db::ProviderRow,
+    models_dev: &crate::model_catalog::ModelsDevCatalog,
+) -> Result<Value, ApiError> {
+    let models = db::models_for_provider(&state.pool, &provider.id)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut staged = Vec::with_capacity(models.len());
+    let mut updated = Vec::new();
+    let mut skipped_manual = Vec::new();
+
+    for row in models {
+        let discovery = discovery_object(&row);
+        let mut observation = latest_reconciliation_observation(&discovery).clone();
+        let resolution = crate::model_catalog::resolve(
+            &provider.base_url,
+            &row.upstream_id,
+            Some(models_dev),
+        );
+        let pricing_patch = models_dev_pricing_patch(&observation, &resolution);
+        apply_top_level_discovery_patch(&mut observation, &pricing_patch);
+
+        let observed: Prices = observation
+            .get("prices")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+
+        if !has_automatic_price_observation(&observed, &observation) {
+            staged.push(StagedProviderPricing {
+                model_id: row.id,
+                latest_observation: observation,
+                effective: None,
+                source: String::new(),
+                metadata: Value::Null,
+            });
+            continue;
+        }
+
+        let current = row.prices();
+        let (effective, fields, preserved_manual) =
+            merge_automatic_price_observation(&current, &observed, &observation, &discovery);
+        let catalog_source_state = observation
+            .pointer("/catalog/source_state")
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        if preserved_manual {
+            skipped_manual.push(row.id.clone());
+        }
+        let source = effective_price_source(&fields, &effective);
+        let metadata = json!({
+            "fields": fields,
+            "catalog_source_state": catalog_source_state,
+        });
+        updated.push(row.id.clone());
+        staged.push(StagedProviderPricing {
+            model_id: row.id,
+            latest_observation: observation,
+            effective: Some(effective),
+            source,
+            metadata,
+        });
+    }
+
+    let mutations: Vec<db::ProviderPricingMutation<'_>> = staged
+        .iter()
+        .map(|stage| db::ProviderPricingMutation {
+            model_id: &stage.model_id,
+            latest_observation: &stage.latest_observation,
+            pricing: stage
+                .effective
+                .as_ref()
+                .map(|prices| db::ModelPricingMutation {
+                    prices,
+                    source: &stage.source,
+                    metadata: &stage.metadata,
+                }),
+        })
+        .collect();
+    db::commit_provider_pricing_batch(&state.pool, &mutations)
+        .await
+        .map_err(ApiError::internal)?;
+
+    if !staged.is_empty() {
+        state
+            .registry
+            .reload(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+
+    Ok(json!({
+        "ok": true,
+        "updated": updated,
+        "skipped_manual": skipped_manual,
+    }))
+}
+
 pub(crate) async fn sync_provider_pricing_id(
     state: &AppState,
     id: &str,
@@ -4269,81 +4395,10 @@ pub(crate) async fn sync_provider_pricing_id(
     let outcome = models_dev_fetch.outcome;
     let models_dev = models_dev_fetch.catalog;
 
-    run_if_pricing_refresh_committable(outcome, async {
-        let models = db::models_for_provider(&state.pool, id)
-            .await
-            .map_err(ApiError::internal)?;
-        let mut updated = Vec::new();
-        let mut skipped_manual = Vec::new();
-
-        for row in models {
-            let discovery = discovery_object(&row);
-            let mut observation = latest_reconciliation_observation(&discovery).clone();
-            let resolution = crate::model_catalog::resolve(
-                &provider.base_url,
-                &row.upstream_id,
-                Some(&models_dev),
-            );
-            let pricing_patch = models_dev_pricing_patch(&observation, &resolution);
-            apply_top_level_discovery_patch(&mut observation, &pricing_patch);
-            db::merge_model_discovery(
-                &state.pool,
-                &row.id,
-                &json!({ "latest_observation": observation.clone() }),
-            )
-            .await
-            .map_err(ApiError::internal)?;
-
-            let observed: Prices = observation
-                .get("prices")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok())
-                .unwrap_or_default();
-            if !has_automatic_price_observation(&observed, &observation) {
-                continue;
-            }
-
-            let current = row.prices();
-            let (effective, fields, preserved_manual) =
-                merge_automatic_price_observation(&current, &observed, &observation, &discovery);
-            let catalog_source_state = observation
-                .pointer("/catalog/source_state")
-                .cloned()
-                .unwrap_or(Value::Null);
-
-            if preserved_manual {
-                skipped_manual.push(row.id.clone());
-            }
-            let source = effective_price_source(&fields, &effective);
-            let metadata = json!({
-                "fields": fields,
-                "catalog_source_state": catalog_source_state,
-            });
-            db::commit_effective_model_pricing(
-                &state.pool,
-                &row.id,
-                &effective,
-                &source,
-                &metadata,
-            )
-            .await
-            .map_err(ApiError::internal)?;
-            updated.push(row.id);
-        }
-
-        if !updated.is_empty() {
-            state
-                .registry
-                .reload(&state.pool)
-                .await
-                .map_err(ApiError::internal)?;
-        }
-        Ok(json!({
-            "ok": true,
-            "updated": updated,
-            "skipped_manual": skipped_manual,
-        }))
-    })
+    run_if_pricing_refresh_committable(
+        outcome,
+        apply_provider_pricing_sync(state, &provider, &models_dev),
+    )
     .await
 }
 
@@ -7206,7 +7261,7 @@ pub async fn create_model(
         Some(if imported_from_discovery {
             automatic_price_provenance(&prices, &body.discovery)
         } else {
-            ("operator".to_string(), json!({ "configured_by": "admin" }))
+            operator_price_provenance(&prices)
         })
     } else {
         None
@@ -14042,6 +14097,273 @@ mod credential_enrollment_regression_tests {
         .unwrap();
 
         assert_eq!(reused_version, original_version);
+        let version_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id = ?")
+                .bind(&model_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(version_count, 1);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn provider_pricing_batch_rolls_back_all_models_on_version_failure() {
+        let (state, root) = test_state("provider-pricing-batch-rollback").await;
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "google-pricing-batch",
+                base_url: "https://generativelanguage.googleapis.com/v1beta",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        async fn insert_priced_model(
+            state: &AppState,
+            provider_id: &str,
+            upstream_id: &str,
+            price: f64,
+        ) -> (String, String) {
+            let prices = Prices {
+                input_per_1m: Some(price),
+                ..Prices::default()
+            };
+            let model_id = db::insert_model(
+                &state.pool,
+                &db::NewModel {
+                    provider_id,
+                    upstream_id,
+                    display_name: upstream_id,
+                    enabled: true,
+                    context_window: None,
+                    max_output_tokens: None,
+                    capabilities: json!({}),
+                    prices: serde_json::to_value(&prices).unwrap(),
+                    parameters: json!({}),
+                    thinking_map: json!({}),
+                    extra_request: json!({}),
+                    discovery: json!({
+                        "latest_observation": {
+                            "marker": "before",
+                            "prices": {"input_per_1m": price},
+                            "price_sources": {"input_per_1m": "models.dev:provider"}
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+            let metadata = json!({
+                "fields": {
+                    "input_per_1m": {
+                        "source": "models.dev:provider",
+                        "metadata": {}
+                    }
+                }
+            });
+            let version_id = db::commit_effective_model_pricing(
+                &state.pool,
+                &model_id,
+                &prices,
+                "models.dev:provider",
+                &metadata,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            (model_id, version_id)
+        }
+
+        let (model_a, version_a) =
+            insert_priced_model(&state, &provider_id, "model-a", 1.0).await;
+        let (model_b, version_b) =
+            insert_priced_model(&state, &provider_id, "model-b", 2.0).await;
+        state.registry.reload(&state.pool).await.unwrap();
+
+        sqlx::query(&format!(
+            "CREATE TRIGGER reject_model_b_pricing_batch
+             BEFORE INSERT ON price_versions
+             WHEN NEW.model_id = '{}'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected provider pricing batch failure');
+             END",
+            model_b
+        ))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let catalog = crate::model_catalog::ModelsDevCatalog::from_parts(
+            json!({}),
+            json!({
+                "google": {
+                    "id": "google",
+                    "models": {
+                        "model-a": {
+                            "id": "model-a",
+                            "cost": {"input": 1.5}
+                        },
+                        "model-b": {
+                            "id": "model-b",
+                            "cost": {"input": 2.5}
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let result = apply_provider_pricing_sync(&state, &provider, &catalog).await;
+        assert!(result.is_err());
+
+        state.registry.reload(&state.pool).await.unwrap();
+        for (model_id, expected_price, expected_version) in [
+            (&model_a, 1.0, &version_a),
+            (&model_b, 2.0, &version_b),
+        ] {
+            let row = db::get_model(&state.pool, model_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.prices().input_per_1m, Some(expected_price));
+            let discovery = discovery_object(&row);
+            assert_eq!(
+                discovery
+                    .pointer("/latest_observation/marker")
+                    .and_then(Value::as_str),
+                Some("before")
+            );
+            assert_eq!(
+                discovery
+                    .pointer("/effective_pricing/price_version_id")
+                    .and_then(Value::as_str),
+                Some(expected_version.as_str())
+            );
+
+            let snapshot = state.registry.snapshot();
+            let runtime = snapshot.models.get(model_id).unwrap();
+            assert_eq!(runtime.prices().input_per_1m, Some(expected_price));
+
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id = ?")
+                    .bind(model_id)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(count, 1);
+        }
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn manual_creation_reuses_price_version_on_unrelated_edit() {
+        let (state, root) = test_state("manual-create-price-version-reuse").await;
+        let provider_id = insert_provider(
+            &state,
+            "manual-price-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+
+        let Json(created) = create_model(
+            State(state.clone()),
+            auth(),
+            Path(provider_id),
+            Json(ModelBody {
+                upstream_id: "manual-priced-model".into(),
+                display_name: Some("Manual Priced Model".into()),
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({
+                    "input_per_1m": 1.0,
+                    "output_per_1m": 2.0
+                }),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({}),
+                transport_override: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let model_id = created["id"].as_str().unwrap().to_string();
+        let created_row = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let created_discovery = discovery_object(&created_row);
+        let original_version = created_discovery
+            .pointer("/effective_pricing/price_version_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        update_model(
+            State(state.clone()),
+            auth(),
+            Path(model_id.clone()),
+            Json(ModelBody {
+                upstream_id: created_row.upstream_id.clone(),
+                display_name: Some("Renamed Manual Priced Model".into()),
+                enabled: created_row.enabled != 0,
+                context_window: created_row.context_window,
+                max_output_tokens: created_row.max_output_tokens,
+                capabilities: serde_json::from_str(&created_row.capabilities).unwrap(),
+                prices: serde_json::from_str(&created_row.prices).unwrap(),
+                parameters: serde_json::from_str(&created_row.parameters).unwrap(),
+                thinking_map: created_row.thinking(),
+                extra_request: created_row.extra_request_value(),
+                discovery: created_discovery,
+                transport_override: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let updated = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let updated_discovery = discovery_object(&updated);
+        assert_eq!(
+            updated_discovery
+                .pointer("/effective_pricing/price_version_id")
+                .and_then(Value::as_str),
+            Some(original_version.as_str())
+        );
         let version_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM price_versions WHERE model_id = ?")
                 .bind(&model_id)

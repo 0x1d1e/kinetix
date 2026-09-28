@@ -882,6 +882,12 @@ pub struct ModelPricingMutation<'a> {
     pub metadata: &'a Value,
 }
 
+pub struct ProviderPricingMutation<'a> {
+    pub model_id: &'a str,
+    pub latest_observation: &'a Value,
+    pub pricing: Option<ModelPricingMutation<'a>>,
+}
+
 pub struct ModelOperatorMutation<'a> {
     pub id: &'a str,
     pub display_name: &'a str,
@@ -1535,6 +1541,58 @@ async fn apply_effective_model_pricing_transaction(
         anyhow::bail!("model '{model_id}' disappeared while committing effective pricing");
     }
     Ok(version_id)
+}
+
+/// Commit one provider-wide pricing synchronization atomically. New discovery
+/// observations and effective immutable pricing become visible together, or all
+/// staged model changes are rolled back.
+pub async fn commit_provider_pricing_batch(
+    pool: &Pool,
+    mutations: &[ProviderPricingMutation<'_>],
+) -> Result<Vec<Option<String>>> {
+    if mutations.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut model_ids: Vec<&str> = mutations.iter().map(|mutation| mutation.model_id).collect();
+    model_ids.sort_unstable();
+    model_ids.dedup();
+    let mut price_guards = Vec::with_capacity(model_ids.len());
+    for model_id in model_ids {
+        price_guards.push(price_version_lock(model_id).lock_owned().await);
+    }
+
+    let mut tx = pool.begin().await?;
+    let mut version_ids = Vec::with_capacity(mutations.len());
+    for mutation in mutations {
+        let discovery_patch = serde_json::json!({
+            "latest_observation": mutation.latest_observation,
+        });
+        merge_model_discovery_in_transaction(
+            &mut tx,
+            mutation.model_id,
+            &discovery_patch,
+        )
+        .await?;
+
+        let version_id = if let Some(pricing) = mutation.pricing.as_ref() {
+            apply_effective_model_pricing_transaction(
+                &mut tx,
+                mutation.model_id,
+                pricing.prices,
+                pricing.source,
+                pricing.metadata,
+            )
+            .await?
+        } else {
+            None
+        };
+        version_ids.push(version_id);
+    }
+
+    tx.commit().await?;
+    drop(price_guards);
+    Ok(version_ids)
 }
 
 /// Atomically bind the effective model prices to the immutable price version and

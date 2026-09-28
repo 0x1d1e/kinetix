@@ -473,7 +473,7 @@ impl ModelsDevCatalog {
     }
 
     #[cfg(test)]
-    fn from_parts(models: Value, providers: Value) -> Option<Self> {
+    pub(crate) fn from_parts(models: Value, providers: Value) -> Option<Self> {
         Self::from_catalog_value(json!({
             "models": models,
             "providers": providers,

@@ -118,6 +118,52 @@ const modelPricingDetails = (model: ModelConfig) => {
 const formatPricingValue = (value: number | null | undefined) =>
   value == null ? 'unknown' : `${value} / 1M`;
 
+const effectivePricingCell = (
+  model: ModelConfig,
+  pricing: ReturnType<typeof modelPricingDetails>,
+  field: PricingField,
+) => {
+  const values: Record<PricingField, number | null> = {
+    input_per_1m: model.prices.inputPer1M,
+    output_per_1m: model.prices.outputPer1M,
+    cached_per_1m: model.prices.cachedPer1M,
+    cache_write_per_1m: model.prices.cacheWritePer1M,
+    thinking_per_1m: model.prices.thinkingPer1M,
+  };
+  const direct = values[field];
+  if (direct != null) {
+    return {
+      value: direct,
+      source: pricing.effectiveFields[field]?.source || pricing.effectiveSource,
+      fallback: null as string | null,
+    };
+  }
+
+  const fallbackField =
+    field === 'cached_per_1m' || field === 'cache_write_per_1m'
+      ? 'input_per_1m'
+      : field === 'thinking_per_1m'
+        ? 'output_per_1m'
+        : null;
+  const fallbackValue = fallbackField ? values[fallbackField] : null;
+  if (fallbackField && fallbackValue != null) {
+    return {
+      value: fallbackValue,
+      source: pricing.effectiveFields[fallbackField]?.source || pricing.effectiveSource,
+      fallback:
+        fallbackField === 'input_per_1m'
+          ? 'input-rate fallback'
+          : 'output-rate fallback',
+    };
+  }
+
+  return {
+    value: null,
+    source: pricing.effectiveFields[field]?.source || pricing.effectiveSource,
+    fallback: null as string | null,
+  };
+};
+
 const formatPricingTimestamp = (value: string | null | undefined) => {
   if (!value) return '—';
   const parsed = new Date(value);
@@ -1834,13 +1880,16 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                     <div className="font-bold">Field</div>
                                     <div className="font-bold">Effective</div>
                                     <div className="font-bold">Latest observed</div>
-                                    {rows.map((row) => (
+                                    {rows.map((row) => {
+                                      const effective = effectivePricingCell(m, pricing, row.field);
+                                      return (
                                       <React.Fragment key={row.field}>
                                         <div>{row.label}</div>
                                         <div>
-                                          {formatPricingValue(row.effective)}
+                                          {formatPricingValue(effective.value)}
+                                          {effective.fallback ? ` · ${effective.fallback}` : ''}
                                           <span className="block text-[var(--ink)]/55">
-                                            {pricing.effectiveFields[row.field]?.source || pricing.effectiveSource}
+                                            {effective.source}
                                           </span>
                                         </div>
                                         <div>
@@ -1850,7 +1899,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                           </span>
                                         </div>
                                       </React.Fragment>
-                                    ))}
+                                      );
+                                    })}
                                   </div>
                                   <div className="mt-2 pt-2 border-t border-[var(--ink)]/20 text-[var(--ink)]/70">
                                     Catalog: {sourceState?.freshness || 'unknown'}
