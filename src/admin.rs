@@ -1346,6 +1346,8 @@ pub struct ProviderBody {
     pub credential_plugin: String,
     #[serde(default)]
     pub model_source_plugin: String,
+    #[serde(default)]
+    pub pricing_scope: Option<String>,
     /// Optional initial credential.
     pub api_key: Option<String>,
     pub account_label: Option<String>,
@@ -1454,6 +1456,26 @@ pub async fn create_provider(
     }
     let auth =
         AuthScheme::parse(&body.auth_scheme).ok_or_else(|| ApiError::bad("invalid auth_scheme"))?;
+    let conservative_scope = db::conservative_provider_pricing_scope(
+        "manual",
+        None,
+        None,
+        &body.wire_plugin,
+        &body.credential_plugin,
+        &body.model_source_plugin,
+    );
+    if let Some(scope) = body.pricing_scope.as_deref() {
+        if !matches!(scope, "direct_api" | "integration") {
+            return Err(ApiError::bad(
+                "pricing_scope must be 'direct_api' or 'integration'",
+            ));
+        }
+        if scope == "direct_api" && conservative_scope != "direct_api" {
+            return Err(ApiError::bad(
+                "pricing_scope 'direct_api' is not allowed for plugin-backed generic providers",
+            ));
+        }
+    }
 
     let id = db::insert_provider(
         &state.pool,
@@ -1482,6 +1504,11 @@ pub async fn create_provider(
     )
     .await
     .map_err(ApiError::internal)?;
+    if body.pricing_scope.as_deref() == Some("integration") {
+        db::update_provider_pricing_scope(&state.pool, &id, "integration")
+            .await
+            .map_err(ApiError::internal)?;
+    }
 
     if let Some(api_key) = body.api_key.filter(|k| !k.trim().is_empty()) {
         let enc = state.crypto.encrypt(&api_key).map_err(ApiError::internal)?;
@@ -1614,27 +1641,55 @@ pub async fn update_provider(
     }
     let auth =
         AuthScheme::parse(&body.auth_scheme).ok_or_else(|| ApiError::bad("invalid auth_scheme"))?;
-    db::update_provider(
-        &state.pool,
-        &id,
-        &body.name,
-        &body.base_url,
-        wire,
-        auth,
-        body.custom_header_name.as_deref(),
-        body.custom_param_name.as_deref(),
-        Value::Object(body.extra_headers),
-        body.timeout_ms,
-        &body.capability_mode,
-        body.models_path.as_deref(),
-        rate_limit_rules,
-        body.follow_redirects,
-        &body.credential_hosts,
-        body.allow_insecure_tls,
+    let conservative_scope = db::conservative_provider_pricing_scope(
+        &existing.credential_mode,
+        existing.source_plugin_id.as_deref(),
+        existing.source_integration_id.as_deref(),
         &body.wire_plugin,
         &body.credential_plugin,
         &body.model_source_plugin,
-    )
+    );
+    if let Some(scope) = body.pricing_scope.as_deref() {
+        if !matches!(scope, "direct_api" | "integration") {
+            return Err(ApiError::bad(
+                "pricing_scope must be 'direct_api' or 'integration'",
+            ));
+        }
+        let scope_drivers_unchanged = existing.wire_plugin == body.wire_plugin
+            && existing.credential_plugin == body.credential_plugin
+            && existing.model_source_plugin == body.model_source_plugin;
+        if scope == "direct_api"
+            && conservative_scope != "direct_api"
+            && !(existing.pricing_scope == "direct_api" && scope_drivers_unchanged)
+        {
+            return Err(ApiError::bad(
+                "pricing_scope 'direct_api' requires an existing trusted integration scope",
+            ));
+        }
+    }
+    let provider = db::NewProvider {
+        name: &body.name,
+        base_url: &body.base_url,
+        wire_format: wire,
+        auth_scheme: auth,
+        custom_header_name: body.custom_header_name.as_deref(),
+        custom_param_name: body.custom_param_name.as_deref(),
+        extra_headers: Value::Object(body.extra_headers),
+        timeout_ms: body.timeout_ms,
+        capability_mode: &body.capability_mode,
+        models_path: body.models_path.as_deref(),
+        rate_limit_rules,
+        follow_redirects: body.follow_redirects,
+        credential_hosts: &body.credential_hosts,
+        allow_insecure_tls: body.allow_insecure_tls,
+        wire_plugin: &body.wire_plugin,
+        credential_plugin: &body.credential_plugin,
+        model_source_plugin: &body.model_source_plugin,
+        credential_mode: &existing.credential_mode,
+        source_plugin_id: existing.source_plugin_id.as_deref(),
+        source_integration_id: existing.source_integration_id.as_deref(),
+    };
+    db::update_provider(&state.pool, &id, &provider, body.pricing_scope.as_deref())
     .await
     .map_err(ApiError::internal)?;
     if let Some(api_key) = body.api_key.filter(|k| !k.trim().is_empty()) {
@@ -9148,6 +9203,7 @@ pub async fn export_config(
                 "credential_mode": p.credential_mode,
                 "source_plugin_id": p.source_plugin_id,
                 "source_integration_id": p.source_integration_id,
+                "pricing_scope": p.pricing_scope,
                 "enabled": p.enabled != 0,
             })
         })
@@ -9393,6 +9449,17 @@ pub async fn import_config(
                 p["wire_format"].as_str().unwrap_or("")
             ));
         }
+        if let Some(scope) = p.get("pricing_scope").and_then(Value::as_str) {
+            if !matches!(scope, "direct_api" | "integration") {
+                problems.push(format!(
+                    "provider '{name}': pricing_scope must be 'direct_api' or 'integration'"
+                ));
+            }
+        } else if p.get("pricing_scope").is_some() && !p["pricing_scope"].is_null() {
+            problems.push(format!(
+                "provider '{name}': pricing_scope must be 'direct_api' or 'integration'"
+            ));
+        }
         let existing_provider = db::list_providers(&state.pool)
             .await
             .map_err(ApiError::internal)?
@@ -9552,15 +9619,13 @@ pub async fn import_config(
                 existing.source_integration_id.clone()
             };
 
-            db::update_provider(
-                &state.pool,
-                &existing_id,
+            let provider = db::NewProvider {
                 name,
                 base_url,
-                wire,
-                auth,
-                custom_header,
-                custom_param,
+                wire_format: wire,
+                auth_scheme: auth,
+                custom_header_name: custom_header,
+                custom_param_name: custom_param,
                 extra_headers,
                 timeout_ms,
                 capability_mode,
@@ -9569,18 +9634,18 @@ pub async fn import_config(
                 follow_redirects,
                 credential_hosts,
                 allow_insecure_tls,
-                p["wire_plugin"].as_str().unwrap_or(""),
-                p["credential_plugin"].as_str().unwrap_or(""),
-                p["model_source_plugin"].as_str().unwrap_or(""),
-            )
-            .await
-            .map_err(ApiError::internal)?;
-            db::update_provider_credential_semantics(
+                wire_plugin: p["wire_plugin"].as_str().unwrap_or(""),
+                credential_plugin: p["credential_plugin"].as_str().unwrap_or(""),
+                model_source_plugin: p["model_source_plugin"].as_str().unwrap_or(""),
+                credential_mode: credential_mode.as_str(),
+                source_plugin_id: source_plugin_id.as_deref(),
+                source_integration_id: source_integration_id.as_deref(),
+            };
+            db::update_provider(
                 &state.pool,
                 &existing_id,
-                credential_mode.as_str(),
-                source_plugin_id.as_deref(),
-                source_integration_id.as_deref(),
+                &provider,
+                p["pricing_scope"].as_str(),
             )
             .await
             .map_err(ApiError::internal)?;
@@ -9614,6 +9679,11 @@ pub async fn import_config(
             )
             .await
             .map_err(ApiError::internal)?;
+            if let Some(scope) = p["pricing_scope"].as_str() {
+                db::update_provider_pricing_scope(&state.pool, &id, scope)
+                    .await
+                    .map_err(ApiError::internal)?;
+            }
             reconcile_provider_account_mode(&state, &id, credential_mode).await?;
             provider_ids.insert(name.to_string(), id);
         }
@@ -10103,17 +10173,17 @@ async fn reconcile_provider_integration_semantics(
     source_integration_id: &str,
     pricing_scope: crate::plugins::PricingScope,
 ) -> Result<(), ApiError> {
-    reconcile_provider_credential_semantics(
-        state,
+    db::update_provider_credential_semantics_with_scope(
+        &state.pool,
         provider_id,
-        credential_mode,
-        source_plugin_id,
-        source_integration_id,
+        credential_mode.as_str(),
+        Some(source_plugin_id),
+        Some(source_integration_id),
+        Some(pricing_scope.as_str()),
     )
-    .await?;
-    db::update_provider_pricing_scope(&state.pool, provider_id, pricing_scope.as_str())
-        .await
-        .map_err(ApiError::internal)
+    .await
+    .map_err(ApiError::internal)?;
+    reconcile_provider_account_mode(state, provider_id, credential_mode).await
 }
 
 pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) {
@@ -11085,6 +11155,7 @@ mod credential_enrollment_tests {
             credential_mode: mode.into(),
             source_plugin_id: Some("plugin.test".into()),
             source_integration_id: Some("oauth".into()),
+            pricing_scope: "integration".into(),
         }
     }
 
@@ -14144,6 +14215,243 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn provider_plugin_edit_rederives_pricing_scope_conservatively() {
+        let (state, root) = test_state("provider-plugin-pricing-scope").await;
+        let provider_id = insert_provider(
+            &state,
+            "scope-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let existing = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(existing.pricing_scope, "direct_api");
+
+        let provider = db::NewProvider {
+            name: &existing.name,
+            base_url: &existing.base_url,
+            wire_format: existing.wire(),
+            auth_scheme: existing.auth(),
+            custom_header_name: existing.custom_header_name.as_deref(),
+            custom_param_name: existing.custom_param_name.as_deref(),
+            extra_headers: serde_json::to_value(existing.extra_headers_map()).unwrap(),
+            timeout_ms: existing.timeout_ms,
+            capability_mode: &existing.capability_mode,
+            models_path: existing.models_path.as_deref(),
+            rate_limit_rules: serde_json::from_str(&existing.rate_limit_rules).unwrap(),
+            follow_redirects: existing.follow_redirects != 0,
+            credential_hosts: &existing.credential_hosts,
+            allow_insecure_tls: existing.allow_insecure_tls != 0,
+            wire_plugin: "",
+            credential_plugin: "",
+            model_source_plugin: "plugin:plugin.test/models",
+            credential_mode: &existing.credential_mode,
+            source_plugin_id: existing.source_plugin_id.as_deref(),
+            source_integration_id: existing.source_integration_id.as_deref(),
+        };
+        db::update_provider(&state.pool, &provider_id, &provider, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db::get_provider(&state.pool, &provider_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pricing_scope,
+            "integration"
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn scope_transition_revokes_models_dev_effective_pricing_without_sync() {
+        let (state, root) = test_state("scope-transition-price-revoke").await;
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "google-scope-transition",
+                base_url: "https://generativelanguage.googleapis.com/v1beta",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "shared-model",
+                display_name: "Shared Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let catalog = crate::model_catalog::ModelsDevCatalog::from_parts(
+            json!({}),
+            json!({
+                "google": {
+                    "id": "google",
+                    "models": {
+                        "shared-model": {
+                            "id": "shared-model",
+                            "cost": {"input": 0.75, "output": 3.75}
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        apply_provider_pricing_sync(&state, &provider, &catalog)
+            .await
+            .unwrap();
+
+        db::update_provider_pricing_scope(&state.pool, &provider_id, "integration")
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+
+        let model = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.prices().input_per_1m, None);
+        assert_eq!(model.prices().output_per_1m, None);
+        let discovery = discovery_object(&model);
+        assert!(discovery
+            .pointer("/effective_pricing/price_version_id")
+            .is_none_or(Value::is_null));
+        assert_eq!(
+            state
+                .registry
+                .snapshot()
+                .models
+                .get(&model_id)
+                .unwrap()
+                .prices()
+                .input_per_1m,
+            None
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn migration_scope_enforcement_revokes_existing_plugin_models_dev_pricing() {
+        let (state, root) = test_state("migration-scope-price-revoke").await;
+        let provider_id = insert_provider(
+            &state,
+            "migration-plugin-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "legacy-priced-model",
+                display_name: "Legacy Priced Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({"input_per_1m": 1.0}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let prices = Prices {
+            input_per_1m: Some(1.0),
+            ..Prices::default()
+        };
+        let metadata = json!({
+            "fields": {
+                "input_per_1m": {
+                    "source": "models.dev:provider",
+                    "metadata": {}
+                }
+            },
+            "catalog_source_state": {"source": "models.dev"}
+        });
+        db::commit_effective_model_pricing(
+            &state.pool,
+            &model_id,
+            &prices,
+            "models.dev:provider",
+            &metadata,
+        )
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "UPDATE providers
+             SET model_source_plugin='plugin:plugin.test/models', pricing_scope='integration'
+             WHERE id=?",
+        )
+        .bind(&provider_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        db::enforce_provider_pricing_scopes(&state.pool).await.unwrap();
+
+        assert_eq!(
+            db::get_model(&state.pool, &model_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .prices()
+                .input_per_1m,
+            None
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn models_dev_direct_pricing_respects_provider_pricing_scope() {
         let (state, root) = test_state("pricing-scope-isolation").await;
         let catalog = crate::model_catalog::ModelsDevCatalog::from_parts(
@@ -15880,6 +16188,36 @@ mod credential_enrollment_regression_tests {
         assert_eq!(existing.credential_mode, "auth_flow");
         assert_eq!(existing.credential_plugin, "plugin:plugin.test/strategy");
 
+        let plugin_bound_manual = json!({
+            "name": "manual-plugin-bound",
+            "base_url": "http://127.0.0.1:12345",
+            "wire_format": "openai",
+            "auth_scheme": "bearer",
+            "extra_headers": {},
+            "rate_limit_rules": {},
+            "credential_mode": "manual",
+            "credential_plugin": "",
+            "wire_plugin": "",
+            "model_source_plugin": "plugin:plugin.test/models"
+        });
+        import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({"providers": [plugin_bound_manual]}),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let imported = db::list_providers(&state.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "manual-plugin-bound")
+            .unwrap();
+        assert_eq!(imported.pricing_scope, "integration");
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -15894,6 +16232,9 @@ mod credential_enrollment_regression_tests {
             Some("oauth"),
         )
         .await;
+        db::update_provider_pricing_scope(&source.pool, &auth_provider, "direct_api")
+            .await
+            .unwrap();
         let noauth_provider = insert_provider(
             &source,
             "public-provider",
@@ -15980,6 +16321,7 @@ mod credential_enrollment_regression_tests {
         assert_eq!(oauth["credential_mode"], "auth_flow");
         assert_eq!(oauth["source_plugin_id"], "plugin.oauth");
         assert_eq!(oauth["source_integration_id"], "oauth");
+        assert_eq!(oauth["pricing_scope"], "direct_api");
 
         let public = exported["providers"]
             .as_array()
@@ -16020,6 +16362,7 @@ mod credential_enrollment_regression_tests {
         assert_eq!(oauth.credential_mode, "auth_flow");
         assert_eq!(oauth.source_plugin_id.as_deref(), Some("plugin.oauth"));
         assert_eq!(oauth.source_integration_id.as_deref(), Some("oauth"));
+        assert_eq!(oauth.pricing_scope, "direct_api");
 
         let oauth_accounts = db::accounts_for_provider(&target.pool, &oauth.id)
             .await

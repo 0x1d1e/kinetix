@@ -300,6 +300,7 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         credential_mode: "auth_flow".into(),
         source_plugin_id: Some(id.into()),
         source_integration_id: Some("antigravity".into()),
+        pricing_scope: "integration".into(),
     };
     assert_eq!(provider_row.wire(), WireFormat::Plugin);
     let registered = registry.for_provider(&provider_row);

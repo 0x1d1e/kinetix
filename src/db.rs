@@ -41,6 +41,9 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         .run(pool)
         .await
         .context("running migrations")?;
+    enforce_provider_pricing_scopes(pool)
+        .await
+        .context("enforcing provider pricing scopes after migrations")?;
     Ok(())
 }
 
@@ -321,6 +324,7 @@ pub struct ProviderRow {
     pub source_plugin_id: Option<String>,
     #[serde(default)]
     pub source_integration_id: Option<String>,
+    pub pricing_scope: String,
 }
 
 impl ProviderRow {
@@ -429,19 +433,37 @@ pub struct NewProvider<'a> {
     pub source_integration_id: Option<&'a str>,
 }
 
-pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String> {
-    let id = format!("prov_{}", uuid::Uuid::new_v4().simple());
-    let pricing_scope = if p.source_plugin_id.is_some()
-        || p.source_integration_id.is_some()
-        || p.credential_mode != "manual"
-        || !p.wire_plugin.is_empty()
-        || !p.credential_plugin.is_empty()
-        || !p.model_source_plugin.is_empty()
+pub fn conservative_provider_pricing_scope(
+    credential_mode: &str,
+    source_plugin_id: Option<&str>,
+    source_integration_id: Option<&str>,
+    wire_plugin: &str,
+    credential_plugin: &str,
+    model_source_plugin: &str,
+) -> &'static str {
+    if source_plugin_id.is_some()
+        || source_integration_id.is_some()
+        || credential_mode != "manual"
+        || !wire_plugin.is_empty()
+        || !credential_plugin.is_empty()
+        || !model_source_plugin.is_empty()
     {
         "integration"
     } else {
         "direct_api"
-    };
+    }
+}
+
+pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String> {
+    let id = format!("prov_{}", uuid::Uuid::new_v4().simple());
+    let pricing_scope = conservative_provider_pricing_scope(
+        p.credential_mode,
+        p.source_plugin_id,
+        p.source_integration_id,
+        p.wire_plugin,
+        p.credential_plugin,
+        p.model_source_plugin,
+    );
     sqlx::query(
         "INSERT INTO providers
          (id, name, base_url, wire_format, auth_scheme, custom_header_name, custom_param_name,
@@ -491,50 +513,71 @@ pub fn auth_scheme_str(s: AuthScheme) -> &'static str {
 pub async fn update_provider(
     pool: &Pool,
     id: &str,
-    name: &str,
-    base_url: &str,
-    wire_format: WireFormat,
-    auth_scheme: AuthScheme,
-    custom_header_name: Option<&str>,
-    custom_param_name: Option<&str>,
-    extra_headers: Value,
-    timeout_ms: i64,
-    capability_mode: &str,
-    models_path: Option<&str>,
-    rate_limit_rules: Value,
-    follow_redirects: bool,
-    credential_hosts: &str,
-    allow_insecure_tls: bool,
-    wire_plugin: &str,
-    credential_plugin: &str,
-    model_source_plugin: &str,
+    p: &NewProvider<'_>,
+    explicit_pricing_scope: Option<&str>,
 ) -> Result<()> {
+    let existing = get_provider(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?;
+    let drivers_changed = existing.credential_mode != p.credential_mode
+        || existing.source_plugin_id.as_deref() != p.source_plugin_id
+        || existing.source_integration_id.as_deref() != p.source_integration_id
+        || existing.wire_plugin != p.wire_plugin
+        || existing.credential_plugin != p.credential_plugin
+        || existing.model_source_plugin != p.model_source_plugin;
+    let conservative = conservative_provider_pricing_scope(
+        p.credential_mode,
+        p.source_plugin_id,
+        p.source_integration_id,
+        p.wire_plugin,
+        p.credential_plugin,
+        p.model_source_plugin,
+    );
+    let pricing_scope = match explicit_pricing_scope {
+        Some(scope @ ("direct_api" | "integration")) => scope.to_string(),
+        Some(scope) => anyhow::bail!("invalid provider pricing scope '{scope}'"),
+        None if !drivers_changed => existing.pricing_scope.clone(),
+        None => conservative.to_string(),
+    };
+
+    let _guards = provider_price_guards(pool, id).await?;
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE providers SET name=?, base_url=?, wire_format=?, auth_scheme=?, custom_header_name=?,
          custom_param_name=?, extra_headers=?, timeout_ms=?, capability_mode=?, models_path=?,
          rate_limit_rules=?, follow_redirects=?, credential_hosts=?, allow_insecure_tls=?,
-         wire_plugin=?, credential_plugin=?, model_source_plugin=? WHERE id=?",
+         wire_plugin=?, credential_plugin=?, model_source_plugin=?, credential_mode=?,
+         source_plugin_id=?, source_integration_id=?, pricing_scope=? WHERE id=?",
     )
-    .bind(name)
-    .bind(base_url)
-    .bind(wire_format.as_str())
-    .bind(auth_scheme_str(auth_scheme))
-    .bind(custom_header_name)
-    .bind(custom_param_name)
-    .bind(extra_headers.to_string())
-    .bind(timeout_ms)
-    .bind(capability_mode)
-    .bind(models_path)
-    .bind(rate_limit_rules.to_string())
-    .bind(follow_redirects as i64)
-    .bind(credential_hosts)
-    .bind(allow_insecure_tls as i64)
-    .bind(wire_plugin)
-    .bind(credential_plugin)
-    .bind(model_source_plugin)
+    .bind(p.name)
+    .bind(p.base_url)
+    .bind(p.wire_format.as_str())
+    .bind(auth_scheme_str(p.auth_scheme))
+    .bind(p.custom_header_name)
+    .bind(p.custom_param_name)
+    .bind(p.extra_headers.to_string())
+    .bind(p.timeout_ms)
+    .bind(p.capability_mode)
+    .bind(p.models_path)
+    .bind(p.rate_limit_rules.to_string())
+    .bind(p.follow_redirects as i64)
+    .bind(p.credential_hosts)
+    .bind(p.allow_insecure_tls as i64)
+    .bind(p.wire_plugin)
+    .bind(p.credential_plugin)
+    .bind(p.model_source_plugin)
+    .bind(p.credential_mode)
+    .bind(p.source_plugin_id)
+    .bind(p.source_integration_id)
+    .bind(&pricing_scope)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+
+    if pricing_scope == "integration" {
+        revoke_models_dev_effective_pricing_in_transaction(&mut tx, id).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -545,14 +588,48 @@ pub async fn update_provider_credential_semantics(
     source_plugin_id: Option<&str>,
     source_integration_id: Option<&str>,
 ) -> Result<()> {
-    let pricing_scope = if source_plugin_id.is_some()
-        || source_integration_id.is_some()
-        || credential_mode != "manual"
-    {
-        "integration"
-    } else {
-        "direct_api"
+    update_provider_credential_semantics_with_scope(
+        pool,
+        id,
+        credential_mode,
+        source_plugin_id,
+        source_integration_id,
+        None,
+    )
+    .await
+}
+
+pub async fn update_provider_credential_semantics_with_scope(
+    pool: &Pool,
+    id: &str,
+    credential_mode: &str,
+    source_plugin_id: Option<&str>,
+    source_integration_id: Option<&str>,
+    explicit_pricing_scope: Option<&str>,
+) -> Result<()> {
+    let existing = get_provider(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?;
+    let drivers_changed = existing.credential_mode != credential_mode
+        || existing.source_plugin_id.as_deref() != source_plugin_id
+        || existing.source_integration_id.as_deref() != source_integration_id;
+    let conservative = conservative_provider_pricing_scope(
+        credential_mode,
+        source_plugin_id,
+        source_integration_id,
+        &existing.wire_plugin,
+        &existing.credential_plugin,
+        &existing.model_source_plugin,
+    );
+    let pricing_scope = match explicit_pricing_scope {
+        Some(scope @ ("direct_api" | "integration")) => scope.to_string(),
+        Some(scope) => anyhow::bail!("invalid provider pricing scope '{scope}'"),
+        None if !drivers_changed => existing.pricing_scope.clone(),
+        None => conservative.to_string(),
     };
+
+    let _guards = provider_price_guards(pool, id).await?;
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE providers
          SET credential_mode=?, source_plugin_id=?, source_integration_id=?, pricing_scope=?
@@ -561,26 +638,32 @@ pub async fn update_provider_credential_semantics(
     .bind(credential_mode)
     .bind(source_plugin_id)
     .bind(source_integration_id)
-    .bind(pricing_scope)
+    .bind(&pricing_scope)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    if pricing_scope == "integration" {
+        revoke_models_dev_effective_pricing_in_transaction(&mut tx, id).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
-pub async fn update_provider_pricing_scope(
-    pool: &Pool,
-    id: &str,
-    pricing_scope: &str,
-) -> Result<()> {
+pub async fn update_provider_pricing_scope(pool: &Pool, id: &str, pricing_scope: &str) -> Result<()> {
     if !matches!(pricing_scope, "integration" | "direct_api") {
         anyhow::bail!("invalid provider pricing scope '{pricing_scope}'");
     }
+    let _guards = provider_price_guards(pool, id).await?;
+    let mut tx = pool.begin().await?;
     sqlx::query("UPDATE providers SET pricing_scope=? WHERE id=?")
         .bind(pricing_scope)
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    if pricing_scope == "integration" {
+        revoke_models_dev_effective_pricing_in_transaction(&mut tx, id).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -591,6 +674,150 @@ pub async fn provider_pricing_scope(pool: &Pool, id: &str) -> Result<String> {
             .fetch_one(pool)
             .await?,
     )
+}
+
+async fn provider_price_guards(
+    pool: &Pool,
+    provider_id: &str,
+) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+    let model_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM models WHERE provider_id=? ORDER BY id")
+            .bind(provider_id)
+            .fetch_all(pool)
+            .await?;
+    let mut guards = Vec::with_capacity(model_ids.len());
+    for model_id in model_ids {
+        guards.push(price_version_lock(&model_id).lock_owned().await);
+    }
+    Ok(guards)
+}
+
+fn clear_price_field(prices: &mut Prices, field: &str) {
+    match field {
+        "input_per_1m" => prices.input_per_1m = None,
+        "output_per_1m" => prices.output_per_1m = None,
+        "cached_per_1m" => prices.cached_per_1m = None,
+        "cache_write_per_1m" => prices.cache_write_per_1m = None,
+        "thinking_per_1m" => prices.thinking_per_1m = None,
+        _ => {}
+    }
+}
+
+fn effective_source_after_revocation(
+    fields: &serde_json::Map<String, Value>,
+    previous_source: &str,
+    prices: &Prices,
+) -> String {
+    let sources: std::collections::BTreeSet<&str> = fields
+        .values()
+        .filter_map(|field| field.get("source").and_then(Value::as_str))
+        .collect();
+    match sources.len() {
+        1 => sources.into_iter().next().unwrap_or("untracked").to_string(),
+        n if n > 1 => "mixed".to_string(),
+        _ if prices.is_configured() && !previous_source.starts_with("models.dev") => {
+            previous_source.to_string()
+        }
+        _ => "untracked".to_string(),
+    }
+}
+
+async fn revoke_models_dev_effective_pricing_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    provider_id: &str,
+) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, prices, discovery FROM models WHERE provider_id=? ORDER BY id",
+    )
+    .bind(provider_id)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    for row in rows {
+        let model_id: String = row.try_get("id")?;
+        let mut prices: Prices =
+            serde_json::from_str(&row.try_get::<String, _>("prices")?).unwrap_or_default();
+        let discovery: Value = serde_json::from_str(&row.try_get::<String, _>("discovery")?)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let effective = discovery.get("effective_pricing").and_then(Value::as_object);
+        let previous_source = effective
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str)
+            .unwrap_or("untracked");
+        let mut fields = effective
+            .and_then(|value| value.get("fields"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+
+        let models_dev_fields: Vec<String> = fields
+            .iter()
+            .filter_map(|(field, provenance)| {
+                provenance
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .is_some_and(|source| source.starts_with("models.dev"))
+                    .then(|| field.clone())
+            })
+            .collect();
+        let legacy_models_dev_snapshot =
+            models_dev_fields.is_empty() && previous_source.starts_with("models.dev");
+        if models_dev_fields.is_empty() && !legacy_models_dev_snapshot {
+            continue;
+        }
+
+        if legacy_models_dev_snapshot {
+            for field in [
+                "input_per_1m",
+                "output_per_1m",
+                "cached_per_1m",
+                "cache_write_per_1m",
+                "thinking_per_1m",
+            ] {
+                clear_price_field(&mut prices, field);
+            }
+            fields.clear();
+        } else {
+            for field in models_dev_fields {
+                clear_price_field(&mut prices, &field);
+                fields.remove(&field);
+            }
+        }
+
+        let mut metadata = effective
+            .and_then(|value| value.get("metadata"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !metadata.is_object() {
+            metadata = serde_json::json!({});
+        }
+        metadata["fields"] = Value::Object(fields.clone());
+        if !fields.values().any(|field| {
+            field
+                .get("source")
+                .and_then(Value::as_str)
+                .is_some_and(|source| source.starts_with("models.dev"))
+        }) {
+            if let Some(object) = metadata.as_object_mut() {
+                object.remove("catalog_source_state");
+            }
+        }
+        let source = effective_source_after_revocation(&fields, previous_source, &prices);
+        apply_effective_model_pricing_transaction(tx, &model_id, &prices, &source, &metadata)
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn enforce_provider_pricing_scopes(pool: &Pool) -> Result<()> {
+    let provider_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM providers WHERE pricing_scope='integration' ORDER BY id")
+            .fetch_all(pool)
+            .await?;
+    for provider_id in provider_ids {
+        update_provider_pricing_scope(pool, &provider_id, "integration").await?;
+    }
+    Ok(())
 }
 
 pub async fn delete_provider(pool: &Pool, id: &str) -> Result<()> {
