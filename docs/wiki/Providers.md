@@ -48,7 +48,11 @@ response-object/storage semantics continue to fail closed.
 - **Capabilities** (`text`, `vision`, `reasoning`, `tool_calling`, `audio`) drive
   strict-provider filtering and are surfaced in `GET /v1/models`. Unconfigured
   metadata is treated as unknown, not assumed false; strict checks reject only
-  explicitly unsupported capabilities.
+  explicitly unsupported capabilities. `continuation_families` are operator
+  assertions used to preserve Anthropic thinking and redacted-thinking history
+  across compatible model targets. The same provider and upstream model need no
+  family; otherwise set the same family on both models only when both accept
+  that history unchanged. Kinetix does not infer compatibility.
 - **Parameters** (`temperature`, `top_p`, `top_k`, …) each carry a policy
   (`forward` / `clamp` / `reject` / `drop`) and optional min/max/default. A
   configured default is applied when the client omits the field; a client value

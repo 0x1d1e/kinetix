@@ -6,6 +6,7 @@
 //! the commit point (the first client response bytes). A failure after commit
 //! terminates the stream with a format-correct error and is never spliced.
 
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -777,14 +778,15 @@ pub async fn run(
     let session_origin_key = session
         .as_deref()
         .and_then(|session| state.sticky_lookup(session, STICKY_TTL));
-    let session_origin_provider = route.as_ref().and_then(|route| {
+    let session_origin = route.as_ref().and_then(|route| {
         session_origin_key.as_ref().and_then(|key| {
             targets
                 .iter()
                 .find(|target| target_key(route, target) == *key)
-                .map(|target| target.provider.id.clone())
+                .map(continuation_origin)
         })
     });
+    let initial_origin = targets.first().map(continuation_origin);
 
     // Sticky routing and prompt-cache affinity share the same bounded session
     // mapping: both prefer the last successful target while still allowing
@@ -813,7 +815,7 @@ pub async fn run(
     let mut last_error: Option<ProxyError> = None;
     let mut all_accounts: Vec<db::AccountRow> = Vec::new();
     let mut attempts_done = 0usize;
-    let mut previous_provider_id: Option<String> = None;
+    let mut previous_origin: Option<ContinuationOrigin> = None;
     let mut skip_logical_target: Option<String> = None;
     let deadline = started + MAX_PRE_COMMIT_DEADLINE;
 
@@ -1028,21 +1030,31 @@ pub async fn run(
         // Portability applies on cross-format translation, on fallback across
         // providers, and on the first attempt when session provenance shows the
         // previous turn came from a different provider.
-        let cross_provider = previous_provider_id
-            .as_deref()
+        let source_origin = previous_origin
+            .as_ref()
             .or(if attempts_done == 0 {
-                session_origin_provider.as_deref()
+                session_origin.as_ref()
             } else {
                 None
             })
-            .map(|id| id != target.provider.id)
-            .unwrap_or(false);
+            .or(initial_origin.as_ref());
+        let cross_provider =
+            source_origin.is_some_and(|origin| origin.provider_id != target.provider.id);
         let cross_format = !passthrough::is_transport_passthrough(format, &profile.transport);
 
-        // Inline opaque state is evaluated *before* hydration so a signature we
-        // are about to restore for a compatible target is never mistaken for
-        // non-portable client state and stripped.
-        let inline_opaque = request_has_opaque_state(&target_req);
+        // Anthropic continuation is safe for the same provider/model, or when
+        // both models explicitly share an operator-declared continuation family.
+        // Wire-format and upstream model-name equality alone are insufficient.
+        let preserves_anthropic_thinking = format == FrontendFormat::Anthropic
+            && adapter.wire_format() == "anthropic"
+            && anthropic_continuation_is_compatible(source_origin, target);
+        // Evaluate inline opaque state before hydration so a signature about to
+        // be restored for a compatible target is not mistaken for client state.
+        let inline_opaque = request_has_nonportable_inline_state(
+            &target_req,
+            preserves_anthropic_thinking,
+            cross_provider || cross_format,
+        );
 
         // Resolve host-owned stored continuation state for this candidate
         // target. Compatible signatures are restored only after portability is
@@ -1065,7 +1077,7 @@ pub async fn run(
         // an OpenAI target with no session provenance). Without this, the
         // Route's reject/strip_with_warning policy would be bypassed and the
         // state silently dropped.
-        if cross_provider || cross_format || opaque_report.nonportable() {
+        if cross_provider || cross_format || inline_opaque || opaque_report.nonportable() {
             // A target that cannot carry the real stored state may still have a
             // documented placeholder for it (e.g. Gemini's cross-model
             // sentinel). The adapter owns that wire detail; the pipeline only
@@ -1079,6 +1091,7 @@ pub async fn run(
                     inline_opaque,
                     &opaque_report,
                     placeholder,
+                    preserves_anthropic_thinking,
                     &mut trace,
                 )?;
             } else if let Some(placeholder) =
@@ -1089,8 +1102,12 @@ pub async fn run(
                 // substitute for the stored state it cannot carry (e.g. Gemini's
                 // cross-model function-call placeholder). Translate with it
                 // rather than failing the request; never strip silently.
-                let placed =
-                    strip_nonportable_state(&mut target_req, &opaque_report, Some(placeholder));
+                let placed = strip_nonportable_state(
+                    &mut target_req,
+                    &opaque_report,
+                    Some(placeholder),
+                    preserves_anthropic_thinking,
+                );
                 let warning = portability_warning(target, placed);
                 trace.warn(warning.clone());
                 tracing::warn!("{}", warning);
@@ -1273,7 +1290,7 @@ pub async fn run(
 
         let attempt_started = Instant::now();
         attempts_done += 1;
-        previous_provider_id = Some(target.provider.id.clone());
+        previous_origin = Some(continuation_origin(target));
         state.live.set_fallback_hops(
             &meta.request_id,
             (attempts_done - 1) as u32,
@@ -3194,22 +3211,73 @@ async fn order_route_targets(
 /// * `strip_with_warning` — remove the non-portable state, record it in the
 ///   Route Trace, and emit a client-visible warning. Silent stripping is
 ///   forbidden.
-fn request_has_opaque_state(req: &InternalRequest) -> bool {
+#[derive(Clone)]
+struct ContinuationOrigin {
+    provider_id: String,
+    upstream_model_id: String,
+    families: HashSet<String>,
+}
+
+fn continuation_origin(target: &ResolvedTarget) -> ContinuationOrigin {
+    let capabilities =
+        serde_json::from_str::<Value>(&target.model.capabilities).unwrap_or(Value::Null);
+    let families = capabilities
+        .get("continuation_families")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|family| !family.is_empty())
+        .map(str::to_owned)
+        .collect();
+    ContinuationOrigin {
+        provider_id: target.provider.id.clone(),
+        upstream_model_id: target.model.upstream_id.clone(),
+        families,
+    }
+}
+
+fn anthropic_continuation_is_compatible(
+    source: Option<&ContinuationOrigin>,
+    target: &ResolvedTarget,
+) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    if source.provider_id == target.provider.id
+        && source.upstream_model_id == target.model.upstream_id
+    {
+        return true;
+    }
+
+    let target_families = continuation_origin(target).families;
+    source
+        .families
+        .iter()
+        .any(|family| target_families.contains(family))
+}
+
+fn request_has_nonportable_inline_state(
+    req: &InternalRequest,
+    preserves_anthropic_thinking: bool,
+    include_generic_opaque: bool,
+) -> bool {
     req.messages.iter().any(|message| {
-        message.parts.iter().any(|part| {
-            matches!(part, crate::types::Part::Thinking { .. })
-                || matches!(
-                    part,
-                    crate::types::Part::ToolCall {
-                        signature: Some(_),
-                        ..
-                    }
-                )
+        message.parts.iter().any(|part| match part {
+            crate::types::Part::Thinking { signature, .. } => {
+                !preserves_anthropic_thinking || signature.is_none()
+            }
+            crate::types::Part::RedactedThinking { .. } => !preserves_anthropic_thinking,
+            crate::types::Part::ToolCall {
+                signature: Some(_), ..
+            } => include_generic_opaque,
+            _ => false,
         })
     })
 }
 
-fn strip_opaque_raw_body(req: &mut InternalRequest) {
+fn strip_opaque_raw_body(req: &mut InternalRequest, preserves_anthropic_thinking: bool) {
     let Some(raw) = req.raw_body.as_deref() else {
         return;
     };
@@ -3231,11 +3299,20 @@ fn strip_opaque_raw_body(req: &mut InternalRequest) {
         let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
-        parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("thinking"));
+        parts.retain(|part| {
+            let block_type = part.get("type").and_then(Value::as_str);
+            preserves_anthropic_thinking
+                || !matches!(block_type, Some("thinking" | "redacted_thinking"))
+        });
         for part in parts {
-            if let Some(object) = part.as_object_mut() {
-                object.remove("signature");
-                object.remove("thoughtSignature");
+            let block_type = part.get("type").and_then(Value::as_str);
+            if !preserves_anthropic_thinking
+                || !matches!(block_type, Some("thinking" | "redacted_thinking"))
+            {
+                if let Some(object) = part.as_object_mut() {
+                    object.remove("signature");
+                    object.remove("thoughtSignature");
+                }
             }
         }
     }
@@ -3388,10 +3465,9 @@ fn hydrate_opaque_state(req: &mut InternalRequest, report: &OpaqueHydrationRepor
 ///   Route Trace, and emit a client-visible warning. Silent stripping is
 ///   forbidden.
 ///
-/// `inline_opaque` reflects opaque state already present in the decoded request
-/// (thinking parts, tool-call signatures) and `report` reflects host-owned
-/// stored continuation state resolved for this target. Either source can make
-/// the conversation non-portable for the candidate target.
+/// `inline_opaque` reflects state that this target cannot carry; `report` reflects
+/// host-owned stored continuation state resolved for this target. Either source
+/// can make the conversation non-portable for the candidate target.
 ///
 /// `placeholder` is the target adapter's documented stand-in for a historical
 /// call whose real signature cannot be carried (e.g. a different model in the
@@ -3406,6 +3482,7 @@ fn apply_portability(
     inline_opaque: bool,
     report: &OpaqueHydrationReport,
     placeholder: Option<&'static str>,
+    preserves_anthropic_thinking: bool,
     trace: &mut RouteTrace,
 ) -> Result<(), ProxyError> {
     if !inline_opaque && !report.nonportable() {
@@ -3420,7 +3497,7 @@ fn apply_portability(
     }
 
     // portability=strip_with_warning
-    let placed = strip_nonportable_state(req, report, placeholder);
+    let placed = strip_nonportable_state(req, report, placeholder, preserves_anthropic_thinking);
     let warning = portability_warning(target, placed);
     trace.warn(warning.clone());
     tracing::warn!(route = %route.name, "{}", warning);
@@ -3430,6 +3507,7 @@ fn apply_portability(
 /// Remove non-portable continuation state (thinking parts and tool-call
 /// signatures) from the request and, where the target adapter documents a
 /// substitute, paint its placeholder onto the historical calls it cannot carry.
+/// Explicitly compatible Anthropic thinking blocks remain unchanged.
 /// Returns the number of placeholders applied. Shared by Route-based
 /// `strip_with_warning` fallback and a direct target that has a protocol-valid
 /// same-family translation.
@@ -3437,11 +3515,17 @@ fn strip_nonportable_state(
     req: &mut InternalRequest,
     report: &OpaqueHydrationReport,
     placeholder: Option<&'static str>,
+    preserves_anthropic_thinking: bool,
 ) -> usize {
     let mut placed = 0usize;
     for msg in &mut req.messages {
-        msg.parts
-            .retain(|p| !matches!(p, crate::types::Part::Thinking { .. }));
+        msg.parts.retain(|part| match part {
+            crate::types::Part::Thinking { signature, .. } => {
+                preserves_anthropic_thinking && signature.is_some()
+            }
+            crate::types::Part::RedactedThinking { .. } => preserves_anthropic_thinking,
+            _ => true,
+        });
         for part in &mut msg.parts {
             if let crate::types::Part::ToolCall { id, signature, .. } = part {
                 *signature = None;
@@ -3457,7 +3541,7 @@ fn strip_nonportable_state(
             }
         }
     }
-    strip_opaque_raw_body(req);
+    strip_opaque_raw_body(req, preserves_anthropic_thinking);
     placed
 }
 
@@ -4331,9 +4415,10 @@ async fn drive_stream(
     .await;
 }
 
-/// Same-format passthrough streaming (FR-2.7, FR-2.10). Raw frames are
-/// preserved, but no client bytes are emitted until a semantic upstream event
-/// has been validated.
+/// Same-format passthrough streaming (FR-2.7, FR-2.10). Event payloads are
+/// forwarded without JSON re-encoding, but the SSE framer normalizes line
+/// endings and this driver reconstructs frame delimiters. No client bytes are
+/// emitted until a semantic upstream event has been validated.
 #[allow(clippy::too_many_arguments)]
 async fn drive_stream_passthrough(
     state: AppState,
@@ -7186,9 +7271,12 @@ mod route_policy_tests {
         let target = target();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         let report = OpaqueHydrationReport::default();
-        apply_portability(&mut req, &route, &target, true, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, true, &report, None, false, &mut trace,
+        )
+        .unwrap();
 
-        assert!(!request_has_opaque_state(&req));
+        assert!(!request_has_nonportable_inline_state(&req, false, true));
         assert!(!trace.warnings.is_empty());
         let raw: Value = serde_json::from_str(req.raw_body.as_deref().unwrap()).unwrap();
         assert_eq!(raw["messages"][0]["content"].as_array().unwrap().len(), 1);
@@ -7209,10 +7297,17 @@ mod route_policy_tests {
         route.portability_policy = "reject".into();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         let report = OpaqueHydrationReport::default();
-        assert!(
-            apply_portability(&mut req, &route, &target(), true, &report, None, &mut trace)
-                .is_err()
-        );
+        assert!(apply_portability(
+            &mut req,
+            &route,
+            &target(),
+            true,
+            &report,
+            None,
+            false,
+            &mut trace,
+        )
+        .is_err());
     }
 
     #[test]
@@ -7227,7 +7322,10 @@ mod route_policy_tests {
             incompatible: 1,
             ..Default::default()
         };
-        apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, false, &report, None, false, &mut trace,
+        )
+        .unwrap();
         assert_eq!(trace.warnings.len(), 1);
     }
 
@@ -7272,6 +7370,7 @@ mod route_policy_tests {
             false,
             &report,
             Some("PLACEHOLDER"),
+            false,
             &mut trace,
         )
         .unwrap();
@@ -7319,7 +7418,10 @@ mod route_policy_tests {
             ..Default::default()
         };
 
-        apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, false, &report, None, false, &mut trace,
+        )
+        .unwrap();
 
         assert!(matches!(
             &req.messages[0].parts[0],
@@ -7343,9 +7445,10 @@ mod route_policy_tests {
             incompatible: 1,
             ..Default::default()
         };
-        assert!(
-            apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).is_err()
-        );
+        assert!(apply_portability(
+            &mut req, &route, &target, false, &report, None, false, &mut trace,
+        )
+        .is_err());
     }
 
     #[test]
@@ -7355,7 +7458,10 @@ mod route_policy_tests {
         let target = target();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         let report = OpaqueHydrationReport::default();
-        apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, false, &report, None, false, &mut trace,
+        )
+        .unwrap();
         assert!(trace.warnings.is_empty());
     }
 
@@ -7429,9 +7535,12 @@ mod route_policy_tests {
             ..Default::default()
         };
 
-        let inline = request_has_opaque_state(&req);
+        let inline = request_has_nonportable_inline_state(&req, false, true);
         assert!(inline);
-        apply_portability(&mut req, &route, &target, inline, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, inline, &report, None, false, &mut trace,
+        )
+        .unwrap();
         hydrate_opaque_state(&mut req, &report);
 
         assert_eq!(req.messages[0].parts.len(), 1);

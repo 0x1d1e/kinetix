@@ -374,6 +374,10 @@ pub enum Part {
         text: String,
         signature: Option<String>,
     },
+    /// Opaque Anthropic block payload, replayable only unchanged to a compatible target.
+    RedactedThinking {
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +461,7 @@ impl InternalRequest {
                 chars += match p {
                     Part::Text(t) => t.len() as u64,
                     Part::Thinking { text, .. } => text.len() as u64,
+                    Part::RedactedThinking { data } => data.len() as u64,
                     Part::ToolCall {
                         name, arguments, ..
                     } => (name.len() + arguments.len()) as u64,

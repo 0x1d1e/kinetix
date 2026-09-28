@@ -69,14 +69,18 @@ impl AnthropicAdapter {
             match p {
                 Part::Text(t) => out.push(json!({ "type": "text", "text": t })),
                 Part::Thinking { text, signature } => {
-                    if let Some(sig) = signature {
+                    if let Some(signature) = signature {
                         out.push(json!({
                             "type": "thinking",
                             "thinking": text,
-                            "signature": sig
+                            "signature": signature
                         }));
                     }
                 }
+                Part::RedactedThinking { data } => out.push(json!({
+                    "type": "redacted_thinking",
+                    "data": data
+                })),
                 Part::Image(ImageData::Base64 { mime, data }) => out.push(json!({
                     "type": "image",
                     "source": { "type": "base64", "media_type": mime, "data": data }
@@ -922,6 +926,38 @@ mod tests {
             extra: Default::default(),
             raw_body: None,
         }
+    }
+
+    #[test]
+    fn body_replays_thinking_and_redacted_blocks_unchanged() {
+        let p = provider();
+        let m = model();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+        let req = crate::frontends::anthropic::decode_request(json!({
+            "model": "claude-sonnet-5",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "hidden reasoning", "signature": "signed-state"},
+                    {"type": "redacted_thinking", "data": "opaque-redacted-state"}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let body = AnthropicAdapter::new().build_body(&ctx, &req).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([
+                {"type":"thinking","thinking":"hidden reasoning","signature":"signed-state"},
+                {"type":"redacted_thinking","data":"opaque-redacted-state"}
+            ])
+        );
     }
 
     fn rendered_system_text(body: &Value) -> String {

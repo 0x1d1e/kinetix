@@ -185,7 +185,7 @@ fn nested_translation_issues(obj: &serde_json::Map<String, Value>) -> Vec<String
                         let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
                         let path = format!("messages[{message_index}].content[{block_index}]");
                         match kind {
-                            "text" | "tool_use" | "thinking" => {}
+                            "text" | "tool_use" | "thinking" | "redacted_thinking" => {}
                             "image" => {
                                 let source_type = block
                                     .get("source")
@@ -363,6 +363,14 @@ fn decode_content(content: Option<&Value>) -> Vec<Part> {
                             .and_then(|s| s.as_str())
                             .map(String::from);
                         out.push(Part::Thinking { text, signature });
+                    }
+                    "redacted_thinking" => {
+                        let data = b
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        out.push(Part::RedactedThinking { data });
                     }
                     _ => {}
                 }

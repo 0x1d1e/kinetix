@@ -61,7 +61,7 @@ impl OpenAiResponsesAdapter {
                         "tool state must be serialized as Responses function-call input items",
                     ));
                 }
-                Part::Thinking { .. } => {
+                Part::Thinking { .. } | Part::RedactedThinking { .. } => {
                     return Err(Self::bad_request(
                         "provider reasoning state is not supported as Responses input",
                     ));
@@ -80,7 +80,7 @@ impl OpenAiResponsesAdapter {
                     for part in &message.parts {
                         match part {
                             Part::Text(text) => texts.push(text.as_str()),
-                            Part::Thinking { .. } => {
+                            Part::Thinking { .. } | Part::RedactedThinking { .. } => {
                                 return Err(Self::bad_request(
                                     "provider reasoning state is not supported as Responses input",
                                 ));

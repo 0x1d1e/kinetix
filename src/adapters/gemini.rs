@@ -29,6 +29,16 @@ impl GeminiAdapter {
         GeminiAdapter
     }
 
+    fn bad_request(message: impl Into<String>) -> UpstreamFailure {
+        UpstreamFailure {
+            kind: FailureKind::BadRequest,
+            status: None,
+            retry_after_secs: None,
+            message: message.into(),
+            quota_reset_at: None,
+        }
+    }
+
     fn role_str(role: Role) -> &'static str {
         match role {
             Role::Assistant => "model",
@@ -37,7 +47,7 @@ impl GeminiAdapter {
         }
     }
 
-    fn encode_parts(parts: &[Part], out: &mut Vec<Value>) {
+    fn encode_parts(parts: &[Part], out: &mut Vec<Value>) -> Result<(), UpstreamFailure> {
         for p in parts {
             match p {
                 Part::Text(t) => out.push(json!({ "text": t })),
@@ -51,6 +61,11 @@ impl GeminiAdapter {
                         }
                         out.push(part);
                     }
+                }
+                Part::RedactedThinking { .. } => {
+                    return Err(Self::bad_request(
+                        "redacted Anthropic thinking state cannot be translated to Gemini input",
+                    ));
                 }
                 Part::Image(img) => match img {
                     ImageData::Base64 { mime, data } => {
@@ -95,19 +110,20 @@ impl GeminiAdapter {
                 }
             }
         }
+        Ok(())
     }
 
-    fn build_contents(req: &InternalRequest) -> Vec<Value> {
+    fn build_contents(req: &InternalRequest) -> Result<Vec<Value>, UpstreamFailure> {
         let mut contents = Vec::new();
         for m in &req.messages {
             let mut parts = Vec::new();
-            Self::encode_parts(&m.parts, &mut parts);
+            Self::encode_parts(&m.parts, &mut parts)?;
             if parts.is_empty() {
                 continue;
             }
             contents.push(json!({ "role": Self::role_str(m.role), "parts": parts }));
         }
-        contents
+        Ok(contents)
     }
 
     fn build_generation_config(ctx: &UpstreamContext<'_>, req: &InternalRequest) -> Value {
@@ -652,7 +668,7 @@ impl Adapter for GeminiAdapter {
             );
         }
 
-        body.insert("contents".to_string(), json!(Self::build_contents(req)));
+        body.insert("contents".to_string(), json!(Self::build_contents(req)?));
 
         let gen_cfg = Self::build_generation_config(ctx, req);
         if gen_cfg.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
@@ -1079,7 +1095,8 @@ mod schema_tests {
                 signature: Some("sig-thinking".into()),
             }],
             &mut out,
-        );
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["thought"], true);
         assert_eq!(out[0]["thoughtSignature"], "sig-thinking");

@@ -416,6 +416,9 @@ pub fn request_to_json(req: &InternalRequest) -> String {
                     Part::Thinking { text, signature } => {
                         json!({ "type": "thinking", "text": text, "signature": signature })
                     }
+                    Part::RedactedThinking { data } => {
+                        json!({ "type": "redacted_thinking", "data": data })
+                    }
                 })
                 .collect();
             json!({ "role": format!("{:?}", m.role).to_lowercase(), "parts": parts })
