@@ -1859,16 +1859,12 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                           <div className="bg-[var(--paper)] p-2 border border-[var(--ink)] rounded">
                             {(() => {
                               const pricing = modelPricingDetails(m);
-                              const rows: Array<{
-                                field: PricingField;
-                                label: string;
-                                effective: number | null;
-                              }> = [
-                                { field: 'input_per_1m', label: 'Input', effective: m.prices.inputPer1M },
-                                { field: 'output_per_1m', label: 'Output', effective: m.prices.outputPer1M },
-                                { field: 'cached_per_1m', label: 'Cache read', effective: m.prices.cachedPer1M },
-                                { field: 'cache_write_per_1m', label: 'Cache write', effective: m.prices.cacheWritePer1M },
-                                { field: 'thinking_per_1m', label: 'Thinking', effective: m.prices.thinkingPer1M },
+                              const rows: Array<{ field: PricingField; label: string }> = [
+                                { field: 'input_per_1m', label: 'Input' },
+                                { field: 'output_per_1m', label: 'Output' },
+                                { field: 'cached_per_1m', label: 'Cache read' },
+                                { field: 'cache_write_per_1m', label: 'Cache write' },
+                                { field: 'thinking_per_1m', label: 'Thinking' },
                               ];
                               const sourceState = pricing.observation.catalog?.source_state;
                               return (
@@ -1883,22 +1879,22 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                     {rows.map((row) => {
                                       const effective = effectivePricingCell(m, pricing, row.field);
                                       return (
-                                      <React.Fragment key={row.field}>
-                                        <div>{row.label}</div>
-                                        <div>
-                                          {formatPricingValue(effective.value)}
-                                          {effective.fallback ? ` · ${effective.fallback}` : ''}
-                                          <span className="block text-[var(--ink)]/55">
-                                            {effective.source}
-                                          </span>
-                                        </div>
-                                        <div>
-                                          {formatPricingValue(pricing.observation.prices?.[row.field])}
-                                          <span className="block text-[var(--ink)]/55">
-                                            {pricing.observation.price_sources?.[row.field] || 'untracked'}
-                                          </span>
-                                        </div>
-                                      </React.Fragment>
+                                        <React.Fragment key={row.field}>
+                                          <div>{row.label}</div>
+                                          <div>
+                                            {formatPricingValue(effective.value)}
+                                            {effective.fallback ? ` · ${effective.fallback}` : ''}
+                                            <span className="block text-[var(--ink)]/55">
+                                              {effective.source}
+                                            </span>
+                                          </div>
+                                          <div>
+                                            {formatPricingValue(pricing.observation.prices?.[row.field])}
+                                            <span className="block text-[var(--ink)]/55">
+                                              {pricing.observation.price_sources?.[row.field] || 'untracked'}
+                                            </span>
+                                          </div>
+                                        </React.Fragment>
                                       );
                                     })}
                                   </div>
