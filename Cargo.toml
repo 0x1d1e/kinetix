@@ -1,6 +1,6 @@
 [package]
 name = "kinetix"
-version = "0.5.10"
+version = "0.5.11"
 edition = "2021"
 description = "Multi-protocol LLM proxy: OpenAI/Anthropic in, configurable upstreams out, with virtual keys, account pools, Routes, and cost tracking"
 license = "MIT"
