@@ -14529,6 +14529,300 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn config_import_materializes_operator_model_ownership_and_survives_pricing_sync() {
+        let (state, root) = test_state("config-import-model-ownership").await;
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "config-import-provider",
+                base_url: "https://generativelanguage.googleapis.com/v1beta",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "gemini-3.8-flash",
+                display_name: "Gemini 3.8 Flash",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({"tool_calling": false}),
+                prices: json!({}),
+                parameters: json!({
+                    "temperature": {"supported": false}
+                }),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let automatic_prices = Prices {
+            input_per_1m: Some(1.0),
+            ..Prices::default()
+        };
+        db::commit_effective_model_pricing(
+            &state.pool,
+            &model_id,
+            &automatic_prices,
+            "models.dev:provider",
+            &json!({
+                "fields": {
+                    "input_per_1m": {
+                        "source": "models.dev:provider",
+                        "metadata": {}
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({
+                    "models": [{
+                        "provider": "config-import-provider",
+                        "upstream_id": "gemini-3.8-flash",
+                        "display_name": "Gemini 3.8 Flash",
+                        "enabled": true,
+                        "context_window": 200000,
+                        "max_output_tokens": 32000,
+                        "capabilities": {
+                            "tool_calling": true
+                        },
+                        "prices": {
+                            "input_per_1m": 9.99
+                        },
+                        "parameters": {
+                            "temperature": {"supported": true}
+                        },
+                        "thinking_map": {
+                            "levels": {"high": "high"},
+                            "mode": "level",
+                            "level_field": "reasoning_effort"
+                        },
+                        "extra_request": {},
+                        "transport_override": null
+                    }]
+                }),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let imported = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported.prices().input_per_1m, Some(9.99));
+        let discovery = discovery_object(&imported);
+        assert_eq!(
+            discovery
+                .pointer("/effective_pricing/source")
+                .and_then(Value::as_str),
+            Some("operator")
+        );
+        assert_eq!(
+            discovery
+                .pointer("/effective_pricing/fields/input_per_1m/source")
+                .and_then(Value::as_str),
+            Some("operator")
+        );
+        assert_eq!(
+            discovery
+                .pointer("/effective_pricing/fields/input_per_1m/metadata/configured_by")
+                .and_then(Value::as_str),
+            Some("config_import")
+        );
+        assert_eq!(
+            discovery
+                .pointer("/operator_capability_overrides/tool_calling")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            discovery
+                .pointer("/operator_parameter_overrides/temperature")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            discovery
+                .pointer("/operator_thinking_overrides/thinking_map/mode")
+                .and_then(Value::as_str),
+            Some("level")
+        );
+
+        let version_id = discovery
+            .pointer("/effective_pricing/price_version_id")
+            .and_then(Value::as_str)
+            .expect("imported operator price must be version-backed");
+        let (version_source, version_input): (String, Option<f64>) =
+            sqlx::query_as("SELECT source, input_per_1m FROM price_versions WHERE id=?")
+                .bind(version_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(version_source, "operator");
+        assert_eq!(version_input, Some(9.99));
+
+        let catalog = crate::model_catalog::ModelsDevCatalog::from_parts(
+            json!({}),
+            json!({
+                "google": {
+                    "id": "google",
+                    "api": "https://generativelanguage.googleapis.com/v1beta",
+                    "models": {
+                        "gemini-3.8-flash": {
+                            "id": "gemini-3.8-flash",
+                            "cost": {
+                                "input": 0.75,
+                                "output": 3.75
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        apply_provider_pricing_sync(&state, &provider, &catalog)
+            .await
+            .unwrap();
+
+        let after_sync = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_sync.prices().input_per_1m, Some(9.99));
+        let after_discovery = discovery_object(&after_sync);
+        assert_eq!(
+            after_discovery
+                .pointer("/effective_pricing/fields/input_per_1m/source")
+                .and_then(Value::as_str),
+            Some("operator")
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn integration_scope_filters_bundled_catalog_prices() {
+        let prices = Prices {
+            input_per_1m: Some(1.0),
+            ..Prices::default()
+        };
+        let filtered = automatic_prices_for_provider_scope(
+            &prices,
+            &json!({
+                "price_sources": {
+                    "input_per_1m": "bundled_catalog:provider"
+                }
+            }),
+            "integration",
+        );
+        assert_eq!(filtered.input_per_1m, None);
+    }
+
+    #[tokio::test]
+    async fn integration_scope_revokes_existing_bundled_catalog_prices() {
+        let (state, root) = test_state("bundled-catalog-price-scope").await;
+        let provider_id = insert_provider(
+            &state,
+            "bundled-catalog-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "bundled-priced-model",
+                display_name: "Bundled Priced Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let prices = Prices {
+            input_per_1m: Some(1.5),
+            ..Prices::default()
+        };
+        db::commit_effective_model_pricing(
+            &state.pool,
+            &model_id,
+            &prices,
+            "bundled_catalog",
+            &json!({
+                "fields": {
+                    "input_per_1m": {
+                        "source": "bundled_catalog",
+                        "metadata": {}
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        db::update_provider_pricing_scope(&state.pool, &provider_id, "integration")
+            .await
+            .unwrap();
+
+        let model = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.prices().input_per_1m, None);
+        assert!(discovery_object(&model)
+            .get("effective_pricing")
+            .is_none_or(Value::is_null));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn discovery_import_keeps_models_dev_prices_observed_for_integration_scope() {
         let (state, root) = test_state("integration-import-price-scope").await;
         let provider_id = insert_provider(
@@ -17011,6 +17305,84 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn config_import_rejects_untrusted_direct_api_scope_for_new_and_existing_plugin_providers()
+    {
+        let (state, root) = test_state("untrusted-import-pricing-scope").await;
+        let provider_config = |name: &str| {
+            json!({
+                "name": name,
+                "base_url": "http://127.0.0.1:12345",
+                "wire_format": "openai",
+                "auth_scheme": "bearer",
+                "extra_headers": {},
+                "rate_limit_rules": {},
+                "credential_mode": "manual",
+                "credential_plugin": "",
+                "wire_plugin": "",
+                "model_source_plugin": "",
+                "source_plugin_id": "plugin.test",
+                "source_integration_id": "direct",
+                "pricing_scope": "direct_api"
+            })
+        };
+
+        let new_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({"providers": [provider_config("new-plugin-provider")]}),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(new_error.0, StatusCode::BAD_REQUEST);
+        assert!(new_error
+            .1
+            .contains("pricing_scope 'direct_api' requires"));
+        assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
+
+        let existing_id = insert_provider(
+            &state,
+            "existing-plugin-provider",
+            crate::plugins::CredentialMode::Manual,
+            Some("plugin.test"),
+            Some("direct"),
+        )
+        .await;
+        assert_eq!(
+            db::provider_pricing_scope(&state.pool, &existing_id)
+                .await
+                .unwrap(),
+            "integration"
+        );
+
+        let existing_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({"providers": [provider_config("existing-plugin-provider")]}),
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(existing_error.0, StatusCode::BAD_REQUEST);
+        assert!(existing_error
+            .1
+            .contains("pricing_scope 'direct_api' requires"));
+        assert_eq!(
+            db::provider_pricing_scope(&state.pool, &existing_id)
+                .await
+                .unwrap(),
+            "integration"
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn config_export_import_round_trips_credential_semantics() {
         let (source, source_root) = test_state("export-source").await;
         let auth_provider = insert_provider(
@@ -17021,9 +17393,6 @@ mod credential_enrollment_regression_tests {
             Some("oauth"),
         )
         .await;
-        db::update_provider_pricing_scope(&source.pool, &auth_provider, "direct_api")
-            .await
-            .unwrap();
         let noauth_provider = insert_provider(
             &source,
             "public-provider",
@@ -17110,7 +17479,7 @@ mod credential_enrollment_regression_tests {
         assert_eq!(oauth["credential_mode"], "auth_flow");
         assert_eq!(oauth["source_plugin_id"], "plugin.oauth");
         assert_eq!(oauth["source_integration_id"], "oauth");
-        assert_eq!(oauth["pricing_scope"], "direct_api");
+        assert_eq!(oauth["pricing_scope"], "integration");
 
         let public = exported["providers"]
             .as_array()
@@ -17151,7 +17520,7 @@ mod credential_enrollment_regression_tests {
         assert_eq!(oauth.credential_mode, "auth_flow");
         assert_eq!(oauth.source_plugin_id.as_deref(), Some("plugin.oauth"));
         assert_eq!(oauth.source_integration_id.as_deref(), Some("oauth"));
-        assert_eq!(oauth.pricing_scope, "direct_api");
+        assert_eq!(oauth.pricing_scope, "integration");
 
         let oauth_accounts = db::accounts_for_provider(&target.pool, &oauth.id)
             .await
