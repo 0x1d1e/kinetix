@@ -273,8 +273,8 @@ pub fn resolve_execution_profile_for_target(
     let explicitly_owned_thinking_map = owned_thinking_map_value.is_some();
     let owned_thinking_map = owned_thinking_map_value
         .and_then(|value| serde_json::from_value::<ThinkingMap>(value.clone()).ok());
-    let thinking_map_owned =
-        explicitly_owned_thinking_map || (thinking_ownership.is_none() && admin_thinking_configured);
+    let thinking_map_owned = explicitly_owned_thinking_map
+        || (thinking_ownership.is_none() && admin_thinking_configured);
 
     // A reasoning-disable probe changes runtime executability, not just
     // descriptive capability metadata. Apply it before deriving the effective
