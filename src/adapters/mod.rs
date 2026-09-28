@@ -368,9 +368,7 @@ pub fn resolve_execution_profile_for_target(
                             }
                         }
                     }
-                    Some("unsupported")
-                        if !thinking_map_owned && !reasoning_capability_owned =>
-                    {
+                    Some("unsupported") if !thinking_map_owned && !reasoning_capability_owned => {
                         thinking_map.levels.remove(level);
                         if let Some(capability) = reasoning.as_mut() {
                             capability.levels.retain(|candidate| candidate != level);
