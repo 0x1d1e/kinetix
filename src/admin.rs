@@ -9896,6 +9896,7 @@ pub async fn export_config(
             "sticky_routing": r.sticky_routing != 0,
             "cache_affinity": r.cache_affinity != 0,
             "max_attempts": r.max_attempts,
+            "max_concurrent_requests": r.max_concurrent_requests,
             "enabled": r.enabled != 0,
             "targets": targets_json,
         }));
@@ -10292,6 +10293,16 @@ pub async fn import_config(
         let targets = r["targets"].as_array().map(|a| a.len()).unwrap_or(0);
         if targets == 0 {
             problems.push(format!("route '{name}' has no targets"));
+        }
+        if let Some(value) = r
+            .get("max_concurrent_requests")
+            .filter(|value| !value.is_null())
+        {
+            if !value.as_i64().is_some_and(|limit| limit >= 0) {
+                problems.push(format!(
+                    "route '{name}': max_concurrent_requests must be positive or zero for unlimited"
+                ));
+            }
         }
         plan.push(json!({"kind": "route", "name": name, "action": "upsert", "targets": targets}));
     }
@@ -19017,6 +19028,34 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
+        let route_id = db::insert_route(
+            &source.pool,
+            &db::NewRoute {
+                name: "limited-route",
+                description: "",
+                strategy: "priority",
+                fallback_triggers: json!({}),
+                portability_policy: "strip_with_warning",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: Some(2),
+                max_concurrent_requests: Some(4),
+            },
+        )
+        .await
+        .unwrap();
+        db::insert_route_target(
+            &source.pool,
+            &route_id,
+            None,
+            &source_model_id,
+            1,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .unwrap();
 
         let exported = export_config(
             State(source.clone()),
@@ -19028,6 +19067,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap()
         .0;
+        assert_eq!(exported["routes"][0]["max_concurrent_requests"], json!(4));
 
         let oauth = exported["providers"]
             .as_array()
@@ -19111,6 +19151,12 @@ mod credential_enrollment_regression_tests {
             "openai-responses"
         );
 
+        let imported_route = db::get_route_by_name(&target.pool, "limited-route")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported_route.max_concurrent_requests, Some(4));
+
         let public_accounts = db::accounts_for_provider(&target.pool, &public.id)
             .await
             .unwrap();
@@ -19126,6 +19172,54 @@ mod credential_enrollment_regression_tests {
 
         let _ = std::fs::remove_dir_all(source_root);
         let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn config_import_dry_run_rejects_negative_route_concurrency() {
+        let (state, root) = test_state("negative-route-concurrency-dry-run").await;
+        let config = json!({
+            "routes": [{
+                "name": "limited-route",
+                "max_concurrent_requests": -1,
+                "targets": [{"model": "provider/model"}]
+            }]
+        });
+
+        let dry_run = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: config.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], false);
+        assert!(dry_run["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|problem| problem
+                .as_str()
+                .is_some_and(|problem| problem.contains("max_concurrent_requests"))));
+
+        let apply_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+        assert!(db::list_routes(&state.pool).await.unwrap().is_empty());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

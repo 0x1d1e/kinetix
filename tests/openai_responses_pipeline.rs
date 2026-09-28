@@ -1,7 +1,9 @@
 //! End-to-end coverage for validated OpenAI Responses requests dispatched to a
 //! native Responses target through the API frontend and streaming pipeline.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+
+use futures::StreamExt;
 
 use axum::{
     body::{to_bytes, Body},
@@ -75,6 +77,15 @@ async fn upstream(
     });
 
     match test_case.as_str() {
+        "lease_lifecycle" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from(concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"second\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n"
+            )))
+            .unwrap(),
         "stream_refusal" => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
@@ -173,15 +184,19 @@ async fn call_responses(
         }
     }
     let raw_body = body.to_string();
+    let response = call_raw_responses(state, raw_body).await;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+async fn call_raw_responses(state: &AppState, raw_body: String) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {CLIENT_KEY}")).unwrap(),
     );
-    let response = api::responses(State(state.clone()), headers, raw_body).await;
-    let status = response.status();
-    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    (status, String::from_utf8(body.to_vec()).unwrap())
+    api::responses(State(state.clone()), headers, raw_body).await
 }
 
 async fn call_chat(state: &AppState) -> (StatusCode, String) {
@@ -311,7 +326,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
             sticky_routing: false,
             cache_affinity: false,
             max_attempts: Some(1),
-            max_concurrent_requests: None,
+            max_concurrent_requests: Some(1),
         },
     )
     .await
@@ -738,6 +753,73 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
         requests[10].body.pointer("/messages/0/content/0/text"),
         Some(&json!("case:translated_full"))
     );
+    drop(requests);
+
+    let first = call_raw_responses(
+        &state,
+        json!({
+            "model": "responses-route",
+            "input": "case:lease_lifecycle",
+            "stream": true,
+            "stream_options": {"include_obfuscation": false},
+            "text": {"format": {"type": "text"}}
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let request_id = first
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let mut first_body = first.into_body().into_data_stream();
+    assert!(!first_body.next().await.unwrap().unwrap().is_empty());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if state
+                .live
+                .snapshot()
+                .iter()
+                .any(|request| request.request_id == request_id && request.finished)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("upstream stream driver should finish");
+    assert_eq!(state.admission.metrics_snapshot().inflight_inferences, 1);
+
+    let second = call_raw_responses(
+        &state,
+        json!({
+            "model": "responses-route",
+            "input": "case:lease_lifecycle",
+            "stream": true
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(second);
+
+    drop(first_body);
+    let third = call_raw_responses(
+        &state,
+        json!({
+            "model": "responses-route",
+            "input": "case:lease_lifecycle",
+            "stream": true
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(third.status(), StatusCode::OK);
+    let _ = to_bytes(third.into_body(), 1024 * 1024).await.unwrap();
 
     server.abort();
     let _ = std::fs::remove_dir_all(&root);

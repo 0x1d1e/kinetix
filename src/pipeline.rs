@@ -100,7 +100,7 @@ pub struct RequestMeta {
     /// Atomic RPM/TPM/budget reservation owned by this request. Dropping it
     /// before finalization cancels the reservation.
     pub admission: Option<crate::admission::AdmissionReservation>,
-    /// Bounded global, key, and Route in-flight admission held through stream completion.
+    /// Bounded global, key, and Route in-flight admission; streaming transfers it to the response body.
     pub concurrency: Option<crate::admission::ConcurrencyReservation>,
     /// Set by a watchdog when the client disconnects, so an in-flight upstream
     /// response can be aborted even if the write channel still looks open.
@@ -3721,6 +3721,7 @@ async fn stream_response(
             flag: meta.disconnected.clone(),
             notify: notify.clone(),
             at: meta.disconnect_at.clone(),
+            _concurrency: meta.concurrency.take(),
         };
         let mut body_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let watched = async_stream::stream! {
@@ -4624,6 +4625,7 @@ struct DisconnectGuard {
     flag: Arc<std::sync::atomic::AtomicBool>,
     notify: Arc<tokio::sync::Notify>,
     at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    _concurrency: Option<crate::admission::ConcurrencyReservation>,
 }
 
 impl Drop for DisconnectGuard {
