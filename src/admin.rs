@@ -14759,6 +14759,70 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn pricing_sync_does_not_materialize_bundled_catalog_prices_for_integration_scope() {
+        let (state, root) = test_state("bundled-catalog-sync-scope").await;
+        let provider_id = insert_provider(
+            &state,
+            "bundled-sync-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        db::update_provider_pricing_scope(&state.pool, &provider_id, "integration")
+            .await
+            .unwrap();
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "bundled-sync-model",
+                display_name: "Bundled Sync Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({
+                    "prices": {
+                        "input_per_1m": 1.5
+                    },
+                    "price_sources": {
+                        "input_per_1m": "bundled_catalog:provider"
+                    }
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let catalog =
+            crate::model_catalog::ModelsDevCatalog::from_parts(json!({}), json!({})).unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        apply_provider_pricing_sync(&state, &provider, &catalog)
+            .await
+            .unwrap();
+
+        let model = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.prices().input_per_1m, None);
+        assert!(discovery_object(&model)
+            .get("effective_pricing")
+            .is_none_or(Value::is_null));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn integration_scope_revokes_existing_bundled_catalog_prices() {
         let (state, root) = test_state("bundled-catalog-price-scope").await;
         let provider_id = insert_provider(
