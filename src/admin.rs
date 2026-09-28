@@ -3620,16 +3620,15 @@ fn automatic_price_provenance(prices: &Prices, observation: &Value) -> (String, 
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| automatic_price_source(observation));
-        let (observed_at, source_state, catalog_provider) =
-            if source.starts_with("models.dev") {
-                (
-                    catalog_observed_at.clone(),
-                    catalog_source_state.clone(),
-                    catalog_provider_price_identity(observation),
-                )
-            } else {
-                (provider_observed_at.clone(), Value::Null, Value::Null)
-            };
+        let (observed_at, source_state, catalog_provider) = if source.starts_with("models.dev") {
+            (
+                catalog_observed_at.clone(),
+                catalog_source_state.clone(),
+                catalog_provider_price_identity(observation),
+            )
+        } else {
+            (provider_observed_at.clone(), Value::Null, Value::Null)
+        };
         set_price_field_provenance(
             &mut fields,
             field,
@@ -3718,16 +3717,15 @@ fn merge_automatic_price_observation(
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| automatic_price_source(observation));
-        let (observed_at, source_state, catalog_provider) =
-            if source.starts_with("models.dev") {
-                (
-                    catalog_observed_at.clone(),
-                    catalog_source_state.clone(),
-                    catalog_provider_price_identity(observation),
-                )
-            } else {
-                (provider_observed_at.clone(), Value::Null, Value::Null)
-            };
+        let (observed_at, source_state, catalog_provider) = if source.starts_with("models.dev") {
+            (
+                catalog_observed_at.clone(),
+                catalog_source_state.clone(),
+                catalog_provider_price_identity(observation),
+            )
+        } else {
+            (provider_observed_at.clone(), Value::Null, Value::Null)
+        };
         set_price_field_provenance(
             &mut fields,
             field,
@@ -14349,19 +14347,20 @@ mod credential_enrollment_regression_tests {
         .unwrap();
 
         let model_id = created["id"].as_str().unwrap();
-        let model = db::get_model(&state.pool, model_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let model = db::get_model(&state.pool, model_id).await.unwrap().unwrap();
         assert_eq!(model.prices().input_per_1m, None);
         assert_eq!(model.prices().output_per_1m, None);
         let discovery = discovery_object(&model);
         assert_eq!(
-            discovery.pointer("/prices/input_per_1m").and_then(Value::as_f64),
+            discovery
+                .pointer("/prices/input_per_1m")
+                .and_then(Value::as_f64),
             Some(1.25)
         );
         assert_eq!(
-            discovery.pointer("/prices/output_per_1m").and_then(Value::as_f64),
+            discovery
+                .pointer("/prices/output_per_1m")
+                .and_then(Value::as_f64),
             Some(6.5)
         );
         assert!(discovery
@@ -14638,12 +14637,10 @@ mod credential_enrollment_regression_tests {
         .unwrap();
 
         let mut observation_same = observation_a.clone();
-        observation_same["catalog"]["source_state"]["retrieved_at"] =
-            json!("2026-09-28T01:00:00Z");
+        observation_same["catalog"]["source_state"]["retrieved_at"] = json!("2026-09-28T01:00:00Z");
         observation_same["catalog"]["source_state"]["freshness"] = json!("stale");
         observation_same["catalog"]["source_state"]["etag"] = json!("b");
-        let (source_same, metadata_same) =
-            automatic_price_provenance(&prices, &observation_same);
+        let (source_same, metadata_same) = automatic_price_provenance(&prices, &observation_same);
         let version_same = db::commit_effective_model_pricing(
             &state.pool,
             &model_id,
