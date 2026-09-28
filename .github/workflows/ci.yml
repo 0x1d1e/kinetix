@@ -77,6 +77,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       # The dashboard bundle is embedded into the binary via rust-embed.
       # Reuse the dashboard job's artifact instead of rebuilding it here.
       - name: Download embedded dashboard
@@ -90,6 +94,9 @@ jobs:
 
       - name: Tests
         run: cargo test --quiet
+
+      - name: Stable OpenCode v1 profile compatibility
+        run: bash scripts/test-opencode-v1-profile.sh
 
       - name: Build compatibility binary
         run: cargo build --quiet --bin kinetix

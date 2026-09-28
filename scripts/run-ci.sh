@@ -25,7 +25,7 @@ for arg in "$@"; do
       printf 'Mirrors .github/workflows/ci.yml locally:\n'
       printf '  format             cargo fmt --all -- --check + documentation checks\n'
       printf '  dashboard          npm ci + tsc --noEmit + npm run build\n'
-      printf '  rust               clippy + test + build + compat-matrix (needs format, dashboard)\n'
+      printf '  rust               clippy + test + OpenCode v1 + build + compat-matrix (needs format, dashboard)\n'
       printf '  dependency-policy  cargo-deny --all-features check (push-only in CI)\n\n'
       printf '  --skip-deps   Skip the dependency-policy job.\n'
       exit 0
@@ -101,6 +101,7 @@ dashboard_job() {
 rust_job() {
   run_step "cargo clippy --all-targets" cargo clippy --all-targets &&
     run_step "cargo test --quiet" cargo test --quiet &&
+    run_step "stable OpenCode v1 profile compatibility" bash scripts/test-opencode-v1-profile.sh &&
     run_step "cargo build --quiet --bin kinetix" cargo build --quiet --bin kinetix &&
     run_step "compat-matrix.sh" env \
       KINETIX_BIN="target/debug/kinetix" \

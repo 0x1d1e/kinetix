@@ -39,7 +39,8 @@ In **Virtual Keys**, select a key, a client, and one of that key's currently
 usable models or Routes to generate configuration for Pi, Claude Code, Codex, or
 OpenCode. The generator uses the effective public base URL and preserves each
 client's endpoint format: Chat Completions for Pi and OpenCode, Responses for
-Codex, and Anthropic Messages for Claude Code.
+Codex, and Anthropic Messages for Claude Code. OpenCode profiles target the
+stable v1 custom-provider schema, not the separate v2 configuration format.
 
 Profiles are previews and downloads only; Kinetix does not edit local files.
 When the full virtual key is available, it is included in the generated

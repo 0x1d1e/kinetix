@@ -14728,6 +14728,130 @@ mod credential_enrollment_regression_tests {
         }
     }
 
+    mod client_profile_model_grant_tests {
+        use super::*;
+
+        async fn state_with_qualified_model_grant(
+            tag: &str,
+        ) -> (AppState, std::path::PathBuf, String) {
+            let (state, root) = test_state(tag).await;
+            let provider_a = insert_provider(
+                &state,
+                "provider-a",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let provider_b = insert_provider(
+                &state,
+                "provider-b",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            for provider_id in [&provider_a, &provider_b] {
+                db::insert_model(
+                    &state.pool,
+                    &db::NewModel {
+                        provider_id,
+                        upstream_id: "model",
+                        display_name: "Model",
+                        enabled: true,
+                        context_window: None,
+                        max_output_tokens: None,
+                        capabilities: json!({}),
+                        prices: json!({}),
+                        parameters: json!({}),
+                        thinking_map: json!({}),
+                        extra_request: json!({}),
+                        discovery: json!({}),
+                    },
+                )
+                .await
+                .unwrap();
+                db::insert_account(
+                    &state.pool,
+                    provider_id,
+                    "profile-test-account",
+                    "encrypted-test-secret",
+                    "masked",
+                    1,
+                    1,
+                    None,
+                    "none",
+                )
+                .await
+                .unwrap();
+            }
+
+            let key = db::VirtualKeyRow {
+                id: format!("key_{tag}"),
+                key_hash: "test-hash".into(),
+                name: "qualified model key".into(),
+                owner: "test".into(),
+                tag: String::new(),
+                allowed_models: json!(["provider-b/model"]).to_string(),
+                allowed_providers: json!([provider_b]).to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                daily_budget: None,
+                monthly_budget: None,
+                expires_at: None,
+                status: "active".into(),
+                allowed_ips: json!([]).to_string(),
+                body_logging: 0,
+                created_at: db::now_iso(),
+                revoked_at: None,
+            };
+            db::insert_virtual_key(&state.pool, &key).await.unwrap();
+            state.registry.reload(&state.pool).await.unwrap();
+            (state, root, key.id)
+        }
+
+        #[tokio::test]
+        async fn model_list_includes_provider_qualified_exact_grant() {
+            let (state, root, key_id) = state_with_qualified_model_grant("qualified-list").await;
+            let Json(body) = client_profile_models(State(state.clone()), auth(), Path(key_id))
+                .await
+                .unwrap();
+            assert_eq!(body["models"], json!([{ "id": "provider-b/model" }]));
+            drop(state);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[tokio::test]
+        async fn provider_qualified_model_grant_generates_a_profile() {
+            let (state, root, key_id) =
+                state_with_qualified_model_grant("qualified-generate").await;
+            let response = generate_client_profile(
+                State(state.clone()),
+                auth(),
+                Json(GenerateClientProfileBody {
+                    key_id,
+                    client: crate::client_profiles::ClientApp::Pi,
+                    model: "provider-b/model".into(),
+                    api_key: None,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(axum::http::header::CACHE_CONTROL),
+                Some(&axum::http::HeaderValue::from_static("no-store"))
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let profile: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(profile["model"], "provider-b/model");
+            drop(state);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
     #[tokio::test]
     async fn reasoning_disable_api_validates_value_before_model_lookup() {
         let (state, root) = test_state("reasoning-disable-probe").await;

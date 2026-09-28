@@ -138,7 +138,8 @@ fn model_entries(
     key_allowed_providers: &[String],
 ) -> Vec<ModelEntry> {
     let snap = registry.snapshot();
-    // Client-facing names: aliases and Routes first, then bare upstream model IDs.
+    // Client-facing names: aliases and Routes first, then upstream IDs. Add
+    // provider-qualified IDs only when a key explicitly grants one.
     let mut entries: Vec<ModelEntry> = Vec::new();
     for alias in snap.aliases.values() {
         let (context_window, max_output_tokens, capabilities) = match alias.target_type.as_str() {
@@ -182,6 +183,27 @@ fn model_entries(
             });
         }
     }
+    for model in snap.models.values().filter(|model| model.enabled != 0) {
+        let Some(provider) = snap.providers.get(&model.provider_id) else {
+            continue;
+        };
+        let mut provider_names = [provider.name.as_str(), provider.id.as_str()];
+        provider_names.sort_unstable();
+        for provider_name in provider_names {
+            let name = format!("{provider_name}/{}", model.upstream_id);
+            if !has_provider_qualified_grant(key_allowed, &name)
+                || entries.iter().any(|entry| entry.name == name)
+            {
+                continue;
+            }
+            entries.push(ModelEntry {
+                name,
+                context_window: model.context_window,
+                max_output_tokens: model.max_output_tokens,
+                capabilities: declared_caps(model),
+            });
+        }
+    }
 
     entries.retain(|entry| {
         crate::db::VirtualKeyRow::model_is_allowed(key_allowed, &entry.name)
@@ -189,6 +211,15 @@ fn model_entries(
     });
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
+}
+
+fn has_provider_qualified_grant(allowed: &[String], model: &str) -> bool {
+    // Only expose qualified names when a grant explicitly scopes a provider.
+    // A wildcard-only key keeps the existing concise model list.
+    allowed.iter().any(|grant| {
+        grant.contains('/')
+            && crate::db::VirtualKeyRow::model_is_allowed(std::slice::from_ref(grant), model)
+    })
 }
 
 fn provider_policy_allows(
@@ -411,6 +442,47 @@ mod tests {
         );
         let ids: Vec<_> = restricted.into_iter().map(|model| model.id).collect();
         assert_eq!(ids, ["permitted-model", "permitted-route"]);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn client_profile_models_include_provider_qualified_exact_grants() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-qualified-client-profile-models-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("kinetix.db");
+        let database_url = format!("sqlite://{}", database.display());
+        let pool = crate::db::connect(&database_url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+
+        let provider_a = insert_test_provider(&pool, "provider-a").await;
+        let provider_b = insert_test_provider(&pool, "provider-b").await;
+        insert_test_model(&pool, &provider_a, "model").await;
+        insert_test_model(&pool, &provider_b, "model").await;
+
+        let registry = Registry::new();
+        registry.reload(&pool).await.unwrap();
+        let visible = client_profile_models(
+            &registry,
+            &["provider-b/model".into()],
+            std::slice::from_ref(&provider_b),
+        );
+
+        assert_eq!(
+            visible
+                .into_iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>(),
+            ["provider-b/model"]
+        );
+        assert!(matches!(
+            registry.resolve("provider-b/model"),
+            Some(crate::registry::Resolved::Single { provider_id, .. }) if provider_id == provider_b
+        ));
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);

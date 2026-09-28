@@ -167,15 +167,17 @@ fn open_code_files(base_url: &str, model: &str, api_key: &str) -> Vec<ProfileFil
     let config = json!({
         "$schema": "https://opencode.ai/config.json",
         "model": "kinetix/default",
-        "providers": {
+        "provider": {
             "kinetix": {
                 "name": "Kinetix",
-                "env": [KEY_ENV],
-                "package": "@opencode/ai/providers/openai-compatible",
-                "settings": { "baseURL": base_url },
+                "npm": "@ai-sdk/openai-compatible",
+                "options": {
+                    "baseURL": base_url,
+                    "apiKey": format!("{{env:{KEY_ENV}}}"),
+                },
                 "models": {
                     "default": {
-                        "modelID": model,
+                        "id": model,
                         "name": model,
                     }
                 },
@@ -314,27 +316,97 @@ mod tests {
 
         assert_eq!(config["model"], "kinetix/default");
         assert_eq!(
-            config["providers"]["kinetix"]["package"],
-            "@opencode/ai/providers/openai-compatible"
+            config["provider"]["kinetix"]["npm"],
+            "@ai-sdk/openai-compatible"
         );
         assert_eq!(
-            config["providers"]["kinetix"]["settings"]["baseURL"],
+            config["provider"]["kinetix"]["options"]["baseURL"],
             "https://kinetix.example/v1"
         );
-        assert_eq!(config["providers"]["kinetix"]["env"][0], KEY_ENV);
         assert_eq!(
-            config["providers"]["kinetix"]["models"]["default"]["modelID"],
+            config["provider"]["kinetix"]["options"]["apiKey"],
+            format!("{{env:{KEY_ENV}}}")
+        );
+        assert_eq!(
+            config["provider"]["kinetix"]["models"]["default"]["id"],
             "coder"
         );
-        assert!(config["providers"]["kinetix"]["models"]["default"]["capabilities"].is_null());
-        assert!(config["providers"]["kinetix"]["models"]["default"]["limit"].is_null());
-        assert!(config["providers"]["kinetix"]["models"]["default"]["cost"].is_null());
+        assert!(config["provider"]["kinetix"]["models"]["default"]["capabilities"].is_null());
+        assert!(config["provider"]["kinetix"]["models"]["default"]["limit"].is_null());
+        assert!(config["provider"]["kinetix"]["models"]["default"]["cost"].is_null());
         assert!(!file(&profile, "opencode.json")
             .content
             .contains("sk-kinetix-<paste-your-key>"));
         assert!(file(&profile, "kinetix-api-key.sh")
             .content
             .contains("sk-kinetix-<paste-your-key>"));
+    }
+
+    #[test]
+    #[ignore = "run scripts/test-opencode-v1-profile.sh against stable OpenCode 1.18.33"]
+    fn open_code_v1_profile_is_loaded_by_stable_cli() {
+        const STABLE_VERSION: &str = "1.18.33";
+        let executable = std::env::var_os("KINETIX_OPENCODE_V1_BIN")
+            .expect("the compatibility script must provide the pinned OpenCode v1 CLI");
+        let version = std::process::Command::new(&executable)
+            .arg("--version")
+            .output()
+            .expect("OpenCode v1 CLI starts");
+        assert!(version.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&version.stdout).trim(),
+            STABLE_VERSION
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-opencode-v1-profile-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share")).unwrap();
+
+        let profile = generate(
+            ClientApp::OpenCode,
+            "https://kinetix.example",
+            "provider-b/model",
+            None,
+        );
+        std::fs::write(
+            root.join("opencode.json"),
+            &file(&profile, "opencode.json").content,
+        )
+        .unwrap();
+        let output = std::process::Command::new(executable)
+            .args(["--log-level", "ERROR", "debug", "config"])
+            .current_dir(&root)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env(KEY_ENV, "test-only-virtual-key")
+            .output()
+            .expect("OpenCode v1 debug config starts");
+        assert!(
+            output.status.success(),
+            "OpenCode rejected the generated config: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let resolved: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(resolved["model"], "kinetix/default");
+        assert_eq!(
+            resolved["provider"]["kinetix"]["npm"],
+            "@ai-sdk/openai-compatible"
+        );
+        assert_eq!(
+            resolved["provider"]["kinetix"]["options"]["baseURL"],
+            "https://kinetix.example/v1"
+        );
+        assert_eq!(
+            resolved["provider"]["kinetix"]["models"]["default"]["id"],
+            "provider-b/model"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -357,7 +429,7 @@ mod tests {
             Some("https://kinetix.example/v1")
         );
         assert_eq!(
-            opencode_json["providers"]["kinetix"]["settings"]["baseURL"],
+            opencode_json["provider"]["kinetix"]["options"]["baseURL"],
             "https://kinetix.example/v1"
         );
         assert!(file(&claude, "kinetix-claude.sh")
