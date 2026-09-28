@@ -1758,8 +1758,9 @@ pub async fn update_provider(
     let endpoint_unchanged = normalize_provider_endpoint_identity(&existing.base_url)
         == normalize_provider_endpoint_identity(&body.base_url);
     if effective_scope == "direct_api" && conservative_scope != "direct_api" {
-        let reusable_existing_trust =
-            existing.pricing_scope == "direct_api" && scope_drivers_unchanged && endpoint_unchanged;
+        let reusable_existing_trust = existing.pricing_scope == "direct_api"
+            && scope_drivers_unchanged
+            && endpoint_unchanged;
         match direct_api_manifest_trust(
             &state,
             &body.name,
@@ -9515,10 +9516,7 @@ fn filter_imported_ownership_pricing_for_scope(
     }
 
     let mut filtered = ownership.clone();
-    filtered.pricing = Some((
-        effective_price_source(&fields, &effective),
-        filtered_metadata,
-    ));
+    filtered.pricing = Some((effective_price_source(&fields, &effective), filtered_metadata));
     (effective, filtered, suppressed)
 }
 
@@ -18108,14 +18106,11 @@ mod credential_enrollment_regression_tests {
             .find(|provider| provider.name == "portable-direct-provider")
             .unwrap();
         assert_eq!(provider.pricing_scope, "integration");
-        let model = db::find_model_by_upstream(
-            &state.pool,
-            &provider.id,
-            "portable-priced-model",
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let model =
+            db::find_model_by_upstream(&state.pool, &provider.id, "portable-priced-model")
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(model.prices().input_per_1m, None);
         let discovery = discovery_object(&model);
         assert!(discovery
