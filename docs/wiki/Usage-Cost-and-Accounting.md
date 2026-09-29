@@ -17,10 +17,10 @@ account/provider (admin-only), the opaque Route id, the upstream request id, a
 
 | Field | Values | Meaning |
 | --- | --- | --- |
-| `usage_confidence` | `provider_reported` | The upstream reported the counts. |
-| | `estimated` | A derived/partial count. |
-| | `unknown` | Not known (e.g. a client disconnect). |
-| `cost_known` | `1` / `0` | Whether the model has prices so cost could be computed. |
+| `usage_confidence` | `provider_reported` | The upstream reported complete input and output totals. |
+| | `estimated` | A count was derived rather than reported. |
+| | `unknown` | A required total is missing or unavailable (including partial reports). |
+| `cost_known` | `1` / `0` | Whether cost was computed from configured prices and complete canonical totals. |
 
 Unknown token counts are **omitted** from client responses rather than coerced to
 zero. A spend total is never presented as complete when some usage is unpriced —
@@ -30,10 +30,11 @@ and `unknown_cost_requests`.
 ## Cost
 
 Cost is billed per 1M tokens: `(input − cached) × input + cached × cached_price +
-output × output + thinking × thinking_price`. Cached defaults to the input price
-and thinking to the output price. **If prices are unconfigured, cost is `None`
-(unknown), not `0.0`.** A `price_versions` table keeps price history so past costs
-stay reproducible.
+output × output + thinking × thinking_price`. Both canonical input and output
+totals must be known; a missing total is not treated as zero. Cached defaults to
+the input price and thinking to the output price. **If prices or required totals
+are unavailable, cost is `None` (unknown), not `0.0`.** A `price_versions` table
+keeps price history so past costs stay reproducible.
 
 ## Per-key limits and budgets
 

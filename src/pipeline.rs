@@ -7116,10 +7116,10 @@ async fn finalize_log(
     }
 
     // Accounting truthfulness (FR-6.8): provider-reported vs unknown.
-    let usage_confidence = if request_usage.input.is_some() || request_usage.output.is_some() {
-        "provider_reported"
-    } else {
-        "unknown"
+    // Partial canonical totals are incomplete, not provider-reported usage.
+    let usage_confidence = match (request_usage.input, request_usage.output) {
+        (Some(_), Some(_)) => "provider_reported",
+        _ => "unknown",
     };
 
     // Persist authoritative cache status from final provider-reported usage.

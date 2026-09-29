@@ -168,6 +168,47 @@ done
 check "unknown failed cost stays outside known subtotal" "$FAIL_BUDGET_USAGE" '"known_cost_usd":0.0'
 check "unknown failed cost still makes budget remainder unknown" "$FAIL_BUDGET_USAGE" '"daily_budget_usd":null'
 
+# Partial provider usage must keep cost and budget state unknown.
+PARTIAL_USAGE_KEY="sk-kinetix-smoke-partial-usage-budget"
+PARTIAL_USAGE_REQUEST='{"model":"syn-openai-partial","stream":false,"messages":[{"role":"user","content":"fixture:partial-usage"}]}'
+PARTIAL_USAGE_FIRST_CODE="$(curl -s --max-time 20 -o "$WORK/partial-usage-first" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $PARTIAL_USAGE_KEY" -H 'content-type: application/json' -d "$PARTIAL_USAGE_REQUEST")"
+check "partial-usage priced request succeeds" "$PARTIAL_USAGE_FIRST_CODE" '200'
+for _ in $(seq 1 50); do
+  PARTIAL_USAGE="$(curl -s "$BASE/v1/usage" -H "authorization: Bearer $PARTIAL_USAGE_KEY")"
+  if python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["usage"]["daily"]["requests"] >= 1 else 1)' <<<"$PARTIAL_USAGE"; then
+    break
+  fi
+  sleep 0.1
+done
+check "partial usage preserves reported input" "$PARTIAL_USAGE" '"input_tokens":100'
+check "partial usage keeps output unknown" "$PARTIAL_USAGE" '"output_tokens":null'
+check "partial usage contributes zero known cost" "$PARTIAL_USAGE" '"known_cost_usd":0.0'
+check "partial usage counts unknown cost" "$PARTIAL_USAGE" '"unknown_cost_requests":1'
+check "partial usage counts unknown usage" "$PARTIAL_USAGE" '"unknown_usage_requests":1'
+check "partial usage makes remaining budget unknown" "$PARTIAL_USAGE" '"daily_budget_usd":null'
+PARTIAL_USAGE_DB_ROW="$(python3 - "$DB" <<'PY'
+import json, sqlite3, sys
+row = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT input_tokens, output_tokens, cost_known, usage_confidence FROM usage_logs WHERE key_name = ? ORDER BY ts DESC LIMIT 1",
+    ("Partial Usage Budget Key",),
+).fetchone()
+print(json.dumps(row))
+PY
+)"
+check "partial usage persists unknown canonical accounting" "$PARTIAL_USAGE_DB_ROW" '[100, null, 0, "unknown"]'
+PARTIAL_USAGE_RESERVATION="$(python3 - "$DB" <<'PY'
+import sqlite3, sys
+row = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT admission_cost_usd FROM usage_logs WHERE key_name = ? ORDER BY ts DESC LIMIT 1",
+    ("Partial Usage Budget Key",),
+).fetchone()
+print("yes" if row and row[0] is not None and row[0] > 0 else "no")
+PY
+)"
+check "partial usage retains conservative admission cost" "$PARTIAL_USAGE_RESERVATION" 'yes'
+PARTIAL_USAGE_SECOND_CODE="$(curl -s --max-time 20 -o "$WORK/partial-usage-second" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $PARTIAL_USAGE_KEY" -H 'content-type: application/json' -d "$PARTIAL_USAGE_REQUEST")"
+check "partial usage consumes live budget reservation" "$PARTIAL_USAGE_SECOND_CODE" '429'
+
 restart_kinetix
 check "healthz after restart" "$(curl -s "$BASE/healthz")" '"data_plane":"serving"'
 FAIL_RPM_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/failure-rpm-after-restart" -w '%{http_code}' \
@@ -177,6 +218,8 @@ FAIL_RPM_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/failure-rpm-after-resta
 check "failed request consumes RPM slot after restart" "$FAIL_RPM_RESTART_CODE" '429'
 FAIL_BUDGET_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/failure-budget-after-restart" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $FAIL_BUDGET_KEY" -H 'content-type: application/json' -d '{"model":"syn-fail-budget","stream":false,"messages":[{"role":"user","content":"fail"}]}')"
 check "failed request keeps budget reservation after restart" "$FAIL_BUDGET_RESTART_CODE" '429'
+PARTIAL_USAGE_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/partial-usage-after-restart" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $PARTIAL_USAGE_KEY" -H 'content-type: application/json' -d "$PARTIAL_USAGE_REQUEST")"
+check "partial usage keeps budget reservation after restart" "$PARTIAL_USAGE_RESTART_CODE" '429'
 
 # translation (OpenAI inbound -> Gemini outbound)
 TRANSL="$(curl -s -N --max-time 20 -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"model":"syn-gemini-3","stream":true,"messages":[{"role":"user","content":"hi"}]}')"
