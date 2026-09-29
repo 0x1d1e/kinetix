@@ -7329,7 +7329,7 @@ pub async fn test_account(
         .unwrap_or(0);
 
     if ok {
-        let _ = db::touch_probe_at(&state.pool, &id).await;
+        let _ = db::record_manual_probe_at(&state.pool, &id).await;
         let _ = db::reset_account_failures(&state.pool, &id).await;
     }
     let _ = db::insert_audit(
@@ -7979,20 +7979,9 @@ pub async fn update_account(
             "account status must be either healthy or disabled",
         ));
     }
-    db::update_account(
-        &state.pool,
-        &id,
-        &body.label,
-        body.status.as_deref(),
-        body.priority,
-        body.weight,
-        body.soft_quota_usd,
-        &body.quota_type,
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    // Optionally rotate a manually enrolled credential.
-    if let Some(api_key) = body.api_key.filter(|k| !k.trim().is_empty()) {
+    // Validate and prepare credential rotation before applying any account
+    // configuration or lifecycle changes, so rejected edits are side-effect free.
+    let rotated_credential = if let Some(api_key) = body.api_key.filter(|k| !k.trim().is_empty()) {
         let account = db::get_account(&state.pool, &id)
             .await
             .map_err(ApiError::internal)?
@@ -8005,9 +7994,27 @@ pub async fn update_account(
             return Err(ApiError::bad(error));
         }
         let enc = state.crypto.encrypt(&api_key).map_err(ApiError::internal)?;
+        Some((enc, crypto::mask_secret(&api_key)))
+    } else {
+        None
+    };
+
+    db::update_account(
+        &state.pool,
+        &id,
+        &body.label,
+        body.status.as_deref(),
+        body.priority,
+        body.weight,
+        body.soft_quota_usd,
+        &body.quota_type,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    if let Some((encrypted_key, key_mask)) = rotated_credential {
         sqlx::query("UPDATE accounts SET secret_enc=?, key_mask=? WHERE id=?")
-            .bind(enc)
-            .bind(crypto::mask_secret(&api_key))
+            .bind(encrypted_key)
+            .bind(key_mask)
             .bind(&id)
             .execute(&state.pool)
             .await
@@ -18090,6 +18097,82 @@ mod credential_enrollment_regression_tests {
             assert_eq!(after.circuit_open_until, before.circuit_open_until);
             assert_eq!(after.consecutive_failures, before.consecutive_failures);
         }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn rejected_credential_rotation_does_not_mutate_account_lifecycle() {
+        let (state, root) = test_state("rejected-account-credential-rotation").await;
+        let provider_id = insert_provider(
+            &state,
+            "rejected-account-credential-rotation",
+            crate::plugins::CredentialMode::AuthFlow,
+            Some("plugin.test"),
+            Some("oauth"),
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("existing-oauth-credential").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "account",
+            &encrypted,
+            "oauth:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let cooldown_until = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        db::set_account_status(
+            &state.pool,
+            &account_id,
+            "cooldown",
+            "rate_limited",
+            Some(&cooldown_until),
+            None,
+            Some("rate limited"),
+        )
+        .await
+        .unwrap();
+        let before = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = update_account(
+            State(state.clone()),
+            auth(),
+            Path(account_id.clone()),
+            Json(AccountBody {
+                provider_id,
+                label: "updated-account".into(),
+                api_key: Some("candidate-manual-credential".into()),
+                priority: 1,
+                weight: 1,
+                soft_quota_usd: None,
+                quota_type: "none".into(),
+                status: Some("healthy".into()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+
+        let after = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.label, before.label);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.status_reason, before.status_reason);
+        assert_eq!(after.status_changed_at, before.status_changed_at);
+        assert_eq!(after.cooldown_until, before.cooldown_until);
+        assert_eq!(after.account_state_version, before.account_state_version);
+        assert_eq!(after.key_mask, before.key_mask);
 
         let _ = std::fs::remove_dir_all(root);
     }

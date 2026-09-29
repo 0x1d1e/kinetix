@@ -1045,20 +1045,53 @@ pub async fn recover_account_after_success(
     observed_state_version: i64,
     is_half_open_probe: bool,
 ) -> Result<bool> {
+    let now = now_iso();
     let result = sqlx::query(
         "UPDATE accounts SET \
-         status_reason=CASE WHEN status='healthy' AND circuit_open_until IS NOT NULL AND status_reason='circuit_open' THEN 'circuit_recovered' ELSE status_reason END, \
-         status_changed_at=CASE WHEN status='healthy' AND circuit_open_until IS NOT NULL AND status_reason='circuit_open' THEN ? ELSE status_changed_at END, \
-         last_error=CASE WHEN status='healthy' THEN NULL ELSE last_error END, \
+         status=CASE \
+             WHEN status='cooldown' AND julianday(cooldown_until) <= julianday(?) THEN 'healthy' \
+             WHEN status='exhausted' AND julianday(quota_reset_at) <= julianday(?) THEN 'healthy' \
+             ELSE status END, \
+         status_reason=CASE \
+             WHEN status='cooldown' AND julianday(cooldown_until) <= julianday(?) THEN 'cooldown_elapsed' \
+             WHEN status='exhausted' AND julianday(quota_reset_at) <= julianday(?) THEN 'quota_reset' \
+             WHEN status='healthy' AND circuit_open_until IS NOT NULL AND status_reason='circuit_open' THEN 'circuit_recovered' \
+             ELSE status_reason END, \
+         status_changed_at=CASE \
+             WHEN (status='cooldown' AND julianday(cooldown_until) <= julianday(?)) \
+               OR (status='exhausted' AND julianday(quota_reset_at) <= julianday(?)) \
+               OR (status='healthy' AND circuit_open_until IS NOT NULL AND status_reason='circuit_open') \
+             THEN ? ELSE status_changed_at END, \
+         cooldown_until=CASE WHEN status='cooldown' AND julianday(cooldown_until) <= julianday(?) THEN NULL ELSE cooldown_until END, \
+         quota_reset_at=CASE WHEN status='exhausted' AND julianday(quota_reset_at) <= julianday(?) THEN NULL ELSE quota_reset_at END, \
+         last_error=CASE \
+             WHEN status='healthy' \
+               OR (status='cooldown' AND julianday(cooldown_until) <= julianday(?)) \
+               OR (status='exhausted' AND julianday(quota_reset_at) <= julianday(?)) \
+             THEN NULL ELSE last_error END, \
          circuit_open_until=NULL, consecutive_failures=0, \
          account_state_version=account_state_version + 1 \
          WHERE id=? AND status != 'disabled' AND account_state_version=? \
-         AND ((circuit_open_until IS NULL AND consecutive_failures != 0) \
+         AND ((circuit_open_until IS NULL AND (consecutive_failures != 0 \
+                  OR (status='cooldown' AND julianday(cooldown_until) <= julianday(?)) \
+                  OR (status='exhausted' AND julianday(quota_reset_at) <= julianday(?)))) \
               OR (? AND circuit_open_until IS NOT NULL))",
     )
-    .bind(now_iso())
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
     .bind(id)
     .bind(observed_state_version)
+    .bind(&now)
+    .bind(&now)
     .bind(is_half_open_probe)
     .execute(pool)
     .await?;
@@ -1125,9 +1158,42 @@ pub async fn reset_account_failures(pool: &Pool, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Record the instant an account was last actively probed (half-open recovery,
-/// FR-4.7). Kept separate from the status write so it is a pure timestamp touch.
-pub async fn touch_probe_at(pool: &Pool, id: &str) -> Result<()> {
+/// Atomically reserve an eligible half-open account probe. The immutable
+/// registry version prevents a stale candidate from claiming after lifecycle
+/// state changes; the conditional timestamp update permits one winner per gap.
+pub async fn claim_half_open_probe_at(
+    pool: &Pool,
+    id: &str,
+    observed_state_version: i64,
+    now: DateTime<Utc>,
+    min_gap_secs: i64,
+) -> Result<bool> {
+    let probe_after = (now.clone() - chrono::Duration::seconds(min_gap_secs.max(0))).to_rfc3339();
+    let now = now.to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE accounts SET last_probe_at=? \
+         WHERE id=? AND status != 'disabled' AND account_state_version=? \
+           AND circuit_open_until IS NOT NULL \
+           AND julianday(circuit_open_until) <= julianday(?) \
+           AND (status != 'cooldown' OR (cooldown_until IS NOT NULL AND julianday(cooldown_until) <= julianday(?))) \
+           AND (status != 'exhausted' OR (quota_reset_at IS NOT NULL AND julianday(quota_reset_at) <= julianday(?))) \
+           AND (last_probe_at IS NULL OR julianday(last_probe_at) <= julianday(?))",
+    )
+    .bind(&now)
+    .bind(id)
+    .bind(observed_state_version)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&probe_after)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Record the timestamp of an explicit administrator-initiated account test.
+/// Automatic half-open dispatch must use [`claim_half_open_probe_at`].
+pub async fn record_manual_probe_at(pool: &Pool, id: &str) -> Result<()> {
     sqlx::query("UPDATE accounts SET last_probe_at = ? WHERE id = ?")
         .bind(Utc::now().to_rfc3339())
         .bind(id)
@@ -3779,6 +3845,121 @@ mod account_success_recovery_tests {
         assert_eq!(account.consecutive_failures, 0);
         assert!(account.cooldown_until.is_none());
         assert!(account.quota_reset_at.is_none());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn expired_lifecycle_success_recovers(
+        tag: &str,
+        status: &str,
+        reason: &str,
+        expected_reason: &str,
+        is_cooldown: bool,
+    ) {
+        let (pool, account_id, root) = recovery_account(tag).await;
+        let expired = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        set_account_status(
+            &pool,
+            &account_id,
+            status,
+            reason,
+            is_cooldown.then_some(expired.as_str()),
+            (!is_cooldown).then_some(expired.as_str()),
+            Some("old upstream failure"),
+        )
+        .await
+        .unwrap();
+        record_account_failure(&pool, &account_id, 3, 60)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE accounts SET status_changed_at='2000-01-01T00:00:00Z' WHERE id=?")
+            .bind(&account_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = get_account(&pool, &account_id).await.unwrap().unwrap();
+
+        assert!(recover_account_after_success(
+            &pool,
+            &account_id,
+            before.account_state_version,
+            false,
+        )
+        .await
+        .unwrap());
+        let after = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert_eq!(after.status, "healthy");
+        assert_eq!(after.status_reason, expected_reason);
+        assert_ne!(after.status_changed_at, before.status_changed_at);
+        assert!(after
+            .status_changed_at
+            .as_deref()
+            .and_then(parse_dt)
+            .is_some_and(|changed| changed >= Utc::now() - chrono::Duration::seconds(2)));
+        assert!(after.cooldown_until.is_none());
+        assert!(after.quota_reset_at.is_none());
+        assert!(after.last_error.is_none());
+        assert!(after.circuit_open_until.is_none());
+        assert_eq!(after.consecutive_failures, 0);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn successful_traffic_persists_expired_cooldown_recovery() {
+        expired_lifecycle_success_recovers(
+            "expired-cooldown-success",
+            "cooldown",
+            "rate_limited",
+            "cooldown_elapsed",
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn successful_traffic_persists_expired_quota_recovery() {
+        expired_lifecycle_success_recovers(
+            "expired-quota-success",
+            "exhausted",
+            "account_quota_exhausted",
+            "quota_reset",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_half_open_claims_have_exactly_one_winner() {
+        let (pool, account_id, root) = recovery_account("probe-claim-race").await;
+        record_account_failure(&pool, &account_id, 1, -1)
+            .await
+            .unwrap();
+        let account = get_account(&pool, &account_id).await.unwrap().unwrap();
+        let now = Utc::now();
+
+        let (first, second) = tokio::join!(
+            claim_half_open_probe_at(
+                &pool,
+                &account_id,
+                account.account_state_version,
+                now,
+                crate::pool::HALF_OPEN_PROBE_MIN_GAP_SECS,
+            ),
+            claim_half_open_probe_at(
+                &pool,
+                &account_id,
+                account.account_state_version,
+                now,
+                crate::pool::HALF_OPEN_PROBE_MIN_GAP_SECS,
+            ),
+        );
+        assert_eq!(
+            usize::from(first.unwrap()) + usize::from(second.unwrap()),
+            1
+        );
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);

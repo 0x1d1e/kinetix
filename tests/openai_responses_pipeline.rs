@@ -75,6 +75,25 @@ async fn upstream(
     });
 
     match test_case.as_str() {
+        "probe_race" => {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "id": "resp_probe_race",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "probe recovered"}]
+                        }],
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }
         "timeout" => {
             tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
             Response::builder()
@@ -753,6 +772,118 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
     );
     assert_eq!(requests[11].body["model"], UPSTREAM_MODEL);
     assert_eq!(requests[11].body["input"], "case:timeout");
+    drop(requests);
+
+    // Use a fresh provider circuit and route so earlier test traffic cannot
+    // affect this concurrency regression.
+    let probe_provider_id = db::insert_provider(
+        &state.pool,
+        &db::NewProvider {
+            name: "mock-openai-probe-race",
+            base_url: &base_url,
+            wire_format: WireFormat::Openai,
+            auth_scheme: AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: json!({}),
+            timeout_ms: 2_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: true,
+            wire_plugin: "",
+            credential_plugin: "",
+            model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let probe_account_id = db::insert_account(
+        &state.pool,
+        &probe_provider_id,
+        "probe-race-account",
+        &state.crypto.encrypt("probe-race-key").unwrap(),
+        "probe-race-key",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+    let probe_model_id = db::insert_model(
+        &state.pool,
+        &db::NewModel {
+            provider_id: &probe_provider_id,
+            upstream_id: UPSTREAM_MODEL,
+            display_name: "Probe race model",
+            enabled: true,
+            context_window: None,
+            max_output_tokens: Some(1024),
+            capabilities: json!({"text": true}),
+            prices: json!({}),
+            parameters: json!({}),
+            thinking_map: json!({}),
+            extra_request: json!({}),
+            discovery: json!({"configured_transport": "openai-responses"}),
+        },
+    )
+    .await
+    .unwrap();
+    let probe_route_id = db::insert_route(
+        &state.pool,
+        &db::NewRoute {
+            name: "probe-race-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &state.pool,
+        &probe_route_id,
+        None,
+        &probe_model_id,
+        1,
+        1,
+        "{}",
+        "{}",
+    )
+    .await
+    .unwrap();
+    db::record_account_failure(&state.pool, &probe_account_id, 1, -1)
+        .await
+        .unwrap();
+    state.registry.reload(&state.pool).await.unwrap();
+
+    let (first, second) = tokio::join!(
+        call_responses(&state, "probe-race-route", "probe_race", false, json!({})),
+        call_responses(&state, "probe-race-route", "probe_race", false, json!({})),
+    );
+    assert_eq!(
+        usize::from(first.0.is_success()) + usize::from(second.0.is_success()),
+        1,
+        "exactly one concurrent request should win the half-open probe: {first:?}, {second:?}"
+    );
+    let probe_dispatches = mock
+        .requests
+        .lock()
+        .await
+        .iter()
+        .filter(|request| request.body["input"] == "case:probe_race")
+        .count();
+    assert_eq!(probe_dispatches, 1, "only one upstream probe may dispatch");
 
     server.abort();
     let _ = std::fs::remove_dir_all(&root);

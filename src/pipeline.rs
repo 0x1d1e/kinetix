@@ -1295,6 +1295,44 @@ pub async fn run(
             }
         };
 
+        if probing {
+            match db::claim_half_open_probe_at(
+                &state.pool,
+                &target.account.id,
+                target.account.account_state_version,
+                chrono::Utc::now(),
+                pool::HALF_OPEN_PROBE_MIN_GAP_SECS,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    provider_attempt.finish_neutral();
+                    let detail =
+                        "half-open recovery probe already claimed or account state changed";
+                    trace.step("skip", Some(target.account.label.clone()), detail);
+                    meta.fallback_path
+                        .push(format!("{}:probe_claimed", target.account.label));
+                    state.record_skip();
+                    last_error = Some(ProxyError::all_unavailable(detail, None));
+                    continue;
+                }
+                Err(error) => {
+                    provider_attempt.finish_neutral();
+                    tracing::warn!(
+                        account_id = %target.account.id,
+                        error = %error,
+                        "failed to claim half-open account probe"
+                    );
+                    let detail = "half-open recovery probe could not be claimed";
+                    trace.step("skip", Some(target.account.label.clone()), detail);
+                    state.record_skip();
+                    last_error = Some(ProxyError::all_unavailable(detail, None));
+                    continue;
+                }
+            }
+        }
+
         let attempt_started = Instant::now();
         attempts_done += 1;
         previous_provider_id = Some(target.provider.id.clone());
@@ -1318,11 +1356,6 @@ pub async fn run(
                 }
             ),
         );
-
-        if probing {
-            // Record that we are actively probing this account (FR-4.7).
-            let _ = db::touch_probe_at(&state.pool, &target.account.id).await;
-        }
 
         let send_result = match tokio::time::timeout(
             send_budget,
