@@ -10389,6 +10389,11 @@ pub async fn import_config(
     let mut warnings = compatibility_warnings;
     let mut conflicts: Vec<Value> = Vec::new();
     let mut missing_resources: Vec<Value> = Vec::new();
+    let _import_guard = if body.apply {
+        Some(state.registry.config_import_lock().await)
+    } else {
+        None
+    };
     let existing_providers = db::list_providers(&state.pool)
         .await
         .map_err(ApiError::internal)?;
@@ -21203,6 +21208,93 @@ mod credential_enrollment_regression_tests {
         reload.await.unwrap();
         reload_acquired_rx.await.unwrap();
         assert_eq!(state.registry.account(&account_id).unwrap().priority, 10);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn concurrent_config_imports_replan_after_the_first_commit() {
+        let (state, root) = test_state("concurrent-config-imports").await;
+        let config = json!({
+            "kinetix_config_version": 2,
+            "providers": [{
+                "name": "shared-import-provider",
+                "base_url": "https://shared-import.example/v1",
+                "wire_format": "openai",
+                "auth_scheme": "bearer",
+                "extra_headers": {},
+                "rate_limit_rules": {},
+                "credential_mode": "manual",
+                "enabled": true
+            }],
+            "models": [{
+                "provider": "shared-import-provider",
+                "upstream_id": "shared-model",
+                "display_name": "Shared Model",
+                "capabilities": {},
+                "prices": {},
+                "parameters": {},
+                "thinking_map": {},
+                "extra_request": {}
+            }]
+        });
+        let start = Arc::new(Barrier::new(3));
+        let first_state = state.clone();
+        let first_start = start.clone();
+        let first_config = config.clone();
+        let first = tokio::spawn(async move {
+            first_start.wait().await;
+            import_config(
+                State(first_state),
+                auth(),
+                Json(ImportBody {
+                    config: first_config,
+                    apply: true,
+                }),
+            )
+            .await
+        });
+        let second_state = state.clone();
+        let second_start = start.clone();
+        let second = tokio::spawn(async move {
+            second_start.wait().await;
+            import_config(
+                State(second_state),
+                auth(),
+                Json(ImportBody {
+                    config,
+                    apply: true,
+                }),
+            )
+            .await
+        });
+        start.wait().await;
+
+        let first_response = first.await.unwrap().expect("first import succeeds").0;
+        let second_response = second
+            .await
+            .unwrap()
+            .expect("second import re-plans and succeeds")
+            .0;
+        assert_eq!(first_response["ok"], true);
+        assert_eq!(second_response["ok"], true);
+
+        let providers = db::list_providers(&state.pool).await.unwrap();
+        let matching_providers: Vec<_> = providers
+            .iter()
+            .filter(|provider| provider.name == "shared-import-provider")
+            .collect();
+        assert_eq!(matching_providers.len(), 1);
+        let models = db::list_models(&state.pool).await.unwrap();
+        let matching_models: Vec<_> = models
+            .iter()
+            .filter(|model| {
+                model.provider_id == matching_providers[0].id && model.upstream_id == "shared-model"
+            })
+            .collect();
+        assert_eq!(matching_models.len(), 1);
+        assert!(state.registry.model(&matching_models[0].id).is_some());
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);

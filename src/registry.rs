@@ -23,6 +23,7 @@ use crate::db::{
 pub struct Registry {
     inner: Arc<RwLock<Arc<Snapshot>>>,
     publication: Arc<tokio::sync::Mutex<()>>,
+    config_imports: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Holds the registry publication lock across a control-plane database update.
@@ -82,7 +83,13 @@ impl Registry {
         Registry {
             inner: Arc::new(RwLock::new(Arc::new(Snapshot::default()))),
             publication: Arc::new(tokio::sync::Mutex::new(())),
+            config_imports: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Serialize apply imports before they read control-plane state to plan.
+    pub(crate) async fn config_import_lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.config_imports.clone().lock_owned().await
     }
 
     pub(crate) async fn publication(&self) -> RegistryPublication<'_> {
