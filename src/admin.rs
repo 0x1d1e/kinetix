@@ -10249,21 +10249,8 @@ fn account_export_enabled(status: &str, status_reason: &str) -> Option<bool> {
     }
     match status_reason {
         "operator_disabled" => Some(false),
-        "operator_enabled"
-        | "account_created"
-        | "operator_reset"
-        | "healthy"
-        | "credential_rejected"
-        | "rate_limited"
-        | "account_quota_exhausted"
-        | "probe_healthy"
-        | "probe_degraded"
-        | "probe_unavailable"
-        | "circuit_open"
-        | "circuit_recovered"
-        | "cooldown_elapsed"
-        | "quota_reset" => Some(true),
-        _ => None,
+        "existing_disabled" | "unknown" if status == "disabled" => None,
+        _ => Some(true),
     }
 }
 
@@ -11219,6 +11206,7 @@ pub async fn import_config(
         .map(|model| model.id.clone())
         .collect();
     let _model_price_guards = db::lock_model_price_versions(&model_price_ids).await;
+    let publication = state.registry.publication().await;
     let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     let mut provider_ids = existing_provider_ids.clone();
     let mut provider_modes: std::collections::HashMap<String, String> = existing_providers
@@ -11385,6 +11373,20 @@ pub async fn import_config(
         .map_err(ApiError::internal)?;
         match existing_ids.as_slice() {
             [account_id] => {
+                let enabled =
+                    imported_account_enabled(account, source_version).map_err(ApiError::bad)?;
+                db::update_account_policy_in_transaction(
+                    &mut tx,
+                    account_id,
+                    enabled,
+                    account["priority"].as_i64().unwrap_or(1),
+                    account["weight"].as_i64().unwrap_or(1),
+                    account["soft_quota_usd"].as_f64(),
+                    account["quota_type"].as_str().unwrap_or("none"),
+                    account["quota_window_s"].as_i64(),
+                )
+                .await
+                .map_err(ApiError::internal)?;
                 account_ids_by_ref.insert(reference.to_string(), account_id.clone());
             }
             [] => {
@@ -11825,7 +11827,7 @@ pub async fn import_config(
         .await
         .map_err(ApiError::internal)?;
     tx.commit().await.map_err(ApiError::internal)?;
-    state.registry.activate(next_registry);
+    publication.activate(next_registry);
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -21138,6 +21140,196 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn staged_import_snapshot_cannot_overwrite_later_account_update() {
+        let (state, root) = test_state("staged-snapshot-account-update").await;
+        let provider_id = insert_provider(
+            &state,
+            "staged-snapshot-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "Primary",
+            &state.crypto.encrypt("secret").unwrap(),
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        // Hold the same publication lock as config import while staging an
+        // older snapshot, then queue a newer account-state reload.
+        let publication = state.registry.publication().await;
+        let stale_snapshot = crate::registry::Registry::build_snapshot(&state.pool)
+            .await
+            .unwrap();
+
+        db::update_account(
+            &state.pool,
+            &account_id,
+            "Primary",
+            None,
+            10,
+            7,
+            None,
+            "none",
+            None,
+        )
+        .await
+        .unwrap();
+        let reload_registry = state.registry.clone();
+        let reload_pool = state.pool.clone();
+        let (reload_started, reload_start_rx) = tokio::sync::oneshot::channel();
+        let (reload_acquired, mut reload_acquired_rx) = tokio::sync::oneshot::channel();
+        let reload = tokio::spawn(async move {
+            let _ = reload_started.send(());
+            let publication = reload_registry.publication().await;
+            let _ = reload_acquired.send(());
+            publication.reload(&reload_pool).await.unwrap();
+        });
+        reload_start_rx.await.unwrap();
+        assert!(matches!(
+            reload_acquired_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        publication.activate(stale_snapshot);
+        reload.await.unwrap();
+        reload_acquired_rx.await.unwrap();
+        assert_eq!(state.registry.account(&account_id).unwrap().priority, 10);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_import_applies_account_policy_to_existing_credentials() {
+        let (source, source_root) = test_state("existing-account-policy-source").await;
+        let source_provider = insert_provider(
+            &source,
+            "existing-account-policy-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let source_account = db::insert_account(
+            &source.pool,
+            &source_provider,
+            "Primary",
+            &source.crypto.encrypt("source-secret").unwrap(),
+            "source:****",
+            10,
+            20,
+            Some(35.5),
+            "rolling",
+        )
+        .await
+        .unwrap();
+        db::update_account(
+            &source.pool,
+            &source_account,
+            "Primary",
+            Some("disabled"),
+            10,
+            20,
+            Some(35.5),
+            "rolling",
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE accounts SET quota_window_s=3600 WHERE id=?")
+            .bind(&source_account)
+            .execute(&source.pool)
+            .await
+            .unwrap();
+        let config = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let (target, target_root) = test_state("existing-account-policy-target").await;
+        let target_provider = insert_provider(
+            &target,
+            "existing-account-policy-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let target_account = db::insert_account(
+            &target.pool,
+            &target_provider,
+            "Primary",
+            &target.crypto.encrypt("target-secret").unwrap(),
+            "target:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+
+        let dry_run = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: config.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true);
+        let _ = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let restored = db::get_account(&target.pool, &target_account)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            target.crypto.decrypt(&restored.secret_enc).unwrap(),
+            "target-secret"
+        );
+        assert_eq!(restored.status, "disabled");
+        assert_eq!(restored.status_reason, "operator_disabled");
+        assert_eq!(restored.priority, 10);
+        assert_eq!(restored.weight, 20);
+        assert_eq!(restored.quota_type, "rolling");
+        assert_eq!(restored.quota_window_s, Some(3600));
+        assert_eq!(restored.soft_quota_usd, Some(35.5));
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
     async fn config_export_import_preserves_account_policy_not_runtime_health() {
         let (source, source_root) = test_state("account-policy-source").await;
         let provider_id = insert_provider(
@@ -21708,6 +21900,15 @@ mod credential_enrollment_regression_tests {
             account_export_enabled("disabled", "existing_disabled"),
             None
         );
+        assert_eq!(
+            account_export_enabled("cooldown", "cooldown_cleared"),
+            Some(true)
+        );
+        assert_eq!(
+            account_export_enabled("disabled", "future_runtime_reason"),
+            Some(true)
+        );
+        assert_eq!(account_export_enabled("healthy", "unknown"), Some(true));
     }
 
     #[tokio::test]

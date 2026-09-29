@@ -135,9 +135,11 @@ cooldown or circuit state. Version 1 and unversioned imports remain supported.
 Run with `apply:false` first to review validation problems, conflicts, warnings,
 and missing resources. Ambiguous existing account labels are conflicts. Applying
 uses one transaction; a failed import leaves the database unchanged. Imports
-upsert providers, models, Routes, and aliases without deleting them or replacing
-existing credentials with imported secrets. Changing a provider to
-`credential_mode: none` may remove its credential accounts to enforce that mode.
+upsert providers, models, Routes, and aliases without deleting them. Unambiguous
+account matches receive imported operator policy while retaining their existing
+credentials; imported credentials are used only for new accounts. Changing a
+provider to `credential_mode: none` may remove its credential accounts to enforce
+that mode.
 
 ## Plugin storage and host configuration
 

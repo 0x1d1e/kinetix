@@ -1819,6 +1819,73 @@ pub(crate) async fn insert_account_in_transaction(
     Ok(id)
 }
 
+/// Apply imported operator-owned account policy without replacing credentials.
+/// Runtime health remains intact unless policy changes the account's enabled state.
+pub(crate) async fn update_account_policy_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    enabled: bool,
+    priority: i64,
+    weight: i64,
+    soft_quota_usd: Option<f64>,
+    quota_type: &str,
+    quota_window_s: Option<i64>,
+) -> Result<()> {
+    let (current_status, current_reason) = sqlx::query_as::<_, (String, String)>(
+        "SELECT status, status_reason FROM accounts WHERE id=?",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("account {id} disappeared during config import"))?;
+
+    let (status, status_reason) = if !enabled {
+        ("disabled", "operator_disabled")
+    } else if current_status == "disabled"
+        && matches!(
+            current_reason.as_str(),
+            "operator_disabled" | "existing_disabled" | "unknown"
+        )
+    {
+        ("healthy", "operator_enabled")
+    } else {
+        (current_status.as_str(), current_reason.as_str())
+    };
+    let reset_runtime_state =
+        !enabled || status != current_status || status_reason != current_reason;
+    let now = now_iso();
+    sqlx::query(
+        "UPDATE accounts SET status=?, status_reason=?, \
+         status_changed_at=CASE WHEN status=? AND status_reason=? THEN status_changed_at ELSE ? END, \
+         cooldown_until=CASE WHEN ? THEN NULL ELSE cooldown_until END, \
+         quota_reset_at=CASE WHEN ? THEN NULL ELSE quota_reset_at END, \
+         last_error=CASE WHEN ? THEN NULL ELSE last_error END, \
+         circuit_open_until=CASE WHEN ? THEN NULL ELSE circuit_open_until END, \
+         consecutive_failures=CASE WHEN ? THEN 0 ELSE consecutive_failures END, \
+         quota_type=?, quota_window_s=?, soft_quota_usd=?, priority=?, weight=?, \
+         account_state_version=account_state_version + 1 WHERE id=?",
+    )
+    .bind(status)
+    .bind(status_reason)
+    .bind(status)
+    .bind(status_reason)
+    .bind(now)
+    .bind(reset_runtime_state)
+    .bind(reset_runtime_state)
+    .bind(reset_runtime_state)
+    .bind(reset_runtime_state)
+    .bind(reset_runtime_state)
+    .bind(quota_type)
+    .bind(quota_window_s)
+    .bind(soft_quota_usd)
+    .bind(priority)
+    .bind(weight)
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn update_account(
     pool: &Pool,
     id: &str,

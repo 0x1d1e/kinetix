@@ -22,6 +22,14 @@ use crate::db::{
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<RwLock<Arc<Snapshot>>>,
+    publication: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Holds the registry publication lock across a control-plane database update.
+/// Publish the matching snapshot before dropping the guard.
+pub(crate) struct RegistryPublication<'a> {
+    registry: &'a Registry,
+    _guard: tokio::sync::MutexGuard<'a, ()>,
 }
 
 #[derive(Default)]
@@ -73,13 +81,19 @@ impl Registry {
     pub fn new() -> Self {
         Registry {
             inner: Arc::new(RwLock::new(Arc::new(Snapshot::default()))),
+            publication: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    pub(crate) async fn publication(&self) -> RegistryPublication<'_> {
+        RegistryPublication {
+            registry: self,
+            _guard: self.publication.lock().await,
         }
     }
 
     pub async fn reload(&self, pool: &Pool) -> Result<()> {
-        let snapshot = Self::build_snapshot(pool).await?;
-        self.activate(snapshot);
-        Ok(())
+        self.publication().await.reload(pool).await
     }
 
     /// Build a registry snapshot without making it active.
@@ -145,8 +159,9 @@ impl Registry {
         ))
     }
 
-    /// Atomically activate a fully built immutable snapshot.
-    pub fn activate(&self, snapshot: Snapshot) {
+    /// Atomically activate a fully built immutable snapshot while publication
+    /// is serialized by `RegistryPublication`.
+    fn activate(&self, snapshot: Snapshot) {
         *self.inner.write() = Arc::new(snapshot);
     }
 
@@ -387,6 +402,21 @@ impl Registry {
             })
             .map(|r| r.name.clone())
             .collect()
+    }
+}
+
+impl RegistryPublication<'_> {
+    /// Build and publish a fresh snapshot while holding the publication lock.
+    pub(crate) async fn reload(self, pool: &Pool) -> Result<()> {
+        let snapshot = Registry::build_snapshot(pool).await?;
+        self.activate(snapshot);
+        Ok(())
+    }
+
+    /// Publish a snapshot staged from a transaction after that transaction has
+    /// committed. The lock excludes concurrent reloads until activation.
+    pub(crate) fn activate(self, snapshot: Snapshot) {
+        self.registry.activate(snapshot);
     }
 }
 
