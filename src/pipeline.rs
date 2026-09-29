@@ -167,12 +167,9 @@ impl Drop for RequestMeta {
                 .is_some_and(crate::client_disconnect::ClientDisconnect::is_cancelled);
         if disconnected_after_dispatch {
             if let Some(admission) = self.admission.take() {
-                if self.partial_attempts.is_empty() {
-                    admission.reconcile_incomplete();
-                } else {
-                    let (usage, cost) = aggregate_admission_accounting(self, None, None);
-                    admission.reconcile(&usage, cost);
-                }
+                // The active dispatch may have incurred unreported usage. Earlier
+                // attempts cannot make this request's total exact.
+                admission.reconcile_incomplete();
             }
         }
     }
@@ -1061,6 +1058,7 @@ pub(crate) async fn run_with_disconnect(
     let mut skip_logical_target: Option<String> = None;
     let deadline = started + MAX_PRE_COMMIT_DEADLINE;
     let mut auth_retried_accounts = std::collections::HashSet::new();
+    let mut last_precommit_failure = None;
 
     while let Some(target_owned) = pending_targets.pop_front() {
         let target = &target_owned;
@@ -1622,6 +1620,7 @@ pub(crate) async fn run_with_disconnect(
         }
 
         let attempt_started = Instant::now();
+        last_precommit_failure = None;
         attempts_done += 1;
         previous_origin = Some(continuation_origin(target));
         state.live.set_fallback_hops(
@@ -1723,6 +1722,18 @@ pub(crate) async fn run_with_disconnect(
                             provider_timeout,
                         )
                         .await
+                    } else if is_sse {
+                        prepare_success_response(
+                            resp,
+                            &adapter,
+                            false,
+                            format,
+                            use_passthrough,
+                            &encoder_ctx,
+                            first_event_remaining,
+                            provider_timeout,
+                        )
+                        .await
                     } else {
                         match tokio::time::timeout(
                             first_event_remaining,
@@ -1762,7 +1773,6 @@ pub(crate) async fn run_with_disconnect(
                             if let Some(attempt_usage) = record_precommit_attempt_usage(
                                 state,
                                 &meta,
-                                &target_req,
                                 target,
                                 key.as_ref(),
                                 &trace,
@@ -1770,7 +1780,6 @@ pub(crate) async fn run_with_disconnect(
                                 precommit_usage,
                                 &failure,
                                 termination,
-                                attempt_started,
                                 attempts_done,
                             )
                             .await
@@ -1831,9 +1840,29 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                 );
                                 reconcile_partial_attempts(&mut meta);
+                                record_precommit_request_log(
+                                    state,
+                                    &meta,
+                                    &req,
+                                    target,
+                                    key.as_ref(),
+                                    &trace,
+                                    upstream_request_id.as_deref(),
+                                    &failure,
+                                    termination,
+                                    started,
+                                    attempts_done,
+                                );
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
                                 return Err(failure_to_error(&failure, target));
                             }
+                            last_precommit_failure = Some((
+                                (*target).clone(),
+                                upstream_request_id.clone(),
+                                failure.clone(),
+                                termination,
+                                attempts_done,
+                            ));
                             if failure.kind == FailureKind::TargetError {
                                 skip_logical_target = target.route_target_id.clone();
                             }
@@ -2265,6 +2294,23 @@ pub(crate) async fn run_with_disconnect(
         .map(|e| e.message.clone())
         .unwrap_or_else(|| format!("all targets of {name} are currently unavailable"));
     trace.finish("all_targets_unavailable");
+    if let Some((target, upstream_request_id, failure, termination, attempts_done)) =
+        last_precommit_failure
+    {
+        record_precommit_request_log(
+            state,
+            &meta,
+            &req,
+            &target,
+            key.as_ref(),
+            &trace,
+            upstream_request_id.as_deref(),
+            &failure,
+            termination,
+            started,
+            attempts_done,
+        );
+    }
     state.live.finish(
         &meta.request_id,
         "all_targets_unavailable",
@@ -2962,6 +3008,11 @@ impl PreparedResponseFailure {
             precommit_usage: TokenUsage::default(),
         }
     }
+
+    fn with_precommit_usage(mut self, usage: &TokenUsage) -> Self {
+        self.precommit_usage = usage.clone();
+        self
+    }
 }
 
 impl From<UpstreamFailure> for PreparedResponseFailure {
@@ -3110,35 +3161,44 @@ async fn prepare_success_response(
     let mut prefetched = Vec::new();
     let mut precommit_usage = TokenUsage::default();
     let mut visibility_encoder = (!passthrough).then(|| Encoder::new(format, encoder_ctx.clone()));
+    let first_event_deadline = tokio::time::Instant::now() + first_event_timeout;
     loop {
-        match response.chunk().await {
-            Ok(Some(bytes)) => {
+        let remaining = first_event_deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, response.chunk()).await {
+            Ok(Ok(Some(bytes))) => {
                 prefetched.push(bytes.clone());
-                let frames = framer.push(&bytes).map_err(|error| UpstreamFailure {
-                    kind: FailureKind::MalformedUpstream,
-                    status: Some(502),
-                    retry_after_secs: None,
-                    message: error.to_string(),
-                    quota_reset_at: None,
+                let frames = framer.push(&bytes).map_err(|error| {
+                    PreparedResponseFailure::from(UpstreamFailure {
+                        kind: FailureKind::MalformedUpstream,
+                        status: Some(502),
+                        retry_after_secs: None,
+                        message: error.to_string(),
+                        quota_reset_at: None,
+                    })
+                    .with_precommit_usage(&precommit_usage)
                 })?;
                 for frame in frames {
                     let Some(payload) = crate::sse::extract_data(&frame) else {
                         continue;
                     };
                     if let Some(failure) = payload_error_failure(adapter, &payload) {
-                        return Err(failure.into());
+                        return Err(PreparedResponseFailure::from(failure)
+                            .with_precommit_usage(&precommit_usage));
                     }
                     if payload.trim() == "[DONE]" {
-                        return Err(UpstreamFailure {
+                        return Err(PreparedResponseFailure::from(UpstreamFailure {
                             kind: FailureKind::MalformedUpstream,
                             status: Some(502),
                             retry_after_secs: None,
                             message: "upstream SSE ended before any model event".into(),
                             quota_reset_at: None,
-                        }
-                        .into());
+                        })
+                        .with_precommit_usage(&precommit_usage));
                     }
-                    let events = adapter.parse_stream_chunk(&payload)?;
+                    let events = adapter.parse_stream_chunk(&payload).map_err(|failure| {
+                        PreparedResponseFailure::from(failure)
+                            .with_precommit_usage(&precommit_usage)
+                    })?;
                     for event in &events {
                         if let StreamEvent::Usage(value) = event {
                             precommit_usage.merge(value);
@@ -3166,7 +3226,7 @@ async fn prepare_success_response(
                     }
                 }
             }
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 let message = if framer.pending_bytes() > 0 {
                     "upstream SSE ended with an incomplete frame"
                 } else {
@@ -3184,10 +3244,11 @@ async fn prepare_success_response(
                 } else {
                     StreamOutcome::UpstreamCleanEof
                 };
-                return Err(PreparedResponseFailure::new(failure, outcome));
+                return Err(PreparedResponseFailure::new(failure, outcome)
+                    .with_precommit_usage(&precommit_usage));
             }
-            Err(error) => {
-                return Err(UpstreamFailure {
+            Ok(Err(error)) => {
+                return Err(PreparedResponseFailure::from(UpstreamFailure {
                     kind: if error.is_timeout() {
                         FailureKind::Timeout
                     } else {
@@ -3197,8 +3258,14 @@ async fn prepare_success_response(
                     retry_after_secs: None,
                     message: classify_reqwest(&error),
                     quota_reset_at: None,
-                }
-                .into());
+                })
+                .with_precommit_usage(&precommit_usage));
+            }
+            Err(_) => {
+                return Err(PreparedResponseFailure::from(timeout_failure(
+                    "upstream timed out before first valid event",
+                ))
+                .with_precommit_usage(&precommit_usage));
             }
         }
     }
@@ -6271,7 +6338,7 @@ fn usage_has_reported_tokens(usage: &TokenUsage) -> bool {
         || usage.thinking.is_some()
 }
 
-fn aggregate_admission_accounting(
+fn aggregate_request_accounting(
     meta: &RequestMeta,
     current_usage: Option<&TokenUsage>,
     current_cost: Option<f64>,
@@ -6295,7 +6362,9 @@ fn aggregate_admission_accounting(
     let usage = TokenUsage {
         input: sum_field(|usage| usage.input),
         output: sum_field(|usage| usage.output),
-        ..TokenUsage::default()
+        cached: sum_field(|usage| usage.cached),
+        cache_write: sum_field(|usage| usage.cache_write),
+        thinking: sum_field(|usage| usage.thinking),
     };
 
     let cost = if usages.is_empty() {
@@ -6315,6 +6384,22 @@ fn aggregate_admission_accounting(
     (usage, cost)
 }
 
+fn aggregate_admission_accounting(
+    meta: &RequestMeta,
+    current_usage: Option<&TokenUsage>,
+    current_cost: Option<f64>,
+) -> (TokenUsage, Option<f64>) {
+    let (usage, cost) = aggregate_request_accounting(meta, current_usage, current_cost);
+    (
+        TokenUsage {
+            input: usage.input,
+            output: usage.output,
+            ..TokenUsage::default()
+        },
+        cost,
+    )
+}
+
 fn reconcile_partial_attempts(meta: &mut RequestMeta) {
     if meta.partial_attempts.is_empty() {
         return;
@@ -6329,7 +6414,6 @@ fn reconcile_partial_attempts(meta: &mut RequestMeta) {
 async fn record_precommit_attempt_usage(
     state: &AppState,
     meta: &RequestMeta,
-    req: &InternalRequest,
     target: &ResolvedTarget,
     key: Option<&db::VirtualKeyRow>,
     trace: &RouteTrace,
@@ -6337,13 +6421,9 @@ async fn record_precommit_attempt_usage(
     usage: TokenUsage,
     failure: &UpstreamFailure,
     termination: StreamTermination,
-    attempt_started: Instant,
     attempts_done: usize,
 ) -> Option<PartialAttemptUsage> {
-    if !usage_has_reported_tokens(&usage) {
-        return None;
-    }
-
+    let has_reported_usage = usage_has_reported_tokens(&usage);
     let computed_cost = (usage.input.is_some() && usage.output.is_some())
         .then(|| cost::compute_cost(&target.model.prices(), &usage))
         .flatten();
@@ -6373,7 +6453,91 @@ async fn record_precommit_attempt_usage(
     } else {
         (None, None)
     };
-    let status = termination.request_status();
+    state.log_queue.enqueue_attempt(usage_attempt_row(
+        meta,
+        target,
+        key,
+        upstream_request_id,
+        attempts_done,
+        &usage,
+        cost,
+        price_version_id.as_deref(),
+        termination,
+        Some(&failure.message),
+        &trace.opaque_route_id,
+    ));
+    has_reported_usage.then_some(PartialAttemptUsage { usage, cost })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn usage_attempt_row(
+    meta: &RequestMeta,
+    target: &ResolvedTarget,
+    key: Option<&db::VirtualKeyRow>,
+    upstream_request_id: Option<&str>,
+    attempt_number: usize,
+    usage: &TokenUsage,
+    cost: Option<f64>,
+    price_version_id: Option<&str>,
+    termination: StreamTermination,
+    error_message: Option<&str>,
+    opaque_route_id: &str,
+) -> db::UsageAttemptRow {
+    db::UsageAttemptRow {
+        id: format!("usage_attempt_{}", uuid::Uuid::new_v4().simple()),
+        request_id: meta.request_id.clone(),
+        attempt_number: attempt_number as i64,
+        ts: db::now_iso(),
+        key_id: key.map(|key| key.id.clone()),
+        key_name: key.map(|key| key.name.clone()),
+        effective_model: Some(target.model.display_name.clone()),
+        route_id: meta.route_id.clone(),
+        route_name: meta.route_name.clone(),
+        serving_account_id: Some(target.account.id.clone()),
+        serving_account: Some(target.account.label.clone()),
+        serving_provider: Some(target.provider.name.clone()),
+        upstream_request_id: upstream_request_id.map(str::to_owned),
+        status: termination.request_status().to_string(),
+        status_code: termination.status_code(),
+        input_tokens: usage.input.map(|value| value as i64),
+        output_tokens: usage.output.map(|value| value as i64),
+        cached_tokens: usage.cached.map(|value| value as i64),
+        cache_write_tokens: usage.cache_write.map(|value| value as i64),
+        thinking_tokens: usage.thinking.map(|value| value as i64),
+        cost_usd: cost,
+        cost_known: cost.is_some() as i64,
+        price_version_id: price_version_id.map(str::to_owned),
+        usage_confidence: if usage_has_reported_tokens(usage) {
+            "provider_reported".to_string()
+        } else {
+            "unknown".to_string()
+        },
+        commit_state: termination.commit_state.as_usage_str().to_string(),
+        error_message: error_message.map(str::to_owned),
+        opaque_route_id: Some(opaque_route_id.to_string()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_precommit_request_log(
+    state: &AppState,
+    meta: &RequestMeta,
+    req: &InternalRequest,
+    target: &ResolvedTarget,
+    key: Option<&db::VirtualKeyRow>,
+    trace: &RouteTrace,
+    upstream_request_id: Option<&str>,
+    failure: &UpstreamFailure,
+    termination: StreamTermination,
+    started: Instant,
+    attempts_done: usize,
+) {
+    let (usage, cost) = aggregate_request_accounting(meta, None, None);
+    let usage_confidence = if usage_has_reported_tokens(&usage) {
+        "provider_reported"
+    } else {
+        "unknown"
+    };
     let row = UsageLogRow {
         id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
         request_id: meta.request_id.clone(),
@@ -6387,9 +6551,9 @@ async fn record_precommit_attempt_usage(
         route_name: meta.route_name.clone(),
         fallback_hops: attempts_done.saturating_sub(1) as i64,
         fallback_path: serde_json::to_string(&meta.fallback_path).unwrap_or_else(|_| "[]".into()),
-        status: status.to_string(),
+        status: termination.request_status().to_string(),
         status_code: termination.status_code(),
-        latency_ms: Some(attempt_started.elapsed().as_millis() as i64),
+        latency_ms: Some(started.elapsed().as_millis() as i64),
         ttft_ms: None,
         input_tokens: usage.input.map(|value| value as i64),
         output_tokens: usage.output.map(|value| value as i64),
@@ -6398,7 +6562,7 @@ async fn record_precommit_attempt_usage(
         thinking_tokens: usage.thinking.map(|value| value as i64),
         cost_usd: cost,
         cost_known: cost.is_some() as i64,
-        price_version_id,
+        price_version_id: None,
         cache_status: cache_status_from_usage(&usage).to_string(),
         serving_account_id: Some(target.account.id.clone()),
         serving_account: Some(target.account.label.clone()),
@@ -6406,18 +6570,13 @@ async fn record_precommit_attempt_usage(
         upstream_request_id: upstream_request_id.map(str::to_owned),
         flagged: 0,
         error_message: Some(failure.message.clone()),
-        usage_confidence: if usage.input.is_some() || usage.output.is_some() {
-            "provider_reported".to_string()
-        } else {
-            "unknown".to_string()
-        },
+        usage_confidence: usage_confidence.to_string(),
         commit_state: termination.commit_state.as_usage_str().to_string(),
         retry_count: attempts_done.saturating_sub(1) as i64,
         route_trace_id: Some(trace.opaque_route_id.clone()),
         opaque_route_id: Some(trace.opaque_route_id.clone()),
     };
     state.log_queue.enqueue(row);
-    Some(PartialAttemptUsage { usage, cost })
 }
 
 /// Compute cost and enqueue the usage row (never blocks the request path),
@@ -6566,7 +6725,21 @@ async fn finalize_log(
     } else {
         (None, None)
     };
-    let cost_known = cost.is_some();
+    let attempt_number = meta.retry_count.saturating_add(1).max(1) as usize;
+    state.log_queue.enqueue_attempt(usage_attempt_row(
+        meta,
+        &attempt.target,
+        key.as_ref(),
+        attempt.upstream_request_id.as_deref(),
+        attempt_number,
+        &usage,
+        cost,
+        price_version_id.as_deref(),
+        termination,
+        error_message.as_deref(),
+        &trace.opaque_route_id,
+    ));
+    let (request_usage, request_cost) = aggregate_request_accounting(meta, Some(&usage), cost);
 
     // Reconcile against every provider attempt, not only the final fallback
     // target. Incomplete fields retain the conservative reservation estimate.
@@ -6577,7 +6750,7 @@ async fn finalize_log(
     }
 
     // Accounting truthfulness (FR-6.8): provider-reported vs unknown.
-    let usage_confidence = if usage.input.is_some() || usage.output.is_some() {
+    let usage_confidence = if request_usage.input.is_some() || request_usage.output.is_some() {
         "provider_reported"
     } else {
         "unknown"
@@ -6641,20 +6814,26 @@ async fn finalize_log(
         status_code,
         latency_ms: Some(latency_ms),
         ttft_ms,
-        input_tokens: usage.input.map(|v| v as i64),
-        output_tokens: usage.output.map(|v| v as i64),
-        cached_tokens: usage.cached.map(|v| v as i64),
-        cache_write_tokens: usage.cache_write.map(|v| v as i64),
-        thinking_tokens: usage.thinking.map(|v| v as i64),
-        cost_usd: cost,
-        cost_known: cost_known as i64,
-        price_version_id,
+        input_tokens: request_usage.input.map(|v| v as i64),
+        output_tokens: request_usage.output.map(|v| v as i64),
+        cached_tokens: request_usage.cached.map(|v| v as i64),
+        cache_write_tokens: request_usage.cache_write.map(|v| v as i64),
+        thinking_tokens: request_usage.thinking.map(|v| v as i64),
+        cost_usd: request_cost,
+        cost_known: request_cost.is_some() as i64,
+        // A request that spans provider models/rates has no single pricing
+        // version. Its auditable per-attempt versions live in usage_attempts.
+        price_version_id: if meta.partial_attempts.is_empty() {
+            price_version_id
+        } else {
+            None
+        },
         cache_status: meta.cache_status.to_string(),
         serving_account_id: Some(attempt.target.account.id.clone()),
         serving_account: Some(attempt.target.account.label.clone()),
         serving_provider: Some(attempt.target.provider.name.clone()),
         upstream_request_id: attempt.upstream_request_id.clone(),
-        flagged: (usage.input.is_none() && status == "success") as i64,
+        flagged: (request_usage.input.is_none() && status == "success") as i64,
         error_message,
         usage_confidence: usage_confidence.to_string(),
         commit_state: meta.commit_state.to_string(),
@@ -6676,12 +6855,12 @@ async fn finalize_log(
             "status": status,
             "commit_state": meta.commit_state,
             "retry_count": meta.retry_count,
-            "input_tokens": usage.input,
-            "output_tokens": usage.output,
-            "cached_tokens": usage.cached,
-            "cache_write_tokens": usage.cache_write,
-            "thinking_tokens": usage.thinking,
-            "cost_usd": cost,
+            "input_tokens": request_usage.input,
+            "output_tokens": request_usage.output,
+            "cached_tokens": request_usage.cached,
+            "cache_write_tokens": request_usage.cache_write,
+            "thinking_tokens": request_usage.thinking,
+            "cost_usd": request_cost,
             "latency_ms": started.elapsed().as_millis() as i64,
         })
         .to_string();

@@ -9,11 +9,16 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::db::{self, Pool, UsageLogRow};
+use crate::db::{self, Pool, UsageAttemptRow, UsageLogRow};
+
+enum UsageWrite {
+    Request(UsageLogRow),
+    Attempt(UsageAttemptRow),
+}
 
 #[derive(Clone)]
 pub struct UsageLogQueue {
-    tx: mpsc::Sender<UsageLogRow>,
+    tx: mpsc::Sender<UsageWrite>,
     dropped: Arc<AtomicU64>,
     depth: Arc<AtomicU64>,
     capacity: usize,
@@ -21,14 +26,14 @@ pub struct UsageLogQueue {
 
 impl UsageLogQueue {
     pub fn new(pool: Pool, capacity: usize) -> Self {
-        let (tx, mut rx) = mpsc::channel::<UsageLogRow>(capacity);
+        let (tx, mut rx) = mpsc::channel::<UsageWrite>(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
         let depth = Arc::new(AtomicU64::new(0));
 
         let dropped_task = dropped.clone();
         let depth_task = depth.clone();
         tokio::spawn(async move {
-            let mut batch: Vec<UsageLogRow> = Vec::with_capacity(64);
+            let mut batch: Vec<UsageWrite> = Vec::with_capacity(64);
             loop {
                 // Drain whatever is available, then flush.
                 let first = rx.recv().await;
@@ -40,10 +45,14 @@ impl UsageLogQueue {
                         Err(_) => break,
                     }
                 }
-                for row in batch.drain(..) {
+                for write in batch.drain(..) {
                     depth_task.fetch_sub(1, Ordering::Relaxed);
-                    if let Err(e) = db::insert_usage_log(&pool, &row).await {
-                        tracing::warn!(error = %e, "failed to write usage log row");
+                    let result = match write {
+                        UsageWrite::Request(row) => db::insert_usage_log(&pool, &row).await,
+                        UsageWrite::Attempt(row) => db::insert_usage_attempt(&pool, &row).await,
+                    };
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "failed to write usage accounting row");
                         dropped_task.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -65,7 +74,15 @@ impl UsageLogQueue {
 
     /// Enqueue a usage row. Never blocks; drops (and counts) when full.
     pub fn enqueue(&self, row: UsageLogRow) {
-        match self.tx.try_send(row) {
+        self.enqueue_write(UsageWrite::Request(row));
+    }
+
+    pub fn enqueue_attempt(&self, row: UsageAttemptRow) {
+        self.enqueue_write(UsageWrite::Attempt(row));
+    }
+
+    fn enqueue_write(&self, write: UsageWrite) {
+        match self.tx.try_send(write) {
             Ok(()) => {
                 self.depth.fetch_add(1, Ordering::Relaxed);
             }

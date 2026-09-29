@@ -91,6 +91,18 @@ async fn upstream(
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
     });
+    let attempt_number = mock
+        .requests
+        .lock()
+        .await
+        .iter()
+        .filter(|request| {
+            request
+                .body
+                .to_string()
+                .contains(&format!("case:{test_case}"))
+        })
+        .count();
 
     match test_case.as_str() {
         test_case if test_case == "lease_lifecycle" || test_case.starts_with("constraint_probe") => Response::builder()
@@ -197,6 +209,37 @@ async fn upstream(
                     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private reasoning\"}}\n\n",
                     "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"temporarily unavailable\"}}\n\n"
                 )))
+                .unwrap()
+        }
+        "known_partial_then_cancel"
+            if upstream_model == "upstream-anthropic-model" && attempt_number == 1 => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(concat!(
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":13}}}\n\n",
+                    "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7},\"delta\":{}}\n\n",
+                    "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"temporarily unavailable\"}}\n\n"
+                )))
+                .unwrap()
+        }
+        "known_partial_then_cancel" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(async_stream::stream! {
+                std::future::pending::<()>().await;
+                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n"
+                ));
+            }))
+            .unwrap(),
+        "stream_precommit_usage_eof" if upstream_model == "upstream-anthropic-model" => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":13}}}\n\n"
+                ))
                 .unwrap()
         }
         "hidden_reasoning_fallback" => Response::builder()
@@ -340,9 +383,18 @@ async fn call_responses_with_id(
     model: &str,
     test_case: &str,
 ) -> (String, StatusCode, String) {
+    call_responses_with_id_stream(state, model, test_case, false).await
+}
+
+async fn call_responses_with_id_stream(
+    state: &AppState,
+    model: &str,
+    test_case: &str,
+    stream: bool,
+) -> (String, StatusCode, String) {
     let response = call_raw_responses(
         state,
-        json!({"model": model, "input": format!("case:{test_case}"), "stream": false}).to_string(),
+        json!({"model": model, "input": format!("case:{test_case}"), "stream": stream}).to_string(),
     )
     .await;
     let request_id = response
@@ -383,6 +435,28 @@ async fn usage_rows_for_request(
     .unwrap()
 }
 
+async fn usage_attempt_rows_for_request(
+    state: &AppState,
+    request_id: &str,
+) -> Vec<(
+    i64,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<f64>,
+    i64,
+    String,
+)> {
+    sqlx::query_as(
+        "SELECT attempt_number, status, input_tokens, output_tokens, cost_usd, cost_known, commit_state \
+         FROM usage_attempts WHERE request_id = ? ORDER BY attempt_number",
+    )
+    .bind(request_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap()
+}
+
 async fn cancellation_trace_count(state: &AppState, route_name: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM route_traces WHERE route_name = ? AND stream_outcome = 'client_cancelled'",
@@ -416,7 +490,7 @@ async fn wait_for_usage_rows(
         }
     })
     .await
-    .expect("usage attempt rows were not persisted")
+    .expect("request usage row was not persisted")
 }
 
 fn test_key(
@@ -1174,7 +1248,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
             "partial_usage_timeout",
             "responses-partial-usage-fallback",
             StatusCode::OK,
-            2,
+            1,
             23,
             true,
         ),
@@ -1182,7 +1256,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
             "partial_usage_truncated",
             "responses-partial-usage-fallback",
             StatusCode::OK,
-            2,
+            1,
             23,
             true,
         ),
@@ -1211,26 +1285,52 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
             assert!(!body.contains("partial answer"), "{test_case}: {body}");
         }
         let rows = wait_for_usage_rows(&state, &request_id, expected_rows).await;
-        assert_eq!(rows.len(), expected_rows, "{test_case} {route}: {rows:?}");
-        let failed = rows.iter().find(|row| row.0 == "stream_error").unwrap();
+        assert_eq!(rows.len(), 1, "one request-level usage row: {rows:?}");
+        let request = &rows[0];
+        let attempts = usage_attempt_rows_for_request(&state, &request_id).await;
+        assert_eq!(attempts.len(), if fallback { 2 } else { 1 });
         assert_eq!(
-            failed.1,
-            if test_case.ends_with("timeout") {
-                504
-            } else {
-                502
-            }
+            attempts.iter().map(|attempt| attempt.0).collect::<Vec<_>>(),
+            if fallback { vec![1, 2] } else { vec![1] },
+            "provider attempts need stable, unique numbering"
         );
-        assert_eq!((failed.2, failed.3), (Some(13), Some(7)));
+        let failed = attempts
+            .iter()
+            .find(|attempt| attempt.1 == "stream_error")
+            .unwrap();
         assert_eq!(
-            failed.5, 1,
-            "provider-reported partial usage must be priced"
+            failed.2,
+            Some(13),
+            "partial input usage must be attributed to the failed attempt"
         );
+        assert_eq!(failed.3, Some(7));
+        assert_eq!(failed.5, 1, "reported partial usage must be priced");
         assert!((failed.4.unwrap() - 0.000067).abs() < 1e-12);
         assert_eq!(failed.6, "pre_commit");
         if fallback {
-            let succeeded = rows.iter().find(|row| row.0 == "success").unwrap();
+            assert_eq!(request.0, "success");
+            assert_eq!((request.2, request.3), (Some(14), Some(9)));
+            let succeeded = attempts
+                .iter()
+                .find(|attempt| attempt.1 == "success")
+                .unwrap();
             assert_eq!((succeeded.2, succeeded.3), (Some(1), Some(2)));
+            let attempts_cost: f64 = attempts.iter().filter_map(|attempt| attempt.4).sum();
+            assert_eq!(request.5, 1);
+            assert!((request.4.unwrap() - attempts_cost).abs() < 1e-12);
+        } else {
+            assert_eq!(request.0, "stream_error");
+            assert_eq!(
+                request.1,
+                if test_case.ends_with("timeout") {
+                    504
+                } else {
+                    502
+                }
+            );
+            assert_eq!((request.2, request.3), (Some(13), Some(7)));
+            assert!((request.4.unwrap() - 0.000067).abs() < 1e-12);
+            assert_eq!(request.6, "pre_commit");
         }
         let after = state.admission.metrics_snapshot();
         assert_eq!(
@@ -1239,6 +1339,23 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
             "admission must include all provider attempts for {test_case}"
         );
     }
+
+    let (request_id, status, body) = call_responses_with_id_stream(
+        &state,
+        "responses-partial-usage-terminal",
+        "stream_precommit_usage_eof",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    let rows = wait_for_usage_rows(&state, &request_id, 1).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].2, rows[0].3), (Some(13), None));
+    assert_eq!(rows[0].6, "pre_commit");
+    let attempts = usage_attempt_rows_for_request(&state, &request_id).await;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!((attempts[0].2, attempts[0].3), (Some(13), None));
+    assert_eq!(attempts[0].0, 1);
 
     // Use a fresh provider circuit and route so earlier test traffic cannot
     // affect this concurrency regression.
@@ -1707,6 +1824,91 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
         assert!(body.contains(rejection), "{test_case}: {body}");
         assert_eq!(state.admission.metrics_snapshot().inflight_inferences, 0);
     }
+
+    let before = state.admission.metrics_snapshot();
+    let prior_known_partial: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM usage_attempts WHERE route_name = ? AND input_tokens = 13 AND output_tokens = 7",
+    )
+    .bind("responses-hidden-reasoning-fallback-route")
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    let cancellation_input = "case:known_partial_then_cancel";
+    let abandoned_client = client.clone();
+    let abandoned = tokio::spawn(async move {
+        abandoned_client
+            .post(format!("http://{gateway_addr}/v1/responses"))
+            .header("authorization", format!("Bearer {CLIENT_KEY}"))
+            .json(&json!({
+                "model": "responses-hidden-reasoning-fallback-route",
+                "input": cancellation_input,
+                "stream": true
+            }))
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let requests = mock.requests.lock().await;
+            if requests
+                .iter()
+                .filter(|request| request.body.to_string().contains(cancellation_input))
+                .count()
+                >= 2
+            {
+                break;
+            }
+            drop(requests);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let requests = mock.requests.try_lock().unwrap();
+        panic!(
+            "fallback attempt was not dispatched; captured: {:?}",
+            requests
+                .iter()
+                .map(|request| (&request.path, &request.body))
+                .collect::<Vec<_>>()
+        )
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let known_partial: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM usage_attempts WHERE route_name = ? AND input_tokens = 13 AND output_tokens = 7",
+            )
+            .bind("responses-hidden-reasoning-fallback-route")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+            if known_partial > prior_known_partial {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("first fallback attempt's reported usage was not persisted");
+    abandoned.abort();
+    let _ = abandoned.await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while state.admission.metrics_snapshot().inflight_inferences != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("fallback cancellation did not release concurrency admission promptly");
+    let after = state.admission.metrics_snapshot();
+    assert_eq!(
+        after.reconciled_incomplete_total,
+        before.reconciled_incomplete_total + 1,
+        "unknown usage from the active fallback attempt must keep reconciliation incomplete"
+    );
+    assert_eq!(
+        after.reconciled_tokens_total, before.reconciled_tokens_total,
+        "known usage from an earlier attempt cannot stand in for the cancelled attempt"
+    );
 
     gateway_server.abort();
     server.abort();

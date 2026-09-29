@@ -60,6 +60,12 @@ take down the data plane.
 USD reservation remains unavailable when any possible target is unpriced.
 Kinetix does not invent vendor prices.
 
+The `usage_request_logs` view exposes one row per request, consolidating legacy
+per-attempt rows where necessary. New requests store their aggregate in
+`usage_logs`; `usage_attempts` stores per-attempt token and cost attribution.
+Request counts and exports use request rows; token and spend totals use attempt
+rows, with legacy request rows included when no attempt data exists.
+
 ## Usage views
 
 - **Dashboard → Usage & Spend** — spend vs budgets per key, a Today / 24h / 7d /
@@ -72,7 +78,7 @@ Kinetix does not invent vendor prices.
 
 Per-day exports are written to `$KINETIX_DATA_DIR/exports`:
 
-- `usage-<day>.jsonl` — one JSON object per usage row.
+- `usage-<day>.jsonl` - one JSON object per request.
 - `usage-<day>.csv` — a flat per-request table.
 - `summary-<day>.csv` — day totals.
 

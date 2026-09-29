@@ -629,7 +629,7 @@ async fn cmd_status(cli: &Cli) -> Result<()> {
             .fetch_one(&pool)
             .await
             .unwrap_or(0);
-        let usage: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_logs")
+        let usage: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_request_logs")
             .fetch_one(&pool)
             .await
             .unwrap_or(0);
