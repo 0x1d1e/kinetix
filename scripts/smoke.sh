@@ -53,6 +53,27 @@ check_absent() { # check_absent <label> <actual> <forbidden-substring>
   fi
 }
 
+restart_kinetix() {
+  kill "$KPID" 2>/dev/null || true
+  wait "$KPID" 2>/dev/null || true
+  KINETIX_BIND="$BIND" \
+  KINETIX_DATABASE_URL="sqlite://$DB" \
+  KINETIX_MASTER_KEY="$MASTER_KEY" \
+  KINETIX_ADMIN_TOKEN="$ADMIN_TOKEN" \
+  KINETIX_DATA_DIR="$WORK" \
+  KINETIX_ALLOW_PRIVATE_UPSTREAMS=true \
+  KINETIX_ALLOW_INSECURE_TLS=true \
+  KINETIX_BOOTSTRAP_FILE="$ROOT/scripts/smoke-bootstrap.toml" \
+  KINETIX_HOME="$WORK" \
+    ./target/release/kinetix serve >>"$LOG" 2>&1 &
+  KPID=$!
+
+  for _ in $(seq 1 60); do
+    curl -sf "http://$BIND/healthz" >/dev/null 2>&1 && return
+    sleep 0.25
+  done
+}
+
 echo "==> building release binary"
 cargo build --release --quiet || { echo "build failed"; exit 1; }
 
@@ -102,24 +123,42 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 check "client usage includes streamed request" "$CLIENT_USAGE" '"requests":1'
-check "client usage preserves unknown cost" "$CLIENT_USAGE" '"known_cost_usd":null'
+check "unknown-cost request contributes zero known subtotal" "$CLIENT_USAGE" '"known_cost_usd":0.0'
+check "unknown-cost request is counted separately" "$CLIENT_USAGE" '"unknown_cost_requests":1'
 check_absent "client usage hides serving topology" "$CLIENT_USAGE" 'serving_provider'
 check_absent "client usage hides account identity" "$CLIENT_USAGE" 'serving_account'
 
-# A failed upstream attempt is still accounted to the calling key.
-FAIL_CODE="$(curl -s --max-time 20 -o "$WORK/failure-response" -w '%{http_code}' \
-  -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $KEY" \
+# An upstream failure is accounted and consumes RPM, both live and after restart.
+FAIL_RPM_KEY="sk-kinetix-smoke-failure-rpm"
+FAIL_RPM_FIRST_CODE="$(curl -s --max-time 20 -o "$WORK/failure-rpm-first" -w '%{http_code}' \
+  -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $FAIL_RPM_KEY" \
   -H 'content-type: application/json' \
   -d '{"model":"syn-fail","stream":false,"messages":[{"role":"user","content":"fail"}]}')"
-check "failed upstream request returns gateway error" "$FAIL_CODE" '502'
+check "RPM fixture first failed request returns gateway error" "$FAIL_RPM_FIRST_CODE" '502'
+FAIL_RPM_SECOND_CODE="$(curl -s --max-time 20 -o "$WORK/failure-rpm-second" -w '%{http_code}' \
+  -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $FAIL_RPM_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"model":"syn-fail","stream":false,"messages":[{"role":"user","content":"fail"}]}')"
+check "failed request consumes live RPM slot" "$FAIL_RPM_SECOND_CODE" '429'
+
 for _ in $(seq 1 50); do
-  CLIENT_USAGE="$(curl -s "$BASE/v1/usage" -H "authorization: Bearer $KEY")"
-  [[ "$CLIENT_USAGE" == *'"requests":2'* ]] && break
+  FAIL_RPM_USAGE="$(curl -s "$BASE/v1/usage" -H "authorization: Bearer $FAIL_RPM_KEY")"
+  if python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["usage"]["daily"]["requests"] >= 1 else 1)' <<<"$FAIL_RPM_USAGE"; then
+    break
+  fi
   sleep 0.1
 done
-check "client usage includes failed request" "$CLIENT_USAGE" '"requests":2'
-check "failed request usage stays unknown" "$CLIENT_USAGE" '"unknown_usage_requests":1'
-check_absent "failed request usage hides provider topology" "$CLIENT_USAGE" 'serving_provider'
+check "failed RPM request is durably reported once" "$FAIL_RPM_USAGE" '"requests":1'
+check "failed request usage stays unknown" "$FAIL_RPM_USAGE" '"unknown_usage_requests":1'
+check_absent "failed request usage hides provider topology" "$FAIL_RPM_USAGE" 'serving_provider'
+
+restart_kinetix
+check "healthz after restart" "$(curl -s "$BASE/healthz")" '"data_plane":"serving"'
+FAIL_RPM_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/failure-rpm-after-restart" -w '%{http_code}' \
+  -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $FAIL_RPM_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"model":"syn-fail","stream":false,"messages":[{"role":"user","content":"fail"}]}')"
+check "failed request consumes RPM slot after restart" "$FAIL_RPM_RESTART_CODE" '429'
 
 # translation (OpenAI inbound -> Gemini outbound)
 TRANSL="$(curl -s -N --max-time 20 -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"model":"syn-gemini-3","stream":true,"messages":[{"role":"user","content":"hi"}]}')"

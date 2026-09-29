@@ -4088,14 +4088,16 @@ pub async fn key_usage_entries_since(
     pool: &Pool,
     key_id: &str,
     since_iso: &str,
-) -> Result<Vec<(String, i64)>> {
+) -> Result<Vec<(String, Option<i64>)>> {
+    // Keep unknown token totals as None; admission handles them conservatively
+    // instead of converting them to zero after restart.
     let rows = sqlx::query(
-        "SELECT r.ts,
-                COALESCE(a.reported_input_tokens,0) + COALESCE(a.reported_output_tokens,0) AS tokens
-         FROM usage_request_logs r
-         LEFT JOIN usage_request_accounting a ON a.request_id = r.request_id
-         WHERE r.key_id = ? AND r.ts >= ?
-         ORDER BY r.ts ASC",
+        "SELECT ts,
+                CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN NULL
+                     ELSE input_tokens + output_tokens END AS tokens
+         FROM usage_request_logs
+         WHERE key_id = ? AND ts >= ?
+         ORDER BY ts ASC",
     )
     .bind(key_id)
     .bind(since_iso)
@@ -4104,7 +4106,12 @@ pub async fn key_usage_entries_since(
 
     Ok(rows
         .into_iter()
-        .map(|row| (row.get::<String, _>("ts"), row.get::<i64, _>("tokens")))
+        .map(|row| {
+            (
+                row.get::<String, _>("ts"),
+                row.get::<Option<i64>, _>("tokens"),
+            )
+        })
         .collect())
 }
 
@@ -4128,13 +4135,14 @@ pub struct ClientUsageSummary {
     pub requests: i64,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
-    pub known_cost_usd: Option<f64>,
+    pub known_cost_usd: f64,
     pub unknown_cost_requests: i64,
     pub unknown_usage_requests: i64,
 }
 
-/// Bounded usage summary for one key over `[from, to)`. Totals remain unknown
-/// when any request in the period lacks the corresponding token count or cost.
+/// Bounded usage summary for one key over `[from, to)`. Token totals remain
+/// unknown when any request lacks the corresponding count; known cost is the
+/// numeric subtotal of priced requests, including zero when none are priced.
 pub async fn client_usage_summary(
     pool: &Pool,
     key_id: &str,
@@ -4149,11 +4157,8 @@ pub async fn client_usage_summary(
             CASE WHEN COUNT(*) = 0 THEN 0
                  WHEN SUM(CASE WHEN output_tokens IS NULL THEN 1 ELSE 0 END) = 0
                  THEN SUM(output_tokens) ELSE NULL END AS output_tokens,
-            CASE WHEN COUNT(*) = 0 THEN 0.0
-                 WHEN SUM(CASE WHEN cost_known != 0 AND cost_usd IS NOT NULL THEN 1 ELSE 0 END) = 0
-                 THEN NULL
-                 ELSE SUM(CASE WHEN cost_known != 0 AND cost_usd IS NOT NULL THEN cost_usd ELSE 0.0 END)
-            END AS known_cost_usd,
+            COALESCE(SUM(CASE WHEN cost_known != 0 AND cost_usd IS NOT NULL THEN cost_usd ELSE 0.0 END), 0.0)
+                AS known_cost_usd,
             COALESCE(SUM(CASE WHEN cost_known = 0 OR cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS unknown_cost_requests,
             COALESCE(SUM(CASE WHEN usage_confidence = 'unknown' THEN 1 ELSE 0 END), 0) AS unknown_usage_requests
          FROM usage_logs

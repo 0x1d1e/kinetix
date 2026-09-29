@@ -568,7 +568,7 @@ pub async fn client_usage(State(state): State<AppState>, headers: HeaderMap) -> 
         if summary.unknown_cost_requests > 0 {
             return None;
         }
-        Some((limit - summary.known_cost_usd?).max(0.0))
+        Some((limit - summary.known_cost_usd).max(0.0))
     };
     Json(serde_json::json!({
         "periods": {
@@ -947,6 +947,28 @@ mod client_usage_tests {
         }
         assert_eq!(body["remaining"]["daily_budget_usd"], 5.0);
         assert_eq!(body["remaining"]["monthly_budget_usd"], 50.0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unknown_cost_has_zero_known_subtotal_and_unknown_remaining_budget() {
+        let (state, root) = test_state("unknown-cost-only").await;
+        let key = test_key("unknown-cost-key", "unknown-cost-client-key", "active");
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        db::insert_usage_log(&state.pool, &usage_row(&key.id, None, None, None))
+            .await
+            .unwrap();
+        let app = crate::router::build(state.clone());
+
+        let response = request_usage(&app, "/v1/usage", Some("unknown-cost-client-key")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        for period in ["daily", "monthly"] {
+            assert_eq!(body["usage"][period]["known_cost_usd"], 0.0);
+            assert_eq!(body["usage"][period]["unknown_cost_requests"], 1);
+        }
+        assert!(body["remaining"]["daily_budget_usd"].is_null());
+        assert!(body["remaining"]["monthly_budget_usd"].is_null());
         let _ = std::fs::remove_dir_all(root);
     }
 

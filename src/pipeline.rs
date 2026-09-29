@@ -122,8 +122,8 @@ pub struct RequestMeta {
     pub cache_status: &'static str,
     pub commit_state: &'static str,
     pub session: Option<String>,
-    /// Atomic RPM/TPM/budget reservation owned by this request. A disconnect
-    /// after upstream dispatch reconciles it as incomplete instead of canceling it.
+    /// Atomic RPM/TPM/budget reservation owned by this request. A dispatched
+    /// failure or disconnect reconciles it as incomplete instead of canceling it.
     pub admission: Option<crate::admission::AdmissionReservation>,
     /// Usage and costs from failed precommit provider attempts. Persisted as
     /// per-attempt rows and included in admission reconciliation.
@@ -1983,6 +1983,14 @@ pub(crate) async fn run_with_disconnect(
                                     attempts_done,
                                 );
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
+                                enqueue_precommit_failure(
+                                    state,
+                                    &req,
+                                    &mut meta,
+                                    started,
+                                    attempts_done,
+                                    &client_error,
+                                );
                                 return Err(client_error);
                             }
                             let client_error = failure_to_error(&failure, target);
@@ -2322,7 +2330,7 @@ pub(crate) async fn run_with_disconnect(
                                 enqueue_precommit_failure(
                                     state,
                                     &req,
-                                    &meta,
+                                    &mut meta,
                                     started,
                                     attempts_done,
                                     &refresh_error,
@@ -2383,7 +2391,7 @@ pub(crate) async fn run_with_disconnect(
                     enqueue_precommit_failure(
                         state,
                         &req,
-                        &meta,
+                        &mut meta,
                         started,
                         attempts_done,
                         &client_error,
@@ -2488,6 +2496,14 @@ pub(crate) async fn run_with_disconnect(
                         attempts_done,
                     );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
+                    enqueue_precommit_failure(
+                        state,
+                        &req,
+                        &mut meta,
+                        started,
+                        attempts_done,
+                        &client_error,
+                    );
                     return Err(client_error);
                 }
                 last_error = Some(client_error);
@@ -2526,6 +2542,14 @@ pub(crate) async fn run_with_disconnect(
             started,
             failure.attempts_done,
         );
+        enqueue_precommit_failure(
+            state,
+            &req,
+            &mut meta,
+            started,
+            failure.attempts_done,
+            &failure.client_error,
+        );
     }
     state.live.finish(
         &meta.request_id,
@@ -2542,7 +2566,7 @@ pub(crate) async fn run_with_disconnect(
     }
     if let Some(error) = last_error {
         if attempts_done > 0 {
-            enqueue_precommit_failure(state, &req, &meta, started, attempts_done, &error);
+            enqueue_precommit_failure(state, &req, &mut meta, started, attempts_done, &error);
         }
         return Err(error);
     }
@@ -2569,50 +2593,57 @@ pub(crate) async fn run_with_disconnect(
 fn enqueue_precommit_failure(
     state: &AppState,
     req: &InternalRequest,
-    meta: &RequestMeta,
+    meta: &mut RequestMeta,
     started: Instant,
     attempts_done: usize,
     error: &ProxyError,
 ) {
     let retries = attempts_done.saturating_sub(1) as i64;
-    state.log_queue.enqueue(db::UsageLogRow {
-        id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
-        request_id: meta.request_id.clone(),
-        ts: db::now_iso(),
-        key_id: meta.key_id.clone(),
-        key_name: meta.key_name.clone(),
-        client_format: meta.client_format.to_string(),
-        requested_model: req.requested_model.clone(),
-        effective_model: None,
-        route_id: None,
-        route_name: None,
-        fallback_hops: retries,
-        fallback_path: "[]".into(),
-        status: "upstream_error".into(),
-        status_code: i64::from(error.http_status()),
-        latency_ms: Some(started.elapsed().as_millis() as i64),
-        ttft_ms: None,
-        input_tokens: None,
-        output_tokens: None,
-        cached_tokens: None,
-        cache_write_tokens: None,
-        thinking_tokens: None,
-        cost_usd: None,
-        cost_known: 0,
-        price_version_id: None,
-        cache_status: "bypass".into(),
-        serving_account_id: None,
-        serving_account: None,
-        serving_provider: None,
-        upstream_request_id: None,
-        flagged: 0,
-        error_message: None,
-        usage_confidence: "unknown".into(),
-        commit_state: "pre_commit".into(),
-        retry_count: retries,
-        route_trace_id: None,
-        opaque_route_id: None,
-    });
+    if !meta.accounting_enqueued.swap(true, Ordering::AcqRel) {
+        state.log_queue.enqueue(db::UsageLogRow {
+            id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
+            request_id: meta.request_id.clone(),
+            ts: db::now_iso(),
+            key_id: meta.key_id.clone(),
+            key_name: meta.key_name.clone(),
+            client_format: meta.client_format.to_string(),
+            requested_model: req.requested_model.clone(),
+            effective_model: None,
+            route_id: None,
+            route_name: None,
+            fallback_hops: retries,
+            fallback_path: "[]".into(),
+            status: "upstream_error".into(),
+            status_code: i64::from(error.http_status()),
+            latency_ms: Some(started.elapsed().as_millis() as i64),
+            ttft_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            cache_write_tokens: None,
+            thinking_tokens: None,
+            cost_usd: None,
+            cost_known: 0,
+            price_version_id: None,
+            cache_status: "bypass".into(),
+            serving_account_id: None,
+            serving_account: None,
+            serving_provider: None,
+            upstream_request_id: None,
+            flagged: 0,
+            error_message: None,
+            usage_confidence: "unknown".into(),
+            commit_state: "pre_commit".into(),
+            retry_count: retries,
+            route_trace_id: None,
+            opaque_route_id: None,
+        });
+    }
+    if meta.upstream_dispatched.load(Ordering::Acquire) {
+        if let Some(admission) = meta.admission.take() {
+            admission.reconcile_incomplete();
+        }
+    }
 }
 
 fn target_key(route: &db::RouteRow, t: &ResolvedTarget) -> String {

@@ -47,8 +47,11 @@ Inference admission is atomic per virtual key. Kinetix reserves one RPM slot,
 a conservative token allowance, and conservative priced spend before dispatch.
 Active reservations participate in later admission decisions immediately, so a
 concurrent burst cannot all observe the same stale counter. Complete provider
-usage reconciles the reservation after the request; partial/unknown usage keeps
-the conservative reservation.
+usage reconciles the reservation after the request. If token usage is unknown,
+the live TPM ledger retains the conservative pre-dispatch estimate. After a
+restart, a persisted unknown token total fails closed for the rest of that
+60-second window because the estimate is not part of reported usage. Unknown
+token values remain unknown in reports; they are never counted as zero.
 
 The in-memory ledger is seeded once from durable usage history. After that,
 usage-log writes are for reporting/accounting durability rather than admission
@@ -116,11 +119,12 @@ rows, with legacy request rows included when no attempt data exists.
 ```
 
 `usage` includes failed requests with usage rows. Token totals are `null` if any
-request in the window lacks that token count. `known_cost_usd` is the subtotal
-for priced requests; `unknown_cost_requests` counts unpriced requests, and
-remaining budgets are `null` when any request is unpriced. Unset limits are
-`null`. The endpoint never returns model, Route, provider, account, or other key
-identities.
+request in the window lacks that token count. `known_cost_usd` is the numeric
+subtotal for priced requests, including `0` when none are priced;
+`unknown_cost_requests` counts unpriced requests and signals that total spend is
+incomplete. Remaining budgets are `null` when any request is unpriced. Unset
+limits are `null`. The endpoint never returns model, Route, provider, account,
+or other key identities.
 
 ## Exports (JSONL + CSV)
 

@@ -217,7 +217,8 @@ struct KeyLedger {
 
 struct MinuteUse {
     at: Instant,
-    tokens: u64,
+    // Unknown persisted usage blocks TPM admission for the rest of this window.
+    tokens: Option<u64>,
 }
 
 struct ActiveReservation {
@@ -244,6 +245,7 @@ pub struct AdmissionReservation {
 }
 
 impl AdmissionReservation {
+    /// Settle the request count and retain its conservative token estimate.
     pub(crate) fn reconcile_incomplete(self) {
         self.reconcile(&TokenUsage::default(), None);
     }
@@ -430,7 +432,8 @@ impl AdmissionController {
                         .min(MINUTE_WINDOW);
                     ledger.minute.push_back(MinuteUse {
                         at: instant_now.checked_sub(age).unwrap_or(instant_now),
-                        tokens: tokens.max(0) as u64,
+                        // Keep persisted unknown token counts unknown.
+                        tokens: tokens.map(|tokens| tokens.max(0) as u64),
                     });
                 }
             }
@@ -539,7 +542,11 @@ impl KeyLedger {
         let month = (now_wall.year(), now_wall.month());
 
         let mut requests = self.minute.len() as u64;
-        let mut tokens: u64 = self.minute.iter().map(|entry| entry.tokens).sum();
+        let mut tokens = self.minute.iter().fold(0_u64, |total, entry| {
+            entry
+                .tokens
+                .map_or(u64::MAX, |tokens| total.saturating_add(tokens))
+        });
         let mut daily = self.daily_spend;
         let mut monthly = self.monthly_spend;
 
@@ -711,7 +718,7 @@ impl KeyLedger {
         if now.saturating_duration_since(active.at) < MINUTE_WINDOW {
             self.minute.push_back(MinuteUse {
                 at: active.at,
-                tokens,
+                tokens: Some(tokens),
             });
         }
 
@@ -1086,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_usage_keeps_conservative_reservation() {
+    fn incomplete_usage_keeps_the_live_tpm_estimate() {
         let (controller, entry) = initialized_controller();
         let mut key = key();
         key.tpm_limit = Some(100);
@@ -1100,23 +1107,59 @@ mod tests {
                 },
             )
             .unwrap();
-        reservation.reconcile(
-            &TokenUsage {
-                input: Some(10),
-                output: None,
-                ..Default::default()
-            },
-            None,
-        );
+        reservation.reconcile_incomplete();
         let second = controller.reserve_initialized(
             entry,
             &key,
             AdmissionEstimate {
-                tokens: 30,
+                tokens: 20,
                 cost: Some(0.1),
             },
         );
-        assert!(second.is_err());
+        assert!(second.is_ok());
+    }
+
+    #[tokio::test]
+    async fn persisted_unknown_tokens_fail_closed_for_tpm() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-admission-unknown-tokens-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = db::connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+            .await
+            .unwrap();
+        db::migrate(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs
+             (id, request_id, ts, key_id, client_format, requested_model, status, status_code)
+             VALUES (?, ?, ?, ?, 'openai', 'model', 'upstream_error', 502)",
+        )
+        .bind("failed-request")
+        .bind("failed-request")
+        .bind(db::now_iso())
+        .bind("key")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let controller = AdmissionController::default();
+        let entry = controller.entry("key");
+        controller.ensure_initialized(&pool, "key", &entry).await;
+        let mut key = key();
+        key.tpm_limit = Some(100);
+        let next = controller.reserve_initialized(
+            entry,
+            &key,
+            AdmissionEstimate {
+                tokens: 1,
+                cost: None,
+            },
+        );
+        assert!(next.is_err());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
