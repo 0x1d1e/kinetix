@@ -17076,6 +17076,94 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn legacy_cached_discovery_imports_without_observed_at() {
+        let (state, root) = test_state("legacy-discovery-import").await;
+        let provider_id = "provider-legacy-discovery";
+        sqlx::query(
+            "INSERT INTO providers (id, name, base_url, wire_format, auth_scheme, created_at)
+             VALUES (?, 'Provider', 'https://example.test', 'openai', 'bearer', ?)",
+        )
+        .bind(provider_id)
+        .bind(db::now_iso())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        persist_provider_discovery_observations(
+            &state.pool,
+            provider_id,
+            &json!({
+                "models": [{
+                    "id": "legacy-cache-model",
+                    "display_name": "Legacy Cache Model",
+                    "context_window": 4096,
+                    "capabilities": {"text": true},
+                    "execution_supported": true
+                }],
+                "disappeared": []
+            }),
+        )
+        .await
+        .unwrap();
+
+        let cached = cached_model_discovery(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(provider_id.into()),
+        )
+        .await
+        .unwrap();
+        let cached_model = &cached.0["models"][0];
+        assert!(cached_model.get("observed_at").is_none());
+        let mut discovery = json!({
+            "context_window": cached_model["context_window"],
+            "capabilities": cached_model["capabilities"],
+            "execution_supported": cached_model["execution_supported"],
+            "imported_from_discovery": true
+        });
+        if let Some(observed_at) = cached_model.get("observed_at") {
+            discovery["observed_at"] = observed_at.clone();
+        }
+        assert!(discovery.get("observed_at").is_none());
+        let result = create_model(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(provider_id.into()),
+            Json(ModelBody {
+                upstream_id: cached_model["id"].as_str().unwrap().into(),
+                display_name: cached_model["display_name"].as_str().map(str::to_string),
+                enabled: true,
+                context_window: cached_model["context_window"].as_i64(),
+                max_output_tokens: None,
+                capabilities: cached_model["capabilities"].clone(),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery,
+                transport_override: None,
+            }),
+        )
+        .await;
+        let created = result.unwrap_or_else(|error| {
+            panic!("legacy cached model import failed: {error:?}");
+        });
+        let model_id = created.0["id"].as_str().unwrap();
+        assert!(db::get_model(&state.pool, model_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn malformed_import_observations_are_rejected_before_model_creation() {
         let (state, root) = test_state("invalid-observation-import").await;
         let provider_id = "provider-invalid-observation-import";
