@@ -1029,15 +1029,17 @@ pub async fn set_account_status(
     Ok(())
 }
 
-/// Recover cooldown, quota, and circuit state after a valid upstream response.
-/// Disabled credentials remain disabled; the caller does not own that state.
+/// Clear circuit-breaker state after a valid upstream response. Successful
+/// traffic must not erase a newer cooldown, quota reset, or other lifecycle state.
 pub async fn recover_account_after_success(pool: &Pool, id: &str) -> Result<bool> {
     let result = sqlx::query(
-        "UPDATE accounts SET status='healthy', status_reason='recovered', status_changed_at=?, \
-         cooldown_until=NULL, quota_reset_at=NULL, last_error=NULL, \
+        "UPDATE accounts SET \
+         status_reason=CASE WHEN status='healthy' AND circuit_open_until IS NOT NULL AND status_reason='circuit_open' THEN 'circuit_recovered' ELSE status_reason END, \
+         status_changed_at=CASE WHEN status='healthy' AND circuit_open_until IS NOT NULL AND status_reason='circuit_open' THEN ? ELSE status_changed_at END, \
+         last_error=CASE WHEN status='healthy' THEN NULL ELSE last_error END, \
          circuit_open_until=NULL, consecutive_failures=0 \
          WHERE id=? AND status != 'disabled' \
-         AND (status != 'healthy' OR circuit_open_until IS NOT NULL)",
+         AND (circuit_open_until IS NOT NULL OR consecutive_failures != 0)",
     )
     .bind(now_iso())
     .bind(id)
@@ -3445,6 +3447,159 @@ mod price_version_identity_tests {
         assert_eq!(versions, 0);
 
         drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod account_success_recovery_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::sync::oneshot;
+
+    async fn recovery_account(tag: &str) -> (Pool, String, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-account-recovery-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}", root.join("kinetix.db").display());
+        let pool = connect(&database_url).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let provider_id = insert_provider(
+            &pool,
+            &NewProvider {
+                name: "recovery-test",
+                base_url: "https://example.invalid/v1",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let account_id = insert_account(
+            &pool,
+            &provider_id,
+            "recovery-test",
+            "encrypted",
+            "key…",
+            1,
+            1,
+            None,
+            "",
+        )
+        .await
+        .unwrap();
+        (pool, account_id, root)
+    }
+
+    async fn stale_success_after_failure_transition(
+        tag: &str,
+        status: &str,
+        reason: &str,
+        cooldown_until: Option<String>,
+        quota_reset_at: Option<String>,
+    ) {
+        let (pool, account_id, root) = recovery_account(tag).await;
+        let (started_tx, started_rx) = oneshot::channel();
+        let (continue_tx, continue_rx) = oneshot::channel();
+        let success_pool = pool.clone();
+        let success_account_id = account_id.clone();
+        let success = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            continue_rx.await.unwrap();
+            recover_account_after_success(&success_pool, &success_account_id)
+                .await
+                .unwrap()
+        });
+
+        // Model a request already in flight before another request records its
+        // newer lifecycle transition; let its 2xx recovery run afterward.
+        started_rx.await.unwrap();
+        set_account_status(
+            &pool,
+            &account_id,
+            status,
+            reason,
+            cooldown_until.as_deref(),
+            quota_reset_at.as_deref(),
+            Some("newer failure"),
+        )
+        .await
+        .unwrap();
+        continue_tx.send(()).unwrap();
+
+        assert!(!success.await.unwrap());
+        let account = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert_eq!(account.status, status);
+        assert_eq!(account.status_reason, reason);
+        assert_eq!(account.cooldown_until, cooldown_until);
+        assert_eq!(account.quota_reset_at, quota_reset_at);
+        assert_eq!(account.last_error.as_deref(), Some("newer failure"));
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn in_flight_success_does_not_clear_newer_rate_limit_cooldown() {
+        stale_success_after_failure_transition(
+            "rate-limit",
+            "cooldown",
+            "rate_limited",
+            Some((Utc::now() + chrono::Duration::minutes(1)).to_rfc3339()),
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn in_flight_success_does_not_clear_newer_quota_reset() {
+        stale_success_after_failure_transition(
+            "quota",
+            "exhausted",
+            "account_quota_exhausted",
+            None,
+            Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn success_clears_circuit_state_without_rewriting_account_status() {
+        let (pool, account_id, root) = recovery_account("circuit").await;
+        record_account_failure(&pool, &account_id, 1, 30)
+            .await
+            .unwrap();
+
+        assert!(recover_account_after_success(&pool, &account_id)
+            .await
+            .unwrap());
+        let account = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert_eq!(account.status, "healthy");
+        assert_eq!(account.status_reason, "circuit_recovered");
+        assert!(account.circuit_open_until.is_none());
+        assert_eq!(account.consecutive_failures, 0);
+        assert!(account.cooldown_until.is_none());
+        assert!(account.quota_reset_at.is_none());
+
+        pool.close().await;
         let _ = std::fs::remove_dir_all(root);
     }
 }

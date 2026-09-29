@@ -75,6 +75,14 @@ async fn upstream(
     });
 
     match test_case.as_str() {
+        "timeout" => {
+            tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        }
         "stream_refusal" => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
@@ -571,7 +579,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
         json!({"top_k": 23}),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected_top_k}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected_top_k}");
 
     let (status, route_override) = call_responses(
         &state,
@@ -673,8 +681,18 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
     );
     assert_eq!(translated_full["tools"][0]["name"], "weather");
 
+    let (status, timeout_body) = call_responses(
+        &state,
+        "mock-openai-responses/upstream-responses-model",
+        "timeout",
+        false,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{timeout_body}");
+
     let requests = mock.requests.lock().await;
-    assert_eq!(requests.len(), 11);
+    assert_eq!(requests.len(), 12);
     for (request, test_case) in requests
         .iter()
         .take(2)
@@ -733,6 +751,8 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
         requests[10].body.pointer("/messages/0/content/0/text"),
         Some(&json!("case:translated_full"))
     );
+    assert_eq!(requests[11].body["model"], UPSTREAM_MODEL);
+    assert_eq!(requests[11].body["input"], "case:timeout");
 
     server.abort();
     let _ = std::fs::remove_dir_all(&root);

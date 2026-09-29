@@ -1072,7 +1072,7 @@ pub async fn run(
             // decides whether the Route policy allows proceeding.
             let placeholder = adapter.opaque_state_placeholder(&target.model);
             if let Some(route) = &route {
-                apply_portability(
+                if let Err(error) = apply_portability(
                     &mut target_req,
                     route,
                     target,
@@ -1080,7 +1080,17 @@ pub async fn run(
                     &opaque_report,
                     placeholder,
                     &mut trace,
-                )?;
+                ) {
+                    return Err(finish_policy_rejection(
+                        state,
+                        &meta,
+                        &mut trace,
+                        Some(target.account.label.clone()),
+                        error.message,
+                        started,
+                    )
+                    .await);
+                }
             } else if let Some(placeholder) =
                 placeholder.filter(|_| opaque_report.nonportable() && !inline_opaque)
             {
@@ -1097,9 +1107,17 @@ pub async fn run(
             } else if inline_opaque || opaque_report.nonportable() {
                 // A direct target with no Route policy must not silently drop
                 // known non-portable continuation state (§24).
-                return Err(ProxyError::unsupported(
-                    "non-portable provider continuation state cannot be sent to a direct cross-format target",
-                ));
+                return Err(
+                    finish_policy_rejection(
+                        state,
+                        &meta,
+                        &mut trace,
+                        Some(target.account.label.clone()),
+                        "non-portable provider continuation state cannot be sent to a direct cross-format target",
+                        started,
+                    )
+                    .await,
+                );
             }
         }
 
@@ -1152,13 +1170,16 @@ pub async fn run(
         };
 
         // Parameter policy reject (FR-10.6): a request-level failure, never retried.
-        if let Err(e) = check_param_policy(target, &profile, &target_req) {
-            trace.finish("rejected");
-            state
-                .live
-                .finish(&meta.request_id, "rejected", 0, None, None);
-            let _ = db::insert_route_trace(&state.pool, &trace).await;
-            return Err(e);
+        if let Err(error) = check_param_policy(target, &profile, &target_req) {
+            return Err(finish_policy_rejection(
+                state,
+                &meta,
+                &mut trace,
+                Some(target.account.label.clone()),
+                error.message,
+                started,
+            )
+            .await);
         }
 
         // Same-format passthrough (FR-2.7).
@@ -1169,25 +1190,28 @@ pub async fn run(
         // translating path (FR-2.8). A request-level failure; never retried.
         if !use_passthrough {
             if let Some(msg) = crate::frontends::translation_unsupported(&target_req.extra) {
-                trace.finish("rejected");
-                state
-                    .live
-                    .finish(&meta.request_id, "rejected", 0, None, None);
-                let _ = db::insert_route_trace(&state.pool, &trace).await;
-                return Err(ProxyError::new(
-                    crate::types::ErrorKind::Unsupported,
+                return Err(finish_policy_rejection(
+                    state,
+                    &meta,
+                    &mut trace,
+                    Some(target.account.label.clone()),
                     format!("request uses a feature that cannot be translated: {msg}"),
-                ));
+                    started,
+                )
+                .await);
             }
             if let Err(error) =
                 check_resolved_thinking_translation(adapter.as_ref(), target, &profile, &target_req)
             {
-                trace.finish("rejected");
-                state
-                    .live
-                    .finish(&meta.request_id, "rejected", 0, None, None);
-                let _ = db::insert_route_trace(&state.pool, &trace).await;
-                return Err(error);
+                return Err(finish_policy_rejection(
+                    state,
+                    &meta,
+                    &mut trace,
+                    Some(target.account.label.clone()),
+                    error.message,
+                    started,
+                )
+                .await);
             }
         }
 
@@ -1445,8 +1469,9 @@ pub async fn run(
                         "upstream_validated",
                         if prepared.is_sse { "sse" } else { "json" },
                     );
-                    // Only validated responses clear the circuit-breaker counter.
-                    let _ = pool::recover_after_success(&state.pool, &target.account.id).await;
+                    // A validated response may recover circuit state, but never
+                    // overwrite a newer cooldown/quota transition.
+                    recover_successful_account(state, &target.account.id).await;
                     let provider_circuit_transition =
                         mark_provider_probe_validated(&provider_attempt);
                     let attempt = Attempt {
@@ -2779,14 +2804,70 @@ fn apply_header_reset_to_rate_limit(
     failure
 }
 
+async fn recover_successful_account(state: &AppState, account_id: &str) {
+    match pool::recover_after_success(&state.pool, account_id).await {
+        Ok(true) => {
+            if let Err(error) = state.registry.reload(&state.pool).await {
+                tracing::warn!(
+                    account = %account_id,
+                    %error,
+                    "account circuit recovered but registry reload failed"
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            account = %account_id,
+            %error,
+            "failed to recover account circuit after successful response"
+        ),
+    }
+}
+
+fn policy_rejection(
+    trace: &mut RouteTrace,
+    target: Option<String>,
+    message: impl Into<String>,
+) -> ProxyError {
+    let message = message.into();
+    trace.failure(target, message.clone(), FailureKind::PolicyRejected, None);
+    let mut error = ProxyError::bad_request(message);
+    error.http_status_override = FailureKind::PolicyRejected.client_status(None);
+    error
+}
+
+async fn finish_policy_rejection(
+    state: &AppState,
+    meta: &RequestMeta,
+    trace: &mut RouteTrace,
+    target: Option<String>,
+    message: impl Into<String>,
+    started: Instant,
+) -> ProxyError {
+    let error = policy_rejection(trace, target, message);
+    trace.finish("rejected");
+    state.live.finish(
+        &meta.request_id,
+        "rejected",
+        started.elapsed().as_millis() as u64,
+        None,
+        None,
+    );
+    let _ = db::insert_route_trace(&state.pool, trace).await;
+    error
+}
+
 fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> ProxyError {
     match failure.kind {
         FailureKind::RateLimit | FailureKind::QuotaExhausted => ProxyError::rate_limited(
             failure.message.clone(),
             failure.kind.retry_after_secs(failure),
         ),
-        FailureKind::BadRequest | FailureKind::PolicyRejected => {
-            ProxyError::bad_request(failure.message.clone())
+        FailureKind::BadRequest => ProxyError::bad_request(failure.message.clone()),
+        FailureKind::PolicyRejected => {
+            let mut error = ProxyError::bad_request(failure.message.clone());
+            error.http_status_override = failure.kind.client_status(failure.status);
+            error
         }
         FailureKind::AuthError => ProxyError::upstream(format!(
             "upstream authentication failed for provider '{}'",
@@ -2799,7 +2880,11 @@ fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> Proxy
             Some(404) => ProxyError::not_found(failure.message.clone()),
             _ => ProxyError::upstream(failure.message.clone()),
         },
-        FailureKind::Timeout => ProxyError::upstream("upstream request timed out".to_string()),
+        FailureKind::Timeout => {
+            let mut error = ProxyError::upstream("upstream request timed out".to_string());
+            error.http_status_override = failure.kind.client_status(failure.status);
+            error
+        }
         FailureKind::ConnectionError
         | FailureKind::ServerError
         | FailureKind::MalformedUpstream
@@ -5605,6 +5690,36 @@ mod route_policy_tests {
         }
     }
 
+    #[test]
+    fn final_direct_timeout_uses_the_shared_policy_status() {
+        let error = failure_to_error(&timeout_failure("timed out"), &target());
+        assert_eq!(
+            error.http_status(),
+            FailureKind::Timeout.policy().client_status.unwrap()
+        );
+        assert_eq!(error.http_status(), 504);
+    }
+
+    #[test]
+    fn host_policy_rejection_has_structured_trace_and_policy_status() {
+        let mut trace = RouteTrace::new("req_test".into(), "model".into());
+        let error = policy_rejection(
+            &mut trace,
+            Some("account-test".into()),
+            "request feature is unsupported",
+        );
+
+        assert_eq!(error.http_status(), 400);
+        let step = trace.steps.last().unwrap();
+        assert_eq!(step.failure_kind.as_deref(), Some("policy_rejected"));
+        assert_eq!(step.failure_category.as_deref(), Some("policy_rejection"));
+        assert_eq!(step.failure_reason.as_deref(), Some("policy_rejected"));
+        assert_eq!(step.fallback_rule.as_deref(), Some("never"));
+        assert_eq!(step.account_health_effect.as_deref(), Some("none"));
+        assert_eq!(step.client_status, Some(400));
+        assert_eq!(step.retry_hint.as_deref(), Some("none"));
+    }
+
     fn route(triggers: Value) -> db::RouteRow {
         db::RouteRow {
             id: "route_test".into(),
@@ -6437,6 +6552,45 @@ mod route_policy_tests {
         state.registry.reload(&state.pool).await.unwrap();
 
         (state, root, provider_id, model_id, account_ids)
+    }
+
+    #[tokio::test]
+    async fn successful_recovery_reloads_registry_only_after_a_transition() {
+        let (state, root, _, _, account_ids) = adaptive_dry_run_state().await;
+        let account_id = &account_ids[0];
+
+        sqlx::query("UPDATE accounts SET last_probe_at='db-only' WHERE id=?")
+            .bind(account_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        recover_successful_account(&state, account_id).await;
+        assert!(state
+            .registry
+            .account(account_id)
+            .unwrap()
+            .last_probe_at
+            .is_none());
+
+        db::record_account_failure(&state.pool, account_id, 1, 30)
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        assert!(state
+            .registry
+            .account(account_id)
+            .unwrap()
+            .circuit_open_until
+            .is_some());
+
+        recover_successful_account(&state, account_id).await;
+        let recovered = state.registry.account(account_id).unwrap();
+        assert!(recovered.circuit_open_until.is_none());
+        assert_eq!(recovered.consecutive_failures, 0);
+        assert_eq!(recovered.last_probe_at.as_deref(), Some("db-only"));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

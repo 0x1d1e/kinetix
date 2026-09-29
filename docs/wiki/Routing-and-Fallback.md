@@ -138,7 +138,7 @@ Plugins implementing the `RoutingFactProvider` capability can export typed facts
   Anthropic: a single terminal `error` event). Nothing is silently spliced.
 - The attempt loop is bounded by `max_attempts` (default 5, capped) and a 30-second
   pre-commit deadline, with bounded backoff between attempts (100 ms → 1 s).
-Native adapters and plugins normalize failures to the same kinds:
+The host, native adapters, and plugins use the same failure kinds:
 `rate_limit`, `quota_exhausted`, `auth_error`, `target_error`, `server_error`,
 `connection_error`, `timeout`, `bad_request`, `malformed_upstream`,
 `plugin_failure`, `policy_rejected`, and `client_cancelled`.
@@ -154,6 +154,8 @@ Native adapters and plugins normalize failures to the same kinds:
 | `plugin_failure` | No provider/account health effect. | `on5xx` (enabled by default). | 502 |
 | `bad_request`, `policy_rejected` | No account state change. | Never. | 400 |
 | `client_cancelled` | No provider/plugin health effect. | Never. | No error response |
+
+Core portability, parameter-policy, unsupported-translation, and thinking-translation rejections are traced as `policy_rejected` and return 400. Other unsupported model or configuration responses retain their own status. Route Trace records the shared failure policy fields for these host rejections too.
 
 A Route can disable the `on429`, `onQuota`, `on5xx`, and `onTimeout` triggers;
 missing triggers default to enabled. Auth and target-local failures remain eligible
