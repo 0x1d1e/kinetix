@@ -11017,6 +11017,7 @@ where
     let all_accounts = snapshot.accounts;
     let mut portable_account_refs = std::collections::HashMap::new();
     let mut noauth_account_refs = std::collections::HashMap::new();
+    let mut noauth_account_disabled = std::collections::HashMap::new();
     let mut account_index = 0;
     let mut noauth_index = 0;
     for account in &all_accounts {
@@ -11025,6 +11026,8 @@ where
             let reference = format!("noauth-account-{noauth_index}");
             portable_account_refs.insert(account.id.clone(), reference.clone());
             noauth_account_refs.insert(account.provider_id.clone(), reference);
+            noauth_account_disabled
+                .insert(account.provider_id.clone(), account.status == "disabled");
         } else {
             account_index += 1;
             portable_account_refs.insert(account.id.clone(), format!("account-{account_index}"));
@@ -11066,6 +11069,7 @@ where
             "name": p.name,
             "base_url": p.base_url,
             "noauth_account_ref": noauth_account_refs.get(&p.id),
+            "noauth_account_disabled": noauth_account_disabled.get(&p.id).copied().unwrap_or(false),
             "wire_format": p.wire_format,
             "auth_scheme": p.auth_scheme,
             "custom_header_name": p.custom_header_name,
@@ -12604,13 +12608,21 @@ async fn import_config_apply(
     }
 
     for provider in providers {
+        let name = provider["name"].as_str().unwrap_or("");
+        if provider
+            .get("noauth_account_disabled")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            problems.push(format!(
+                "provider '{name}' noauth_account_disabled must be a boolean"
+            ));
+        }
         let Some(value) = provider.get("noauth_account_ref") else {
             continue;
         };
         if value.is_null() {
             continue;
         }
-        let name = provider["name"].as_str().unwrap_or("");
         let Some(reference) = value.as_str() else {
             problems.push(format!(
                 "provider '{name}' noauth_account_ref must be a string or null"
@@ -12696,7 +12708,16 @@ async fn import_config_apply(
         let target_bodies: Vec<RouteTargetBody> = target_values
             .iter()
             .map(|target| RouteTargetBody {
-                account_id: None,
+                account_id: target
+                    .get("account_ref")
+                    .filter(|value| !value.is_null())
+                    .and_then(Value::as_str)
+                    .map(|reference| format!("account-ref:{reference}"))
+                    .or_else(|| {
+                        target["account_id"]
+                            .as_str()
+                            .map(|account_id| format!("account-id:{account_id}"))
+                    }),
                 model_id: target["model"].as_str().unwrap_or("").to_string(),
                 priority: target["priority"].as_i64().unwrap_or(1),
                 weight: target["weight"].as_i64().unwrap_or(1),
@@ -12886,12 +12907,15 @@ async fn import_config_apply(
         .iter()
         .map(|provider| (provider.name.clone(), provider.credential_mode.clone()))
         .collect();
-    let noauth_account_refs_by_provider: Vec<(String, String)> = providers
+    let noauth_account_refs_by_provider: Vec<(String, String, bool)> = providers
         .iter()
         .filter_map(|provider| {
             Some((
                 provider["name"].as_str()?.to_string(),
                 provider["noauth_account_ref"].as_str()?.to_string(),
+                provider["noauth_account_disabled"]
+                    .as_bool()
+                    .unwrap_or(false),
             ))
         })
         .collect();
@@ -13138,7 +13162,7 @@ async fn import_config_apply(
         .map_err(ApiError::internal)?;
         account_ids_by_ref.insert(reference, account_id);
     }
-    for (provider_name, reference) in noauth_account_refs_by_provider {
+    for (provider_name, reference, noauth_disabled) in noauth_account_refs_by_provider {
         if !provider_modes
             .get(&provider_name)
             .is_some_and(|mode| mode == "none")
@@ -13156,6 +13180,28 @@ async fn import_config_apply(
         .await
         .map_err(ApiError::internal)?
         {
+            if noauth_disabled {
+                let (priority, weight, soft_quota_usd, quota_type, quota_window_s) =
+                    sqlx::query_as::<_, (i64, i64, Option<f64>, String, Option<i64>)>(
+                        "SELECT priority, weight, soft_quota_usd, quota_type, quota_window_s FROM accounts WHERE id=?",
+                    )
+                    .bind(&account_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(ApiError::internal)?;
+                db::update_account_policy_in_transaction(
+                    &mut tx,
+                    &account_id,
+                    false,
+                    priority,
+                    weight,
+                    soft_quota_usd,
+                    &quota_type,
+                    quota_window_s,
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            }
             account_ids_by_ref.insert(reference, account_id);
         }
     }
@@ -24318,6 +24364,17 @@ mod credential_enrollment_regression_tests {
             .into_iter()
             .find(|account| account.label == "__kinetix_noauth__")
             .unwrap();
+        db::set_account_status(
+            &source.pool,
+            &noauth_account.id,
+            "disabled",
+            "operator_disabled",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let route_id = db::insert_route(
             &source.pool,
             &db::NewRoute {
@@ -24379,6 +24436,7 @@ mod credential_enrollment_regression_tests {
         assert_eq!(public["credential_mode"], "none");
         assert_eq!(public["source_plugin_id"], "plugin.public");
         assert_eq!(public["source_integration_id"], "public");
+        assert_eq!(public["noauth_account_disabled"], true);
         assert!(exported["accounts"]
             .as_array()
             .unwrap()
@@ -24475,11 +24533,12 @@ mod credential_enrollment_regression_tests {
             _ => panic!("expected an imported route"),
         }
 
-        let public_accounts = db::accounts_for_provider(&target.pool, &public.id)
+        let public_accounts = db::list_accounts_for_provider(&target.pool, &public.id)
             .await
             .unwrap();
         assert_eq!(public_accounts.len(), 1);
         assert_eq!(public_accounts[0].label, "__kinetix_noauth__");
+        assert_eq!(public_accounts[0].status, "disabled");
         assert_eq!(
             imported_route_targets[0].account_id.as_deref(),
             Some(public_accounts[0].id.as_str())
@@ -24497,7 +24556,7 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
-    async fn config_export_import_remaps_pinned_account_for_fresh_install() {
+    async fn config_export_import_preserves_pinned_disabled_account_for_fresh_install() {
         let (source, source_root) = test_state("pinned-account-export-source").await;
         let provider_id = db::insert_provider(
             &source.pool,
@@ -24559,6 +24618,17 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
+        db::set_account_status(
+            &source.pool,
+            &account_id,
+            "disabled",
+            "operator_disabled",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let route_id = db::insert_route(
             &source.pool,
             &db::NewRoute {
@@ -24606,6 +24676,7 @@ mod credential_enrollment_regression_tests {
         let account_ref = exported["accounts"][0]["ref"]
             .as_str()
             .expect("portable account reference");
+        assert_eq!(exported["accounts"][0]["status"], "disabled");
         assert_eq!(
             exported["routes"][0]["targets"][0]["account_ref"],
             account_ref
@@ -24632,13 +24703,14 @@ mod credential_enrollment_regression_tests {
             .into_iter()
             .find(|provider| provider.name == "portable-pinned-provider")
             .unwrap();
-        let imported_account = db::accounts_for_provider(&target.pool, &imported_provider.id)
+        let imported_account = db::list_accounts_for_provider(&target.pool, &imported_provider.id)
             .await
             .unwrap()
             .into_iter()
             .find(|account| account.label == "primary")
             .unwrap();
         assert_ne!(imported_account.id, account_id);
+        assert_eq!(imported_account.status, "disabled");
         assert_eq!(
             target.crypto.decrypt(&imported_account.secret_enc).unwrap(),
             "portable-secret"

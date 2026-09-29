@@ -227,12 +227,15 @@ pub async fn validate(state: &AppState, config: &RouteConfig) -> anyhow::Result<
                     Vec::new()
                 }
                 Some(account) if account.status == "disabled" => {
-                    result.error(
+                    result.warning(
                         "disabled_account",
-                        format!("pinned account '{}' is disabled", account.label),
+                        format!(
+                            "pinned account '{}' is disabled; this target remains non-dispatchable",
+                            account.label
+                        ),
                         Some(index),
                     );
-                    Vec::new()
+                    vec![account]
                 }
                 Some(account) => vec![account],
             },
@@ -274,7 +277,7 @@ pub async fn validate(state: &AppState, config: &RouteConfig) -> anyhow::Result<
 
         let mut valid_profiles = 0;
         for account in candidate_accounts {
-            if account.status != "healthy" {
+            if account.status != "healthy" && account.status != "disabled" {
                 result.warning(
                     "account_temporarily_unavailable",
                     format!(
