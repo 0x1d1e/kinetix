@@ -2005,6 +2005,7 @@ struct DiscoveredObservation {
     reasoning: Option<crate::adapters::ReasoningCapability>,
     thinking_map: Option<ThinkingMap>,
     capabilities: ModelCapabilityFlags,
+    model_capabilities: Option<Value>,
     capability_sources: Value,
     modalities: Option<Value>,
     prices: Prices,
@@ -2086,6 +2087,10 @@ fn provider_capability_flags(metadata: &Value) -> ModelCapabilityFlags {
                 "/tools/supported",
             ],
         ),
+        parallel_tools: first_bool(
+            metadata,
+            &["/capabilities/parallel_tools", "/parallel_tools/supported"],
+        ),
         structured_output: first_bool(
             metadata,
             &[
@@ -2108,6 +2113,9 @@ fn overlay_capability_flags(base: &mut ModelCapabilityFlags, overlay: &ModelCapa
     }
     if overlay.tool_calling.is_some() {
         base.tool_calling = overlay.tool_calling;
+    }
+    if overlay.parallel_tools.is_some() {
+        base.parallel_tools = overlay.parallel_tools;
     }
     if overlay.structured_output.is_some() {
         base.structured_output = overlay.structured_output;
@@ -2247,6 +2255,9 @@ fn discovered_observation_with_catalog(
         capability.mode.is_some() || !capability.levels.is_empty() || capability.default.is_some()
     }
 
+    let model_capabilities = fallback_metadata
+        .as_ref()
+        .and_then(crate::adapters::validated_model_capabilities_v3);
     let plugin_identity_metadata = fallback_metadata.as_ref().and_then(plugin_identity);
     let provider_variant = fallback_metadata.as_ref().and_then(plugin_provider_variant);
     let opaque_state = fallback_metadata
@@ -2562,6 +2573,12 @@ fn discovered_observation_with_catalog(
             catalog_flags.tool_calling,
             catalog_tools_source.as_deref(),
         ),
+        "parallel_tools": capability_source(
+            provider_flags.parallel_tools,
+            plugin_flags.parallel_tools,
+            catalog_flags.parallel_tools,
+            None,
+        ),
         "structured_output": capability_source(
             provider_flags.structured_output,
             plugin_flags.structured_output,
@@ -2603,6 +2620,7 @@ fn discovered_observation_with_catalog(
         reasoning,
         thinking_map,
         capabilities,
+        model_capabilities,
         capability_sources,
         modalities,
         prices,
@@ -2628,6 +2646,7 @@ fn discovered_capabilities(observation: &DiscoveredObservation) -> Value {
         "reasoning": observation.capabilities.reasoning,
         "vision": observation.capabilities.vision,
         "tool_calling": observation.capabilities.tool_calling,
+        "parallel_tools": observation.capabilities.parallel_tools,
         "structured_output": observation.capabilities.structured_output,
     })
 }
@@ -2705,6 +2724,7 @@ fn set_observed_capability(
         "reasoning" => capabilities.reasoning = value,
         "vision" => capabilities.vision = value,
         "tool_calling" => capabilities.tool_calling = value,
+        "parallel_tools" => capabilities.parallel_tools = value,
         "structured_output" => capabilities.structured_output = value,
         _ => {}
     }
@@ -2756,6 +2776,7 @@ fn preserve_last_known_catalog_observation(
         "reasoning",
         "vision",
         "tool_calling",
+        "parallel_tools",
         "structured_output",
     ] {
         let previous_source = previous_sources.get(field);
@@ -3477,6 +3498,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                         "max_output_tokens": m.max_output_tokens,
                         "display_name": m.display_name,
                         "capabilities": discovered_capabilities(observation),
+                        "model_capabilities": &observation.model_capabilities,
                         "reasoning_capability": &observation.reasoning,
                         "thinking_map": &observation.thinking_map,
                         "transport": observation
@@ -3526,6 +3548,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
             "context_window": m.context_window,
             "max_output_tokens": m.max_output_tokens,
             "capabilities": discovered_capabilities(observation),
+            "model_capabilities": &observation.model_capabilities,
             "reasoning_capability": &observation.reasoning,
             "thinking_map": &observation.thinking_map,
             "transport": &observation.transport,
@@ -12183,6 +12206,7 @@ async fn reconcile_provider_integration_semantics(
     credential_mode: crate::plugins::CredentialMode,
     source_plugin_id: &str,
     source_integration_id: &str,
+    features: Option<&crate::plugins::types::IntegrationFeaturesV1>,
     pricing_scope: crate::plugins::PricingScope,
 ) -> Result<(), ApiError> {
     let lock = model_reconciliation_lock(provider_id);
@@ -12229,6 +12253,9 @@ async fn reconcile_provider_integration_semantics(
     )
     .await
     .map_err(ApiError::internal)?;
+    db::set_provider_integration_features(&state.pool, provider_id, features)
+        .await
+        .map_err(ApiError::internal)?;
     reconcile_provider_account_mode(state, provider_id, credential_mode).await
 }
 
@@ -12291,6 +12318,7 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                 credential_mode,
                 id,
                 &integration.id,
+                integration.features.as_ref(),
                 template.pricing_scope,
             )
             .await
@@ -12358,6 +12386,7 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                 credential_mode,
                 id,
                 &integration.id,
+                integration.features.as_ref(),
                 template.pricing_scope,
             )
             .await
@@ -12980,6 +13009,7 @@ pub async fn setup_plugin_integration_provider(
             credential_mode,
             &id,
             &integration.id,
+            integration.features.as_ref(),
             template.pricing_scope,
         )
         .await?;
@@ -13031,6 +13061,7 @@ pub async fn setup_plugin_integration_provider(
         credential_mode,
         &id,
         &integration.id,
+        integration.features.as_ref(),
         template.pricing_scope,
     )
     .await?;
@@ -13204,6 +13235,7 @@ mod credential_enrollment_tests {
             source_plugin_id: Some("plugin.test".into()),
             source_integration_id: Some("oauth".into()),
             pricing_scope: "integration".into(),
+            integration_features: None,
         }
     }
 
@@ -14800,6 +14832,15 @@ mod reasoning_discovery_control_plane_tests {
             ["low", "high"]
         );
         assert_eq!(observation.capabilities.tool_calling, Some(true));
+        assert_eq!(observation.capabilities.parallel_tools, Some(true));
+        assert_eq!(
+            observation.model_capabilities.as_ref().unwrap()["transport"],
+            json!({
+                "format": "openai-chat",
+                "endpoint": "/v1/chat/completions",
+                "alternatives": [{"format": "anthropic"}]
+            })
+        );
         assert_eq!(
             observation.capability_sources["reasoning"],
             "plugin_capabilities_json"
@@ -15962,6 +16003,10 @@ mod credential_enrollment_regression_tests {
                 }
             }]
         });
+        install_test_plugin_manifest(state, manifest).await;
+    }
+
+    async fn install_test_plugin_manifest(state: &AppState, manifest: Value) {
         let now = db::now_iso();
         sqlx::query(
             "INSERT OR REPLACE INTO plugins
@@ -17351,6 +17396,95 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn auto_provisioned_integration_ceiling_vetoes_model_capabilities() {
+        let (state, root) = test_state_with_plugins("integration-feature-ceiling").await;
+        let manifest = json!({
+            "manifest_version": crate::plugins::MANIFEST_VERSION,
+            "id": "plugin.test",
+            "name": "Feature Ceiling Plugin",
+            "version": "0.1.0",
+            "plugin_api": format!("{}.0.0", crate::plugins::PLUGIN_API_MAJOR),
+            "integrations": [{
+                "id": "ceiling",
+                "name": "Feature Ceiling Provider",
+                "credential_mode": "manual",
+                "features": {
+                    "schema_version": 1,
+                    "streaming": true,
+                    "tools": true,
+                    "parallel_tools": false,
+                    "vision": false,
+                    "reasoning": false,
+                    "structured_output": false,
+                    "model_discovery": false,
+                    "quota_probe": false,
+                    "health_probe": false
+                },
+                "protocols": {
+                    "input": ["openai-chat"],
+                    "upstream": ["openai-chat"]
+                },
+                "provider": {
+                    "base_url": "https://provider.example/v1",
+                    "wire_format": "openai",
+                    "auth_scheme": "bearer"
+                }
+            }]
+        });
+        install_test_plugin_manifest(&state, manifest).await;
+        auto_provision_plugin_providers(&state, "plugin.test").await;
+
+        let provider = db::list_providers(&state.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.source_integration_id.as_deref() == Some("ceiling"))
+            .unwrap();
+        let ceiling = provider.integration_feature_ceiling().unwrap().unwrap();
+        assert!(!ceiling.vision);
+        assert!(!ceiling.parallel_tools);
+
+        db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider.id,
+                upstream_id: "capable-model",
+                display_name: "Capable Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({
+                    "vision": true,
+                    "tool_calling": true,
+                    "parallel_tools": true,
+                    "reasoning": true,
+                    "structured_output": true
+                }),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let model = db::find_model_by_upstream(&state.pool, &provider.id, "capable-model")
+            .await
+            .unwrap()
+            .unwrap();
+        let profile = crate::adapters::resolve_execution_profile(&provider, &model).unwrap();
+        assert_eq!(profile.capabilities.vision, Some(false));
+        assert_eq!(profile.capabilities.tool_calling, Some(true));
+        assert_eq!(profile.capabilities.parallel_tools, Some(false));
+        assert_eq!(profile.capabilities.reasoning, Some(false));
+        assert_eq!(profile.capabilities.structured_output, Some(false));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn explicit_integration_manifest_direct_api_scope_is_preserved() {
         let (state, root) = test_state_with_plugins("manifest-direct-pricing-scope").await;
         let base_url = "https://provider-a.example/v1";
@@ -17389,6 +17523,7 @@ mod credential_enrollment_regression_tests {
             crate::plugins::CredentialMode::Manual,
             "plugin.test",
             "direct",
+            None,
             crate::plugins::PricingScope::DirectApi,
         )
         .await

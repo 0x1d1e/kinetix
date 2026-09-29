@@ -1003,6 +1003,8 @@ pub struct ProviderRow {
     #[serde(default)]
     pub source_integration_id: Option<String>,
     pub pricing_scope: String,
+    #[serde(default)]
+    pub integration_features: Option<String>,
 }
 
 impl ProviderRow {
@@ -1053,6 +1055,19 @@ impl ProviderRow {
     /// The plugin capability supplying this provider's model discovery (§6.0).
     pub fn model_source_plugin_ref(&self) -> Option<crate::plugins::PluginRef> {
         crate::plugins::PluginRef::parse(&self.model_source_plugin)
+    }
+    /// Validated integration feature ceiling, if this provider was created
+    /// from an integration that declares one.
+    pub fn integration_feature_ceiling(
+        &self,
+    ) -> Result<Option<crate::plugins::types::IntegrationFeaturesV1>, String> {
+        let Some(raw) = self.integration_features.as_deref() else {
+            return Ok(None);
+        };
+        let features: crate::plugins::types::IntegrationFeaturesV1 =
+            serde_json::from_str(raw).map_err(|error| error.to_string())?;
+        features.validate()?;
+        Ok(Some(features))
     }
 
     /// Whether a destination host is authorized to receive this provider's
@@ -1130,6 +1145,23 @@ pub fn conservative_provider_pricing_scope(
     } else {
         "direct_api"
     }
+}
+
+pub async fn set_provider_integration_features(
+    pool: &Pool,
+    id: &str,
+    features: Option<&crate::plugins::types::IntegrationFeaturesV1>,
+) -> Result<()> {
+    if let Some(features) = features {
+        features.validate().map_err(anyhow::Error::msg)?;
+    }
+    let serialized = features.map(serde_json::to_string).transpose()?;
+    sqlx::query("UPDATE providers SET integration_features=? WHERE id=?")
+        .bind(serialized)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String> {

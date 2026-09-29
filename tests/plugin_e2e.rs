@@ -456,6 +456,7 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         source_plugin_id: Some(id.into()),
         source_integration_id: Some("antigravity".into()),
         pricing_scope: "integration".into(),
+        integration_features: None,
     };
     assert_eq!(provider_row.wire(), WireFormat::Plugin);
     let registered = registry.for_provider(&provider_row);

@@ -427,13 +427,18 @@ pub fn resolve_execution_profile_for_target(
             .get(name)
             .and_then(serde_json::Value::as_bool)
     };
-    let capabilities = ModelCapabilityFlags {
+    let mut capabilities = ModelCapabilityFlags {
         text: capability("text"),
         reasoning: capability("reasoning"),
         vision: capability("vision"),
         tool_calling: capability("tool_calling"),
+        parallel_tools: capability("parallel_tools"),
         structured_output: capability("structured_output"),
     };
+    let integration_features = provider.integration_feature_ceiling().map_err(|error| {
+        ProxyError::unsupported(format!("invalid integration feature ceiling: {error}"))
+    })?;
+    apply_integration_feature_ceiling(&mut capabilities, integration_features.as_ref());
 
     let mut parameters = model.params();
     let parameter_ownership = discovery.get("operator_parameter_overrides");
@@ -709,7 +714,41 @@ pub struct ModelCapabilityFlags {
     pub reasoning: Option<bool>,
     pub vision: Option<bool>,
     pub tool_calling: Option<bool>,
+    pub parallel_tools: Option<bool>,
     pub structured_output: Option<bool>,
+}
+
+/// Intersect model observations with the integration's declared support ceiling.
+/// A false integration flag vetoes support; a true flag never invents model support.
+fn apply_integration_feature_ceiling(
+    capabilities: &mut ModelCapabilityFlags,
+    ceiling: Option<&crate::plugins::types::IntegrationFeaturesV1>,
+) {
+    let Some(ceiling) = ceiling else {
+        return;
+    };
+    if !ceiling.tools {
+        capabilities.tool_calling = Some(false);
+    }
+    if !ceiling.parallel_tools {
+        capabilities.parallel_tools = Some(false);
+    }
+    if !ceiling.vision {
+        capabilities.vision = Some(false);
+    }
+    if !ceiling.reasoning {
+        capabilities.reasoning = Some(false);
+    }
+    if !ceiling.structured_output {
+        capabilities.structured_output = Some(false);
+    }
+    if capabilities.parallel_tools == Some(true) {
+        capabilities.parallel_tools = match capabilities.tool_calling {
+            Some(true) => Some(true),
+            Some(false) => Some(false),
+            None => None,
+        };
+    }
 }
 
 fn canonical_reasoning_levels(
@@ -1227,6 +1266,13 @@ fn parse_model_capabilities_v3(metadata: &serde_json::Value) -> Option<ModelCapa
     metadata.is_valid().then_some(metadata)
 }
 
+pub(crate) fn validated_model_capabilities_v3(
+    metadata: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    parse_model_capabilities_v3(metadata)?;
+    Some(metadata.clone())
+}
+
 fn plugin_schema_version(metadata: &serde_json::Value) -> Option<u64> {
     metadata.get("schema_version")?.as_u64()
 }
@@ -1236,6 +1282,7 @@ fn capability_flags(
     reasoning: Option<&PluginReasoningCapabilityV1>,
     vision: Option<&VisionCapabilityV1>,
     tools: Option<&SupportCapabilityV1>,
+    parallel_tools: Option<&SupportCapabilityV1>,
     structured_output: Option<&SupportCapabilityV1>,
 ) -> ModelCapabilityFlags {
     ModelCapabilityFlags {
@@ -1243,6 +1290,7 @@ fn capability_flags(
         reasoning: reasoning.map(|value| value.supported),
         vision: vision.map(|value| value.input),
         tool_calling: tools.map(|value| value.supported),
+        parallel_tools: parallel_tools.map(|value| value.supported),
         structured_output: structured_output.map(|value| value.supported),
     }
 }
@@ -1254,6 +1302,7 @@ pub fn plugin_capability_flags_v1(metadata: &serde_json::Value) -> Option<ModelC
         metadata.reasoning.as_ref(),
         metadata.vision.as_ref(),
         metadata.tools.as_ref(),
+        None,
         metadata.structured_output.as_ref(),
     ))
 }
@@ -1268,6 +1317,7 @@ pub fn plugin_capability_flags(metadata: &serde_json::Value) -> Option<ModelCapa
                 metadata.reasoning.as_ref(),
                 metadata.vision.as_ref(),
                 metadata.tools.as_ref(),
+                None,
                 metadata.structured_output.as_ref(),
             ))
         }
@@ -1278,6 +1328,7 @@ pub fn plugin_capability_flags(metadata: &serde_json::Value) -> Option<ModelCapa
                 metadata.reasoning.as_ref(),
                 metadata.vision.as_ref(),
                 metadata.tools.as_ref(),
+                metadata.parallel_tools.as_ref(),
                 metadata.structured_output.as_ref(),
             ))
         }
@@ -2269,6 +2320,7 @@ mod execution_profile_tests {
             source_plugin_id: None,
             source_integration_id: None,
             pricing_scope: "direct_api".into(),
+            integration_features: None,
         }
     }
 
@@ -2386,6 +2438,69 @@ mod execution_profile_tests {
         .to_string();
         let profile = resolve_execution_profile(&provider, &model).unwrap();
         assert_eq!(profile.capabilities.text, None);
+    }
+
+    #[test]
+    fn integration_feature_ceiling_vetoes_model_capabilities() {
+        let mut provider = provider();
+        provider.integration_features = Some(
+            serde_json::json!({
+                "schema_version": 1,
+                "streaming": true,
+                "tools": false,
+                "parallel_tools": false,
+                "vision": false,
+                "reasoning": false,
+                "structured_output": false,
+                "model_discovery": true,
+                "quota_probe": false,
+                "health_probe": false
+            })
+            .to_string(),
+        );
+        let mut model = model();
+        model.capabilities = serde_json::json!({
+            "vision": true,
+            "tool_calling": true,
+            "parallel_tools": true,
+            "reasoning": true,
+            "structured_output": true
+        })
+        .to_string();
+
+        let profile = resolve_execution_profile(&provider, &model).unwrap();
+        assert_eq!(profile.capabilities.vision, Some(false));
+        assert_eq!(profile.capabilities.tool_calling, Some(false));
+        assert_eq!(profile.capabilities.parallel_tools, Some(false));
+        assert_eq!(profile.capabilities.reasoning, Some(false));
+        assert_eq!(profile.capabilities.structured_output, Some(false));
+    }
+
+    #[test]
+    fn integration_feature_ceiling_does_not_invent_model_capabilities() {
+        let mut provider = provider();
+        provider.integration_features = Some(
+            serde_json::json!({
+                "schema_version": 1,
+                "streaming": true,
+                "tools": true,
+                "parallel_tools": true,
+                "vision": true,
+                "reasoning": true,
+                "structured_output": true,
+                "model_discovery": true,
+                "quota_probe": true,
+                "health_probe": true
+            })
+            .to_string(),
+        );
+
+        let profile = resolve_execution_profile(&provider, &model()).unwrap();
+        assert_eq!(profile.capabilities.vision, None);
+        assert_eq!(profile.capabilities.tool_calling, None);
+        assert_eq!(profile.capabilities.parallel_tools, None);
+        assert_eq!(profile.capabilities.reasoning, None);
+        assert_eq!(profile.capabilities.structured_output, None);
     }
 
     #[test]
