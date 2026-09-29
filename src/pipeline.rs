@@ -1469,9 +1469,16 @@ pub async fn run(
                         "upstream_validated",
                         if prepared.is_sse { "sse" } else { "json" },
                     );
-                    // A validated response may recover circuit state, but never
-                    // overwrite a newer cooldown/quota transition.
-                    recover_successful_account(state, &target.account.id).await;
+                    // A validated response may recover only the account state
+                    // version it observed; half-open probes explicitly authorize
+                    // clearing an open circuit.
+                    recover_successful_account(
+                        state,
+                        &target.account.id,
+                        target.account.account_state_version,
+                        probing,
+                    )
+                    .await;
                     let provider_circuit_transition =
                         mark_provider_probe_validated(&provider_attempt);
                     let attempt = Attempt {
@@ -2804,8 +2811,20 @@ fn apply_header_reset_to_rate_limit(
     failure
 }
 
-async fn recover_successful_account(state: &AppState, account_id: &str) {
-    match pool::recover_after_success(&state.pool, account_id).await {
+async fn recover_successful_account(
+    state: &AppState,
+    account_id: &str,
+    observed_state_version: i64,
+    is_half_open_probe: bool,
+) {
+    match pool::recover_after_success(
+        &state.pool,
+        account_id,
+        observed_state_version,
+        is_half_open_probe,
+    )
+    .await
+    {
         Ok(true) => {
             if let Err(error) = state.registry.reload(&state.pool).await {
                 tracing::warn!(
@@ -5813,6 +5832,7 @@ mod route_policy_tests {
             status: "healthy".into(),
             status_reason: "healthy".into(),
             status_changed_at: None,
+            account_state_version: 0,
             cooldown_until: None,
             quota_reset_at: None,
             quota_type: "none".into(),
@@ -6559,12 +6579,17 @@ mod route_policy_tests {
         let (state, root, _, _, account_ids) = adaptive_dry_run_state().await;
         let account_id = &account_ids[0];
 
+        let initial_state_version = state
+            .registry
+            .account(account_id)
+            .unwrap()
+            .account_state_version;
         sqlx::query("UPDATE accounts SET last_probe_at='db-only' WHERE id=?")
             .bind(account_id)
             .execute(&state.pool)
             .await
             .unwrap();
-        recover_successful_account(&state, account_id).await;
+        recover_successful_account(&state, account_id, initial_state_version, false).await;
         assert!(state
             .registry
             .account(account_id)
@@ -6583,7 +6608,12 @@ mod route_policy_tests {
             .circuit_open_until
             .is_some());
 
-        recover_successful_account(&state, account_id).await;
+        let probe_state_version = state
+            .registry
+            .account(account_id)
+            .unwrap()
+            .account_state_version;
+        recover_successful_account(&state, account_id, probe_state_version, true).await;
         let recovered = state.registry.account(account_id).unwrap();
         assert!(recovered.circuit_open_until.is_none());
         assert_eq!(recovered.consecutive_failures, 0);

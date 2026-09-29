@@ -7970,6 +7970,15 @@ pub async fn update_account(
     Path(id): Path<String>,
     Json(body): Json<AccountBody>,
 ) -> ApiResult {
+    if body
+        .status
+        .as_deref()
+        .is_some_and(|status| !matches!(status, "healthy" | "disabled"))
+    {
+        return Err(ApiError::bad(
+            "account status must be either healthy or disabled",
+        ));
+    }
     db::update_account(
         &state.pool,
         &id,
@@ -10884,7 +10893,8 @@ async fn reconcile_provider_account_mode(
                          status='healthy', cooldown_until=NULL, quota_reset_at=NULL,
                          quota_type='none', quota_window_s=NULL, soft_quota_usd=NULL,
                          priority=1, weight=1, last_error=NULL, last_probe_at=NULL,
-                         circuit_open_until=NULL, consecutive_failures=0
+                         circuit_open_until=NULL, consecutive_failures=0,
+                         account_state_version=account_state_version + 1
                      WHERE id=?",
                 )
                 .bind(&empty_secret)
@@ -14598,6 +14608,7 @@ mod reasoning_discovery_control_plane_tests {
 mod credential_enrollment_regression_tests {
     use super::*;
     use std::sync::Arc;
+    use tower::ServiceExt;
 
     struct ExpiredCredential;
 
@@ -17821,9 +17832,18 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
-        assert!(!db::recover_account_after_success(&state.pool, &account_id)
+        let before_recovery = db::get_account(&state.pool, &account_id)
             .await
-            .unwrap());
+            .unwrap()
+            .unwrap();
+        assert!(!db::recover_account_after_success(
+            &state.pool,
+            &account_id,
+            before_recovery.account_state_version,
+            false,
+        )
+        .await
+        .unwrap());
         let account = db::get_account(&state.pool, &account_id)
             .await
             .unwrap()
@@ -17945,6 +17965,131 @@ mod credential_enrollment_regression_tests {
         assert_eq!(listed["status"], "disabled");
         assert_eq!(listed["status_reason"], "operator_disabled");
         assert!(listed["status_changed_at"].is_string());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn account_update_rejects_runtime_and_unknown_statuses() {
+        let (state, root) = test_state("invalid-account-status").await;
+        let provider_id = insert_provider(
+            &state,
+            "invalid-account-status",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("test-key").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "account",
+            &encrypted,
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let app = crate::router::build(state.clone());
+
+        for status in ["cooldown", "exhausted", "degraded", "unknown"] {
+            match status {
+                "cooldown" => {
+                    db::set_account_status(
+                        &state.pool,
+                        &account_id,
+                        "cooldown",
+                        "rate_limited",
+                        Some(&future),
+                        None,
+                        Some("rate limited"),
+                    )
+                    .await
+                    .unwrap();
+                }
+                "exhausted" => {
+                    db::set_account_status(
+                        &state.pool,
+                        &account_id,
+                        "exhausted",
+                        "account_quota_exhausted",
+                        None,
+                        Some(&future),
+                        Some("quota exhausted"),
+                    )
+                    .await
+                    .unwrap();
+                }
+                "degraded" => {
+                    db::set_account_status(
+                        &state.pool,
+                        &account_id,
+                        "healthy",
+                        "healthy",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    db::record_account_failure(&state.pool, &account_id, 1, 60)
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+
+            let before = db::get_account(&state.pool, &account_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri(format!("/admin/api/accounts/{account_id}"))
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .header("x-kinetix-admin-token", "test-admin")
+                        .body(axum::body::Body::from(
+                            json!({
+                                "provider_id": provider_id,
+                                "label": "account",
+                                "api_key": null,
+                                "priority": 1,
+                                "weight": 1,
+                                "soft_quota_usd": null,
+                                "quota_type": "none",
+                                "status": status,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "status {status}"
+            );
+
+            let after = db::get_account(&state.pool, &account_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.status, before.status);
+            assert_eq!(after.status_reason, before.status_reason);
+            assert_eq!(after.cooldown_until, before.cooldown_until);
+            assert_eq!(after.quota_reset_at, before.quota_reset_at);
+            assert_eq!(after.circuit_open_until, before.circuit_open_until);
+            assert_eq!(after.consecutive_failures, before.consecutive_failures);
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }

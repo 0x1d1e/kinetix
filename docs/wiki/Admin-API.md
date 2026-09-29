@@ -58,7 +58,7 @@ expose it behind Cloudflare Access plus the in-Kinetix password/session check.
 | --- | --- |
 | `GET /admin/api/accounts` | List (label, `key_mask`, effective status, lifecycle reason/timestamp, retry time, quotas, totals); accepts optional `provider_id` and includes disabled accounts. |
 | `POST /admin/api/accounts` | Create (requires `api_key`). |
-| `PUT /admin/api/accounts/{id}` | Update fields; a non-empty `api_key` rotates the credential. Omitted `status` preserves lifecycle state; send a status only for an intentional status change. |
+| `PUT /admin/api/accounts/{id}` | Update fields; a non-empty `api_key` rotates the credential. Omitted `status` preserves lifecycle state; explicit status changes accept only `healthy` or `disabled`. Cooldown, quota, and circuit states are runtime-managed. |
 | `POST /admin/api/accounts/{id}/reset` | Clear cooldown/exhaustion/circuit state; does not re-enable a manually disabled account. |
 | `DELETE /admin/api/accounts/{id}` | Delete. |
 

@@ -166,13 +166,27 @@ pub fn should_probe(account: &AccountRow) -> bool {
 }
 
 pub fn should_probe_at(account: &AccountRow, now: DateTime<Utc>) -> bool {
-    // Only circuit-breaker state is probeable. Other non-healthy states have
-    // their own explicit recovery/reset conditions.
-    if matches!(
-        AccountStatus::parse(&account.status),
-        AccountStatus::Disabled | AccountStatus::Cooldown | AccountStatus::Exhausted
-    ) {
-        return false;
+    // Disabled accounts are never probed. Cooldown and quota states block
+    // probes only while their own recovery window is active.
+    match AccountStatus::parse(&account.status) {
+        AccountStatus::Disabled => return false,
+        AccountStatus::Cooldown => {
+            if !matches!(
+                account.cooldown_until.as_deref().and_then(db::parse_dt),
+                Some(until) if until <= now
+            ) {
+                return false;
+            }
+        }
+        AccountStatus::Exhausted => {
+            if !matches!(
+                account.quota_reset_at.as_deref().and_then(db::parse_dt),
+                Some(reset) if reset <= now
+            ) {
+                return false;
+            }
+        }
+        AccountStatus::Healthy | AccountStatus::CircuitOpen => {}
     }
 
     let Some(until) = account.circuit_open_until.as_deref().and_then(db::parse_dt) else {
@@ -290,8 +304,14 @@ pub async fn mark_healthy(pool: &Pool, account_id: &str) -> anyhow::Result<()> {
     .await
 }
 
-pub async fn recover_after_success(pool: &Pool, account_id: &str) -> anyhow::Result<bool> {
-    db::recover_account_after_success(pool, account_id).await
+pub async fn recover_after_success(
+    pool: &Pool,
+    account_id: &str,
+    observed_state_version: i64,
+    is_half_open_probe: bool,
+) -> anyhow::Result<bool> {
+    db::recover_account_after_success(pool, account_id, observed_state_version, is_half_open_probe)
+        .await
 }
 
 /// Clear a cooldown and put the account back in service.
@@ -378,6 +398,7 @@ mod tests {
             status: status.into(),
             status_reason: "healthy".into(),
             status_changed_at: None,
+            account_state_version: 0,
             cooldown_until: None,
             quota_reset_at: None,
             quota_type: "none".into(),
