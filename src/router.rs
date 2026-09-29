@@ -142,6 +142,7 @@ pub fn build(state: AppState) -> Router {
             "/routes/{id}",
             put(admin::update_route).delete(admin::delete_route),
         )
+        .route("/routes/validate", post(admin::validate_route_config))
         .route("/routes/dry-run", post(admin::dry_run_route))
         .route("/validate", post(admin::validate_endpoint))
         .route("/validate/provider", post(admin::validate_provider))

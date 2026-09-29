@@ -3,7 +3,11 @@ import { Shuffle, Plus, ArrowDown, ArrowUp, Shield, Check, Layers, ArrowRight, T
 import { Route, Account, ModelConfig } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { DESIGN_TOKENS } from '../../lib/designSystem';
-import { DryRunResult, Kinetix } from '../../lib/resources';
+import {
+  DryRunResult,
+  Kinetix,
+  RouteValidationResult,
+} from '../../lib/resources';
 
 const ROUTE_STRATEGIES: ReadonlyArray<readonly [Route['selectionStrategy'], string]> = [
   ['priority', 'Priority (Ordered fallback on failure)'],
@@ -21,6 +25,9 @@ const DRY_RUN_REASON_LABELS: Record<string, string> = {
   route_concurrency: 'Route concurrency limit reached',
   soft_quota: 'Simulated quota reached',
   account_soft_quota: 'Account quota reached',
+  quota_fallback_disabled: 'Quota reached; fallback is disabled',
+  unreachable_after_quota_failure: 'Not reached after quota failure',
+  stochastic_selection: 'Selection may vary at runtime',
   adaptive_saturated: 'Adaptive capacity exhausted',
   context_window: 'Input exceeds context window',
   higher_ranked_candidate_selected: 'Another eligible target ranked first',
@@ -51,8 +58,9 @@ interface RoutesViewProps {
   /** Providers the selected virtual key is restricted to (FR-12.19); empty =
    *  no restriction. Used by the Dry Run to reflect access restrictions. */
   allowedProviders?: string[];
-  onAddRoute: (newRoute: Route) => void;
-  onUpdateRoute: (updated: Route) => void;
+  onAddRoute: (newRoute: Route) => Promise<void>;
+  onUpdateRoute: (updated: Route) => Promise<void>;
+  onValidateRoute: (route: Route) => Promise<RouteValidationResult>;
   onDeleteRoute: (routeId: string) => void;
 }
 
@@ -63,6 +71,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
   allowedProviders,
   onAddRoute,
   onUpdateRoute,
+  onValidateRoute,
   onDeleteRoute,
 }) => {
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -70,10 +79,16 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
   const [confirmDeleteRouteId, setConfirmDeleteRouteId] = useState<string | null>(null);
   const [confirmRemoveTargetId, setConfirmRemoveTargetId] = useState<string | null>(null);
   const [routeSearch, setRouteSearch] = useState('');
+  const [routeValidationResult, setRouteValidationResult] = useState<RouteValidationResult | null>(null);
+  const [routeValidationError, setRouteValidationError] = useState<string | null>(null);
+  const [validatingRoute, setValidatingRoute] = useState(false);
+  const [routeMutationError, setRouteMutationError] = useState<string | null>(null);
 
   // New route form
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+  const [initialTargetModelId, setInitialTargetModelId] = useState('');
+  const [initialTargetAccountId, setInitialTargetAccountId] = useState('');
   const [strategy, setStrategy] = useState<Route['selectionStrategy']>('priority');
   const [maxConcurrentRequests, setMaxConcurrentRequests] = useState('');
   const [on429, setOn429] = useState(true);
@@ -86,6 +101,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
   const [dryRunHasImages, setDryRunHasImages] = useState(false);
   const [dryRunHasReasoning, setDryRunHasReasoning] = useState(false);
   const [dryRunInputTokens, setDryRunInputTokens] = useState('1000');
+  const [dryRunAllowFallback, setDryRunAllowFallback] = useState(true);
   const [dryRunSession, setDryRunSession] = useState('');
 
   // Add-target form state (per selected route)
@@ -116,6 +132,12 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
   const activeRoute =
     filteredRoutes.find((route) => route.id === selectedRouteId) ||
     filteredRoutes[0];
+  const initialTargetModel = models.find((model) => model.id === initialTargetModelId);
+  const initialTargetAccounts = accounts.filter(
+    (account) =>
+      account.providerId === initialTargetModel?.providerId &&
+      account.status !== 'disabled',
+  );
 
   /** Renumber targets by their (already ordered) position. */
   const renumber = (targets: Route['targets']): Route['targets'] =>
@@ -162,6 +184,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
         has_images: dryRunHasImages,
         has_reasoning: dryRunHasReasoning,
         input_tokens: Number(dryRunInputTokens) || 0,
+        allow_fallback: dryRunAllowFallback,
         session: dryRunSession.trim() || undefined,
         allowed_providers: allowedProviders ?? [],
       });
@@ -173,11 +196,35 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
     }
   };
 
-  const handleCreateSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!name.trim()) return;
+  const handleValidateRoute = async () => {
+    if (!activeRoute) return;
+    setValidatingRoute(true);
+    setRouteValidationError(null);
+    try {
+      setRouteValidationResult(await onValidateRoute(activeRoute));
+    } catch (error) {
+      setRouteValidationResult(null);
+      setRouteValidationError((error as Error).message);
+    } finally {
+      setValidatingRoute(false);
+    }
+  };
 
-    // Routes start empty: the user adds their own fallback targets.
+  const handleCreateSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const model = models.find((candidate) => candidate.id === initialTargetModelId);
+    if (!name.trim() || !model) return;
+    const account = accounts.find((candidate) => candidate.id === initialTargetAccountId);
+    const target = {
+      id: `tgt-${Date.now()}`,
+      accountId: account?.id ?? '',
+      accountLabel: account?.label ?? '(auto)',
+      providerName: model.providerName,
+      modelId: model.id,
+      modelDisplayName: model.displayName,
+      priority: 1,
+      weight: 1,
+    };
     const newRoute: Route = {
       id: `route-${Date.now()}`,
       name: name.trim().toLowerCase().replace(/\s+/g, '-'),
@@ -189,7 +236,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
         on5xx,
         onTimeout: true,
       },
-      targets: [],
+      targets: [target],
       portabilityPolicy: 'strip_with_warning',
       cacheAffinity: true,
       stickyRouting: sticky,
@@ -198,12 +245,19 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
       status: 'active',
     };
 
-    onAddRoute(newRoute);
-    setSelectedRouteId(newRoute.id);
-    setShowCreateModal(false);
-    setName('');
-    setDescription('');
-    setMaxConcurrentRequests('');
+    setRouteMutationError(null);
+    try {
+      await onAddRoute(newRoute);
+      setSelectedRouteId(newRoute.id);
+      setShowCreateModal(false);
+      setName('');
+      setDescription('');
+      setInitialTargetModelId('');
+      setInitialTargetAccountId('');
+      setMaxConcurrentRequests('');
+    } catch (error) {
+      setRouteMutationError((error as Error).message);
+    }
   };
 
   return (
@@ -348,6 +402,16 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                     </span>
 
                     <button
+                      onClick={handleValidateRoute}
+                      disabled={validatingRoute}
+                      className="px-2.5 py-1 text-xs font-heading font-bold text-[var(--pen-green)] hover:bg-[var(--tint-green)] border border-[var(--pen-green)]/50 hover:border-[var(--pen-green)] rounded flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-50"
+                      title="Check this Route against persisted local metadata without upstream calls"
+                    >
+                      <Shield className="w-3.5 h-3.5" />
+                      <span>{validatingRoute ? 'Validating…' : 'Validate'}</span>
+                    </button>
+
+                    <button
                       onClick={handleDryRun}
                       disabled={dryRunning}
                       className="px-2.5 py-1 text-xs font-heading font-bold text-[var(--pen-blue)] hover:bg-[var(--tint-blue)] border border-[var(--pen-blue)]/50 hover:border-[var(--pen-blue)] rounded flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-50"
@@ -388,6 +452,39 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                     )}
                   </div>
                 </div>
+
+                {(routeValidationResult || routeValidationError) && (
+                  <div
+                    className="mb-5 p-3 border-2 rounded text-sm"
+                    role={routeValidationError || !routeValidationResult?.valid ? 'alert' : 'status'}
+                    style={{
+                      borderColor: routeValidationError || !routeValidationResult?.valid
+                        ? 'var(--marker-red)'
+                        : 'var(--pen-green)',
+                    }}
+                  >
+                    {routeValidationError ? (
+                      <p>{routeValidationError}</p>
+                    ) : (
+                      <>
+                        <strong>
+                          {routeValidationResult?.valid ? 'Route is valid' : 'Route has validation errors'}
+                        </strong>
+                        {routeValidationResult?.issues.length ? (
+                          <ul className="mt-2 space-y-1">
+                            {routeValidationResult.issues.map((issue, index) => (
+                              <li key={`${issue.code}-${index}`}>
+                                <span className="font-bold">{issue.severity}: {issue.code}</span>
+                                {issue.target_index == null ? '' : ` (target ${issue.target_index + 1})`}
+                                {' - '}{issue.message}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                )}
 
                 {/* Targets Fallback Sequence */}
                 <div className="space-y-3 mb-6">
@@ -728,6 +825,17 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                       <span>{label as string} required</span>
                     </label>
                   ))}
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={dryRunAllowFallback}
+                      onChange={(event) => setDryRunAllowFallback(event.target.checked)}
+                      className="accent-[var(--pen-blue)]"
+                    />
+                    <span title="The Route's onQuota trigger can still disable quota fallback.">
+                      Allow request fallback
+                    </span>
+                  </label>
                   <label className="flex flex-col gap-1">
                     <span>Input tokens</span>
                     <input
@@ -774,9 +882,18 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                     <div style={{ color: 'var(--danger-text)' }}>{dryRunResult.error}</div>
                   ) : (
                     <>
-                      <div className="mb-2">
-                        Would select:{' '}
-                        <strong>{dryRunResult.would_select ?? '(no eligible target)'}</strong>
+                      <div className="mb-1">
+                        Outcome:{' '}
+                        <strong>
+                          {dryRunResult.outcome === 'stochastic'
+                            ? 'Stochastic; no exact target predicted'
+                            : dryRunResult.outcome === 'rate_limited'
+                              ? 'Would return HTTP 429; no target dispatched'
+                              : dryRunResult.would_select ?? '(no eligible target)'}
+                        </strong>
+                      </div>
+                      <div className="mb-2 text-[var(--ink)]/70">
+                        {dryRunResult.selection_note}
                       </div>
                       <div className="overflow-x-auto">
                         <table className="min-w-[800px] w-full table-fixed text-xs">

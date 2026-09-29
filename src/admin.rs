@@ -27,6 +27,7 @@ use crate::db::{self, Pool};
 use crate::frontends::FrontendFormat;
 use crate::limits;
 use crate::pipeline;
+use crate::route_validation;
 use crate::types::{AuthScheme, Prices, ThinkingMap, WireFormat};
 
 type ApiResult = Result<Json<Value>, ApiError>;
@@ -9345,51 +9346,68 @@ fn portability_default() -> String {
     "strip_with_warning".into()
 }
 
-fn validate_route_body(body: &RouteBody) -> Result<(), ApiError> {
-    if !matches!(
-        body.strategy.as_str(),
-        "priority" | "round-robin" | "weighted" | "least-used" | "adaptive"
-    ) {
-        return Err(ApiError::bad("invalid route strategy"));
+fn route_validation_config(body: &RouteBody, id: Option<&str>) -> route_validation::RouteConfig {
+    route_validation::RouteConfig {
+        id: id.map(str::to_owned),
+        name: body.name.clone(),
+        strategy: body.strategy.clone(),
+        portability_policy: body.portability_policy.clone(),
+        fallback_triggers: body.fallback_triggers.clone(),
+        max_attempts: body.max_attempts,
+        max_concurrent_requests: body.max_concurrent_requests,
+        enabled: true,
+        targets: body
+            .targets
+            .iter()
+            .map(|target| route_validation::RouteTargetConfig {
+                model_id: target.model_id.clone(),
+                account_id: target.account_id.clone(),
+                priority: target.priority,
+                weight: target.weight,
+                predicate: target.predicate.clone(),
+                param_overrides: target.param_overrides.clone(),
+            })
+            .collect(),
     }
-    if body.max_concurrent_requests.is_some_and(|limit| limit < 0) {
-        return Err(ApiError::bad(
-            "max_concurrent_requests must be positive or zero for unlimited",
-        ));
-    }
-    if !matches!(
-        body.portability_policy.as_str(),
-        "reject" | "strip_with_warning"
-    ) {
-        return Err(ApiError::bad(
-            "portability_policy must be 'reject' or 'strip_with_warning'",
-        ));
-    }
-    if !body.fallback_triggers.is_null() {
-        let Some(triggers) = body.fallback_triggers.as_object() else {
-            return Err(ApiError::bad("fallback_triggers must be a JSON object"));
-        };
-        for key in ["on429", "onQuota", "on5xx", "onTimeout"] {
-            if let Some(value) = triggers.get(key) {
-                if !value.is_boolean() {
-                    return Err(ApiError::bad(format!(
-                        "fallback_triggers.{key} must be boolean"
-                    )));
-                }
-            }
-        }
-    }
-    for target in &body.targets {
-        if !target.param_overrides.is_null() && !target.param_overrides.is_object() {
-            return Err(ApiError::bad(
-                "route target param_overrides must be a JSON object",
-            ));
-        }
+}
+
+fn validate_route_structure(body: &RouteBody) -> Result<(), ApiError> {
+    let validation = route_validation::validate_structure(&route_validation_config(body, None));
+    if !validation.valid {
+        let errors = validation
+            .issues
+            .iter()
+            .filter(|issue| issue.severity == "error")
+            .map(|issue| format!("{}: {}", issue.code, issue.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::bad(format!("Route validation failed: {errors}")));
     }
     Ok(())
 }
 
-#[derive(Deserialize)]
+async fn validate_route_body(
+    state: &AppState,
+    body: &RouteBody,
+    id: Option<&str>,
+) -> Result<route_validation::RouteValidation, ApiError> {
+    let validation = route_validation::validate(state, &route_validation_config(body, id))
+        .await
+        .map_err(ApiError::internal)?;
+    if !validation.valid {
+        let errors = validation
+            .issues
+            .iter()
+            .filter(|issue| issue.severity == "error")
+            .map(|issue| format!("{}: {}", issue.code, issue.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::bad(format!("Route validation failed: {errors}")));
+    }
+    Ok(validation)
+}
+
+#[derive(Clone, Deserialize)]
 pub struct RouteTargetBody {
     pub account_id: Option<String>,
     pub model_id: String,
@@ -9410,7 +9428,7 @@ pub async fn create_route(
     _auth: AdminAuth,
     Json(body): Json<RouteBody>,
 ) -> ApiResult {
-    validate_route_body(&body)?;
+    validate_route_body(&state, &body, None).await?;
     let id = db::insert_route(
         &state.pool,
         &db::NewRoute {
@@ -9456,7 +9474,7 @@ pub async fn update_route(
     Path(id): Path<String>,
     Json(body): Json<RouteBody>,
 ) -> ApiResult {
-    validate_route_body(&body)?;
+    validate_route_body(&state, &body, Some(&id)).await?;
     db::update_route(
         &state.pool,
         &id,
@@ -9549,6 +9567,31 @@ pub async fn delete_route(
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// `POST /admin/api/routes/validate`: validate proposed Route configuration
+/// against persisted provider, account, model, plugin, and alias metadata.
+#[derive(Deserialize)]
+pub struct ProposedRouteBody {
+    /// Existing Route id to exclude from duplicate-name checks during updates.
+    #[serde(default)]
+    pub route_id: Option<String>,
+    #[serde(flatten)]
+    pub route: RouteBody,
+}
+
+pub async fn validate_route_config(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Json(body): Json<ProposedRouteBody>,
+) -> ApiResult {
+    let validation = route_validation::validate(
+        &state,
+        &route_validation_config(&body.route, body.route_id.as_deref()),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!(validation)))
 }
 
 /// `POST /admin/api/routes/dry-run` (FR-8.7): evaluate routing for a
@@ -12476,7 +12519,7 @@ pub async fn import_config(
             max_concurrent_requests: r["max_concurrent_requests"].as_i64(),
             targets: target_bodies,
         };
-        if let Err(error) = validate_route_body(&route_body) {
+        if let Err(error) = validate_route_structure(&route_body) {
             problems.push(format!("route '{name}': {}", error.1));
         }
         if r.get("enabled").is_some_and(|value| !value.is_null()) && !r["enabled"].is_boolean() {
@@ -13141,7 +13184,6 @@ pub async fn import_config(
             max_concurrent_requests: r["max_concurrent_requests"].as_i64(),
             targets: Vec::new(),
         };
-        validate_route_body(&body)?;
         let mut target_bodies = Vec::new();
         for t in r["targets"].as_array().unwrap_or(&empty) {
             let model_key = t["model"].as_str().unwrap_or("");
@@ -13172,7 +13214,7 @@ pub async fn import_config(
         }
         let mut body = body;
         body.targets = target_bodies;
-        validate_route_body(&body)?;
+        validate_route_structure(&body)?;
         let rid = match route_ids.get(name).cloned() {
             Some(route_id) => {
                 sqlx::query(

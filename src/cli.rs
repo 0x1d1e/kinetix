@@ -300,6 +300,18 @@ pub enum RouteAction {
         #[arg(long = "target", required = true)]
         targets: Vec<String>,
     },
+    /// Validate a saved Route by name or id.
+    Validate {
+        selector: String,
+    },
+    /// Simulate routing for a model/Route using an optional JSON descriptor file.
+    DryRun {
+        #[arg(long)]
+        model: String,
+        /// JSON object with the same fields accepted by the Admin API.
+        #[arg(long)]
+        descriptor: Option<PathBuf>,
+    },
     Remove {
         id: String,
     },
@@ -1009,8 +1021,33 @@ async fn cmd_account(cli: &Cli, args: AccountArgs) -> Result<()> {
 }
 
 async fn cmd_route(cli: &Cli, args: RouteArgs) -> Result<()> {
-    let (_, pool, _) = open(cli).await?;
+    let (config, pool, crypto) = open(cli).await?;
     match args.action {
+        RouteAction::Validate { selector } => {
+            let state = route_tool_state(config, pool, crypto).await?;
+            let validation = crate::route_validation::validate_saved(&state, &selector).await?;
+            println!("{}", serde_json::to_string_pretty(&validation)?);
+            if !validation.valid {
+                bail!("Route validation failed");
+            }
+            Ok(())
+        }
+        RouteAction::DryRun { model, descriptor } => {
+            let state = route_tool_state(config, pool, crypto).await?;
+            let descriptor = match descriptor {
+                Some(path) => {
+                    let contents = tokio::fs::read_to_string(&path).await.with_context(|| {
+                        format!("reading dry-run descriptor {}", path.display())
+                    })?;
+                    serde_json::from_str::<crate::pipeline::DryRunRequest>(&contents)
+                        .with_context(|| format!("parsing dry-run descriptor {}", path.display()))?
+                }
+                None => crate::pipeline::DryRunRequest::default(),
+            };
+            let result = crate::pipeline::dry_run(&state, &model, &descriptor).await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
         RouteAction::List => {
             for r in db::list_routes(&pool).await? {
                 let targets = db::route_targets(&pool, &r.id).await?;
@@ -1033,31 +1070,91 @@ async fn cmd_route(cli: &Cli, args: RouteArgs) -> Result<()> {
             max_attempts,
             targets,
         } => {
-            let id = format!("route_{}", uuid::Uuid::new_v4().simple());
-            sqlx::query(
-                "INSERT INTO routes (id, name, description, strategy, fallback_triggers, continuity_policy, portability_policy, sticky_routing, cache_affinity, max_attempts, enabled, created_at)
-                 VALUES (?,?,?,?,'{\"on429\":true,\"onQuota\":true,\"on5xx\":true,\"onTimeout\":true}','strip',?,0,?,?,1,?)",
-            )
-            .bind(&id)
-            .bind(&name)
-            .bind(&description)
-            .bind(&strategy)
-            .bind(&portability_policy)
-            .bind(cache_affinity as i64)
-            .bind(max_attempts)
-            .bind(db::now_iso())
-            .execute(&pool)
-            .await?;
-            for (i, spec) in targets.iter().enumerate() {
-                let (prov, upstream) = spec
+            let mut resolved_targets = Vec::with_capacity(targets.len());
+            let mut validation_targets = Vec::with_capacity(targets.len());
+            for (index, spec) in targets.iter().enumerate() {
+                let (provider_name, upstream) = spec
                     .split_once('/')
                     .with_context(|| format!("target '{spec}' must be provider/upstream_id"))?;
-                let provider_id = resolve_provider(&pool, prov).await?;
+                let provider_id = resolve_provider(&pool, provider_name).await?;
                 let model = db::find_model_by_upstream(&pool, &provider_id, upstream)
                     .await?
-                    .with_context(|| format!("no model {upstream} on provider {prov}"))?;
-                db::insert_route_target(&pool, &id, None, &model.id, (i as i64) + 1, 1, "{}", "{}")
-                    .await?;
+                    .with_context(|| format!("no model {upstream} on provider {provider_name}"))?;
+                validation_targets.push(crate::route_validation::RouteTargetConfig {
+                    model_id: model.id.clone(),
+                    account_id: None,
+                    priority: index as i64 + 1,
+                    weight: 1,
+                    predicate: serde_json::json!({}),
+                    param_overrides: serde_json::json!({}),
+                });
+                resolved_targets.push(model.id);
+            }
+
+            let state = route_tool_state(config, pool.clone(), crypto).await?;
+            let validation = crate::route_validation::validate(
+                &state,
+                &crate::route_validation::RouteConfig {
+                    id: None,
+                    name: name.clone(),
+                    strategy: strategy.clone(),
+                    portability_policy: portability_policy.clone(),
+                    fallback_triggers: serde_json::json!({
+                        "on429": true,
+                        "onQuota": true,
+                        "on5xx": true,
+                        "onTimeout": true,
+                    }),
+                    max_attempts: Some(max_attempts),
+                    max_concurrent_requests: None,
+                    enabled: true,
+                    targets: validation_targets,
+                },
+            )
+            .await?;
+            if !validation.valid {
+                let errors = validation
+                    .issues
+                    .iter()
+                    .filter(|issue| issue.severity == "error")
+                    .map(|issue| format!("{}: {}", issue.code, issue.message))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                bail!("Route validation failed: {errors}");
+            }
+
+            let id = db::insert_route(
+                &pool,
+                &db::NewRoute {
+                    name: &name,
+                    description: &description,
+                    strategy: &strategy,
+                    fallback_triggers: serde_json::json!({
+                        "on429": true,
+                        "onQuota": true,
+                        "on5xx": true,
+                        "onTimeout": true,
+                    }),
+                    portability_policy: &portability_policy,
+                    sticky_routing: false,
+                    cache_affinity,
+                    max_attempts: Some(max_attempts),
+                    max_concurrent_requests: None,
+                },
+            )
+            .await?;
+            for (index, model_id) in resolved_targets.iter().enumerate() {
+                db::insert_route_target(
+                    &pool,
+                    &id,
+                    None,
+                    model_id,
+                    index as i64 + 1,
+                    1,
+                    "{}",
+                    "{}",
+                )
+                .await?;
             }
             println!("route created: {id}");
             Ok(())
@@ -1068,6 +1165,41 @@ async fn cmd_route(cli: &Cli, args: RouteArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn route_tool_state(
+    config: Config,
+    pool: Pool,
+    crypto: Crypto,
+) -> Result<crate::app::AppState> {
+    let registry = Arc::new(crate::registry::Registry::new());
+    registry.reload(&pool).await?;
+    let state =
+        crate::server::build_app_state(Arc::new(config), pool, registry, Arc::new(crypto)).await?;
+
+    // Register enabled plugin adapters in memory only. Unlike server startup,
+    // offline inspection must not reconcile or mutate plugin state.
+    if let Some(manager) = state.plugin_manager().cloned() {
+        for plugin in manager.list().await? {
+            if !plugin.status().is_enabled() {
+                continue;
+            }
+            let Some(manifest) = plugin.manifest() else {
+                continue;
+            };
+            if let Err(error) = crate::plugins::adapter::register_declared_adapters(
+                &state.adapters,
+                manager.as_ref().clone(),
+                &plugin.id,
+                &manifest.provides,
+            )
+            .await
+            {
+                tracing::warn!(plugin = %plugin.id, error = %error, "plugin adapter unavailable to route inspection");
+            }
+        }
+    }
+    Ok(state)
 }
 
 async fn cmd_alias(cli: &Cli, args: AliasArgs) -> Result<()> {

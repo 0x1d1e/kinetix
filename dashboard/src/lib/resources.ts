@@ -220,6 +220,40 @@ export interface TestResult {
   response_preview?: string;
 }
 
+export interface RouteTargetInput {
+  account_id: string | null;
+  model_id: string;
+  priority: number;
+  weight: number;
+}
+
+export interface RouteConfigInput {
+  route_id?: string;
+  name: string;
+  description?: string;
+  strategy: string;
+  fallback_triggers: Record<string, boolean>;
+  portability_policy: string;
+  sticky_routing?: boolean;
+  cache_affinity?: boolean;
+  max_attempts?: number | null;
+  max_concurrent_requests?: number | null;
+  targets: RouteTargetInput[];
+}
+
+export interface RouteValidationIssue {
+  severity: 'error' | 'warning';
+  code: string;
+  message: string;
+  target_index?: number;
+}
+
+export interface RouteValidationResult {
+  valid: boolean;
+  route: string;
+  issues: RouteValidationIssue[];
+}
+
 export interface DryRunDescriptor {
   frontend?: string;
   key_tag?: string;
@@ -229,6 +263,7 @@ export interface DryRunDescriptor {
   input_tokens?: number;
   allowed_providers?: string[];
   soft_quota_reached?: boolean;
+  allow_fallback?: boolean;
   session?: string;
 }
 
@@ -280,6 +315,9 @@ export interface DryRunResult {
   strategy: string | null;
   candidates: DryRunCandidate[];
   would_select: string | null;
+  selection_mode: 'deterministic' | 'stochastic';
+  outcome: 'selected' | 'rate_limited' | 'no_eligible_target' | 'stochastic';
+  selection_note: string;
   plugin_fact_failures: { plugin: string; reason: string }[];
   note: string;
 }
@@ -671,8 +709,10 @@ export const Kinetix = {
     const r = await api.get<{ routes: any[] }>('/admin/api/routes');
     return r.routes.map(mapRoute);
   },
-  createRoute: (body: Record<string, unknown>) => api.post('/admin/api/routes', body),
-  updateRoute: (id: string, body: Record<string, unknown>) => api.put(`/admin/api/routes/${id}`, body),
+  createRoute: (body: RouteConfigInput) => api.post('/admin/api/routes', body),
+  updateRoute: (id: string, body: RouteConfigInput) => api.put(`/admin/api/routes/${id}`, body),
+  validateRoute: (body: RouteConfigInput) =>
+    api.post<RouteValidationResult>('/admin/api/routes/validate', body),
   deleteRoute: (id: string) => api.del(`/admin/api/routes/${id}`),
   dryRunRoute: (model: string, descriptor: DryRunDescriptor) =>
     api.post<DryRunResult>('/admin/api/routes/dry-run', { model, ...descriptor }),

@@ -56,6 +56,7 @@ pub mod provider_work;
 pub mod quota;
 pub mod ratelimit;
 pub mod registry;
+pub mod route_validation;
 pub mod router;
 pub mod server;
 pub mod sse;

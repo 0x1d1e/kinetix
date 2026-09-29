@@ -175,6 +175,51 @@ pub fn init_tracing(json: bool) {
     }
 }
 
+/// Build the shared control-plane state used by serving and offline route tools.
+/// Plugin activation remains a separate server-startup step because it can
+/// reconcile persisted plugin state.
+pub async fn build_app_state(
+    config: Arc<Config>,
+    pool: db::Pool,
+    registry: Arc<Registry>,
+    crypto: Arc<Crypto>,
+) -> Result<AppState> {
+    let log_queue = UsageLogQueue::new(pool.clone(), 4096);
+    let http = reqwest::Client::builder()
+        .pool_max_idle_per_host(64)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .connect_timeout(Duration::from_secs(10))
+        .http2_adaptive_window(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("kinetix/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building HTTP client")?;
+    let state = AppState::new(
+        config.clone(),
+        pool.clone(),
+        registry,
+        crypto.clone(),
+        http,
+        log_queue,
+        config.ip_rate_limit_per_min,
+    );
+    match PluginManager::new(
+        pool,
+        crypto,
+        HostPolicy {
+            allow_private_network: config.allow_private_upstreams,
+            ..HostPolicy::default()
+        },
+        config.paths.plugin_packages_dir(),
+    ) {
+        Ok(manager) => Ok(state.with_plugins(Arc::new(manager))),
+        Err(error) => {
+            tracing::warn!(error = %error, "plugin host unavailable; plugins disabled");
+            Ok(state)
+        }
+    }
+}
+
 /// Run the full server with the given configuration.
 pub async fn run(config: Arc<Config>) -> Result<()> {
     init_tracing(config.log_json);
@@ -218,49 +263,8 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
             "initial registry reload failed; starting with an empty snapshot and retrying in the background"
         );
     }
-    let log_queue = UsageLogQueue::new(pool.clone(), 4096);
     warn_on_unroutable_routes(&registry);
-
-    // HTTP client for upstreams: pooled, HTTP/2, bounded connect timeout, and
-    // zero redirects by default (NFR-3.10).
-    let http = reqwest::Client::builder()
-        .pool_max_idle_per_host(64)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .connect_timeout(Duration::from_secs(10))
-        .http2_adaptive_window(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("kinetix/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building HTTP client")?;
-
-    let state = AppState::new(
-        config.clone(),
-        pool.clone(),
-        registry.clone(),
-        crypto,
-        http,
-        log_queue,
-        config.ip_rate_limit_per_min,
-    );
-    // Build the plugin host even when no plugins are installed so the registry
-    // participates in the runtime
-    // snapshot from the start. If the host cannot be constructed the server
-    // still starts; plugin-backed capabilities simply stay unavailable.
-    let state = match PluginManager::new(
-        pool.clone(),
-        state.crypto.clone(),
-        HostPolicy {
-            allow_private_network: config.allow_private_upstreams,
-            ..HostPolicy::default()
-        },
-        config.paths.plugin_packages_dir(),
-    ) {
-        Ok(manager) => state.with_plugins(Arc::new(manager)),
-        Err(e) => {
-            tracing::warn!(error = %e, "plugin host unavailable; plugins disabled");
-            state
-        }
-    };
+    let state = build_app_state(config.clone(), pool.clone(), registry, crypto).await?;
 
     // Disable persisted plugins that fail the current manifest or permission
     // contract before re-registering previously enabled capabilities. This also
