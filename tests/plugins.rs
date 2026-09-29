@@ -227,6 +227,50 @@ async fn startup_reconciliation_disables_invalid_enabled_manifests() {
 }
 
 #[tokio::test]
+async fn startup_reconciliation_disables_plugin_missing_declared_adapter_world() {
+    let (m, pool) = manager().await;
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
+    m.install(&kxp, None, &[], false).await.unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+    m.enable("dev.example.foo").await.unwrap();
+
+    let healthy_manifest = GOOD_MANIFEST
+        .replace("dev.example.foo", "dev.example.bar")
+        .replace("foo-models", "bar-models")
+        .replace("foo-facts", "bar-facts");
+    let healthy_kxp = build_kxp(&healthy_manifest, VALID_COMPONENT);
+    m.install(&healthy_kxp, None, &[], false).await.unwrap();
+    m.approve_permissions("dev.example.bar").await.unwrap();
+    m.enable("dev.example.bar").await.unwrap();
+
+    // Simulate a legacy enabled row: the old manifest and component were
+    // accepted because enablement checked only the base plugin world.
+    let stored: String = sqlx::query_scalar("SELECT manifest_json FROM plugins WHERE id = ?")
+        .bind("dev.example.foo")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    manifest["provides"]["provider_adapters"] = serde_json::json!(["foo-adapter"]);
+    sqlx::query("UPDATE plugins SET manifest_json = ? WHERE id = ?")
+        .bind(manifest.to_string())
+        .bind("dev.example.foo")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    m.reconcile_enabled_plugins().await.unwrap();
+
+    let row = m.get("dev.example.foo").await.unwrap().unwrap();
+    assert_eq!(row.enabled, 0);
+    assert!(!m.is_usable("dev.example.foo").await);
+
+    let healthy_row = m.get("dev.example.bar").await.unwrap().unwrap();
+    assert_eq!(healthy_row.enabled, 1);
+    assert!(m.is_usable("dev.example.bar").await);
+}
+
+#[tokio::test]
 async fn install_preserves_exact_package_and_provenance() {
     let (m, pool) = manager().await;
     let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);

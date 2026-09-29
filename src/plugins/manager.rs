@@ -768,8 +768,8 @@ impl PluginManager {
         Ok(())
     }
 
-    /// Disable enabled plugins whose persisted manifest or approved grants no
-    /// longer satisfy the current host contract.
+    /// Disable enabled plugins whose persisted manifest, approved grants, or
+    /// active component no longer satisfy the current host contract.
     pub async fn reconcile_enabled_plugins(&self) -> Result<()> {
         let rows = store::list_plugins(&self.inner.pool).await?;
         for row in rows.into_iter().filter(|row| row.status().is_enabled()) {
@@ -797,6 +797,27 @@ impl PluginManager {
                 tracing::warn!(
                     plugin = %row.id,
                     "disabling plugin whose approved permissions no longer match its manifest"
+                );
+                store::set_enabled(&self.inner.pool, &row.id, false).await?;
+                continue;
+            }
+
+            let contract_result = match self.compiled_component(&row) {
+                Ok(component) => {
+                    self.validate_component_contract(
+                        &validated.manifest,
+                        &validated.effective,
+                        component.as_ref(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = contract_result {
+                tracing::warn!(
+                    plugin = %row.id,
+                    error = %error,
+                    "disabling plugin that fails startup component validation"
                 );
                 store::set_enabled(&self.inner.pool, &row.id, false).await?;
             }
