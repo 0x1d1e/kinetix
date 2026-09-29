@@ -424,12 +424,12 @@ async fn atomic_rename_noreplace(
     {
         use std::os::unix::ffi::OsStrExt;
 
-        let source = source.to_owned();
-        let destination = destination.to_owned();
-        return Ok(tokio::task::spawn_blocking(move || {
-            let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+        let source_path = source.to_owned();
+        let destination_path = destination.to_owned();
+        let result = tokio::task::spawn_blocking(move || {
+            let source = std::ffi::CString::new(source_path.as_os_str().as_bytes())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-            let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+            let destination = std::ffi::CString::new(destination_path.as_os_str().as_bytes())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
             // SAFETY: both paths are live NUL-terminated C strings and the call does not retain pointers.
             let result = unsafe {
@@ -453,19 +453,50 @@ async fn atomic_rename_noreplace(
             }
         })
         .await
-        .context("joining marker publication task")??);
+        .context("joining marker publication task")?;
+        publish_after_renameat2(result, source, destination).await
     }
 
     #[cfg(not(target_os = "linux"))]
-    {
-        match tokio::fs::hard_link(source, destination).await {
-            Ok(()) => {
-                tokio::fs::remove_file(source).await?;
-                Ok(true)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(error) => Err(error).context("atomically publishing pending marker"),
+    atomic_hard_link_noreplace(source, destination).await
+}
+
+#[cfg(target_os = "linux")]
+async fn publish_after_renameat2(
+    result: std::io::Result<bool>,
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<bool> {
+    match result {
+        Ok(published) => Ok(published),
+        Err(error) if renameat2_unsupported(&error) => {
+            atomic_hard_link_noreplace(source, destination).await
         }
+        Err(error) => Err(error).context("atomically publishing pending marker"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn renameat2_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+    )
+}
+
+async fn atomic_hard_link_noreplace(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<bool> {
+    match tokio::fs::hard_link(source, destination).await {
+        Ok(()) => {
+            tokio::fs::remove_file(source)
+                .await
+                .context("removing temporary marker after hard-link publication")?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error).context("atomically publishing pending marker via hard link"),
     }
 }
 
@@ -4071,5 +4102,52 @@ mod price_version_identity_tests {
 
         drop(pool);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod pending_marker_publication_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsupported_renameat2_errors_use_atomic_no_replace_fallback() {
+        for code in [libc::ENOSYS, libc::EINVAL, libc::EOPNOTSUPP] {
+            assert!(renameat2_unsupported(&std::io::Error::from_raw_os_error(
+                code
+            )));
+        }
+        assert!(!renameat2_unsupported(&std::io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-marker-fallback-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let temporary = root.join("marker.tmp");
+        let marker = root.join("marker.ready");
+        tokio::fs::write(&temporary, b"first").await.unwrap();
+        assert!(publish_after_renameat2(
+            Err(std::io::Error::from_raw_os_error(libc::ENOSYS)),
+            &temporary,
+            &marker,
+        )
+        .await
+        .unwrap());
+        assert!(!temporary.exists());
+
+        tokio::fs::write(&temporary, b"replacement").await.unwrap();
+        assert!(!publish_after_renameat2(
+            Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            &temporary,
+            &marker,
+        )
+        .await
+        .unwrap());
+        assert_eq!(tokio::fs::read(&marker).await.unwrap(), b"first");
+        assert_eq!(tokio::fs::read(&temporary).await.unwrap(), b"replacement");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
