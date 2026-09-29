@@ -53,8 +53,9 @@ ingress:
 
 - Pre-migration snapshots named `kinetix-pre-migration-<ts>-<uuid>.db` are
   written before pending migrations or pricing repairs change an existing
-  database. Failed retries reuse and protect the same snapshot. After startup
-  work succeeds, the newest 3 are retained; current databases start without one.
+  database. Failed retries reuse and protect the same snapshot. Pending
+  snapshots for databases sharing this directory are protected and excluded
+  from the three-snapshot limit; current databases start without one.
 - **Scheduled backups** (`VACUUM INTO`, transactionally consistent) run every 6
   hours, keeping the newest 14, in `$KINETIX_DATA_DIR/backups`. A `RESTORE.txt`
   documents the procedure.

@@ -8,7 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, Row, SqlitePool};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -197,21 +197,51 @@ async fn prepare_pending_pre_migration_backup(
     let Some(markers) = markers else {
         return Ok(None);
     };
+    let preparing_exists = tokio::fs::try_exists(&markers.preparing).await?;
     if tokio::fs::try_exists(&markers.ready).await? {
-        let snapshot = read_pending_snapshot(&markers.ready, &markers.backup_dir).await?;
-        if !tokio::fs::metadata(&snapshot)
-            .await
-            .is_ok_and(|metadata| metadata.is_file())
-        {
-            anyhow::bail!(
-                "pending pre-migration snapshot {} is missing; refusing database changes",
-                snapshot.display()
-            );
+        match read_ready_snapshot(&markers.ready, &markers.backup_dir).await {
+            Ok(snapshot) => {
+                if preparing_exists {
+                    match read_pending_snapshot(&markers.preparing, &markers.backup_dir).await {
+                        Ok(preparing_snapshot) if preparing_snapshot == snapshot => {}
+                        Ok(_) => anyhow::bail!(
+                            "pending pre-migration markers refer to different snapshots"
+                        ),
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "discarding incomplete preparing pre-migration marker"
+                            );
+                            tokio::fs::remove_file(&markers.preparing)
+                                .await
+                                .context("removing incomplete preparing pre-migration marker")?;
+                            sync_backup_directory(&markers.backup_dir).await?;
+                        }
+                    }
+                }
+                return Ok(Some(PendingPreMigrationBackup { markers, snapshot }));
+            }
+            Err(ready_error) if preparing_exists => {
+                let preparing_is_valid =
+                    read_pending_snapshot(&markers.preparing, &markers.backup_dir)
+                        .await
+                        .is_ok();
+                if !preparing_is_valid {
+                    return Err(ready_error).context("validating pending pre-migration markers");
+                }
+                tracing::warn!(
+                    error = %ready_error,
+                    "discarding incomplete ready pre-migration marker"
+                );
+                tokio::fs::remove_file(&markers.ready)
+                    .await
+                    .context("removing incomplete ready pre-migration marker")?;
+                sync_backup_directory(&markers.backup_dir).await?;
+            }
+            Err(error) => return Err(error),
         }
-        return Ok(Some(PendingPreMigrationBackup { markers, snapshot }));
     }
 
-    let preparing_exists = tokio::fs::try_exists(&markers.preparing).await?;
     if !preparing_exists && !changes_pending {
         return Ok(None);
     }
@@ -223,21 +253,35 @@ async fn prepare_pending_pre_migration_backup(
         .await
         .context("creating pre-migration backup directory")?;
     let snapshot = if preparing_exists {
-        let snapshot = read_pending_snapshot(&markers.preparing, &markers.backup_dir).await?;
-        if !tokio::fs::try_exists(&snapshot).await? {
-            if !database_has_schema(pool).await? {
-                let _ = tokio::fs::remove_file(&markers.preparing).await;
-                return Ok(None);
+        match read_pending_snapshot(&markers.preparing, &markers.backup_dir).await {
+            Ok(snapshot) => {
+                if !pending_snapshot_exists(&snapshot).await? {
+                    if !database_has_schema(pool).await? {
+                        tokio::fs::remove_file(&markers.preparing).await?;
+                        sync_backup_directory(&markers.backup_dir).await?;
+                        return Ok(None);
+                    }
+                    write_pre_migration_snapshot(pool, &snapshot).await?;
+                }
+                snapshot
             }
-            let temporary = pre_migration_snapshot_temporary_path(&snapshot)?;
-            if tokio::fs::try_exists(&temporary).await? {
-                tokio::fs::remove_file(&temporary).await.with_context(|| {
-                    format!("removing incomplete snapshot {}", temporary.display())
-                })?;
+            Err(error) => {
+                tracing::warn!(error = %error, "discarding incomplete preparing pre-migration marker");
+                tokio::fs::remove_file(&markers.preparing)
+                    .await
+                    .context("removing incomplete preparing pre-migration marker")?;
+                sync_backup_directory(&markers.backup_dir).await?;
+                if !changes_pending || !database_has_schema(pool).await? {
+                    return Ok(None);
+                }
+                let snapshot = new_pre_migration_backup_path(&markers.backup_dir);
+                create_pending_marker(&markers.preparing, &snapshot)
+                    .await
+                    .context("creating pre-migration backup marker")?;
+                write_pre_migration_snapshot(pool, &snapshot).await?;
+                snapshot
             }
-            write_pre_migration_snapshot(pool, &snapshot).await?;
         }
-        snapshot
     } else {
         let snapshot = new_pre_migration_backup_path(&markers.backup_dir);
         create_pending_marker(&markers.preparing, &snapshot)
@@ -247,11 +291,18 @@ async fn prepare_pending_pre_migration_backup(
         snapshot
     };
 
+    // A preparing marker can outlive a crash before its directory entry was
+    // durable, so make both the snapshot and its directory entry durable again
+    // before publishing the ready marker.
+    sync_snapshot(&snapshot).await?;
+    sync_backup_directory(&markers.backup_dir).await?;
     create_pending_marker(&markers.ready, &snapshot).await?;
     if let Err(error) = tokio::fs::remove_file(&markers.preparing).await {
         if error.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(error = %error, "could not remove preparing pre-migration marker");
         }
+    } else if let Err(error) = sync_backup_directory(&markers.backup_dir).await {
+        tracing::warn!(error = %error, "could not persist preparing marker cleanup");
     }
     Ok(Some(PendingPreMigrationBackup { markers, snapshot }))
 }
@@ -277,35 +328,174 @@ async fn read_pending_snapshot(
     Ok(backup_dir.join(name))
 }
 
+async fn read_ready_snapshot(
+    marker: &std::path::Path,
+    backup_dir: &std::path::Path,
+) -> Result<PathBuf> {
+    let snapshot = read_pending_snapshot(marker, backup_dir).await?;
+    if !pending_snapshot_exists(&snapshot).await? {
+        anyhow::bail!(
+            "pending pre-migration snapshot {} is missing; refusing database changes",
+            snapshot.display()
+        );
+    }
+    sync_snapshot(&snapshot).await?;
+    sync_backup_directory(backup_dir).await?;
+    Ok(snapshot)
+}
+
+async fn pending_snapshot_exists(snapshot: &std::path::Path) -> Result<bool> {
+    match tokio::fs::metadata(snapshot).await {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("checking snapshot {}", snapshot.display()))
+        }
+    }
+}
+
 async fn create_pending_marker(marker: &std::path::Path, snapshot: &std::path::Path) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
+    let backup_dir = marker.parent().context("pending marker has no parent")?;
     let name = snapshot
         .file_name()
         .and_then(|name| name.to_str())
         .context("invalid pre-migration snapshot filename")?;
-    match tokio::fs::OpenOptions::new()
+    if tokio::fs::try_exists(marker).await? {
+        ensure_pending_marker_matches(marker, backup_dir, name).await?;
+        sync_backup_directory(backup_dir).await?;
+        return Ok(());
+    }
+
+    let marker_name = marker
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid pending marker filename")?;
+    let temporary = marker.with_file_name(format!(
+        ".{marker_name}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(marker)
+        .open(&temporary)
         .await
-    {
-        Ok(mut file) => {
-            file.write_all(format!("{name}\n").as_bytes()).await?;
-            file.sync_all().await?;
-            Ok(())
+        .with_context(|| format!("creating temporary marker {}", temporary.display()))?;
+    let publication = async {
+        file.write_all(format!("{name}\n").as_bytes()).await?;
+        file.sync_all().await?;
+        drop(file);
+
+        if atomic_rename_noreplace(&temporary, marker).await? {
+            sync_backup_directory(backup_dir).await?;
+        } else {
+            tokio::fs::remove_file(&temporary).await?;
+            ensure_pending_marker_matches(marker, backup_dir, name).await?;
+            sync_backup_directory(backup_dir).await?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let backup_dir = marker.parent().context("pending marker has no parent")?;
-            let existing = read_pending_snapshot(marker, backup_dir).await?;
-            if existing.file_name() == snapshot.file_name() {
-                Ok(())
-            } else {
-                anyhow::bail!("pending pre-migration marker already refers to another snapshot")
-            }
-        }
-        Err(error) => Err(error).with_context(|| format!("creating marker {}", marker.display())),
+        Ok::<_, anyhow::Error>(())
     }
+    .await;
+    if publication.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    publication.with_context(|| format!("publishing marker {}", marker.display()))
+}
+
+async fn ensure_pending_marker_matches(
+    marker: &std::path::Path,
+    backup_dir: &std::path::Path,
+    expected_name: &str,
+) -> Result<()> {
+    let existing = read_pending_snapshot(marker, backup_dir).await?;
+    if existing.file_name().and_then(|name| name.to_str()) == Some(expected_name) {
+        Ok(())
+    } else {
+        anyhow::bail!("pending pre-migration marker already refers to another snapshot")
+    }
+}
+
+async fn atomic_rename_noreplace(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let source = source.to_owned();
+        let destination = destination.to_owned();
+        return Ok(tokio::task::spawn_blocking(move || {
+            let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            // SAFETY: both paths are live NUL-terminated C strings and the call does not retain pointers.
+            let result = unsafe {
+                libc::renameat2(
+                    libc::AT_FDCWD,
+                    source.as_ptr(),
+                    libc::AT_FDCWD,
+                    destination.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if result == 0 {
+                Ok(true)
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        })
+        .await
+        .context("joining marker publication task")??);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        match tokio::fs::hard_link(source, destination).await {
+            Ok(()) => {
+                tokio::fs::remove_file(source).await?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error).context("atomically publishing pending marker"),
+        }
+    }
+}
+
+async fn sync_snapshot(snapshot: &std::path::Path) -> Result<()> {
+    tokio::fs::File::open(snapshot)
+        .await
+        .with_context(|| {
+            format!(
+                "opening pre-migration snapshot {} for sync",
+                snapshot.display()
+            )
+        })?
+        .sync_all()
+        .await
+        .with_context(|| format!("syncing pre-migration snapshot {}", snapshot.display()))
+}
+
+async fn sync_backup_directory(directory: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let directory_path = directory.to_owned();
+        let display_path = directory.display().to_string();
+        tokio::task::spawn_blocking(move || std::fs::File::open(&directory_path)?.sync_all())
+            .await
+            .context("joining backup directory sync task")?
+            .with_context(|| format!("syncing backup directory {display_path}"))?;
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
 }
 
 async fn database_has_schema(pool: &Pool) -> Result<bool> {
@@ -347,9 +537,12 @@ async fn write_pre_migration_snapshot(pool: &Pool, snapshot: &std::path::Path) -
         return Err(error)
             .with_context(|| format!("writing pre-migration backup {}", snapshot.display()));
     }
+    sync_snapshot(&temporary).await?;
     tokio::fs::rename(&temporary, snapshot)
         .await
         .with_context(|| format!("publishing pre-migration backup {}", snapshot.display()))?;
+    let backup_dir = snapshot.parent().context("snapshot path has no parent")?;
+    sync_backup_directory(backup_dir).await?;
     tracing::info!(backup = %snapshot.display(), "wrote pre-migration backup");
     Ok(())
 }
@@ -361,15 +554,20 @@ async fn finish_pending_pre_migration_backup(pending: PendingPreMigrationBackup)
         tracing::warn!(error = %error, "could not rotate pre-migration backups");
         return;
     }
-    if let Err(error) = tokio::fs::remove_file(&pending.markers.preparing).await {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(error = %error, "could not remove preparing pre-migration marker");
-            return;
+    let mut changed = false;
+    for marker in [&pending.markers.preparing, &pending.markers.ready] {
+        match tokio::fs::remove_file(marker).await {
+            Ok(()) => changed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "could not clear pending pre-migration marker");
+                return;
+            }
         }
     }
-    if let Err(error) = tokio::fs::remove_file(&pending.markers.ready).await {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(error = %error, "could not clear pending pre-migration marker");
+    if changed {
+        if let Err(error) = sync_backup_directory(&pending.markers.backup_dir).await {
+            tracing::warn!(error = %error, "could not persist pending marker cleanup");
         }
     }
 }
@@ -378,6 +576,7 @@ async fn retain_pre_migration_backups(
     backup_dir: &std::path::Path,
     protected: &std::path::Path,
 ) -> Result<()> {
+    let pending = pending_pre_migration_snapshots(backup_dir).await?;
     let mut entries = tokio::fs::read_dir(backup_dir)
         .await
         .context("reading pre-migration backup directory")?;
@@ -389,6 +588,7 @@ async fn retain_pre_migration_backups(
     {
         let path = entry.path();
         if path != protected
+            && !pending.contains(&path)
             && entry
                 .file_type()
                 .await
@@ -414,6 +614,59 @@ async fn retain_pre_migration_backups(
             .with_context(|| format!("removing old pre-migration backup {}", old.display()))?;
     }
     Ok(())
+}
+
+async fn pending_pre_migration_snapshots(backup_dir: &std::path::Path) -> Result<HashSet<PathBuf>> {
+    let mut entries = tokio::fs::read_dir(backup_dir)
+        .await
+        .context("reading pending pre-migration markers")?;
+    let mut snapshots = HashSet::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .context("reading pending pre-migration marker entries")?
+    {
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_pending_pre_migration_marker_filename)
+        {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .await
+            .context("reading pending marker entry type")?
+            .is_file()
+        {
+            anyhow::bail!(
+                "pending pre-migration marker {} is not a regular file",
+                path.display()
+            );
+        }
+        let snapshot = read_pending_snapshot(&path, backup_dir).await?;
+        if !pending_snapshot_exists(&snapshot).await? {
+            anyhow::bail!(
+                "pending pre-migration snapshot {} is missing; refusing backup rotation",
+                snapshot.display()
+            );
+        }
+        snapshots.insert(snapshot);
+    }
+    Ok(snapshots)
+}
+
+fn is_pending_pre_migration_marker_filename(name: &str) -> bool {
+    let Some(marker) = name.strip_prefix(".kinetix-pre-migration-") else {
+        return false;
+    };
+    let Some((id, stage)) = marker.rsplit_once('.') else {
+        return false;
+    };
+    id.len() == 64
+        && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && matches!(stage, "preparing" | "ready")
 }
 
 fn database_file_path(database_url: &str) -> Option<PathBuf> {
@@ -501,9 +754,10 @@ To restore:\n\n\
        cp <snapshot>.db /var/lib/kinetix/kinetix.db\n\
   4. Ensure ownership matches the service user (chown kinetix:kinetix).\n\
   5. Start Kinetix (systemctl start kinetix); migrations re-run automatically.\n\n\
-Retention: the newest 14 scheduled snapshots and 3 pre-migration snapshots are\n\
-kept after successful upgrades. A snapshot for an unfinished upgrade is\n\
-protected and reused on retries until migrations and repairs succeed.\n";
+Retention: the newest 14 scheduled and 3 completed pre-migration snapshots are\n\
+kept. A snapshot for an unfinished upgrade is protected and reused on retries.\n\
+Pending snapshots for databases sharing this directory are protected and do\n\
+not count toward the three-snapshot limit until migrations and repairs succeed.\n";
     let _ = tokio::fs::write(backup_dir.join("RESTORE.txt"), readme).await;
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let dst = backup_dir.join(format!("kinetix-{stamp}.db"));

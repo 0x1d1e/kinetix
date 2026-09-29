@@ -10,6 +10,7 @@ use kinetix::{
     types::{AuthScheme, Prices, WireFormat},
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -523,6 +524,169 @@ async fn startup_retries_preserve_snapshot_until_pricing_repair_succeeds() {
 }
 
 #[tokio::test]
+async fn interrupted_marker_publication_recovers_the_pending_snapshot() {
+    let root = temp_root("interrupted-marker-publication");
+    let data_dir = root.join("data");
+    let db_path = root.join("kinetix.db");
+    let url = database_url(&db_path);
+    let pool = db::connect(&url).await.unwrap();
+    migrate_to_prefix(&pool, 2).await;
+    sqlx::query("ALTER TABLE usage_logs ADD COLUMN plugin_id TEXT")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let backup_dir = data_dir.join("backups");
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let canonical_db = std::fs::canonicalize(&db_path).unwrap();
+    let marker_id = hex::encode(Sha256::digest(canonical_db.to_string_lossy().as_bytes()));
+    let preparing = backup_dir.join(format!(".kinetix-pre-migration-{marker_id}.preparing"));
+    let ready = backup_dir.join(format!(".kinetix-pre-migration-{marker_id}.ready"));
+    let preparing_name = preparing.file_name().unwrap().to_str().unwrap();
+
+    // Crash after flushing a temporary preparing marker but before rename.
+    let preparing_temporary = backup_dir.join(format!(
+        ".{preparing_name}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut temporary_file = std::fs::File::create(&preparing_temporary).unwrap();
+    use std::io::Write as _;
+    write!(
+        temporary_file,
+        "kinetix-pre-migration-20260928T000000Z-{}.db\n",
+        uuid::Uuid::new_v4().simple()
+    )
+    .unwrap();
+    temporary_file.sync_all().unwrap();
+
+    let first_start = db::open_and_migrate(&url, &data_dir).await;
+    assert!(first_start
+        .err()
+        .is_some_and(|error| error.to_string().contains("running migrations")));
+    let snapshot_name = std::fs::read_to_string(&ready).unwrap();
+    let snapshot_name = snapshot_name.trim().to_owned();
+    let snapshot = backup_dir.join(&snapshot_name);
+    let ready_name = ready.file_name().unwrap().to_str().unwrap();
+
+    // Crash after the flushed temporary ready marker, before its atomic rename.
+    std::fs::rename(&ready, &preparing).unwrap();
+    let ready_temporary = backup_dir.join(format!(
+        ".{ready_name}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut temporary_file = std::fs::File::create(&ready_temporary).unwrap();
+    write!(temporary_file, "{snapshot_name}\n").unwrap();
+    temporary_file.sync_all().unwrap();
+    let retry = db::open_and_migrate(&url, &data_dir).await;
+    assert!(retry
+        .err()
+        .is_some_and(|error| error.to_string().contains("running migrations")));
+    assert!(snapshot.exists());
+    assert_eq!(
+        std::fs::read_to_string(&ready).unwrap().trim(),
+        snapshot_name
+    );
+
+    // Crash after ready-marker rename but before preparing-marker cleanup.
+    std::fs::write(&preparing, format!("{snapshot_name}\n")).unwrap();
+    let retry = db::open_and_migrate(&url, &data_dir).await;
+    assert!(retry
+        .err()
+        .is_some_and(|error| error.to_string().contains("running migrations")));
+    assert!(snapshot.exists());
+
+    // Emulate an interrupted legacy writer that left a truncated final marker.
+    std::fs::write(&ready, b"").unwrap();
+    let retry = db::open_and_migrate(&url, &data_dir).await;
+    assert!(retry
+        .err()
+        .is_some_and(|error| error.to_string().contains("running migrations")));
+    assert!(snapshot.exists());
+    assert_eq!(
+        std::fs::read_to_string(&ready).unwrap().trim(),
+        snapshot_name
+    );
+
+    // A valid ready marker remains authoritative if interrupted cleanup leaves
+    // a truncated preparing marker beside it.
+    std::fs::write(&preparing, b"").unwrap();
+    let retry = db::open_and_migrate(&url, &data_dir).await;
+    assert!(retry
+        .err()
+        .is_some_and(|error| error.to_string().contains("running migrations")));
+    assert!(!preparing.exists());
+    assert_eq!(
+        std::fs::read_to_string(&ready).unwrap().trim(),
+        snapshot_name
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn retention_preserves_another_databases_pending_snapshot() {
+    let root = temp_root("shared-backup-retention");
+    let data_dir = root.join("data");
+    let url_a = database_url(&root.join("database-a.db"));
+    let url_b = database_url(&root.join("database-b.db"));
+
+    let pool = db::connect(&url_a).await.unwrap();
+    migrate_to_prefix(&pool, 2).await;
+    sqlx::query("ALTER TABLE usage_logs ADD COLUMN plugin_id TEXT")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert!(db::open_and_migrate(&url_a, &data_dir).await.is_err());
+
+    let backup_dir = data_dir.join("backups");
+    let pending_snapshot = std::fs::read_dir(&backup_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("kinetix-pre-migration-") && name.ends_with(".db")
+                })
+        })
+        .unwrap();
+    for index in 0..3 {
+        let name = format!(
+            "kinetix-pre-migration-99990101T000000Z-{:032x}.db",
+            index + 1
+        );
+        std::fs::write(backup_dir.join(name), b"completed snapshot placeholder").unwrap();
+    }
+
+    let pool = db::connect(&url_b).await.unwrap();
+    migrate_to_prefix(&pool, 2).await;
+    pool.close().await;
+    db::open_and_migrate(&url_b, &data_dir)
+        .await
+        .unwrap()
+        .close()
+        .await;
+
+    assert!(
+        pending_snapshot.exists(),
+        "database B retention pruned database A's pending restore point"
+    );
+    let retry = db::open_and_migrate(&url_a, &data_dir).await;
+    assert!(
+        retry
+            .err()
+            .is_some_and(|error| error.to_string().contains("running migrations")),
+        "database A should reuse its snapshot and reach the expected migration failure"
+    );
+    assert!(pending_snapshot.exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn scheduled_backup_is_consistent_and_restores_plugin_kv_after_sidecar_cleanup() {
     let root = temp_root("restore");
     let db_path = root.join("kinetix.db");
@@ -559,7 +723,7 @@ async fn scheduled_backup_is_consistent_and_restores_plugin_kv_after_sidecar_cle
     let restore_guide = std::fs::read_to_string(root.join("backups/RESTORE.txt")).unwrap();
     assert!(restore_guide.contains("VACUUM INTO"));
     assert!(restore_guide.contains("including pre-migration snapshots"));
-    assert!(restore_guide.contains("3 pre-migration snapshots"));
+    assert!(restore_guide.contains("3 completed pre-migration snapshots"));
     assert!(restore_guide.contains("Stop Kinetix"));
     assert!(restore_guide.contains("kinetix.db-wal"));
     assert!(restore_guide.contains("kinetix.db-shm"));
