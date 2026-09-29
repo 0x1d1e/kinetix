@@ -540,7 +540,7 @@ pub fn qualifies(kind: FailureKind, status: Option<u16>) -> bool {
     match kind {
         FailureKind::ConnectionError | FailureKind::Timeout => true,
         FailureKind::ServerError | FailureKind::MalformedUpstream => {
-            matches!(status, Some(502 | 503 | 504))
+            matches!(status, Some(502..=504))
         }
         FailureKind::RateLimit
         | FailureKind::QuotaExhausted

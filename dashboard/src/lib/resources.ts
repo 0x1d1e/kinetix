@@ -68,6 +68,7 @@ export interface DiscoveredThinkingMap {
 
 export interface DiscoveredModel {
   id: string;
+  observed_at?: string;
   display_name?: string | null;
   context_window?: number | null;
   max_output_tokens?: number | null;

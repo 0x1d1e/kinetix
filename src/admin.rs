@@ -2679,12 +2679,117 @@ fn discovered_capabilities(observation: &DiscoveredObservation) -> Value {
     })
 }
 
+fn model_discovery_observation_source(observation: &Value) -> String {
+    let mut sources = std::collections::BTreeSet::new();
+    if let Some(fields) = observation
+        .get("capability_sources")
+        .and_then(Value::as_object)
+    {
+        for source in fields.values().filter_map(Value::as_str) {
+            for part in source
+                .split('+')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+            {
+                sources.insert(part.to_string());
+            }
+        }
+    }
+    if let Some(source) = observation
+        .get("transport_source")
+        .and_then(Value::as_str)
+        .filter(|source| !source.trim().is_empty())
+    {
+        sources.insert(source.to_string());
+    }
+    if sources.is_empty() {
+        "upstream_discovery".to_string()
+    } else if sources.len() == 1 {
+        sources.into_iter().next().unwrap_or_default()
+    } else {
+        "mixed".to_string()
+    }
+}
+
+fn durable_model_discovery_value(observation: &Value) -> Value {
+    let mut value = observation.clone();
+    if let Some(fields) = value.as_object_mut() {
+        // Prices have their own immutable version history. Raw source payloads
+        // are intentionally not copied into long-lived observation records.
+        fields.remove("prices");
+        fields.remove("price_sources");
+        fields.remove("raw_metadata");
+        fields.remove("raw_metadata_truncated");
+    }
+    fn remove_raw_catalog_metadata(value: &mut Value) {
+        match value {
+            Value::Object(fields) => {
+                fields.remove("metadata");
+                fields.remove("url");
+                for child in fields.values_mut() {
+                    remove_raw_catalog_metadata(child);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    remove_raw_catalog_metadata(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(catalog) = value.get_mut("catalog") {
+        remove_raw_catalog_metadata(catalog);
+    }
+    value
+}
+
+fn model_discovery_observation(
+    observation: &Value,
+    provider_id: &str,
+    upstream_id: &str,
+) -> (String, String, Value, Value) {
+    let observed_at = observation
+        .get("observed_at")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(db::now_iso);
+    let source = model_discovery_observation_source(observation);
+    let scope = json!({
+        "provider_id": provider_id,
+        "upstream_id": upstream_id,
+        "transport": observation.pointer("/transport/format"),
+    });
+    let value = durable_model_discovery_value(observation);
+    (observed_at, source, scope, value)
+}
+
 async fn persist_model_discovery_update(
     pool: &Pool,
     row: &db::ModelRow,
     fresh: Value,
 ) -> anyhow::Result<()> {
-    db::merge_model_discovery(pool, &row.id, &fresh).await
+    let Some(observation) = fresh
+        .get("latest_observation")
+        .filter(|observation| observation.is_object())
+    else {
+        return db::merge_model_discovery(pool, &row.id, &fresh).await;
+    };
+    let (observed_at, source, scope, value) =
+        model_discovery_observation(observation, &row.provider_id, &row.upstream_id);
+    db::merge_model_discovery_with_observation(
+        pool,
+        &row.id,
+        &fresh,
+        &db::ModelObservationDraft {
+            kind: "metadata_discovery",
+            source: &source,
+            observed_at: &observed_at,
+            scope: &scope,
+            value: &value,
+        },
+    )
+    .await
 }
 
 async fn persist_provider_discovery_observations(
@@ -3337,7 +3442,7 @@ fn raw_discovery_metadata<'a>(payload: &'a Value, model_id: &str) -> Option<&'a 
 }
 
 fn extend_unique_by_id<T>(target: &mut Vec<T>, incoming: Vec<T>, id: impl Fn(&T) -> String) {
-    let mut seen: std::collections::HashSet<String> = target.iter().map(|item| id(item)).collect();
+    let mut seen: std::collections::HashSet<String> = target.iter().map(&id).collect();
     for item in incoming {
         if seen.insert(id(&item)) {
             target.push(item);
@@ -3369,7 +3474,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
     // an independent state machine and never invokes reconciliation implicitly.
     let lock = model_reconciliation_lock(id);
     let _guard = lock.lock().await;
-    let provider = db::get_provider(&state.pool, &id)
+    let provider = db::get_provider(&state.pool, id)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
@@ -3381,7 +3486,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
     let (mut discovered, models_dev_available) = if let Some(pref) =
         provider.model_source_plugin_ref()
     {
-        let manager = plugin_manager(&state)?;
+        let manager = plugin_manager(state)?;
         let reference = format!("plugin:{}/{}", pref.plugin_id, pref.capability);
         let account_aware = manager
             .resolve_binding(&reference, crate::plugins::Capability::AccountModelSource)
@@ -3483,7 +3588,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
             .collect();
         (discovered, models_dev_available)
     } else {
-        discover_models_native(&state, &provider).await?
+        discover_models_native(state, &provider).await?
     };
 
     // Mark which are already imported and record the observation (FR-10.5).
@@ -3492,7 +3597,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
     let discovery_plugin_id = provider
         .model_source_plugin_ref()
         .map(|reference| reference.plugin_id);
-    let existing = db::models_for_provider(&state.pool, &id)
+    let existing = db::models_for_provider(&state.pool, id)
         .await
         .map_err(ApiError::internal)?;
     if !models_dev_available {
@@ -3572,6 +3677,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
         }
         out.push(json!({
             "id": m.id,
+            "observed_at": now,
             "display_name": m.display_name,
             "context_window": m.context_window,
             "max_output_tokens": m.max_output_tokens,
@@ -5424,6 +5530,52 @@ fn probe_cost_upper_bound(
 mod model_lifecycle_regression_tests {
     use super::*;
 
+    async fn observation_test_fixture(
+        tag: &str,
+        context_window: Option<i64>,
+        capabilities: Value,
+        discovery: Value,
+    ) -> (Pool, std::path::PathBuf, String, String) {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-observation-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("test.db").display());
+        let pool = db::connect(&url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let provider_id = format!("provider-{tag}");
+        sqlx::query(
+            "INSERT INTO providers (id, name, base_url, wire_format, auth_scheme, created_at)
+             VALUES (?, 'Provider', 'https://example.test', 'openai', 'bearer', ?)",
+        )
+        .bind(&provider_id)
+        .bind(db::now_iso())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let model_id = db::insert_model(
+            &pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "model",
+                display_name: "Model",
+                enabled: true,
+                context_window,
+                max_output_tokens: None,
+                capabilities,
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery,
+            },
+        )
+        .await
+        .unwrap();
+        (pool, root, provider_id, model_id)
+    }
+
     #[tokio::test]
     async fn pricing_refresh_failure_does_not_advance_last_success() {
         let root = std::env::temp_dir().join(format!(
@@ -6015,6 +6167,162 @@ mod model_lifecycle_regression_tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains("model-1"));
         assert!(ids.contains("model-2"));
+    }
+
+    #[tokio::test]
+    async fn metadata_discovery_is_archived_without_replacing_effective_configuration() {
+        let (pool, root, provider_id, model_id) = observation_test_fixture(
+            "metadata-history",
+            Some(4096),
+            json!({ "text": true }),
+            json!({ "operator_capability_overrides": { "text": true } }),
+        )
+        .await;
+        let row = db::get_model(&pool, &model_id).await.unwrap().unwrap();
+
+        for (observed_at, context_window) in [
+            ("2026-09-01T00:00:00Z", 8192),
+            ("2026-09-02T00:00:00Z", 16384),
+        ] {
+            persist_model_discovery_update(
+                &pool,
+                &row,
+                json!({
+                    "latest_observation": {
+                        "observed_at": observed_at,
+                        "context_window": context_window,
+                        "capabilities": { "text": false },
+                        "capability_sources": {
+                            "context_window": "provider_metadata",
+                            "text": "models.dev:canonical"
+                        },
+                        "prices": { "input_per_1m": 1.0 },
+                        "price_sources": { "input_per_1m": "models.dev:provider" },
+                        "raw_metadata": { "api_key": "must-not-be-retained" },
+                        "catalog": {
+                            "canonical": {
+                                "source": "models.dev:canonical",
+                                "url": "https://catalog.example/model",
+                                "metadata": { "input_price": 1.0 }
+                            },
+                            "source_state": { "source": "models.dev" }
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let updated = db::get_model(&pool, &model_id).await.unwrap().unwrap();
+        assert_eq!(updated.context_window, Some(4096));
+        assert_eq!(
+            serde_json::from_str::<Value>(&updated.capabilities).unwrap()["text"],
+            true
+        );
+        let latest = discovery_object(&updated)["latest_observation"].clone();
+        assert_eq!(latest["context_window"], 16384);
+
+        let observations = db::list_model_observations(&pool, &model_id, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 2);
+        let values: Vec<Value> = observations
+            .iter()
+            .map(|row| serde_json::from_str(&row.value_json).unwrap())
+            .collect();
+        assert_eq!(values[0]["context_window"], 16384);
+        assert_eq!(values[1]["context_window"], 8192);
+        assert_eq!(
+            values[0]["catalog"]["canonical"]["source"],
+            "models.dev:canonical"
+        );
+        assert!(values.iter().all(|value| value.get("prices").is_none()));
+        assert!(values
+            .iter()
+            .all(|value| value.get("raw_metadata").is_none()));
+        assert!(values
+            .iter()
+            .all(|value| value["catalog"]["canonical"].get("metadata").is_none()));
+        assert_eq!(observations[0].source, "mixed");
+        assert_eq!(
+            serde_json::from_str::<Value>(&observations[0].scope_json).unwrap()["provider_id"],
+            provider_id
+        );
+
+        assert!(
+            sqlx::query("UPDATE model_observations SET source='changed' WHERE id=?")
+                .bind(&observations[0].id)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(sqlx::query("DELETE FROM model_observations WHERE id=?")
+            .bind(&observations[0].id)
+            .execute(&pool)
+            .await
+            .is_err());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn probe_history_keeps_replaced_results_and_current_evidence() {
+        let (pool, root, provider_id, model_id) =
+            observation_test_fixture("probe-history", None, json!({}), json!({})).await;
+        let scope = json!({
+            "provider_id": provider_id,
+            "account_id": "account-a",
+            "model_id": model_id,
+            "transport": "openai"
+        });
+        for (status, verified_at) in [
+            ("supported", "2026-09-01T00:00:00Z"),
+            ("unsupported", "2026-09-02T00:00:00Z"),
+        ] {
+            persist_probe_evidence_observation(
+                &pool,
+                &provider_id,
+                &model_id,
+                "tool_calling".into(),
+                json!({
+                    "status": status,
+                    "source": "probe",
+                    "verified_at": verified_at,
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": scope
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows = db::list_model_observations(&pool, &model_id, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, "capability_probe");
+        assert_eq!(rows[0].source, "probe");
+        assert_eq!(
+            serde_json::from_str::<Value>(&rows[0].value_json).unwrap()["status"],
+            "unsupported"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&rows[1].value_json).unwrap()["status"],
+            "supported"
+        );
+        let current = db::get_model(&pool, &model_id).await.unwrap().unwrap();
+        let current_discovery = discovery_object(&current);
+        let evidence = current_discovery["probe_evidence"]["tool_calling"]
+            .as_array()
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0]["status"], "unsupported");
+
+        model_reconciliation_locks().remove(&provider_id);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -6879,11 +7187,27 @@ async fn persist_probe_evidence_observation(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    upsert_probe_evidence(&mut evidence, key, evidence_value);
-    db::merge_model_discovery(
+    upsert_probe_evidence(&mut evidence, key, evidence_value.clone());
+    let observed_at = evidence_value
+        .get("verified_at")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(db::now_iso);
+    let scope = evidence_value
+        .get("scope")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    db::merge_model_discovery_with_observation(
         pool,
         model_id,
         &json!({ "probe_evidence": Value::Object(evidence) }),
+        &db::ModelObservationDraft {
+            kind: "capability_probe",
+            source: "probe",
+            observed_at: &observed_at,
+            scope: &scope,
+            value: &evidence_value,
+        },
     )
     .await
 }
@@ -7458,6 +7782,53 @@ pub async fn list_models(State(state): State<AppState>, _auth: AdminAuth) -> Api
     Ok(Json(json!({ "models": out })))
 }
 
+#[derive(Deserialize)]
+pub struct ModelObservationsQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+pub async fn list_model_observations(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+    Query(query): Query<ModelObservationsQuery>,
+) -> ApiResult {
+    let limit = query.limit.unwrap_or(100);
+    let offset = query.offset.unwrap_or(0);
+    if !(1..=500).contains(&limit) {
+        return Err(ApiError::bad("limit must be between 1 and 500"));
+    }
+    if offset < 0 {
+        return Err(ApiError::bad("offset must be non-negative"));
+    }
+    let mut rows = db::list_model_observations(&state.pool, &id, limit + 1, offset)
+        .await
+        .map_err(ApiError::internal)?;
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let observations = rows
+        .into_iter()
+        .map(|row| {
+            Ok(json!({
+                "id": row.id,
+                "model_id": row.model_id,
+                "kind": row.kind,
+                "source": row.source,
+                "observed_at": row.observed_at,
+                "scope": serde_json::from_str::<Value>(&row.scope_json).map_err(ApiError::internal)?,
+                "value": serde_json::from_str::<Value>(&row.value_json).map_err(ApiError::internal)?,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Json(json!({
+        "observations": observations,
+        "limit": limit,
+        "offset": offset,
+        "next_offset": has_more.then_some(offset + limit),
+    })))
+}
+
 fn model_json(m: &db::ModelRow, providers: &[db::ProviderRow]) -> Value {
     let provider_name = providers
         .iter()
@@ -7739,6 +8110,41 @@ pub async fn create_model(
             },
         );
     }
+    let initial_latest_observation = if imported_from_discovery {
+        body.discovery
+            .get("latest_observation")
+            .filter(|observation| {
+                observation
+                    .as_object()
+                    .is_some_and(|fields| !fields.is_empty())
+            })
+            .cloned()
+            .or_else(|| {
+                let fields = body.discovery.as_object()?;
+                fields
+                    .keys()
+                    .any(|key| {
+                        !matches!(
+                            key.as_str(),
+                            "imported_from_discovery" | "execution_supported"
+                        )
+                    })
+                    .then(|| body.discovery.clone())
+            })
+            .map(|mut observation| {
+                if let Some(fields) = observation.as_object_mut() {
+                    if !fields.get("observed_at").is_some_and(Value::is_string) {
+                        fields.insert("observed_at".into(), json!(db::now_iso()));
+                    }
+                }
+                observation
+            })
+    } else {
+        None
+    };
+    if let Some(observation) = initial_latest_observation.as_ref() {
+        discovery_patch.insert("latest_observation".into(), observation.clone());
+    }
     if !effective_prices.is_configured() {
         discovery_patch.insert("effective_pricing".into(), Value::Null);
     }
@@ -7774,6 +8180,21 @@ pub async fn create_model(
             source,
             metadata,
         });
+    let initial_observation_data = initial_latest_observation.as_ref().map(|observation| {
+        model_discovery_observation(observation, &provider_id, &body.upstream_id)
+    });
+    let initial_observation =
+        initial_observation_data
+            .as_ref()
+            .map(
+                |(observed_at, source, scope, value)| db::ModelObservationDraft {
+                    kind: "metadata_discovery",
+                    source,
+                    observed_at,
+                    scope,
+                    value,
+                },
+            );
 
     let (id, _) = db::commit_model_creation(
         &state.pool,
@@ -7796,6 +8217,7 @@ pub async fn create_model(
             discovery_patch: &discovery_patch,
             opaque_state_plugin: opaque_state_plugin.as_deref(),
             pricing,
+            initial_observation,
         },
     )
     .await
@@ -12057,6 +12479,7 @@ pub async fn import_config(
                     discovery_patch: &discovery_patch,
                     opaque_state_plugin: None,
                     pricing,
+                    initial_observation: None,
                 },
             )
             .await
@@ -15654,6 +16077,13 @@ mod reasoning_discovery_control_plane_tests {
             discovery["latest_observation"]["raw_metadata_truncated"],
             false
         );
+        let observation_history = db::list_model_observations(&pool, &model_id, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(observation_history.len(), 1);
+        let archived: Value = serde_json::from_str(&observation_history[0].value_json).unwrap();
+        assert!(archived.get("raw_metadata").is_none());
+        assert_eq!(archived["capabilities"]["tool_calling"], true);
         assert!(
             discovery.get("reasoning_capability").is_none(),
             "fresh reasoning metadata must remain observational until accepted"
@@ -16201,14 +16631,19 @@ mod reasoning_discovery_control_plane_tests {
                 enabled: true,
                 context_window: observation.model.context_window,
                 max_output_tokens: observation.model.max_output_tokens,
-                capabilities: discovery_caps,
+                capabilities: discovery_caps.clone(),
                 prices: json!({}),
                 parameters: json!({}),
                 thinking_map: ThinkingMap::default(),
                 extra_request: json!({}),
                 discovery: json!({
                     "imported_from_discovery": true,
-                    "execution_supported": true
+                    "execution_supported": true,
+                    "observed_at": "2026-09-30T00:00:00Z",
+                    "context_window": observation.model.context_window,
+                    "max_output_tokens": observation.model.max_output_tokens,
+                    "capabilities": &discovery_caps,
+                    "capability_sources": &observation.capability_sources
                 }),
                 transport_override: None,
             }),
@@ -16224,6 +16659,14 @@ mod reasoning_discovery_control_plane_tests {
             serde_json::from_str::<Value>(&row.capabilities).unwrap(),
             json!({"structured_output": true})
         );
+        let imported_history = db::list_model_observations(&pool, model_id, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(imported_history.len(), 1);
+        let imported_value: Value = serde_json::from_str(&imported_history[0].value_json).unwrap();
+        assert_eq!(imported_value["observed_at"], "2026-09-30T00:00:00Z");
+        assert_eq!(imported_value["context_window"], Value::Null);
+        assert_eq!(imported_value["capabilities"]["structured_output"], true);
         assert!(row.caps().structured_output);
         assert!(!row.caps().vision);
         assert!(!row.caps().tool_calling);
@@ -16492,6 +16935,115 @@ mod credential_enrollment_regression_tests {
             0,
         );
         (state, root)
+    }
+
+    #[tokio::test]
+    async fn model_observations_endpoint_paginates_and_keeps_deleted_model_history() {
+        let (state, root) = test_state("model-observations").await;
+        let provider_id = "provider-observations-api";
+        sqlx::query(
+            "INSERT INTO providers (id, name, base_url, wire_format, auth_scheme, created_at)
+             VALUES (?, 'Provider', 'https://example.test', 'openai', 'bearer', ?)",
+        )
+        .bind(provider_id)
+        .bind(db::now_iso())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id,
+                upstream_id: "model",
+                display_name: "Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let row = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        for observed_at in ["2026-09-01T00:00:00Z", "2026-09-02T00:00:00Z"] {
+            persist_model_discovery_update(
+                &state.pool,
+                &row,
+                json!({
+                    "latest_observation": {
+                        "observed_at": observed_at,
+                        "context_window": null,
+                        "capability_sources": {}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let first_page = list_model_observations(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(model_id.clone()),
+            Query(ModelObservationsQuery {
+                limit: Some(1),
+                offset: Some(0),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_page.0["observations"].as_array().unwrap().len(), 1);
+        assert_eq!(first_page.0["next_offset"], 1);
+        assert!(first_page.0["observations"][0].get("scope").is_some());
+        assert!(first_page.0["observations"][0].get("value").is_some());
+
+        let second_page = list_model_observations(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(model_id.clone()),
+            Query(ModelObservationsQuery {
+                limit: Some(1),
+                offset: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_page.0["observations"].as_array().unwrap().len(), 1);
+        assert!(second_page.0["next_offset"].is_null());
+
+        db::delete_model(&state.pool, &model_id).await.unwrap();
+        let retained = list_model_observations(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(model_id),
+            Query(ModelObservationsQuery {
+                limit: Some(10),
+                offset: Some(0),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retained.0["observations"].as_array().unwrap().len(), 2);
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     async fn test_state_with_plugins(tag: &str) -> (AppState, std::path::PathBuf) {

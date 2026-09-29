@@ -661,6 +661,10 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
           }
         : { levels: {} },
       discovery: {
+        observed_at: m.observed_at || null,
+        context_window: m.context_window ?? null,
+        max_output_tokens: m.max_output_tokens ?? null,
+        display_name: m.display_name ?? null,
         capabilities: m.capabilities || {},
         reasoning_capability: m.reasoning_capability || null,
         thinking_map: m.thinking_map || null,

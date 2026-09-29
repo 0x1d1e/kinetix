@@ -2165,7 +2165,7 @@ fn median_observed_ttft(
 
     values.sort_by(f64::total_cmp);
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         Some(values[mid - 1] + (values[mid] - values[mid - 1]) / 2.0)
     } else {
         Some(values[mid])
@@ -2879,7 +2879,7 @@ async fn handle_key_failure(
             (Some("cooldown"), "rate_limited", Some(until), None)
         }
         FailureKind::QuotaExhausted => {
-            let reset = failure.quota_reset_at.clone().unwrap_or_else(|| {
+            let reset = failure.quota_reset_at.unwrap_or_else(|| {
                 chrono::Utc::now()
                     + chrono::Duration::seconds(default_quota_window(&target.account))
             });

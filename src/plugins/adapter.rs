@@ -125,7 +125,7 @@ impl PluginAdapter {
                 "invalid_request" | "unsupported" => FailureKind::BadRequest,
                 "unauthorized" => FailureKind::AuthError,
                 "protocol_error" | "plugin_internal" => FailureKind::PluginFailure,
-                _ => FailureKind::parse(code).unwrap_or_else(|| {
+                _ => FailureKind::parse(code).unwrap_or({
                     if *retryable {
                         FailureKind::PluginFailure
                     } else {

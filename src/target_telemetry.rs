@@ -324,10 +324,8 @@ fn spawn_worker(
             tokio::select! {
                 event = rx.recv() => {
                     let Some(event) = event else {
-                        if !pending.is_empty() {
-                            if flush(&pool, &mut pending).await.is_err() {
-                                dropped_persistence.fetch_add(pending_events, Ordering::Relaxed);
-                            }
+                        if !pending.is_empty() && flush(&pool, &mut pending).await.is_err() {
+                            dropped_persistence.fetch_add(pending_events, Ordering::Relaxed);
                         }
                         break;
                     };

@@ -113,6 +113,10 @@ pub fn build(state: AppState) -> Router {
         .route("/models", get(admin::list_models))
         .route("/providers/{id}/models", post(admin::create_model))
         .route(
+            "/models/{id}/observations",
+            get(admin::list_model_observations),
+        )
+        .route(
             "/models/{id}",
             put(admin::update_model).delete(admin::delete_model),
         )

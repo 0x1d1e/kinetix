@@ -221,7 +221,7 @@ fn model_entries_in(
 
     entries.retain(|entry| {
         crate::db::VirtualKeyRow::model_is_allowed(key_allowed, &entry.name)
-            && provider_policy_allows(&snap, &entry.name, key_allowed_providers)
+            && provider_policy_allows(snap, &entry.name, key_allowed_providers)
     });
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries

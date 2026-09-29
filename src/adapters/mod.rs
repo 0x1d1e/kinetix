@@ -2415,6 +2415,36 @@ mod execution_profile_tests {
     }
 
     #[test]
+    fn expired_probe_is_not_authoritative_but_remains_in_discovery_history() {
+        let provider = provider();
+        let mut model = model();
+        let evidence = serde_json::json!({
+            "status": "supported",
+            "verified_at": "2025-01-01T00:00:00Z",
+            "fresh_until": "2025-01-02T00:00:00Z",
+            "scope": {
+                "provider_id": "provider",
+                "account_id": "account",
+                "model_id": "model",
+                "transport": "openai"
+            }
+        });
+        model.discovery = serde_json::json!({
+            "probe_evidence": { "tool_calling": [evidence] }
+        })
+        .to_string();
+
+        let profile =
+            resolve_execution_profile_for_target(&provider, &model, Some("account")).unwrap();
+        assert_eq!(profile.capabilities.tool_calling, None);
+        let history = serde_json::from_str::<serde_json::Value>(&model.discovery).unwrap();
+        assert_eq!(
+            history["probe_evidence"]["tool_calling"][0]["status"],
+            "supported"
+        );
+    }
+
+    #[test]
     fn keeps_absent_capabilities_unknown_and_explicit_values() {
         let provider = provider();
         let mut model = model();

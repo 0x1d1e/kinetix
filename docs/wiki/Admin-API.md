@@ -47,10 +47,13 @@ expose it behind Cloudflare Access plus the in-Kinetix password/session check.
 
 | Method & path | Purpose |
 | --- | --- |
-| `GET /admin/api/models` | List (all providers). |
+| `GET /admin/api/models` | List (all providers), including effective values and the latest discovery/probe state. |
+| `GET /admin/api/models/{id}/observations` | Append-only metadata-discovery and capability-probe history (`limit` defaults to 100, maximum 500; `offset` defaults to 0). |
 | `POST /admin/api/providers/{id}/models` | Create a model for a provider. Optional `transport_override` selects `openai`, `openai-responses`, `anthropic`, `gemini`, or a `plugin:<id>/<adapter>` reference; omit/null to use discovered transport, then provider default. |
 | `PUT /admin/api/models/{id}` | Update, including optional `transport_override`. |
-| `DELETE /admin/api/models/{id}` | Delete. |
+| `DELETE /admin/api/models/{id}` | Delete the model; its observation history remains available by model id. |
+
+Model observations retain normalized non-pricing evidence, source provenance, scope, and observation time. Effective model configuration remains in the model record; historical and effective prices continue to use price versions.
 
 ## Accounts
 
