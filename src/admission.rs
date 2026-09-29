@@ -241,10 +241,15 @@ pub struct AdmissionReservation {
     metrics: Arc<AdmissionMetrics>,
     id: u64,
     estimate_tokens: u64,
+    estimated_cost: Option<f64>,
     settled: bool,
 }
 
 impl AdmissionReservation {
+    pub(crate) fn conservative_cost_estimate(&self) -> Option<f64> {
+        self.estimated_cost
+    }
+
     /// Settle the request count and retain its conservative token estimate.
     pub(crate) fn reconcile_incomplete(self) {
         self.reconcile(&TokenUsage::default(), None);
@@ -413,8 +418,8 @@ impl AdmissionController {
 
         let (minute, daily, monthly) = tokio::join!(
             db::key_usage_entries_since(pool, key_id, &minute_since),
-            db::key_spend_since(pool, key_id, &daily_since),
-            db::key_spend_since(pool, key_id, &monthly_since),
+            db::key_admission_budget_spend_since(pool, key_id, &daily_since),
+            db::key_admission_budget_spend_since(pool, key_id, &monthly_since),
         );
 
         let mut ledger = entry.ledger.lock();
@@ -505,6 +510,7 @@ impl AdmissionController {
             metrics: self.metrics.clone(),
             id,
             estimate_tokens: estimate.tokens,
+            estimated_cost: estimate.cost,
             settled: false,
         })
     }
@@ -1154,6 +1160,65 @@ mod tests {
             AdmissionEstimate {
                 tokens: 1,
                 cost: None,
+            },
+        );
+        assert!(next.is_err());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn persisted_unknown_cost_retains_budget_reservation_after_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-admission-unknown-cost-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = db::connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+            .await
+            .unwrap();
+        db::migrate(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs
+             (id, request_id, ts, key_id, client_format, requested_model, status, status_code,
+              cost_usd, cost_known, admission_cost_usd)
+             VALUES (?, ?, ?, ?, 'openai', 'model', 'upstream_error', 502, NULL, 0, ?)",
+        )
+        .bind("failed-request")
+        .bind("failed-request")
+        .bind(db::now_iso())
+        .bind("key")
+        .bind(0.8f64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let daily_since = crate::pool::window_start("daily", None);
+        assert_eq!(
+            db::key_spend_since(&pool, "key", &daily_since)
+                .await
+                .unwrap(),
+            0.0
+        );
+        assert_eq!(
+            db::key_admission_budget_spend_since(&pool, "key", &daily_since)
+                .await
+                .unwrap(),
+            0.8
+        );
+
+        let controller = AdmissionController::default();
+        let entry = controller.entry("key");
+        controller.ensure_initialized(&pool, "key", &entry).await;
+        let mut key = key();
+        key.daily_budget = Some(1.0);
+        let next = controller.reserve_initialized(
+            entry,
+            &key,
+            AdmissionEstimate {
+                tokens: 1,
+                cost: Some(0.4),
             },
         );
         assert!(next.is_err());

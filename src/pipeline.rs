@@ -281,6 +281,10 @@ impl RequestMeta {
             retry_count: self.partial_attempts.len().saturating_sub(1) as i64,
             route_trace_id: last_attempt.row.opaque_route_id.clone(),
             opaque_route_id: last_attempt.row.opaque_route_id.clone(),
+            admission_cost_usd: self
+                .admission
+                .as_ref()
+                .and_then(|admission| admission.conservative_cost_estimate()),
         };
         log_queue.enqueue_bundle(db::UsageAccountingBundle {
             request: request_row,
@@ -1966,7 +1970,6 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                     None,
                                 );
-                                reconcile_partial_attempts(&mut meta);
                                 let client_error = failure_to_error(&failure, target);
                                 record_precommit_request_log(
                                     state,
@@ -2311,7 +2314,6 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                     None,
                                 );
-                                reconcile_partial_attempts(&mut meta);
                                 record_precommit_request_log(
                                     state,
                                     &meta,
@@ -2372,7 +2374,6 @@ pub(crate) async fn run_with_disconnect(
                         None,
                         None,
                     );
-                    reconcile_partial_attempts(&mut meta);
                     record_precommit_request_log(
                         state,
                         &meta,
@@ -2480,7 +2481,6 @@ pub(crate) async fn run_with_disconnect(
                         None,
                         None,
                     );
-                    reconcile_partial_attempts(&mut meta);
                     record_precommit_request_log(
                         state,
                         &meta,
@@ -2514,7 +2514,6 @@ pub(crate) async fn run_with_disconnect(
 
     // 4. Every target unavailable (FR-12.12).
     state.failures_pre_commit.fetch_add(1, Ordering::Relaxed);
-    reconcile_partial_attempts(&mut meta);
     let retry_after = pool::soonest_recovery(&all_accounts)
         .map(|t| ((t - chrono::Utc::now()).num_seconds().max(1)) as u64);
     let name = route
@@ -2599,6 +2598,14 @@ fn enqueue_precommit_failure(
     error: &ProxyError,
 ) {
     let retries = attempts_done.saturating_sub(1) as i64;
+    let upstream_dispatched = meta.upstream_dispatched.load(Ordering::Acquire);
+    let admission_cost_usd = upstream_dispatched
+        .then(|| {
+            meta.admission
+                .as_ref()
+                .and_then(|admission| admission.conservative_cost_estimate())
+        })
+        .flatten();
     if !meta.accounting_enqueued.swap(true, Ordering::AcqRel) {
         state.log_queue.enqueue(db::UsageLogRow {
             id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
@@ -2637,11 +2644,13 @@ fn enqueue_precommit_failure(
             retry_count: retries,
             route_trace_id: None,
             opaque_route_id: None,
+            admission_cost_usd,
         });
     }
-    if meta.upstream_dispatched.load(Ordering::Acquire) {
+    if upstream_dispatched {
         if let Some(admission) = meta.admission.take() {
-            admission.reconcile_incomplete();
+            let (usage, cost) = aggregate_admission_accounting(meta, None, None);
+            admission.reconcile(&usage, cost);
         }
     }
 }
@@ -6702,16 +6711,6 @@ fn aggregate_admission_accounting(
     )
 }
 
-fn reconcile_partial_attempts(meta: &mut RequestMeta) {
-    if meta.partial_attempts.is_empty() {
-        return;
-    }
-    if let Some(admission) = meta.admission.take() {
-        let (usage, cost) = aggregate_admission_accounting(meta, None, None);
-        admission.reconcile(&usage, cost);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn record_precommit_attempt_usage(
     state: &AppState,
@@ -6859,6 +6858,18 @@ fn record_precommit_request_log(
     attempts_done: usize,
 ) {
     let (usage, cost) = aggregate_request_accounting(meta, None, None);
+    let admission_cost_usd = if usage.input.is_some() && usage.output.is_some() && cost.is_some() {
+        None
+    } else {
+        meta.upstream_dispatched
+            .load(Ordering::Acquire)
+            .then(|| {
+                meta.admission
+                    .as_ref()
+                    .and_then(|admission| admission.conservative_cost_estimate())
+            })
+            .flatten()
+    };
     let usage_confidence = if usage_has_reported_tokens(&usage) {
         "provider_reported"
     } else {
@@ -6901,6 +6912,7 @@ fn record_precommit_request_log(
         retry_count: attempts_done.saturating_sub(1) as i64,
         route_trace_id: Some(trace.opaque_route_id.clone()),
         opaque_route_id: Some(trace.opaque_route_id.clone()),
+        admission_cost_usd,
     };
     state.log_queue.enqueue_bundle(db::UsageAccountingBundle {
         request: row,
@@ -7084,11 +7096,22 @@ async fn finalize_log(
     );
     let (request_usage, request_cost) = aggregate_request_accounting(meta, Some(&usage), cost);
 
-    // Reconcile against every provider attempt, not only the final fallback
-    // target. Incomplete fields retain the conservative reservation estimate.
+    // Only complete token totals and cost replace the reservation with actuals.
+    // Persist its conservative estimate otherwise, so restart admission matches
+    // the live ledger.
+    let (admission_usage, admission_cost) =
+        aggregate_admission_accounting(meta, Some(&usage), cost);
+    let admission_cost_usd = if admission_usage.input.is_some()
+        && admission_usage.output.is_some()
+        && admission_cost.is_some()
+    {
+        None
+    } else {
+        meta.admission
+            .as_ref()
+            .and_then(|admission| admission.conservative_cost_estimate())
+    };
     if let Some(admission) = meta.admission.take() {
-        let (admission_usage, admission_cost) =
-            aggregate_admission_accounting(meta, Some(&usage), cost);
         admission.reconcile(&admission_usage, admission_cost);
     }
 
@@ -7183,6 +7206,7 @@ async fn finalize_log(
         retry_count: meta.retry_count,
         route_trace_id: Some(trace.opaque_route_id.clone()),
         opaque_route_id: Some(trace.opaque_route_id.clone()),
+        admission_cost_usd,
     };
     let mut attempt_rows = meta
         .partial_attempts

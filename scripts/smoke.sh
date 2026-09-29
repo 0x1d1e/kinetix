@@ -152,6 +152,22 @@ check "failed RPM request is durably reported once" "$FAIL_RPM_USAGE" '"requests
 check "failed request usage stays unknown" "$FAIL_RPM_USAGE" '"unknown_usage_requests":1'
 check_absent "failed request usage hides provider topology" "$FAIL_RPM_USAGE" 'serving_provider'
 
+# An unknown actual cost must retain its conservative estimate for budget admission.
+FAIL_BUDGET_KEY="sk-kinetix-smoke-budget-reservation"
+FAIL_BUDGET_FIRST_CODE="$(curl -s --max-time 20 -o "$WORK/failure-budget-first" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $FAIL_BUDGET_KEY" -H 'content-type: application/json' -d '{"model":"syn-fail-budget","stream":false,"messages":[{"role":"user","content":"fail"}]}')"
+check "priced failed request returns gateway error" "$FAIL_BUDGET_FIRST_CODE" '502'
+FAIL_BUDGET_SECOND_CODE="$(curl -s --max-time 20 -o "$WORK/failure-budget-second" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $FAIL_BUDGET_KEY" -H 'content-type: application/json' -d '{"model":"syn-fail-budget","stream":false,"messages":[{"role":"user","content":"fail"}]}')"
+check "failed request consumes live budget reservation" "$FAIL_BUDGET_SECOND_CODE" '429'
+for _ in $(seq 1 50); do
+  FAIL_BUDGET_USAGE="$(curl -s "$BASE/v1/usage" -H "authorization: Bearer $FAIL_BUDGET_KEY")"
+  if python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["usage"]["daily"]["requests"] >= 1 else 1)' <<<"$FAIL_BUDGET_USAGE"; then
+    break
+  fi
+  sleep 0.1
+done
+check "unknown failed cost stays outside known subtotal" "$FAIL_BUDGET_USAGE" '"known_cost_usd":0.0'
+check "unknown failed cost still makes budget remainder unknown" "$FAIL_BUDGET_USAGE" '"daily_budget_usd":null'
+
 restart_kinetix
 check "healthz after restart" "$(curl -s "$BASE/healthz")" '"data_plane":"serving"'
 FAIL_RPM_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/failure-rpm-after-restart" -w '%{http_code}' \
@@ -159,6 +175,8 @@ FAIL_RPM_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/failure-rpm-after-resta
   -H 'content-type: application/json' \
   -d '{"model":"syn-fail","stream":false,"messages":[{"role":"user","content":"fail"}]}')"
 check "failed request consumes RPM slot after restart" "$FAIL_RPM_RESTART_CODE" '429'
+FAIL_BUDGET_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/failure-budget-after-restart" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $FAIL_BUDGET_KEY" -H 'content-type: application/json' -d '{"model":"syn-fail-budget","stream":false,"messages":[{"role":"user","content":"fail"}]}')"
+check "failed request keeps budget reservation after restart" "$FAIL_BUDGET_RESTART_CODE" '429'
 
 # translation (OpenAI inbound -> Gemini outbound)
 TRANSL="$(curl -s -N --max-time 20 -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"model":"syn-gemini-3","stream":true,"messages":[{"role":"user","content":"hi"}]}')"

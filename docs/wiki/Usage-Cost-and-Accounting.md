@@ -122,7 +122,9 @@ rows, with legacy request rows included when no attempt data exists.
 request in the window lacks that token count. `known_cost_usd` is the numeric
 subtotal for priced requests, including `0` when none are priced;
 `unknown_cost_requests` counts unpriced requests and signals that total spend is
-incomplete. Remaining budgets are `null` when any request is unpriced. Unset
+incomplete. Remaining budgets are `null` when any request is unpriced. Admission
+also retains conservative cost reservations for failed requests with unknown
+cost across restarts; these reservations are not reported as known cost. Unset
 limits are `null`. The endpoint never returns model, Route, provider, account,
 or other key identities.
 

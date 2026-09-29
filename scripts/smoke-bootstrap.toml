@@ -27,6 +27,14 @@ allowed_models = ["syn-fail"]
 rpm_limit = 1
 tpm_limit = 100000000
 
+[[virtual_keys]]
+name = "Failed Request Budget Key"
+key = "sk-kinetix-smoke-budget-reservation"
+owner = "smoke"
+tag = "failure-budget"
+allowed_models = ["syn-fail-budget"]
+daily_budget = 1.0
+
 [[providers]]
 name = "Synth OpenAI"
 base_url = "http://127.0.0.1:9199/openai/v1"
@@ -158,6 +166,30 @@ capability_mode = "permissive"
   max_output_tokens = 8192
   capabilities = ["text", "vision", "reasoning", "tool_calling"]
   thinking_map = { levels = { low = { "thinkingConfig.thinkingBudget" = 512 }, medium = { "thinkingConfig.thinkingBudget" = 2048 }, high = { "thinkingConfig.thinkingBudget" = 4096 } } }
+
+[[providers]]
+name = "Synth Failure Budget"
+base_url = "http://127.0.0.1:9199/gemini/v1beta"
+wire_format = "gemini"
+auth_scheme = "custom_header"
+custom_header_name = "x-goog-api-key"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-failure-budget"
+  api_key = "smoke-failure-budget-key"
+  priority = 1
+  quota_type = "none"
+
+  [[providers.models]]
+  upstream_id = "syn-fail-budget"
+  display_name = "Synthetic Failing Budget Model"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text"]
+  prices = { input_per_1m = 100.0, output_per_1m = 100.0 }
 
 [[providers]]
 name = "Synth Anthropic"

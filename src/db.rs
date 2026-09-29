@@ -3780,6 +3780,10 @@ pub struct UsageLogRow {
     pub retry_count: i64,
     pub route_trace_id: Option<String>,
     pub opaque_route_id: Option<String>,
+    /// Conservative cost reserved for admission when actual cost is unknown.
+    /// This internal value is not part of serialized usage reports.
+    #[serde(skip_serializing, default)]
+    pub admission_cost_usd: Option<f64>,
 }
 
 pub async fn insert_usage_log(pool: &Pool, u: &UsageLogRow) -> Result<()> {
@@ -3794,8 +3798,8 @@ async fn insert_usage_log_on(conn: &mut sqlx::SqliteConnection, u: &UsageLogRow)
          route_name, fallback_hops, fallback_path, status, status_code, latency_ms, ttft_ms, input_tokens,
          output_tokens, cached_tokens, cache_write_tokens, thinking_tokens, cost_usd, cost_known, price_version_id, cache_status,
          serving_account_id, serving_account, serving_provider, upstream_request_id, flagged, error_message,
-         usage_confidence, commit_state, retry_count, route_trace_id, opaque_route_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         usage_confidence, commit_state, retry_count, route_trace_id, opaque_route_id, admission_cost_usd)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&u.id)
     .bind(&u.request_id)
@@ -3833,6 +3837,7 @@ async fn insert_usage_log_on(conn: &mut sqlx::SqliteConnection, u: &UsageLogRow)
     .bind(u.retry_count)
     .bind(&u.route_trace_id)
     .bind(&u.opaque_route_id)
+    .bind(u.admission_cost_usd)
     .execute(conn)
     .await?;
     Ok(())
@@ -4062,6 +4067,24 @@ pub async fn key_spend_since(pool: &Pool, key_id: &str, since_iso: &str) -> Resu
     let row = sqlx::query(
         "SELECT COALESCE(SUM(CASE WHEN cost_known != 0 THEN cost_usd ELSE 0.0 END),0.0) as total
          FROM usage_accounting_rows WHERE key_id = ? AND ts >= ?",
+    )
+    .bind(key_id)
+    .bind(since_iso)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<f64, _>("total"))
+}
+
+/// Spend used to rebuild key budget admission after restart. Unknown actual
+/// costs use their persisted conservative reservation; known costs use actuals.
+pub async fn key_admission_budget_spend_since(
+    pool: &Pool,
+    key_id: &str,
+    since_iso: &str,
+) -> Result<f64> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(COALESCE(admission_cost_usd, cost_usd)),0.0) as total
+         FROM usage_logs WHERE key_id = ? AND ts >= ?",
     )
     .bind(key_id)
     .bind(since_iso)
@@ -5759,6 +5782,7 @@ mod usage_request_log_tests {
             retry_count: fallback_hops,
             route_trace_id: None,
             opaque_route_id: None,
+            admission_cost_usd: None,
         }
     }
 

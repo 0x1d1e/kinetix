@@ -830,6 +830,7 @@ mod client_usage_tests {
             retry_count: 0,
             route_trace_id: None,
             opaque_route_id: Some("private-opaque-route-id".into()),
+            admission_cost_usd: None,
         }
     }
 
