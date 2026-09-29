@@ -220,6 +220,70 @@ export interface TestResult {
   response_preview?: string;
 }
 
+export interface DryRunDescriptor {
+  frontend?: string;
+  key_tag?: string;
+  has_tools?: boolean;
+  has_images?: boolean;
+  has_reasoning?: boolean;
+  input_tokens?: number;
+  allowed_providers?: string[];
+  soft_quota_reached?: boolean;
+  session?: string;
+}
+
+export interface DryRunCapabilityDetail {
+  required: boolean;
+  status: 'supported' | 'unsupported' | 'unknown';
+  eligible: boolean;
+}
+
+export interface DryRunCandidate {
+  candidate_id: string;
+  strategy_rank: number | null;
+  target: string;
+  model: string;
+  model_id: string;
+  provider: string;
+  provider_id: string;
+  account: string;
+  account_id: string;
+  account_status: string;
+  half_open_probe: boolean;
+  route_target_id: string | null;
+  priority: number;
+  weight: number;
+  predicate_result: 'true' | 'false' | 'unknown' | string;
+  predicate_explanation: string;
+  predicate_eligible: boolean;
+  capability_eligible: boolean;
+  capability_details: Record<string, DryRunCapabilityDetail | string>;
+  context_eligible: boolean;
+  provider_permitted: boolean;
+  quota_available: boolean;
+  account_quota_available: boolean;
+  provider_circuit_state: 'closed' | 'open' | 'half_open' | string;
+  provider_circuit_available: boolean;
+  provider_circuit_retry_at: string | null;
+  route_capacity_available: boolean;
+  adaptive_capacity_available: boolean | null;
+  eligible: boolean;
+  not_selected_reasons: string[];
+  selected: boolean;
+  decision_reason: string;
+}
+
+export interface DryRunResult {
+  requested_model: string;
+  route: string | null;
+  route_id: string | null;
+  strategy: string | null;
+  candidates: DryRunCandidate[];
+  would_select: string | null;
+  plugin_fact_failures: { plugin: string; reason: string }[];
+  note: string;
+}
+
 export interface ExportFile {
   name: string;
   day: string;
@@ -610,8 +674,8 @@ export const Kinetix = {
   createRoute: (body: Record<string, unknown>) => api.post('/admin/api/routes', body),
   updateRoute: (id: string, body: Record<string, unknown>) => api.put(`/admin/api/routes/${id}`, body),
   deleteRoute: (id: string) => api.del(`/admin/api/routes/${id}`),
-  dryRunRoute: (model: string, descriptor: Record<string, unknown>) =>
-    api.post<any>('/admin/api/routes/dry-run', { model, ...descriptor }),
+  dryRunRoute: (model: string, descriptor: DryRunDescriptor) =>
+    api.post<DryRunResult>('/admin/api/routes/dry-run', { model, ...descriptor }),
 
   // --- aliases -------------------------------------------------------------
   async aliases(): Promise<ModelAlias[]> {

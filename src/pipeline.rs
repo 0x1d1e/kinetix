@@ -205,7 +205,9 @@ fn token_count_exact_target(
                     &target.model,
                     Some(target.account.id.as_str()),
                 )
-                .map(|profile| profile_satisfies_needs(&profile.capabilities, &needs))
+                .map(|profile| {
+                    profile_satisfies_needs(&profile.capabilities, &needs, target.provider.strict())
+                })
                 .unwrap_or(false));
         (allowed_providers.is_empty() || allowed_providers.contains(&target.provider.id))
             && capabilities_match
@@ -627,6 +629,7 @@ pub(crate) async fn run_with_disconnect(
         });
     }
 
+    let mut execution_profiles = std::collections::HashMap::new();
     let (mut targets, route, route_target_origins) = match resolved {
         Resolved::Single {
             provider_id,
@@ -668,14 +671,9 @@ pub(crate) async fn run_with_disconnect(
                 requested_route: Some(&route.name),
                 ..request_facts
             };
-            let ordered = if route.strategy == "adaptive" {
-                targets
-            } else {
-                order_route_targets(state, &route, targets).await.targets
-            };
             // Retain route-wide producer provenance before request-specific
             // predicates and other eligibility filters remove candidates.
-            let route_target_origins = ordered
+            let route_target_origins = targets
                 .iter()
                 .map(|target| (target_key(&route, target), continuation_origin(target)))
                 .collect::<Vec<_>>();
@@ -683,7 +681,7 @@ pub(crate) async fn run_with_disconnect(
             // eligibility filtering. Fire-and-forget; never blocks routing.
             if let Some(manager) = state.plugin_manager().cloned() {
                 let req_id = meta.request_id.clone();
-                for t in &ordered {
+                for t in &targets {
                     let json = serde_json::json!({
                         "request_id": req_id,
                         "route": route.name,
@@ -722,15 +720,29 @@ pub(crate) async fn run_with_disconnect(
                 trace.plugin_fact_failure(plugin_id, reason);
             }
             let mut kept = Vec::new();
-            for t in ordered {
+            for t in targets {
+                let profile = crate::adapters::resolve_execution_profile_for_target(
+                    &t.provider,
+                    &t.model,
+                    Some(t.account.id.as_str()),
+                );
+                let (capabilities, capabilities_raw) = match profile.as_ref() {
+                    Ok(profile) => predicate_capabilities(profile, &t.model),
+                    Err(_) => (
+                        t.model.caps(),
+                        serde_json::from_str::<Value>(&t.model.capabilities).unwrap_or(Value::Null),
+                    ),
+                };
+                if let Ok(profile) = profile {
+                    execution_profiles.insert(execution_profile_key(&t), profile);
+                }
                 let tgt_facts = TargetFacts {
                     model_id: &t.model.id,
                     model_display: &t.model.display_name,
                     provider_id: &t.provider.id,
                     provider_name: &t.provider.name,
-                    capabilities: &t.model.caps(),
-                    capabilities_raw: &serde_json::from_str::<Value>(&t.model.capabilities)
-                        .unwrap_or(Value::Null),
+                    capabilities: &capabilities,
+                    capabilities_raw: &capabilities_raw,
                     context_window: t.model.context_window,
                     max_output_tokens: t.model.max_output_tokens,
                 };
@@ -759,12 +771,49 @@ pub(crate) async fn run_with_disconnect(
         state.live.set_fallback_hops(&meta.request_id, 0, 0);
     }
 
+    // Resolve and filter capabilities before any Route strategy orders candidates.
+    let mut capable_targets = Vec::with_capacity(targets.len());
+    for target in targets.drain(..) {
+        let key = execution_profile_key(&target);
+        let profile = match execution_profiles.get(&key).cloned() {
+            Some(profile) => Ok(profile),
+            None => crate::adapters::resolve_execution_profile_for_target(
+                &target.provider,
+                &target.model,
+                Some(target.account.id.as_str()),
+            ),
+        };
+        let profile = match profile {
+            Ok(profile) => profile,
+            Err(error) => {
+                trace.step(
+                    "skip",
+                    Some(target.model.display_name.clone()),
+                    format!("invalid execution profile: {}", error.message),
+                );
+                continue;
+            }
+        };
+        let eligibility =
+            capability_eligibility(&profile.capabilities, &needs, target.provider.strict());
+        if !eligibility.eligible {
+            trace.step(
+                "skip",
+                Some(target.model.display_name.clone()),
+                eligibility.reasons.join("; "),
+            );
+            continue;
+        }
+        execution_profiles.insert(key, profile);
+        capable_targets.push(target);
+    }
+    targets = capable_targets;
+
     // Filter by key provider restrictions (FR-12.19) and compatibility (FR-12.11).
     let allowed_providers = key
         .as_ref()
         .map(|k| k.allowed_providers())
         .unwrap_or_default();
-    let before = targets.len();
     targets.retain(|t| {
         if !allowed_providers.is_empty() && !allowed_providers.contains(&t.provider.id) {
             trace.step(
@@ -801,15 +850,13 @@ pub(crate) async fn run_with_disconnect(
         }
         true
     });
-    let _ = before;
 
-    // Adaptive telemetry is intentionally applied only after hard eligibility
-    // (predicate, provider restriction, capability, and context filtering).
-    // Ineligible candidates must not affect route-wide neutral telemetry.
+    // Every Route strategy runs only after predicates, access, capabilities,
+    // and context limits have reduced the candidate set.
     if let Some(route) = &route {
+        let ordering = order_route_targets(state, route, targets).await;
+        targets = ordering.targets;
         if route.strategy == "adaptive" {
-            let ordering = order_route_targets(state, route, targets).await;
-            targets = ordering.targets;
             for target in &targets {
                 trace_adaptive_quota_evidence(&mut trace, target, &ordering.quota_evidence);
             }
@@ -1014,22 +1061,10 @@ pub(crate) async fn run_with_disconnect(
 
         // Resolve target transport and its execution metadata before any
         // target-specific credential lookup or network dispatch.
-        let profile = match crate::adapters::resolve_execution_profile_for_target(
-            &target.provider,
-            &target.model,
-            Some(target.account.id.as_str()),
-        ) {
-            Ok(profile) => profile,
-            Err(error) => {
-                trace.step(
-                    "skip",
-                    Some(target.model.display_name.clone()),
-                    format!("invalid execution profile: {}", error.message),
-                );
-                last_error = Some(error);
-                continue;
-            }
-        };
+        let profile = execution_profiles
+            .get(&execution_profile_key(target))
+            .cloned()
+            .expect("eligible target has a resolved execution profile");
         trace.resolved_transport(
             target.model.display_name.clone(),
             profile.transport.as_str(),
@@ -2022,6 +2057,14 @@ pub(crate) async fn run_with_disconnect(
 
 fn target_key(route: &db::RouteRow, t: &ResolvedTarget) -> String {
     format!("{}|{}|{}", route.id, t.account.id, t.model.id)
+}
+
+fn execution_profile_key(target: &ResolvedTarget) -> (String, String, String) {
+    (
+        target.provider.id.clone(),
+        target.account.id.clone(),
+        target.model.id.clone(),
+    )
 }
 
 fn target_route_model_identity(key: &str) -> Option<(&str, &str)> {
@@ -3274,6 +3317,37 @@ fn select_accounts(
     Ok(pool::order_accounts(available, preferred))
 }
 
+fn select_accounts_for_simulation(
+    snap: &crate::registry::Snapshot,
+    provider_id: &str,
+    seed: u64,
+) -> Vec<db::AccountRow> {
+    let accounts: Vec<_> = snap
+        .accounts
+        .values()
+        .filter(|account| account.provider_id == provider_id)
+        .cloned()
+        .collect();
+    let available: Vec<_> = accounts
+        .iter()
+        .filter(|account| {
+            matches!(
+                pool::effective_status(account),
+                pool::AccountStatus::Healthy
+            )
+        })
+        .cloned()
+        .collect();
+    order_accounts_for_simulation(
+        if available.is_empty() {
+            accounts
+        } else {
+            available
+        },
+        seed,
+    )
+}
+
 /// Gather plugin routing facts for a request (§6.4).
 ///
 /// Every enabled plugin that declares a `routing_facts` capability is invoked
@@ -3399,8 +3473,18 @@ async fn gather_plugin_facts(
 /// Order sibling accounts for one logical route target. Account priority is
 /// primary; weight biases the first choice within equal-priority tiers while
 /// retaining every sibling for fallback.
-fn order_route_account_candidates(targets: Vec<ResolvedTarget>) -> Vec<ResolvedTarget> {
-    let accounts = pool::order_accounts(targets.iter().map(|t| t.account.clone()).collect(), None);
+fn order_route_account_candidates(
+    targets: Vec<ResolvedTarget>,
+    simulation_seed: Option<u64>,
+) -> Vec<ResolvedTarget> {
+    let accounts: Vec<_> = targets
+        .iter()
+        .map(|target| target.account.clone())
+        .collect();
+    let accounts = match simulation_seed {
+        Some(seed) => order_accounts_for_simulation(accounts, seed),
+        None => pool::order_accounts(accounts, None),
+    };
     let mut by_account: std::collections::HashMap<String, ResolvedTarget> = targets
         .into_iter()
         .map(|target| (target.account.id.clone(), target))
@@ -3410,6 +3494,57 @@ fn order_route_account_candidates(targets: Vec<ResolvedTarget>) -> Vec<ResolvedT
         .into_iter()
         .filter_map(|account| by_account.remove(&account.id))
         .collect()
+}
+
+fn order_accounts_for_simulation(
+    mut accounts: Vec<db::AccountRow>,
+    seed: u64,
+) -> Vec<db::AccountRow> {
+    accounts.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut start = 0;
+    while start < accounts.len() {
+        let priority = accounts[start].priority;
+        let mut end = start + 1;
+        while end < accounts.len() && accounts[end].priority == priority {
+            end += 1;
+        }
+        for index in start..end {
+            let total: u64 = accounts[index..end]
+                .iter()
+                .map(|account| account.weight.max(1) as u64)
+                .sum();
+            let identity = accounts[index..end]
+                .iter()
+                .map(|account| account.id.as_str())
+                .collect::<Vec<_>>()
+                .join("|");
+            let pick = stable_route_hash(seed ^ index as u64, identity.as_bytes()) % total;
+            let mut cumulative = 0;
+            let mut selected = index;
+            for (offset, account) in accounts[index..end].iter().enumerate() {
+                cumulative += account.weight.max(1) as u64;
+                if pick < cumulative {
+                    selected = index + offset;
+                    break;
+                }
+            }
+            accounts.swap(index, selected);
+        }
+        start = end;
+    }
+    accounts
+}
+
+fn stable_route_hash(seed: u64, bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0xcbf29ce484222325_u64 ^ seed, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
 }
 
 fn adaptive_account_dispatchable(target: &ResolvedTarget) -> bool {
@@ -3427,13 +3562,37 @@ async fn order_route_targets(
     route: &db::RouteRow,
     targets: Vec<ResolvedTarget>,
 ) -> OrderedRouteTargets {
+    order_route_targets_inner(state, route, targets, None).await
+}
+
+async fn order_route_targets_for_simulation(
+    state: &AppState,
+    route: &db::RouteRow,
+    targets: Vec<ResolvedTarget>,
+    seed: u64,
+) -> OrderedRouteTargets {
+    order_route_targets_inner(state, route, targets, Some(seed)).await
+}
+
+async fn order_route_targets_inner(
+    state: &AppState,
+    route: &db::RouteRow,
+    targets: Vec<ResolvedTarget>,
+    simulation_seed: Option<u64>,
+) -> OrderedRouteTargets {
     // Freeze adaptive telemetry for this ordering pass. acquire() still
     // performs the authoritative live capacity check immediately before
     // dispatch, but one sort must never observe a moving comparator.
     let adaptive_dispatchable = (route.strategy == "adaptive").then(|| {
         targets
             .iter()
-            .filter(|target| adaptive_account_dispatchable(target))
+            .filter(|target| {
+                adaptive_account_dispatchable(target)
+                    && state
+                        .provider_circuits
+                        .availability(&target.provider.id)
+                        .available
+            })
             .map(adaptive_candidate_key)
             .collect::<std::collections::HashSet<_>>()
     });
@@ -3485,13 +3644,23 @@ async fn order_route_targets(
     }
 
     for group in &mut groups {
-        *group = order_route_account_candidates(std::mem::take(group));
+        let seed = simulation_seed.map(|seed| {
+            let key = group
+                .first()
+                .and_then(|target| target.route_target_id.as_deref())
+                .unwrap_or("direct");
+            stable_route_hash(seed, key.as_bytes())
+        });
+        *group = order_route_account_candidates(std::mem::take(group), seed);
     }
 
     match route.strategy.as_str() {
         "round-robin" => {
-            let counter = state.rr_counter(&route.id);
-            let n = counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let n = if simulation_seed.is_some() {
+                state.rr_counter_snapshot(&route.id)
+            } else {
+                state.rr_counter(&route.id).fetch_add(1, Ordering::Relaxed)
+            } as usize;
             if !groups.is_empty() {
                 let offset = n % groups.len();
                 groups.rotate_left(offset);
@@ -3499,23 +3668,28 @@ async fn order_route_targets(
         }
         "weighted" => {
             use rand::Rng;
-            let total: i64 = groups
+            let total: u64 = groups
                 .iter()
-                .filter_map(|g| g.first())
-                .map(|t| t.weight.max(1))
+                .filter_map(|group| group.first())
+                .map(|target| target.weight.max(1) as u64)
                 .sum();
             if total > 0 {
-                let mut pick = rand::thread_rng().gen_range(0..total);
-                let mut idx = 0;
+                let mut pick = simulation_seed
+                    .map(|seed| stable_route_hash(seed, route.id.as_bytes()) % total)
+                    .unwrap_or_else(|| rand::thread_rng().gen_range(0..total));
+                let mut index = 0;
                 for (i, group) in groups.iter().enumerate() {
-                    let weight = group.first().map(|t| t.weight.max(1)).unwrap_or(1);
-                    pick -= weight;
-                    if pick < 0 {
-                        idx = i;
+                    let weight = group
+                        .first()
+                        .map(|target| target.weight.max(1) as u64)
+                        .unwrap_or(1);
+                    if pick < weight {
+                        index = i;
                         break;
                     }
+                    pick -= weight;
                 }
-                groups.rotate_left(idx);
+                groups.rotate_left(index);
             }
         }
         "adaptive" => {
@@ -4045,19 +4219,67 @@ fn check_thinking_translation(
     )))
 }
 
-fn target_profile_supports_request(
-    target: &ResolvedTarget,
+#[derive(Debug, Clone)]
+struct CapabilityEligibility {
+    eligible: bool,
+    details: Value,
+    reasons: Vec<String>,
+}
+
+fn capability_eligibility(
+    capabilities: &crate::adapters::ModelCapabilityFlags,
     needs: &crate::types::CapabilityNeeds,
-) -> bool {
-    integration_feature_ceiling_satisfies_needs(&target.provider, needs)
-        && (!target.provider.strict()
-            || crate::adapters::resolve_execution_profile_for_target(
-                &target.provider,
-                &target.model,
-                Some(target.account.id.as_str()),
-            )
-            .map(|profile| profile_satisfies_needs(&profile.capabilities, needs))
-            .unwrap_or(false))
+    strict: bool,
+) -> CapabilityEligibility {
+    let mut eligible = true;
+    let mut reasons = Vec::new();
+    let mut detail = serde_json::Map::new();
+    for (name, needed, value) in [
+        ("vision", needs.vision, capabilities.vision),
+        ("tool_calling", needs.tools, capabilities.tool_calling),
+        (
+            "parallel_tools",
+            needs.parallel_tools,
+            capabilities.parallel_tools,
+        ),
+        ("reasoning", needs.reasoning, capabilities.reasoning),
+        (
+            "structured_output",
+            needs.structured_output,
+            capabilities.structured_output,
+        ),
+    ] {
+        let status = match value {
+            Some(true) => "supported",
+            Some(false) => "unsupported",
+            None => "unknown",
+        };
+        let supported = !needed || value == Some(true) || (value.is_none() && !strict);
+        if needed && !supported {
+            eligible = false;
+            reasons.push(format!(
+                "required {name} capability is {status}{}",
+                if status == "unknown" {
+                    " under strict capability mode"
+                } else {
+                    ""
+                }
+            ));
+        }
+        detail.insert(
+            name.to_string(),
+            serde_json::json!({
+                "required": needed,
+                "status": status,
+                "eligible": supported,
+            }),
+        );
+    }
+    CapabilityEligibility {
+        eligible,
+        details: Value::Object(detail),
+        reasons,
+    }
 }
 
 /// Integration declarations are hard ceilings even for permissive providers;
@@ -4113,18 +4335,45 @@ fn provider_satisfies_needs(
     needs: &crate::types::CapabilityNeeds,
 ) -> bool {
     integration_feature_ceiling_satisfies_needs(provider, needs)
-        && (!provider.strict() || profile_satisfies_needs(capabilities, needs))
+        && (!provider.strict() || profile_satisfies_needs(capabilities, needs, provider.strict()))
 }
 
 fn profile_satisfies_needs(
     capabilities: &crate::adapters::ModelCapabilityFlags,
     needs: &crate::types::CapabilityNeeds,
+    strict: bool,
 ) -> bool {
-    (!needs.vision || capabilities.vision != Some(false))
-        && (!needs.tools || capabilities.tool_calling != Some(false))
-        && (!needs.parallel_tools || capabilities.parallel_tools != Some(false))
-        && (!needs.reasoning || capabilities.reasoning != Some(false))
-        && (!needs.structured_output || capabilities.structured_output != Some(false))
+    capability_eligibility(capabilities, needs, strict).eligible
+}
+
+fn predicate_capabilities(
+    profile: &crate::adapters::ResolvedExecutionProfile,
+    model: &db::ModelRow,
+) -> (crate::types::Capabilities, Value) {
+    let resolved = &profile.capabilities;
+    let mut flags = model.caps();
+    flags.text = resolved.text == Some(true);
+    flags.vision = resolved.vision == Some(true);
+    flags.reasoning = resolved.reasoning == Some(true);
+    flags.tool_calling = resolved.tool_calling == Some(true);
+    flags.parallel_tools = resolved.parallel_tools == Some(true);
+    flags.structured_output = resolved.structured_output == Some(true);
+
+    let mut raw = serde_json::from_str::<Value>(&model.capabilities)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    for (name, value) in [
+        ("text", resolved.text),
+        ("vision", resolved.vision),
+        ("reasoning", resolved.reasoning),
+        ("tool_calling", resolved.tool_calling),
+        ("parallel_tools", resolved.parallel_tools),
+        ("structured_output", resolved.structured_output),
+    ] {
+        raw.insert(name.to_string(), value.map_or(Value::Null, Value::Bool));
+    }
+    (flags, Value::Object(raw))
 }
 
 fn check_param_policy(
@@ -5758,6 +6007,8 @@ pub struct DryRunRequest {
     /// reason the data path would skip them.
     #[serde(default)]
     pub soft_quota_reached: bool,
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 pub async fn dry_run(
@@ -5781,6 +6032,10 @@ pub async fn dry_run(
         structured_output: descriptor.has_structured_output,
     };
 
+    let simulation_seed = stable_route_hash(
+        descriptor.input_tokens.unwrap_or_default() ^ u64::from(descriptor.has_tools),
+        requested_model.as_bytes(),
+    );
     let (targets, route) = match resolved {
         Resolved::Single {
             provider_id,
@@ -5796,7 +6051,7 @@ pub async fn dry_run(
                 .get(&provider_id)
                 .cloned()
                 .ok_or_else(|| ProxyError::not_found("provider not found"))?;
-            let accounts = select_accounts(&snap, &provider_id, None)?;
+            let accounts = select_accounts_for_simulation(&snap, &provider_id, simulation_seed);
             (
                 accounts
                     .into_iter()
@@ -5814,20 +6069,12 @@ pub async fn dry_run(
                 None,
             )
         }
-        Resolved::Route { route, targets } => {
-            let ordered = if route.strategy == "adaptive" {
-                targets
-            } else {
-                order_route_targets(state, &route, targets).await.targets
-            };
-            (ordered, Some(route))
-        }
+        Resolved::Route { route, targets } => (targets, Some(route)),
     };
 
     let adaptive_route = route
         .as_ref()
         .is_some_and(|route| route.strategy == "adaptive");
-    let dry_run_traffic = adaptive_route.then(|| snapshot_traffic_targets(state, &targets));
 
     let request_facts = RequestFacts {
         frontend,
@@ -5839,132 +6086,225 @@ pub async fn dry_run(
         has_reasoning: descriptor.has_reasoning,
         input_tokens: descriptor.input_tokens.unwrap_or(0),
     };
+    let plugin_facts = gather_plugin_facts(state, &request_facts, None).await;
 
-    let adaptive_rank = if adaptive_route {
-        let mut hard_eligible = Vec::new();
-        for t in &targets {
-            let tgt_facts = TargetFacts {
-                model_id: &t.model.id,
-                model_display: &t.model.display_name,
-                provider_id: &t.provider.id,
-                provider_name: &t.provider.name,
-                capabilities: &t.model.caps(),
-                capabilities_raw: &serde_json::from_str::<Value>(&t.model.capabilities)
-                    .unwrap_or(Value::Null),
-                context_window: t.model.context_window,
-                max_output_tokens: t.model.max_output_tokens,
-            };
-            let predicate_ok =
-                predicate::eligibility(&t.predicate, &request_facts, &tgt_facts).eligible;
-            let caps_ok = target_profile_supports_request(t, &needs);
-            let ctx_ok = t
-                .model
-                .context_window
-                .map(|c| c <= 0 || request_facts.input_tokens <= c as u64)
-                .unwrap_or(true);
-            let provider_allowed = descriptor.allowed_providers.is_empty()
-                || descriptor.allowed_providers.contains(&t.provider.id);
-            let protocol_ok = dry_run_provider_accepts_frontend(&t.provider, frontend);
-            if predicate_ok && caps_ok && ctx_ok && provider_allowed && protocol_ok {
-                hard_eligible.push(t.clone());
+    let mut hard_eligible = Vec::new();
+    let mut evaluations = std::collections::HashMap::new();
+    for target in &targets {
+        let profile = crate::adapters::resolve_execution_profile_for_target(
+            &target.provider,
+            &target.model,
+            Some(target.account.id.as_str()),
+        );
+        let (capabilities, capabilities_raw, capability) = match profile.as_ref() {
+            Ok(profile) => {
+                let (capabilities, raw) = predicate_capabilities(profile, &target.model);
+                let capability =
+                    capability_eligibility(&profile.capabilities, &needs, target.provider.strict());
+                (capabilities, raw, capability)
+            }
+            Err(error) => (
+                target.model.caps(),
+                serde_json::from_str::<Value>(&target.model.capabilities).unwrap_or(Value::Null),
+                CapabilityEligibility {
+                    eligible: false,
+                    details: serde_json::json!({"execution_profile": "invalid"}),
+                    reasons: vec![format!("invalid execution profile: {}", error.message)],
+                },
+            ),
+        };
+        let target_facts = TargetFacts {
+            model_id: &target.model.id,
+            model_display: &target.model.display_name,
+            provider_id: &target.provider.id,
+            provider_name: &target.provider.name,
+            capabilities: &capabilities,
+            capabilities_raw: &capabilities_raw,
+            context_window: target.model.context_window,
+            max_output_tokens: target.model.max_output_tokens,
+        };
+        let predicate_result = predicate::eligibility_with_facts(
+            &target.predicate,
+            &request_facts,
+            &target_facts,
+            &plugin_facts,
+        );
+        let context_eligible = target
+            .model
+            .context_window
+            .map(|limit| limit <= 0 || request_facts.input_tokens <= limit as u64)
+            .unwrap_or(true);
+        let provider_permitted = descriptor.allowed_providers.is_empty()
+            || descriptor.allowed_providers.contains(&target.provider.id);
+        let integration_features_allowed =
+            integration_feature_ceiling_satisfies_needs(&target.provider, &needs);
+        let protocol_ok = dry_run_provider_accepts_frontend(&target.provider, frontend);
+        let hard_eligible_target = predicate_result.eligible
+            && capability.eligible
+            && integration_features_allowed
+            && context_eligible
+            && provider_permitted
+            && protocol_ok;
+        if hard_eligible_target {
+            hard_eligible.push(target.clone());
+        }
+        evaluations.insert(
+            adaptive_candidate_key(target),
+            (
+                predicate_result,
+                capability,
+                context_eligible,
+                provider_permitted,
+                integration_features_allowed,
+                protocol_ok,
+            ),
+        );
+    }
+
+    let dry_run_traffic = adaptive_route.then(|| snapshot_traffic_targets(state, &hard_eligible));
+    let route_rank = if let Some(route) = &route {
+        let mut ordered =
+            order_route_targets_for_simulation(state, route, hard_eligible, simulation_seed)
+                .await
+                .targets;
+        let (mut dispatchable, mut deferred): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
+        for target in ordered.drain(..) {
+            if matches!(
+                pool::effective_status(&target.account),
+                pool::AccountStatus::CircuitOpen
+            ) && !pool::should_probe(&target.account)
+            {
+                deferred.push(target);
+            } else {
+                dispatchable.push(target);
             }
         }
-
-        let route = route.as_ref().expect("adaptive dry-run route");
-        let ordered = order_route_targets(state, route, hard_eligible).await;
+        dispatchable.append(&mut deferred);
+        if let (Some(session), true) = (
+            descriptor.session.as_deref(),
+            route.cache_affinity != 0 || route.sticky_routing != 0,
+        ) {
+            if let Some(sticky_key) = state.sticky_lookup(session, STICKY_TTL) {
+                if let Some(index) = dispatchable
+                    .iter()
+                    .position(|target| target_key(route, target) == sticky_key)
+                {
+                    dispatchable.rotate_left(index);
+                }
+            }
+        }
         Some(
-            ordered
-                .targets
+            dispatchable
                 .iter()
                 .enumerate()
                 .map(|(rank, target)| (adaptive_candidate_key(target), rank))
                 .collect::<std::collections::HashMap<_, _>>(),
         )
     } else {
-        None
+        Some(
+            targets
+                .iter()
+                .enumerate()
+                .map(|(rank, target)| (adaptive_candidate_key(target), rank))
+                .collect::<std::collections::HashMap<_, _>>(),
+        )
     };
 
     let mut candidates = Vec::new();
     let mut selected: Option<String> = None;
+    let mut selected_identity: Option<String> = None;
     let mut selected_rank = usize::MAX;
     for t in &targets {
-        let tgt_facts = TargetFacts {
-            model_id: &t.model.id,
-            model_display: &t.model.display_name,
-            provider_id: &t.provider.id,
-            provider_name: &t.provider.name,
-            capabilities: &t.model.caps(),
-            capabilities_raw: &serde_json::from_str::<Value>(&t.model.capabilities)
-                .unwrap_or(Value::Null),
-            context_window: t.model.context_window,
-            max_output_tokens: t.model.max_output_tokens,
-        };
-        let elig = predicate::eligibility(&t.predicate, &request_facts, &tgt_facts);
+        let (elig, capability, ctx_ok, provider_allowed, integration_features_allowed, protocol_ok) =
+            evaluations
+                .get(&adaptive_candidate_key(t))
+                .expect("every dry-run candidate has an evaluation")
+                .clone();
         let status = pool::effective_status(&t.account);
         let half_open_probe =
             matches!(status, pool::AccountStatus::CircuitOpen) && pool::should_probe(&t.account);
         let account_eligible = matches!(status, pool::AccountStatus::Healthy) || half_open_probe;
-        let caps_ok = target_profile_supports_request(t, &needs);
-        let ctx_ok = t
-            .model
-            .context_window
-            .map(|c| c <= 0 || request_facts.input_tokens <= c as u64)
-            .unwrap_or(true);
-        let provider_allowed = descriptor.allowed_providers.is_empty()
-            || descriptor.allowed_providers.contains(&t.provider.id);
-        let protocol_ok = dry_run_provider_accepts_frontend(&t.provider, frontend);
-        let quota_ok = !descriptor.soft_quota_reached;
+        let account_quota_reached = pool::soft_quota_reached(&state.pool, &t.account)
+            .await
+            .map_err(|_| ProxyError::internal("could not inspect account quota state"))?;
+        let quota_override_available = !descriptor.soft_quota_reached;
+        let quota_ok = quota_override_available && !account_quota_reached;
         let adaptive_capacity_ok = dry_run_traffic
             .as_ref()
             .and_then(|snapshots| snapshots.get(&traffic_key(t)))
             .map(|snapshot| snapshot.has_capacity)
             .unwrap_or(true);
+        let provider_circuit = state.provider_circuits.availability(&t.provider.id);
+        let route_capacity = route
+            .as_ref()
+            .map(|route| {
+                state
+                    .admission
+                    .route_capacity_available(&route.id, route.max_concurrent_requests)
+            })
+            .unwrap_or(true);
         let would_select = elig.eligible
             && account_eligible
-            && caps_ok
+            && capability.eligible
+            && integration_features_allowed
             && ctx_ok
             && provider_allowed
             && protocol_ok
+            && provider_circuit.available
+            && route_capacity
             && quota_ok
             && adaptive_capacity_ok;
-        if would_select {
-            let rank = adaptive_rank
-                .as_ref()
-                .and_then(|ranks| ranks.get(&adaptive_candidate_key(t)).copied())
-                .unwrap_or(0);
-            if selected.is_none() || rank < selected_rank {
-                selected_rank = rank;
-                selected = Some(format!("{} @ {}", t.model.display_name, t.account.label));
-            }
+        let candidate_id = adaptive_candidate_key(t);
+        let rank = route_rank
+            .as_ref()
+            .and_then(|ranks| ranks.get(&candidate_id).copied());
+        if let Some(rank) =
+            rank.filter(|rank| would_select && (selected.is_none() || *rank < selected_rank))
+        {
+            selected_rank = rank;
+            selected = Some(format!("{} @ {}", t.model.display_name, t.account.label));
+            selected_identity = Some(candidate_id.clone());
         }
-        // Enumerate the reasons a candidate is not selected so the dry run is
-        // explainable (FR-8.7), not just a boolean.
-        let mut reasons: Vec<&str> = Vec::new();
+        let mut reasons = Vec::new();
         if !elig.eligible {
-            reasons.push("predicate");
+            reasons.push("predicate".to_string());
         }
         if !account_eligible {
-            reasons.push("account_state");
+            reasons.push("account_state".to_string());
         }
-        if !caps_ok {
-            reasons.push("capabilities");
+        if !capability.eligible {
+            reasons.extend(capability.reasons.iter().cloned());
         }
         if !ctx_ok {
-            reasons.push("context_window");
+            reasons.push("context_window".to_string());
         }
         if !provider_allowed {
-            reasons.push("provider_not_permitted");
+            reasons.push("provider_not_permitted".to_string());
+        }
+        if !integration_features_allowed {
+            reasons.push("integration_feature_ceiling".to_string());
         }
         if !protocol_ok {
-            reasons.push("input_protocol");
+            reasons.push("input_protocol".to_string());
         }
-        if !quota_ok {
-            reasons.push("soft_quota");
+        if !provider_circuit.available {
+            reasons.push("provider_circuit_open".to_string());
+        }
+        if !route_capacity {
+            reasons.push("route_concurrency".to_string());
+        }
+        if !quota_override_available {
+            reasons.push("soft_quota".to_string());
+        }
+        if account_quota_reached {
+            reasons.push("account_soft_quota".to_string());
         }
         if !adaptive_capacity_ok {
-            reasons.push("adaptive_saturated");
+            reasons.push("adaptive_saturated".to_string());
         }
         candidates.push(serde_json::json!({
+            "candidate_id": candidate_id,
+            "strategy_rank": rank,
             "target": format!("{} @ {}", t.model.display_name, t.account.label),
             "model": t.model.display_name,
             "model_id": t.model.id,
@@ -5980,14 +6320,50 @@ pub async fn dry_run(
             "predicate_result": elig.result.as_str(),
             "predicate_explanation": elig.explanation,
             "predicate_eligible": elig.eligible,
-            "capability_eligible": caps_ok,
+            "capability_eligible": capability.eligible,
+            "capability_details": capability.details,
+            "integration_features_allowed": integration_features_allowed,
             "context_eligible": ctx_ok,
             "provider_permitted": provider_allowed,
-            "quota_available": quota_ok,
+            "quota_available": quota_override_available,
+            "account_quota_available": !account_quota_reached,
+            "provider_circuit_state": provider_circuit.state,
+            "provider_circuit_available": provider_circuit.available,
+            "provider_circuit_retry_at": provider_circuit.retry_at,
+            "route_capacity_available": route_capacity,
             "adaptive_capacity_available": adaptive_route.then_some(adaptive_capacity_ok),
             "eligible": would_select,
             "not_selected_reasons": reasons,
         }));
+    }
+
+    for candidate in &mut candidates {
+        let is_selected = candidate["candidate_id"].as_str() == selected_identity.as_deref();
+        candidate["selected"] = serde_json::json!(is_selected);
+        candidate["decision_reason"] = serde_json::json!(if is_selected {
+            if route.is_some() {
+                "selected_by_route_strategy"
+            } else {
+                "selected_by_account_pool"
+            }
+        } else if candidate["eligible"].as_bool() == Some(true) {
+            if route.is_some() {
+                "higher_ranked_candidate_selected"
+            } else {
+                "another_account_ordered_first"
+            }
+        } else {
+            "ineligible"
+        });
+        if !is_selected && candidate["eligible"].as_bool() == Some(true) {
+            if let Some(reasons) = candidate["not_selected_reasons"].as_array_mut() {
+                reasons.push(serde_json::json!(if route.is_some() {
+                    "higher_ranked_candidate_selected"
+                } else {
+                    "another_account_ordered_first"
+                }));
+            }
+        }
     }
 
     Ok(serde_json::json!({
@@ -5997,6 +6373,9 @@ pub async fn dry_run(
         "strategy": route.as_ref().map(|r| r.strategy.clone()),
         "candidates": candidates,
         "would_select": selected,
+        "plugin_fact_failures": plugin_facts.failures.iter().map(|(plugin, reason)| {
+            serde_json::json!({"plugin": plugin, "reason": reason})
+        }).collect::<Vec<_>>(),
         "note": "Dry run only: no production state was mutated and no upstream call was made.",
     }))
 }
@@ -6004,6 +6383,36 @@ pub async fn dry_run(
 #[cfg(test)]
 mod route_policy_tests {
     use super::*;
+
+    #[test]
+    fn capability_eligibility_preserves_unknown_and_unsupported_states() {
+        let needs = crate::types::CapabilityNeeds {
+            vision: true,
+            tools: false,
+            reasoning: false,
+        };
+        let unknown = crate::adapters::ModelCapabilityFlags::default();
+        let permissive = capability_eligibility(&unknown, &needs, false);
+        assert!(permissive.eligible);
+        assert_eq!(permissive.details["vision"]["status"], "unknown");
+
+        let strict = capability_eligibility(&unknown, &needs, true);
+        assert!(!strict.eligible);
+        assert_eq!(
+            strict.reasons,
+            ["required vision capability is unknown under strict capability mode"]
+        );
+
+        let unsupported = crate::adapters::ModelCapabilityFlags {
+            vision: Some(false),
+            ..Default::default()
+        };
+        assert!(!capability_eligibility(&unsupported, &needs, false).eligible);
+        assert_eq!(
+            capability_eligibility(&unsupported, &needs, false).details["vision"]["status"],
+            "unsupported"
+        );
+    }
 
     #[test]
     fn accountless_failures_from_duplicate_route_rows_share_serving_identity() {
@@ -7077,6 +7486,222 @@ mod route_policy_tests {
         assert!(recovered.circuit_open_until.is_none());
         assert_eq!(recovered.consecutive_failures, 0);
         assert_eq!(recovered.last_probe_at.as_deref(), Some("db-only"));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dry_run_surfaces_unknown_capabilities_and_applies_provider_mode() {
+        let (state, root, provider_id, _, _) = adaptive_dry_run_state().await;
+        let permissive = dry_run(
+            &state,
+            "adaptive-dry-run",
+            &DryRunRequest {
+                has_images: true,
+                ..DryRunRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+        let candidates = permissive["candidates"].as_array().unwrap();
+        assert!(candidates.iter().all(|candidate| {
+            candidate["capability_details"]["vision"]["status"] == "unknown"
+                && candidate["capability_eligible"] == true
+        }));
+
+        sqlx::query("UPDATE providers SET capability_mode='strict' WHERE id=?")
+            .bind(provider_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let strict = dry_run(
+            &state,
+            "adaptive-dry-run",
+            &DryRunRequest {
+                has_images: true,
+                ..DryRunRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(strict["would_select"].is_null());
+        assert!(strict["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| {
+                candidate["capability_details"]["vision"]["status"] == "unknown"
+                    && candidate["capability_eligible"] == false
+            }));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dry_run_ordering_is_deterministic_and_does_not_advance_round_robin() {
+        let (state, root, _, _, _) = adaptive_dry_run_state().await;
+        let route_id = state
+            .registry
+            .snapshot()
+            .routes
+            .values()
+            .find(|route| route.name == "adaptive-dry-run")
+            .unwrap()
+            .id
+            .clone();
+
+        for strategy in ["round-robin", "weighted"] {
+            sqlx::query("UPDATE routes SET strategy=? WHERE id=?")
+                .bind(strategy)
+                .bind(&route_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            state.registry.reload(&state.pool).await.unwrap();
+
+            let cursor_before = state.rr_counter_snapshot(&route_id);
+            let first = dry_run(&state, "adaptive-dry-run", &DryRunRequest::default())
+                .await
+                .unwrap();
+            let second = dry_run(&state, "adaptive-dry-run", &DryRunRequest::default())
+                .await
+                .unwrap();
+            assert_eq!(first, second, "{strategy} dry runs must be deterministic");
+            assert_eq!(state.rr_counter_snapshot(&route_id), cursor_before);
+            assert!(first["would_select"].is_string());
+        }
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_account_quota_without_mutating_account_state() {
+        let (state, root, _, _, account_ids) = adaptive_dry_run_state().await;
+        let quota_account = &account_ids[0];
+        sqlx::query("UPDATE accounts SET soft_quota_usd=0.5, quota_type='daily' WHERE id=?")
+            .bind(quota_account)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(db::now_iso())
+        .bind(quota_account)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+
+        let result = dry_run(&state, "adaptive-dry-run", &DryRunRequest::default())
+            .await
+            .unwrap();
+        let candidates = result["candidates"].as_array().unwrap();
+        let quota_candidate = candidates
+            .iter()
+            .find(|candidate| candidate["account_id"] == *quota_account)
+            .unwrap();
+        assert_eq!(quota_candidate["account_quota_available"], false);
+        assert!(quota_candidate["not_selected_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "account_soft_quota"));
+        assert_ne!(quota_candidate["account_status"], "exhausted");
+        assert_eq!(result["would_select"], "Adaptive Model @ fallback");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_provider_circuit_without_recording_a_reject() {
+        let (state, root, provider_id, model_id, account_ids) = adaptive_dry_run_state().await;
+        for account_id in &account_ids {
+            state
+                .provider_circuits
+                .begin_attempt(
+                    &provider_id,
+                    account_id,
+                    &format!("{model_id}-{account_id}"),
+                )
+                .unwrap()
+                .finish_failure(FailureKind::ServerError, Some(503));
+        }
+        let before = state.provider_circuits.snapshot(&provider_id);
+        assert_eq!(
+            before.state,
+            crate::provider_circuit::ProviderCircuitState::Open
+        );
+
+        let result = dry_run(&state, "adaptive-dry-run", &DryRunRequest::default())
+            .await
+            .unwrap();
+        assert!(result["would_select"].is_null());
+        assert!(result["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| {
+                candidate["provider_circuit_available"] == false
+                    && candidate["not_selected_reasons"]
+                        .as_array()
+                        .is_some_and(|reasons| {
+                            reasons
+                                .iter()
+                                .any(|reason| reason == "provider_circuit_open")
+                        })
+            }));
+        assert_eq!(
+            state.provider_circuits.snapshot(&provider_id).rejects,
+            before.rejects,
+            "simulation must not increment provider-circuit rejects"
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dry_run_promotes_a_session_affine_target() {
+        let (state, root, _, model_id, account_ids) = adaptive_dry_run_state().await;
+        let route_id = state
+            .registry
+            .snapshot()
+            .routes
+            .values()
+            .find(|route| route.name == "adaptive-dry-run")
+            .unwrap()
+            .id
+            .clone();
+        sqlx::query("UPDATE routes SET strategy='priority', sticky_routing=1 WHERE id=?")
+            .bind(&route_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        state.sticky_remember(
+            "sticky-session",
+            format!("{route_id}|{}|{model_id}", account_ids[1]),
+        );
+
+        let result = dry_run(
+            &state,
+            "adaptive-dry-run",
+            &DryRunRequest {
+                session: Some("sticky-session".into()),
+                ..DryRunRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["would_select"], "Adaptive Model @ fallback");
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);

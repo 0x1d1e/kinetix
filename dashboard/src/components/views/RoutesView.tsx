@@ -3,7 +3,7 @@ import { Shuffle, Plus, ArrowDown, ArrowUp, Shield, Check, Layers, ArrowRight, T
 import { Route, Account, ModelConfig } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { DESIGN_TOKENS } from '../../lib/designSystem';
-import { Kinetix } from '../../lib/resources';
+import { DryRunResult, Kinetix } from '../../lib/resources';
 
 const ROUTE_STRATEGIES: ReadonlyArray<readonly [Route['selectionStrategy'], string]> = [
   ['priority', 'Priority (Ordered fallback on failure)'],
@@ -12,6 +12,20 @@ const ROUTE_STRATEGIES: ReadonlyArray<readonly [Route['selectionStrategy'], stri
   ['least-used', 'Least-used (prefer idle accounts)'],
   ['adaptive', 'Adaptive (capacity + TTFT EWMA)'],
 ];
+
+const DRY_RUN_REASON_LABELS: Record<string, string> = {
+  predicate: 'Predicate did not match',
+  account_state: 'Account unavailable',
+  provider_not_permitted: 'Key cannot access provider',
+  provider_circuit_open: 'Provider circuit unavailable',
+  route_concurrency: 'Route concurrency limit reached',
+  soft_quota: 'Simulated quota reached',
+  account_soft_quota: 'Account quota reached',
+  adaptive_saturated: 'Adaptive capacity exhausted',
+  context_window: 'Input exceeds context window',
+  higher_ranked_candidate_selected: 'Another eligible target ranked first',
+  another_account_ordered_first: 'Another account was ordered first',
+};
 
 
 interface RoutesViewProps {
@@ -50,8 +64,13 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
   const [onQuota, setOnQuota] = useState(true);
   const [on5xx, setOn5xx] = useState(true);
   const [sticky, setSticky] = useState(true);
-  const [dryRunResult, setDryRunResult] = useState<any | null>(null);
+  const [dryRunResult, setDryRunResult] = useState<(DryRunResult | { error: string }) | null>(null);
   const [dryRunning, setDryRunning] = useState(false);
+  const [dryRunHasTools, setDryRunHasTools] = useState(false);
+  const [dryRunHasImages, setDryRunHasImages] = useState(false);
+  const [dryRunHasReasoning, setDryRunHasReasoning] = useState(false);
+  const [dryRunInputTokens, setDryRunInputTokens] = useState('1000');
+  const [dryRunSession, setDryRunSession] = useState('');
 
   // Add-target form state (per selected route)
   const [newTargetModelId, setNewTargetModelId] = useState('');
@@ -123,10 +142,11 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
     try {
       const r = await Kinetix.dryRunRoute(activeRoute.name, {
         frontend: 'openai',
-        has_tools: false,
-        has_images: false,
-        has_reasoning: false,
-        input_tokens: 1000,
+        has_tools: dryRunHasTools,
+        has_images: dryRunHasImages,
+        has_reasoning: dryRunHasReasoning,
+        input_tokens: Number(dryRunInputTokens) || 0,
+        session: dryRunSession.trim() || undefined,
         allowed_providers: allowedProviders ?? [],
       });
       setDryRunResult(r);
@@ -672,6 +692,52 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                 </div>
               </div>
 
+              <div className="mt-4 pt-3 border-t border-dashed border-[var(--ink)]/30">
+                <h5 className="font-heading font-bold text-sm text-[var(--ink)] mb-2">
+                  Representative request for simulation
+                </h5>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                  {[
+                    ['Tools', dryRunHasTools, setDryRunHasTools],
+                    ['Images', dryRunHasImages, setDryRunHasImages],
+                    ['Reasoning', dryRunHasReasoning, setDryRunHasReasoning],
+                  ].map(([label, checked, setChecked]) => (
+                    <label key={label as string} className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={checked as boolean}
+                        onChange={(event) => (setChecked as (value: boolean) => void)(event.target.checked)}
+                        className="accent-[var(--pen-blue)]"
+                      />
+                      <span>{label as string} required</span>
+                    </label>
+                  ))}
+                  <label className="flex flex-col gap-1">
+                    <span>Input tokens</span>
+                    <input
+                      type="number"
+                      min="0"
+                      value={dryRunInputTokens}
+                      onChange={(event) => setDryRunInputTokens(event.target.value)}
+                      className="bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded font-mono"
+                    />
+                  </label>
+                  <label className="flex flex-col gap-1 col-span-2 md:col-span-4">
+                    <span>Session key (optional)</span>
+                    <input
+                      type="text"
+                      value={dryRunSession}
+                      onChange={(event) => setDryRunSession(event.target.value)}
+                      placeholder="Use a known session to simulate affinity"
+                      className="bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded font-mono"
+                    />
+                    <span className="text-[var(--ink)]/60">
+                      Uses in-memory affinity when this session has a known target.
+                    </span>
+                  </label>
+                </div>
+              </div>
+
               {dryRunResult && (
                 <div
                   className="mt-4 p-4 text-sm font-mono bg-[var(--surface)] border-2 border-[var(--pen-blue)]"
@@ -688,46 +754,76 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                       ✕
                     </button>
                   </div>
-                  {dryRunResult.error ? (
+                  {'error' in dryRunResult ? (
                     <div style={{ color: 'var(--danger-text)' }}>{dryRunResult.error}</div>
                   ) : (
                     <>
                       <div className="mb-2">
                         Would select:{' '}
-                        <strong>
-                          {dryRunResult.would_select
-                            ? typeof dryRunResult.would_select === 'string'
-                              ? dryRunResult.would_select
-                              : `${dryRunResult.would_select.model} @ ${dryRunResult.would_select.account}`
-                            : '(no eligible target)'}
-                        </strong>
+                        <strong>{dryRunResult.would_select ?? '(no eligible target)'}</strong>
                       </div>
-                      <table className="w-full text-xs">
-                        <thead>
-                          <tr className="text-left border-b border-[var(--ink)]/30">
-                            <th className="py-1">Target</th>
-                            <th>Predicate</th>
-                            <th>Caps</th>
-                            <th>Account</th>
-                            <th>Eligible</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {(dryRunResult.candidates || []).map((c: any, i: number) => (
-                            <tr key={i} className="border-b border-[var(--ink)]/10">
-                              <td className="py-1">
-                                {c.model} @ {c.account || '—'}
-                              </td>
-                              <td>{c.predicate_result ?? '—'}</td>
-                              <td>{c.capability_eligible ? 'ok' : 'no'}</td>
-                              <td>{c.account_status ?? '—'}</td>
-                              <td style={{ color: c.eligible ? 'var(--pen-green)' : 'var(--danger-text)' }}>
-                                {c.eligible ? 'yes' : 'no'}
-                              </td>
+                      <div className="overflow-x-auto">
+                        <table className="min-w-[900px] w-full text-xs">
+                          <thead>
+                            <tr className="text-left border-b border-[var(--ink)]/30">
+                              <th scope="col" className="py-1">Candidate</th>
+                              <th scope="col">Predicate</th>
+                              <th scope="col">Capabilities</th>
+                              <th scope="col">Availability</th>
+                              <th scope="col">Decision</th>
+                              <th scope="col">Reason</th>
                             </tr>
-                          ))}
-                        </tbody>
-                      </table>
+                          </thead>
+                          <tbody>
+                            {dryRunResult.candidates.map((candidate, index) => {
+                              const capabilitySummary = Object.entries(candidate.capability_details)
+                                .map(([name, detail]) =>
+                                  typeof detail === 'string'
+                                    ? `${name}: ${detail}`
+                                    : `${detail.required ? '* ' : ''}${name}: ${detail.status}`,
+                                )
+                                .join(', ');
+                              const reasons = candidate.not_selected_reasons.map(
+                                (reason) => DRY_RUN_REASON_LABELS[reason] || reason,
+                              );
+                              return (
+                                <tr key={candidate.candidate_id || index} className={`border-b border-[var(--ink)]/10 ${candidate.selected ? 'bg-[var(--tint-blue)] font-bold' : ''}`}>
+                                  <td className="py-1">
+                                    {candidate.strategy_rank == null ? '-' : `#${candidate.strategy_rank + 1}`} · {candidate.model} @ {candidate.account || '-'}
+                                  </td>
+                                  <td title={candidate.predicate_explanation || undefined}>
+                                    {candidate.predicate_result || '-'}
+                                  </td>
+                                  <td>{capabilitySummary || (candidate.capability_eligible ? 'ok' : 'unknown')}</td>
+                                  <td>
+                                    {candidate.account_status} · circuit {candidate.provider_circuit_state}
+                                    {candidate.route_capacity_available === false ? ' · route full' : ''}
+                                    {candidate.account_quota_available === false ? ' · account quota' : ''}
+                                  </td>
+                                  <td style={{ color: candidate.selected ? 'var(--pen-blue)' : candidate.eligible ? 'var(--pen-green)' : 'var(--danger-text)' }}>
+                                    {candidate.selected ? 'selected' : candidate.eligible ? 'eligible' : 'skipped'}
+                                  </td>
+                                  <td>
+                                    {reasons.length
+                                      ? reasons.join('; ')
+                                      : candidate.selected
+                                        ? 'Selected by route strategy'
+                                        : candidate.decision_reason}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      {dryRunResult.plugin_fact_failures.length > 0 && (
+                        <p className="mt-2 text-[var(--danger-text)]">
+                          Routing facts unavailable:{' '}
+                          {dryRunResult.plugin_fact_failures
+                            .map(({ plugin, reason }) => `${plugin}: ${reason}`)
+                            .join('; ')}
+                        </p>
+                      )}
                       <div className="mt-2 text-[var(--ink)]/60">{dryRunResult.note}</div>
                     </>
                   )}

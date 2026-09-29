@@ -306,12 +306,7 @@ fn fact_value(
         "target_provider" | "target_provider_id" => Some(Value::String(t.provider_id.to_string())),
         "target_capability" => {
             let cap = fact.arg()?;
-            let declared = capabilities_declared(t.capabilities_raw, cap);
-            if declared {
-                Some(Value::Bool(capability_flag(t.capabilities, cap)))
-            } else {
-                None // not configured => unknown
-            }
+            capability_value(t.capabilities_raw, cap).map(Value::Bool)
         }
         "target_context_window" => t.context_window.map(|v| Value::Number(v.into())),
         "target_max_output_tokens" => t.max_output_tokens.map(|v| Value::Number(v.into())),
@@ -319,26 +314,16 @@ fn fact_value(
     }
 }
 
-fn capability_flag(caps: &Capabilities, name: &str) -> bool {
-    match name {
-        "text" => caps.text,
-        "vision" => caps.vision,
-        "reasoning" => caps.reasoning,
-        "tool_calling" | "tools" => caps.tool_calling,
-        "audio" => caps.audio,
-        "structured_output" => caps.structured_output,
-        _ => false,
-    }
-}
-
-/// Whether the capabilities JSON explicitly declares this capability.
-fn capabilities_declared(raw: &Value, name: &str) -> bool {
+/// A known boolean capability value; absent, null, and malformed values remain unknown.
+fn capability_value(raw: &Value, name: &str) -> Option<bool> {
     let keys: &[&str] = match name {
         "tool_calling" => &["tool_calling", "tools", "tool_calls"],
         "structured_output" => &["structured_output", "structuredOutput"],
         other => &[other],
     };
-    keys.iter().any(|k| raw.get(k).is_some())
+    keys.iter()
+        .find_map(|key| raw.get(key))
+        .and_then(Value::as_bool)
 }
 
 /// Evaluate a predicate tree with no plugin facts (native-only).
@@ -651,6 +636,21 @@ mod tests {
         let raw = json!({"vision": true});
         let e = eligibility(&pred, &req(true), &target(&caps, &raw));
         assert!(e.eligible);
+    }
+
+    #[test]
+    fn explicit_null_capability_does_not_fall_through_to_an_alias() {
+        assert_eq!(
+            capability_value(
+                &json!({"tool_calling": null, "tools": true}),
+                "tool_calling"
+            ),
+            None
+        );
+        assert_eq!(
+            capability_value(&json!({"tools": true}), "tool_calling"),
+            Some(true)
+        );
     }
 
     #[test]

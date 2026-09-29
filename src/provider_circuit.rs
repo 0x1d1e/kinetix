@@ -38,6 +38,13 @@ pub struct ProviderFailureSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ProviderCircuitAvailability {
+    pub state: ProviderCircuitState,
+    pub available: bool,
+    pub retry_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ProviderCircuitSnapshot {
     pub provider_id: String,
     pub state: ProviderCircuitState,
@@ -327,6 +334,30 @@ impl ProviderCircuits {
         let circuit = self.circuit(provider_id);
         let mut state = circuit.lock();
         state.snapshot(provider_id, Utc::now())
+    }
+
+    /// Read provider-circuit eligibility without creating state, purging
+    /// observations, or incrementing rejection counters.
+    pub fn availability(&self, provider_id: &str) -> ProviderCircuitAvailability {
+        let now = Utc::now();
+        let Some(circuit) = self.inner.get(provider_id) else {
+            return ProviderCircuitAvailability {
+                state: ProviderCircuitState::Closed,
+                available: true,
+                retry_at: None,
+            };
+        };
+        let state = circuit.lock();
+        let available = match state.state {
+            ProviderCircuitState::Closed => true,
+            ProviderCircuitState::Open => state.retry_at.is_none_or(|retry_at| retry_at <= now),
+            ProviderCircuitState::HalfOpen => state.half_open_inflight == 0,
+        };
+        ProviderCircuitAvailability {
+            state: state.state,
+            available,
+            retry_at: state.retry_at,
+        }
     }
 
     pub fn snapshots(&self) -> Vec<ProviderCircuitSnapshot> {
@@ -809,9 +840,13 @@ mod tests {
             state.retry_at = Some(Utc::now() - ChronoDuration::seconds(1));
         }
 
-        circuits.check_available("p").unwrap();
+        let availability = circuits.availability("p");
+        assert_eq!(availability.state, ProviderCircuitState::Open);
+        assert!(availability.available);
+        assert!(circuits.availability("unknown-provider").available);
         // A candidate can pass this gate and fail local validation without
         // consuming the network-probe lease.
+        circuits.check_available("p").unwrap();
         circuits.check_available("p").unwrap();
         assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Open);
 

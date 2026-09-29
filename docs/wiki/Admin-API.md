@@ -75,7 +75,9 @@ Account responses include `status_reason`, `status_changed_at`, and `retry_at`. 
 | `POST /admin/api/routes` | Create (name, strategy, fallback triggers, `portability_policy`, `cache_affinity`, `max_attempts`, targets). |
 | `PUT /admin/api/routes/{id}` | Update (replaces targets). |
 | `DELETE /admin/api/routes/{id}` | Delete. |
-| `POST /admin/api/routes/dry-run` | Route Dry Run: returns candidate ordering, predicate outcomes, eligibility, and the would-be selection **without** touching production. |
+| `POST /admin/api/routes/dry-run` | Simulate a representative request; returns candidate ordering, predicate outcomes, capability states, eligibility reasons, and the would-be selection without contacting an upstream. |
+
+The dry-run descriptor accepts request capability flags, input-token count, provider allowlist, an optional quota override, and an optional session key. For Routes with sticky or cache affinity enabled, a known session mapping promotes its target; unknown sessions do not. Candidate output distinguishes supported, unsupported, and unknown capabilities and includes strategy rank, account quota, and current circuit/concurrency availability. Simulation reads routing snapshots but does not reserve capacity, advance round-robin state, or update affinity.
 
 ## Aliases
 

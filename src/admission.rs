@@ -304,6 +304,20 @@ impl AdmissionController {
         self.metrics.snapshot()
     }
 
+    /// Snapshot route concurrency without reserving a slot or recording a rejection.
+    pub fn route_capacity_available(&self, route_id: &str, limit: Option<i64>) -> bool {
+        let Some(limit) = limit.filter(|limit| *limit > 0) else {
+            return true;
+        };
+        self.concurrency
+            .lock()
+            .routes
+            .get(route_id)
+            .copied()
+            .unwrap_or_default()
+            < limit as u64
+    }
+
     pub fn reserve_concurrency(
         &self,
         key: Option<(&str, Option<i64>)>,
@@ -1148,9 +1162,12 @@ mod tests {
         drop(key_reservation);
 
         let route_controller = AdmissionController::new(2);
+        assert!(route_controller.route_capacity_available("route", Some(1)));
         let route_reservation = route_controller
             .reserve_concurrency(None, Some(("route", Some(1))))
             .unwrap();
+        assert!(!route_controller.route_capacity_available("route", Some(1)));
+        assert!(route_controller.route_capacity_available("unlimited", None));
         assert!(route_controller
             .reserve_concurrency(None, Some(("route", Some(1))))
             .is_err());
@@ -1160,6 +1177,7 @@ mod tests {
             1
         );
         drop(route_reservation);
+        assert!(route_controller.route_capacity_available("route", Some(1)));
     }
 
     #[test]
