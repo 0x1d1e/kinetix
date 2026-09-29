@@ -56,6 +56,8 @@ when it skips multiple targets behind an open provider circuit.
 | `kinetix_avg_latency_ms` / `kinetix_avg_ttft_ms` | Averages. |
 | `kinetix_cached_tokens_total` / `kinetix_cache_write_tokens_total` | Cache-read / cache-write token totals. |
 
+Admission metrics omit key and Route identities to keep label cardinality bounded. Incomplete usage keeps the conservative token reservation; the oldest-reservation age is exposed without imposing a fixed stale threshold.
+
 Cache status is derived from final normalized provider usage, not cache affinity or
 a static request flag:
 
@@ -79,6 +81,13 @@ before response commit.
 | `kinetix_usage_unknown_total` / `kinetix_usage_estimated_total` / `kinetix_usage_unknown_cost_total` | Accounting confidence. |
 | `kinetix_credential_failures_total` | Credential-strategy failures. |
 | `kinetix_ip_rate_limited_total` | Per-IP rejections. |
+| `kinetix_admission_reservations_active` / `kinetix_admission_reserved_tokens_active` | Active per-key rate/budget reservations and their conservative token estimates. |
+| `kinetix_admission_reservations_total` / `kinetix_admission_reserved_tokens_total` | Cumulative reservations and estimated tokens. |
+| `kinetix_admission_reconciliations_total{usage}` / `kinetix_admission_reservations_dropped_total` | Complete/incomplete usage reconciliations and reservations dropped before finalization. |
+| `kinetix_admission_reconciled_tokens_total` / `kinetix_admission_token_adjustment_total{direction}` | Provider-reported tokens and reservation decreases/increases when usage is complete. |
+| `kinetix_admission_rejections_total{reason}` | Local RPM, TPM, budget, and concurrency rejections; label values are a fixed set. |
+| `kinetix_admission_inflight_inferences` | Current requests counted against the instance-wide cap. |
+| `kinetix_admission_reservation_oldest_age_seconds` | Age of the oldest active reservation; use workload-specific alert thresholds. |
 | `kinetix_allocations_total` / `kinetix_alloc_bytes_total` | Allocations per request (only when built `--features alloc-stats`; `0` otherwise = honestly "not measured"). |
 
 ## Route Trace
@@ -138,9 +147,9 @@ can never grow unbounded.
 latency, TTFT). Surfaced in the dashboard's Request Inspector and reflected in the
 `kinetix_active_streams` metric.
 
-> Client disconnects after commit are detected immediately; a disconnect during
-> the pre-commit connect window is bounded only by the provider timeout (there is
-> no response body to observe yet).
+> Client connection closure cancels pre-commit upstream work. After commit,
+> dropping the response stream cancels active stream work and releases its
+> concurrency capacity.
 
 ## Alerts
 

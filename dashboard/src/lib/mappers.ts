@@ -33,6 +33,7 @@ export function mapKey(j: any): VirtualKey {
     allowedProviders: Array.isArray(j.allowed_providers) ? j.allowed_providers : [],
     rpmLimit: num(j.rpm_limit, 0),
     tpmLimit: num(j.tpm_limit, 0),
+    maxConcurrentRequests: optionalNum(j.max_concurrent_requests),
     dailyBudget: num(j.daily_budget, 0),
     monthlyBudget: num(j.monthly_budget, 0),
     currentDailySpend: num(j.current_daily_spend),
@@ -224,6 +225,7 @@ export function mapRoute(j: any): Route {
     portabilityPolicy: (j.portability_policy as Route['portabilityPolicy']) || 'strip_with_warning',
     cacheAffinity: !!j.cache_affinity,
     stickyRouting: !!j.sticky_routing,
+    maxConcurrentRequests: optionalNum(j.max_concurrent_requests),
     totalHops: 0,
     status: allExhausted ? 'all_exhausted' : j.enabled === false ? 'degraded' : 'active',
   };

@@ -222,6 +222,7 @@ mod tests {
             allowed_providers: "[]".into(),
             rpm_limit: None,
             tpm_limit: None,
+            max_concurrent_requests: None,
             daily_budget: None,
             monthly_budget: None,
             expires_at: None,

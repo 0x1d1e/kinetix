@@ -144,6 +144,12 @@ pub async fn seed_if_empty(
     // Routes.
     let mut route_ids: std::collections::HashMap<String, String> = Default::default();
     for c in &cfg.routes {
+        if c.max_concurrent_requests.is_some_and(|limit| limit < 0) {
+            anyhow::bail!(
+                "route '{}' max_concurrent_requests must be positive or omitted",
+                c.name
+            );
+        }
         let route_id = db::insert_route(
             pool,
             &db::NewRoute {
@@ -167,6 +173,7 @@ pub async fn seed_if_empty(
                 sticky_routing: c.sticky_routing,
                 cache_affinity: c.cache_affinity,
                 max_attempts: c.max_attempts,
+                max_concurrent_requests: c.max_concurrent_requests.filter(|value| *value > 0),
             },
         )
         .await?;
@@ -246,6 +253,10 @@ pub async fn seed_if_empty(
             allowed_providers: serde_json::to_string(&k.allowed_providers).unwrap(),
             rpm_limit: k.rpm_limit.map(|v| v as i64),
             tpm_limit: k.tpm_limit.map(|v| v as i64),
+            max_concurrent_requests: k
+                .max_concurrent_requests
+                .filter(|value| *value > 0)
+                .map(|v| v as i64),
             daily_budget: k.daily_budget,
             monthly_budget: k.monthly_budget,
             expires_at: k.expires_at.clone(),

@@ -23,6 +23,7 @@ export interface CreateKeyInput {
   allowed_models: string[];
   rpm_limit?: number | null;
   tpm_limit?: number | null;
+  max_concurrent_requests?: number | null;
   daily_budget?: number | null;
   monthly_budget?: number | null;
 }

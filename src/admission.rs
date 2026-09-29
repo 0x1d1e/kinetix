@@ -14,11 +14,179 @@ use crate::types::{InternalRequest, Prices, ProxyError, TokenUsage};
 
 const MINUTE_WINDOW: Duration = Duration::from_secs(60);
 const DEFAULT_OUTPUT_RESERVATION: u64 = 8_192;
+pub const REJECTION_REASONS: [&str; 7] = [
+    "rpm",
+    "tpm",
+    "daily_budget",
+    "monthly_budget",
+    "concurrency_global",
+    "concurrency_key",
+    "concurrency_route",
+];
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AdmissionController {
     keys: Arc<DashMap<String, Arc<KeyAdmission>>>,
     next_id: Arc<AtomicU64>,
+    metrics: Arc<AdmissionMetrics>,
+    concurrency: Arc<parking_lot::Mutex<ConcurrencyState>>,
+    global_concurrency_limit: u64,
+}
+
+impl Default for AdmissionController {
+    fn default() -> Self {
+        Self::new(crate::config::DEFAULT_MAX_INFLIGHT_INFERENCES)
+    }
+}
+
+impl AdmissionController {
+    pub fn new(global_concurrency_limit: u64) -> Self {
+        assert!(
+            global_concurrency_limit > 0,
+            "global concurrency limit must be positive"
+        );
+        Self {
+            keys: Arc::new(DashMap::new()),
+            next_id: Arc::new(AtomicU64::new(0)),
+            metrics: Arc::new(AdmissionMetrics::default()),
+            concurrency: Arc::new(parking_lot::Mutex::new(ConcurrencyState::default())),
+            global_concurrency_limit,
+        }
+    }
+}
+
+#[derive(Default)]
+struct AdmissionMetrics {
+    active_reservations: AtomicU64,
+    active_reserved_tokens: AtomicU64,
+    reservations_total: AtomicU64,
+    reserved_tokens_total: AtomicU64,
+    reconciled_complete_total: AtomicU64,
+    reconciled_incomplete_total: AtomicU64,
+    dropped_total: AtomicU64,
+    reconciled_tokens_total: AtomicU64,
+    reduced_tokens_total: AtomicU64,
+    increased_tokens_total: AtomicU64,
+    inflight_inferences: AtomicU64,
+    rejected: [AtomicU64; REJECTION_REASONS.len()],
+    reservation_started_at: DashMap<u64, Instant>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AdmissionMetricsSnapshot {
+    pub active_reservations: u64,
+    pub active_reserved_tokens: u64,
+    pub reservations_total: u64,
+    pub reserved_tokens_total: u64,
+    pub reconciled_complete_total: u64,
+    pub reconciled_incomplete_total: u64,
+    pub dropped_total: u64,
+    pub reconciled_tokens_total: u64,
+    pub reduced_tokens_total: u64,
+    pub increased_tokens_total: u64,
+    pub inflight_inferences: u64,
+    pub rejected: [u64; REJECTION_REASONS.len()],
+    /// Expose age without imposing an undocumented stale-reservation threshold.
+    pub oldest_reservation_age_secs: u64,
+}
+
+#[derive(Default)]
+struct ConcurrencyState {
+    global: u64,
+    keys: HashMap<String, u64>,
+    routes: HashMap<String, u64>,
+}
+
+#[derive(Clone, Copy)]
+enum RejectionReason {
+    Rpm = 0,
+    Tpm = 1,
+    DailyBudget = 2,
+    MonthlyBudget = 3,
+    GlobalConcurrency = 4,
+    KeyConcurrency = 5,
+    RouteConcurrency = 6,
+}
+
+struct AdmissionFailure {
+    reason: RejectionReason,
+    error: ProxyError,
+}
+
+impl AdmissionMetrics {
+    fn record_rejection(&self, reason: RejectionReason) {
+        self.rejected[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reservation_started(&self, id: u64, estimate: u64) {
+        self.reservations_total.fetch_add(1, Ordering::Relaxed);
+        self.reserved_tokens_total
+            .fetch_add(estimate, Ordering::Relaxed);
+        self.active_reservations.fetch_add(1, Ordering::Relaxed);
+        self.active_reserved_tokens
+            .fetch_add(estimate, Ordering::Relaxed);
+        self.reservation_started_at.insert(id, Instant::now());
+    }
+
+    fn reservation_finished(&self, id: u64, estimate: u64) {
+        self.active_reservations.fetch_sub(1, Ordering::Relaxed);
+        self.active_reserved_tokens
+            .fetch_sub(estimate, Ordering::Relaxed);
+        self.reservation_started_at.remove(&id);
+    }
+
+    fn snapshot(&self) -> AdmissionMetricsSnapshot {
+        let now = Instant::now();
+        let mut oldest_age = Duration::ZERO;
+        for started_at in self.reservation_started_at.iter() {
+            oldest_age = oldest_age.max(now.saturating_duration_since(*started_at));
+        }
+        AdmissionMetricsSnapshot {
+            active_reservations: self.active_reservations.load(Ordering::Relaxed),
+            active_reserved_tokens: self.active_reserved_tokens.load(Ordering::Relaxed),
+            reservations_total: self.reservations_total.load(Ordering::Relaxed),
+            reserved_tokens_total: self.reserved_tokens_total.load(Ordering::Relaxed),
+            reconciled_complete_total: self.reconciled_complete_total.load(Ordering::Relaxed),
+            reconciled_incomplete_total: self.reconciled_incomplete_total.load(Ordering::Relaxed),
+            dropped_total: self.dropped_total.load(Ordering::Relaxed),
+            reconciled_tokens_total: self.reconciled_tokens_total.load(Ordering::Relaxed),
+            reduced_tokens_total: self.reduced_tokens_total.load(Ordering::Relaxed),
+            increased_tokens_total: self.increased_tokens_total.load(Ordering::Relaxed),
+            inflight_inferences: self.inflight_inferences.load(Ordering::Relaxed),
+            rejected: std::array::from_fn(|index| self.rejected[index].load(Ordering::Relaxed)),
+            oldest_reservation_age_secs: oldest_age.as_secs(),
+        }
+    }
+}
+
+pub struct ConcurrencyReservation {
+    state: Arc<parking_lot::Mutex<ConcurrencyState>>,
+    metrics: Arc<AdmissionMetrics>,
+    key_id: Option<String>,
+    route_id: Option<String>,
+}
+
+impl Drop for ConcurrencyReservation {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        state.global = state.global.saturating_sub(1);
+        decrement_active(&mut state.keys, self.key_id.as_deref());
+        decrement_active(&mut state.routes, self.route_id.as_deref());
+        self.metrics
+            .inflight_inferences
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn decrement_active(counts: &mut HashMap<String, u64>, id: Option<&str>) {
+    if let Some(id) = id {
+        if let Some(active) = counts.get_mut(id) {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                counts.remove(id);
+            }
+        }
+    }
 }
 
 struct KeyAdmission {
@@ -68,11 +236,18 @@ pub struct AdmissionEstimate {
 
 pub struct AdmissionReservation {
     entry: Arc<KeyAdmission>,
+    // Instrument the existing reservation lifetime without changing ledger policy.
+    metrics: Arc<AdmissionMetrics>,
     id: u64,
+    estimate_tokens: u64,
     settled: bool,
 }
 
 impl AdmissionReservation {
+    pub(crate) fn reconcile_incomplete(self) {
+        self.reconcile(&TokenUsage::default(), None);
+    }
+
     pub fn reconcile(mut self, usage: &TokenUsage, actual_cost: Option<f64>) {
         let actual_tokens = match (usage.input, usage.output) {
             (Some(input), Some(output)) => Some(input.saturating_add(output)),
@@ -86,6 +261,29 @@ impl AdmissionReservation {
             Utc::now(),
             Instant::now(),
         );
+        self.metrics
+            .reservation_finished(self.id, self.estimate_tokens);
+        if let Some(actual_tokens) = actual_tokens {
+            self.metrics
+                .reconciled_complete_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .reconciled_tokens_total
+                .fetch_add(actual_tokens, Ordering::Relaxed);
+            if actual_tokens < self.estimate_tokens {
+                self.metrics
+                    .reduced_tokens_total
+                    .fetch_add(self.estimate_tokens - actual_tokens, Ordering::Relaxed);
+            } else if actual_tokens > self.estimate_tokens {
+                self.metrics
+                    .increased_tokens_total
+                    .fetch_add(actual_tokens - self.estimate_tokens, Ordering::Relaxed);
+            }
+        } else {
+            self.metrics
+                .reconciled_incomplete_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.settled = true;
     }
 }
@@ -94,11 +292,76 @@ impl Drop for AdmissionReservation {
     fn drop(&mut self) {
         if !self.settled {
             self.entry.ledger.lock().cancel(self.id);
+            self.metrics
+                .reservation_finished(self.id, self.estimate_tokens);
+            self.metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
 impl AdmissionController {
+    pub fn metrics_snapshot(&self) -> AdmissionMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub fn reserve_concurrency(
+        &self,
+        key: Option<(&str, Option<i64>)>,
+        route: Option<(&str, Option<i64>)>,
+    ) -> Result<ConcurrencyReservation, ProxyError> {
+        let mut state = self.concurrency.lock();
+        if state.global >= self.global_concurrency_limit {
+            self.metrics
+                .record_rejection(RejectionReason::GlobalConcurrency);
+            return Err(ProxyError::rate_limited(
+                "local concurrency limit reached; retry after 1 second",
+                Some(1),
+            ));
+        }
+        if let Some((key_id, Some(limit))) = key.filter(|(_, limit)| limit.unwrap_or_default() > 0)
+        {
+            if state.keys.get(key_id).copied().unwrap_or_default() >= limit as u64 {
+                self.metrics
+                    .record_rejection(RejectionReason::KeyConcurrency);
+                return Err(ProxyError::rate_limited(
+                    "virtual key concurrency limit reached; retry after 1 second",
+                    Some(1),
+                ));
+            }
+        }
+        if let Some((route_id, Some(limit))) =
+            route.filter(|(_, limit)| limit.unwrap_or_default() > 0)
+        {
+            if state.routes.get(route_id).copied().unwrap_or_default() >= limit as u64 {
+                self.metrics
+                    .record_rejection(RejectionReason::RouteConcurrency);
+                return Err(ProxyError::rate_limited(
+                    "Route concurrency limit reached; retry after 1 second",
+                    Some(1),
+                ));
+            }
+        }
+
+        state.global += 1;
+        let key_id = key.map(|(id, _)| id.to_string());
+        let route_id = route.map(|(id, _)| id.to_string());
+        if let Some(id) = &key_id {
+            *state.keys.entry(id.clone()).or_default() += 1;
+        }
+        if let Some(id) = &route_id {
+            *state.routes.entry(id.clone()).or_default() += 1;
+        }
+        self.metrics
+            .inflight_inferences
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(ConcurrencyReservation {
+            state: self.concurrency.clone(),
+            metrics: self.metrics.clone(),
+            key_id,
+            route_id,
+        })
+    }
+
     fn entry(&self, key_id: &str) -> Arc<KeyAdmission> {
         self.keys
             .entry(key_id.to_string())
@@ -181,7 +444,13 @@ impl AdmissionController {
             .ledger
             .lock()
             .check_current(key, Utc::now(), Instant::now());
-        result
+        match result {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                self.metrics.record_rejection(failure.reason);
+                Err(failure.error)
+            }
+        }
     }
 
     fn reserve_initialized(
@@ -194,13 +463,21 @@ impl AdmissionController {
             .next_id
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        entry
-            .ledger
-            .lock()
-            .reserve(id, key, estimate, Utc::now(), Instant::now())?;
+        if let Err(failure) =
+            entry
+                .ledger
+                .lock()
+                .reserve(id, key, estimate, Utc::now(), Instant::now())
+        {
+            self.metrics.record_rejection(failure.reason);
+            return Err(failure.error);
+        }
+        self.metrics.reservation_started(id, estimate.tokens);
         Ok(AdmissionReservation {
             entry,
+            metrics: self.metrics.clone(),
             id,
+            estimate_tokens: estimate.tokens,
             settled: false,
         })
     }
@@ -264,40 +541,52 @@ impl KeyLedger {
         key: &VirtualKeyRow,
         now_wall: chrono::DateTime<Utc>,
         now: Instant,
-    ) -> Result<(), ProxyError> {
+    ) -> Result<(), AdmissionFailure> {
         let (requests, tokens, daily, monthly) = self.current(now_wall, now);
         if let Some(rpm) = key.rpm_limit.filter(|value| *value > 0) {
             if requests >= rpm as u64 {
-                return Err(ProxyError::rate_limited(
-                    format!("rate limit exceeded: {rpm} requests per minute"),
-                    Some(60),
-                ));
+                return Err(AdmissionFailure {
+                    reason: RejectionReason::Rpm,
+                    error: ProxyError::rate_limited(
+                        format!("rate limit exceeded: {rpm} requests per minute"),
+                        Some(60),
+                    ),
+                });
             }
         }
         if let Some(tpm) = key.tpm_limit.filter(|value| *value > 0) {
             if tokens >= tpm as u64 {
-                return Err(ProxyError::rate_limited(
-                    format!("token rate limit exceeded: {tpm} tokens per minute"),
-                    Some(60),
-                ));
+                return Err(AdmissionFailure {
+                    reason: RejectionReason::Tpm,
+                    error: ProxyError::rate_limited(
+                        format!("token rate limit exceeded: {tpm} tokens per minute"),
+                        Some(60),
+                    ),
+                });
             }
         }
         if let Some(limit) = key.daily_budget.filter(|value| *value > 0.0) {
             if daily >= limit {
-                return Err(ProxyError::budget_exceeded(format!(
-                    "daily budget exceeded (USD {} of USD {}); resets at 00:00 UTC",
-                    crate::cost::format_usd(daily),
-                    crate::cost::format_usd(limit),
-                )));
+                return Err(AdmissionFailure {
+                    reason: RejectionReason::DailyBudget,
+                    error: ProxyError::budget_exceeded(format!(
+                        "daily budget exceeded (USD {} of USD {}); resets at 00:00 UTC",
+                        crate::cost::format_usd(daily),
+                        crate::cost::format_usd(limit),
+                    )),
+                });
             }
         }
         if let Some(limit) = key.monthly_budget.filter(|value| *value > 0.0) {
             if monthly >= limit {
-                return Err(ProxyError::budget_exceeded(format!(
-                    "monthly budget exceeded (USD {} of USD {}); resets on the 1st",
-                    crate::cost::format_usd(monthly),
-                    crate::cost::format_usd(limit),
-                )));
+                return Err(AdmissionFailure {
+                    reason: RejectionReason::MonthlyBudget,
+                    error: ProxyError::budget_exceeded(format!(
+                        "monthly budget exceeded (USD {} of USD {}); resets on the 1st",
+                        crate::cost::format_usd(monthly),
+                        crate::cost::format_usd(limit),
+                    )),
+                });
             }
         }
         Ok(())
@@ -310,47 +599,59 @@ impl KeyLedger {
         estimate: AdmissionEstimate,
         now_wall: chrono::DateTime<Utc>,
         now: Instant,
-    ) -> Result<(), ProxyError> {
+    ) -> Result<(), AdmissionFailure> {
         let (requests, tokens, daily, monthly) = self.current(now_wall, now);
 
         if let Some(rpm) = key.rpm_limit.filter(|value| *value > 0) {
             if requests.saturating_add(1) > rpm as u64 {
-                return Err(ProxyError::rate_limited(
-                    format!("rate limit exceeded: {rpm} requests per minute"),
-                    Some(60),
-                ));
+                return Err(AdmissionFailure {
+                    reason: RejectionReason::Rpm,
+                    error: ProxyError::rate_limited(
+                        format!("rate limit exceeded: {rpm} requests per minute"),
+                        Some(60),
+                    ),
+                });
             }
         }
         if let Some(tpm) = key.tpm_limit.filter(|value| *value > 0) {
             if tokens.saturating_add(estimate.tokens) > tpm as u64 {
-                return Err(ProxyError::rate_limited(
-                    format!(
-                        "token rate limit exceeded: reserving {} tokens would exceed {tpm} tokens per minute",
-                        estimate.tokens
+                return Err(AdmissionFailure {
+                    reason: RejectionReason::Tpm,
+                    error: ProxyError::rate_limited(
+                        format!(
+                            "token rate limit exceeded: reserving {} tokens would exceed {tpm} tokens per minute",
+                            estimate.tokens
+                        ),
+                        Some(60),
                     ),
-                    Some(60),
-                ));
+                });
             }
         }
         if let Some(cost) = estimate.cost {
             if let Some(limit) = key.daily_budget.filter(|value| *value > 0.0) {
                 if daily + cost > limit {
-                    return Err(ProxyError::budget_exceeded(format!(
-                        "daily budget would be exceeded (USD {} reserved/spent + USD {} request > USD {}); resets at 00:00 UTC",
-                        crate::cost::format_usd(daily),
-                        crate::cost::format_usd(cost),
-                        crate::cost::format_usd(limit),
-                    )));
+                    return Err(AdmissionFailure {
+                        reason: RejectionReason::DailyBudget,
+                        error: ProxyError::budget_exceeded(format!(
+                            "daily budget would be exceeded (USD {} reserved/spent + USD {} request > USD {}); resets at 00:00 UTC",
+                            crate::cost::format_usd(daily),
+                            crate::cost::format_usd(cost),
+                            crate::cost::format_usd(limit),
+                        )),
+                    });
                 }
             }
             if let Some(limit) = key.monthly_budget.filter(|value| *value > 0.0) {
                 if monthly + cost > limit {
-                    return Err(ProxyError::budget_exceeded(format!(
-                        "monthly budget would be exceeded (USD {} reserved/spent + USD {} request > USD {}); resets on the 1st",
-                        crate::cost::format_usd(monthly),
-                        crate::cost::format_usd(cost),
-                        crate::cost::format_usd(limit),
-                    )));
+                    return Err(AdmissionFailure {
+                        reason: RejectionReason::MonthlyBudget,
+                        error: ProxyError::budget_exceeded(format!(
+                            "monthly budget would be exceeded (USD {} reserved/spent + USD {} request > USD {}); resets on the 1st",
+                            crate::cost::format_usd(monthly),
+                            crate::cost::format_usd(cost),
+                            crate::cost::format_usd(limit),
+                        )),
+                    });
                 }
             }
         }
@@ -539,6 +840,7 @@ mod tests {
             allowed_providers: "[]".into(),
             rpm_limit: None,
             tpm_limit: None,
+            max_concurrent_requests: None,
             daily_budget: None,
             monthly_budget: None,
             expires_at: None,
@@ -574,6 +876,29 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
                 controller.reserve_initialized(entry, &key, estimate)
+            }));
+        }
+        barrier.wait();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap().ok())
+            .collect()
+    }
+
+    fn concurrency_burst(
+        controller: AdmissionController,
+        key: Option<(&'static str, Option<i64>)>,
+        route: Option<(&'static str, Option<i64>)>,
+        count: usize,
+    ) -> Vec<ConcurrencyReservation> {
+        let barrier = Arc::new(std::sync::Barrier::new(count + 1));
+        let mut handles = Vec::new();
+        for _ in 0..count {
+            let controller = controller.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                controller.reserve_concurrency(key, route)
             }));
         }
         barrier.wait();
@@ -768,5 +1093,122 @@ mod tests {
             },
         );
         assert!(second.is_err());
+    }
+
+    #[test]
+    fn concurrent_global_key_and_route_bursts_respect_capacity() {
+        let global = concurrency_burst(AdmissionController::new(4), None, None, 32);
+        assert_eq!(global.len(), 4);
+        drop(global);
+
+        let key = concurrency_burst(
+            AdmissionController::new(32),
+            Some(("key", Some(3))),
+            None,
+            32,
+        );
+        assert_eq!(key.len(), 3);
+        drop(key);
+
+        let route = concurrency_burst(
+            AdmissionController::new(32),
+            None,
+            Some(("route", Some(2))),
+            32,
+        );
+        assert_eq!(route.len(), 2);
+    }
+
+    #[test]
+    fn concurrency_reservations_release_capacity_and_count_rejections() {
+        let controller = AdmissionController::new(1);
+        let reservation = controller.reserve_concurrency(None, None).unwrap();
+        assert!(controller.reserve_concurrency(None, None).is_err());
+        assert_eq!(
+            controller.metrics_snapshot().rejected[RejectionReason::GlobalConcurrency as usize],
+            1
+        );
+        drop(reservation);
+        let next = controller.reserve_concurrency(None, None).unwrap();
+        assert_eq!(controller.metrics_snapshot().inflight_inferences, 1);
+        drop(next);
+        assert_eq!(controller.metrics_snapshot().inflight_inferences, 0);
+
+        let key_controller = AdmissionController::new(2);
+        let key_reservation = key_controller
+            .reserve_concurrency(Some(("key", Some(1))), None)
+            .unwrap();
+        assert!(key_controller
+            .reserve_concurrency(Some(("key", Some(1))), None)
+            .is_err());
+        assert_eq!(
+            key_controller.metrics_snapshot().rejected[RejectionReason::KeyConcurrency as usize],
+            1
+        );
+        drop(key_reservation);
+
+        let route_controller = AdmissionController::new(2);
+        let route_reservation = route_controller
+            .reserve_concurrency(None, Some(("route", Some(1))))
+            .unwrap();
+        assert!(route_controller
+            .reserve_concurrency(None, Some(("route", Some(1))))
+            .is_err());
+        assert_eq!(
+            route_controller.metrics_snapshot().rejected
+                [RejectionReason::RouteConcurrency as usize],
+            1
+        );
+        drop(route_reservation);
+    }
+
+    #[test]
+    fn reconciliation_metrics_track_complete_incomplete_and_dropped_reservations() {
+        let (controller, entry) = initialized_controller();
+        let estimate = AdmissionEstimate {
+            tokens: 80,
+            cost: Some(0.8),
+        };
+        let complete = controller
+            .reserve_initialized(entry.clone(), &key(), estimate)
+            .unwrap();
+        assert_eq!(controller.metrics_snapshot().active_reservations, 1);
+        assert_eq!(controller.metrics_snapshot().active_reserved_tokens, 80);
+        complete.reconcile(
+            &TokenUsage {
+                input: Some(10),
+                output: Some(20),
+                ..Default::default()
+            },
+            Some(0.3),
+        );
+
+        let incomplete = controller
+            .reserve_initialized(entry.clone(), &key(), estimate)
+            .unwrap();
+        incomplete.reconcile(
+            &TokenUsage {
+                input: Some(10),
+                output: None,
+                ..Default::default()
+            },
+            None,
+        );
+        let dropped = controller
+            .reserve_initialized(entry, &key(), estimate)
+            .unwrap();
+        drop(dropped);
+
+        let metrics = controller.metrics_snapshot();
+        assert_eq!(metrics.active_reservations, 0);
+        assert_eq!(metrics.active_reserved_tokens, 0);
+        assert_eq!(metrics.reservations_total, 3);
+        assert_eq!(metrics.reserved_tokens_total, 240);
+        assert_eq!(metrics.reconciled_complete_total, 1);
+        assert_eq!(metrics.reconciled_incomplete_total, 1);
+        assert_eq!(metrics.dropped_total, 1);
+        assert_eq!(metrics.reconciled_tokens_total, 30);
+        assert_eq!(metrics.reduced_tokens_total, 50);
+        assert_eq!(metrics.increased_tokens_total, 0);
     }
 }

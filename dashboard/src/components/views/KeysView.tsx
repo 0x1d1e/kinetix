@@ -96,6 +96,7 @@ export const KeysView: React.FC<KeysViewProps> = ({
   const [allowedModels, setAllowedModels] = useState('*');
   const [rpmLimit, setRpmLimit] = useState(60);
   const [tpmLimit, setTpmLimit] = useState(100000);
+  const [maxConcurrentRequests, setMaxConcurrentRequests] = useState('');
   const [dailyBudget, setDailyBudget] = useState(15.0);
   const [monthlyBudget, setMonthlyBudget] = useState(60.0);
 
@@ -123,6 +124,7 @@ export const KeysView: React.FC<KeysViewProps> = ({
       allowedProviders: [],
       rpmLimit: Number(rpmLimit) || 0,
       tpmLimit: Number(tpmLimit) || 0,
+      maxConcurrentRequests: maxConcurrentRequests === '' ? null : Number(maxConcurrentRequests),
       dailyBudget: Number(dailyBudget) || 0,
       monthlyBudget: Number(monthlyBudget) || 0,
       currentDailySpend: 0,
@@ -146,6 +148,7 @@ export const KeysView: React.FC<KeysViewProps> = ({
     setName('');
     setOwner('');
     setTag('');
+    setMaxConcurrentRequests('');
   };
 
   const normalizedSearch = searchQuery.trim().toLowerCase();
@@ -352,6 +355,9 @@ export const KeysView: React.FC<KeysViewProps> = ({
                     <div>
                       Tokens: <strong>{formatTokens(k.tpmLimit)} TPM</strong>
                     </div>
+                    <div className="col-span-2">
+                      Concurrency: <strong>{k.maxConcurrentRequests ?? 'unlimited'}</strong>
+                    </div>
                     <div className="col-span-2 pt-1 border-t border-[var(--ink)]/15">
                       Allowed Models:{' '}
                       <strong className="text-[var(--pen-blue)]">{k.allowedModels.join(', ')}</strong>
@@ -557,6 +563,23 @@ export const KeysView: React.FC<KeysViewProps> = ({
                       style={{ borderRadius: '255px 15px 225px 15px / 15px 225px 15px 255px' }}
                     />
                   </div>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
+                    Max Concurrent Requests
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={maxConcurrentRequests}
+                    onChange={(e) => setMaxConcurrentRequests(e.target.value)}
+                    placeholder="Unlimited"
+                    className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base sketch-shadow-sm focus:outline-none"
+                    style={{ borderRadius: '15px 225px 255px 25px / 255px 25px 225px 15px' }}
+                  />
+                  <p className="text-xs text-[var(--ink)]/60 mt-1">Blank leaves this key without a concurrency cap.</p>
                 </div>
 
                 <div className="pt-2 flex justify-end gap-3">

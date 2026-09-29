@@ -148,6 +148,7 @@ impl AppState {
     ) -> Self {
         let pool_clone = pool.clone();
         let crypto_clone = crypto.clone();
+        let max_inflight_inferences = config.max_inflight_inferences;
         let credentials = Arc::new(StaticKeyStrategy::new(crypto.clone()));
         let sessions = Arc::new(crate::auth::Sessions::new(config.session_ttl_minutes));
         let plugin_auth_sessions = Arc::new(crate::auth::PluginAuthSessions::new());
@@ -181,7 +182,7 @@ impl AppState {
             route_fallbacks: Arc::new(AtomicU64::new(0)),
             last_backup_at: Arc::new(parking_lot::Mutex::new(None)),
             last_backup_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            admission: crate::admission::AdmissionController::default(),
+            admission: crate::admission::AdmissionController::new(max_inflight_inferences),
             upstream_traffic: crate::upstream_traffic::UpstreamTraffic::default(),
             quota: crate::quota::QuotaRegistry::default(),
             provider_circuits: crate::provider_circuit::ProviderCircuits::default(),

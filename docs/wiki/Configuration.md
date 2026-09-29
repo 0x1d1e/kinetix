@@ -36,6 +36,7 @@ after the first run.
 | `KINETIX_ADMIN_TOKEN` | generated | Pre-set the admin password (≥8 chars). If unset, one is generated and printed once. |
 | `KINETIX_BOOTSTRAP_FILE` | unset | TOML seeded into an empty database (see below). |
 | `KINETIX_DATA_DIR` | XDG | Data directory (also where backups/exports live). |
+| `KINETIX_MAX_INFLIGHT_INFERENCES` | `200` | Instance-wide active inference cap; excess requests fail fast with 429. Must be positive. Also configurable as `max_inflight_inferences` in `config.toml`. |
 | `KINETIX_SHUTDOWN_GRACE_SECS` | `30` | Graceful-shutdown drain window. |
 | `KINETIX_IP_RATE_LIMIT_PER_MIN` | `600` | Per-IP abuse limit applied before virtual-key auth (`0` disables). |
 | `KINETIX_SESSION_TTL_MINUTES` | `720` | Admin session lifetime; sessions are in-memory, so a restart forces re-login. |
@@ -62,7 +63,7 @@ database has no providers**; afterwards the database is authoritative. A
 documented example is
 [`config.toml.example`](https://github.com/PrightCord/kinetix/blob/main/config.toml.example).
 
-Bootstrap accepts the same executable controls as the database: provider failure/security settings, account priority/weight/quota window, model parameter/thinking/extra-request policy, route fallback triggers, unpinned provider-pool targets, target predicates/overrides, and virtual-key provider/IP/logging restrictions. Legacy `continuity_policy = "error"` is accepted only for compatibility and maps to `portability_policy = "reject"`; new configuration should use `portability_policy` only.
+Bootstrap accepts the same executable controls as the database: provider failure/security settings, account priority/weight/quota window, model parameter/thinking/extra-request policy, route fallback triggers and optional `max_concurrent_requests`, unpinned provider-pool targets, target predicates/overrides, and virtual-key provider/IP/logging restrictions including optional per-key `max_concurrent_requests`. Zero or omission leaves a key or Route uncapped. Legacy `continuity_policy = "error"` is accepted only for compatibility and maps to `portability_policy = "reject"`; new configuration should use `portability_policy` only.
 
 ```toml
 [[virtual_keys]]

@@ -45,6 +45,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [strategy, setStrategy] = useState<Route['selectionStrategy']>('priority');
+  const [maxConcurrentRequests, setMaxConcurrentRequests] = useState('');
   const [on429, setOn429] = useState(true);
   const [onQuota, setOnQuota] = useState(true);
   const [on5xx, setOn5xx] = useState(true);
@@ -156,6 +157,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
       portabilityPolicy: 'strip_with_warning',
       cacheAffinity: true,
       stickyRouting: sticky,
+      maxConcurrentRequests: maxConcurrentRequests === '' ? null : Number(maxConcurrentRequests),
       totalHops: 0,
       status: 'active',
     };
@@ -165,6 +167,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
     setShowCreateModal(false);
     setName('');
     setDescription('');
+    setMaxConcurrentRequests('');
   };
 
   return (
@@ -274,9 +277,10 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                     </SketchBadge>
                   </div>
 
-                  <div className="mt-3 pt-2 border-t border-[var(--ink)]/20 flex items-center justify-between text-xs font-mono text-[var(--ink)]/70">
+                  <div className="mt-3 pt-2 border-t border-[var(--ink)]/20 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs font-mono text-[var(--ink)]/70">
                     <span>Strategy: <strong>{route.selectionStrategy}</strong></span>
                     <span>{route.targets.length} targets • {route.totalHops} hops</span>
+                    <span>Concurrency: <strong>{route.maxConcurrentRequests ?? 'unlimited'}</strong></span>
                   </div>
                 </div>
               );
@@ -285,7 +289,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
 
           {/* Right Column: Selected Route Detail & Target Fallback Chain */}
           {activeRoute && (
-            <div className="lg:col-span-2 space-y-5">
+            <div className="lg:col-span-2 min-w-0 space-y-5">
               <WobblyCard decoration="tape" className="p-6">
                 <div className="flex flex-wrap items-start justify-between gap-4 mb-4 pb-3 border-b-2 border-dashed border-[var(--ink)]/30">
                   <div>
@@ -475,7 +479,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                       <select
                         value={newTargetModelId}
                         onChange={(e) => setNewTargetModelId(e.target.value)}
-                        className="flex-1 bg-[var(--surface)] border-2 border-[var(--ink)] px-2 py-1.5 text-sm font-mono rounded focus:outline-none"
+                        className="flex-1 min-w-0 bg-[var(--surface)] border-2 border-[var(--ink)] px-2 py-1.5 text-sm font-mono rounded focus:outline-none"
                       >
                         <option value="">Select a model…</option>
                         {models.map((m) => (
@@ -487,7 +491,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                       <select
                         value={newTargetAccountId}
                         onChange={(e) => setNewTargetAccountId(e.target.value)}
-                        className="flex-1 bg-[var(--surface)] border-2 border-[var(--ink)] px-2 py-1.5 text-sm font-mono rounded focus:outline-none"
+                        className="flex-1 min-w-0 bg-[var(--surface)] border-2 border-[var(--ink)] px-2 py-1.5 text-sm font-mono rounded focus:outline-none"
                       >
                         <option value="">Account: auto (lowest priority)</option>
                         {accounts.map((a) => (
@@ -536,6 +540,25 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                       </option>
                     ))}
                   </select>
+                </div>
+
+                <div className="md:col-span-2">
+                  <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
+                    Max Concurrent Requests
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={activeRoute.maxConcurrentRequests ?? ''}
+                    onChange={(e) => onUpdateRoute({
+                      ...activeRoute,
+                      maxConcurrentRequests: e.target.value === '' ? null : Number(e.target.value),
+                    })}
+                    placeholder="Unlimited"
+                    className="w-full md:w-64 bg-[var(--surface)] border border-[var(--ink)] px-2 py-1.5 text-sm font-mono rounded"
+                  />
+                  <p className="text-xs text-[var(--ink)]/60 mt-1">Blank leaves the Route without a concurrency cap.</p>
                 </div>
 
                 <div>
@@ -780,6 +803,23 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                       </option>
                     ))}
                   </select>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
+                    Max Concurrent Requests
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={maxConcurrentRequests}
+                    onChange={(e) => setMaxConcurrentRequests(e.target.value)}
+                    placeholder="Unlimited"
+                    className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base sketch-shadow-sm focus:outline-none font-mono"
+                    style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
+                  />
+                  <p className="text-xs text-[var(--ink)]/60 mt-1">Blank leaves the Route without a concurrency cap.</p>
                 </div>
 
                 <div className="p-3 bg-[var(--postit)] border border-[var(--ink)] rounded space-y-2 text-sm">

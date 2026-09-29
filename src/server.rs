@@ -2,13 +2,22 @@
 //! tasks, and the axum listener. Kept separate from `main.rs` so the CLI can
 //! reuse it for the `serve` subcommand.
 
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::extract::connect_info::Connected;
+use axum::serve::{IncomingStream, Listener};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::app::AppState;
+use crate::client_disconnect::ClientDisconnect;
 use crate::config::Config;
 use crate::crypto::Crypto;
 use crate::logqueue::UsageLogQueue;
@@ -16,6 +25,140 @@ use crate::opaque_state::OpaqueStateStore;
 use crate::plugins::{HostPolicy, PluginManager};
 use crate::registry::Registry;
 use crate::{alerts, bootstrap, db, export, router};
+
+/// Listener that makes the client socket's lifetime available to request handlers.
+pub struct DisconnectAwareListener {
+    inner: TcpListener,
+}
+
+impl DisconnectAwareListener {
+    pub fn new(inner: TcpListener) -> Self {
+        Self { inner }
+    }
+}
+
+/// Connection metadata added to each request by Axum.
+#[derive(Clone, Debug)]
+pub struct ClientConnectionInfo {
+    pub peer_addr: SocketAddr,
+    pub disconnect: ClientDisconnect,
+}
+
+/// IO wrapper used to stop the socket monitor when the server drops a connection.
+#[doc(hidden)]
+pub struct DisconnectAwareIo {
+    stream: TcpStream,
+    disconnect: ClientDisconnect,
+}
+
+impl Drop for DisconnectAwareIo {
+    fn drop(&mut self) {
+        self.disconnect.connection_closed();
+    }
+}
+
+impl AsyncRead for DisconnectAwareIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for DisconnectAwareIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+    }
+}
+
+impl Listener for DisconnectAwareListener {
+    type Io = DisconnectAwareIo;
+    type Addr = ClientConnectionInfo;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, peer_addr) = Listener::accept(&mut self.inner).await;
+            let std_stream = match stream.into_std() {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(%error, "could not convert client stream for disconnect monitoring");
+                    continue;
+                }
+            };
+            let monitor_stream = match std_stream.try_clone() {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(%error, "could not clone client stream for disconnect monitoring");
+                    continue;
+                }
+            };
+            let stream = match TcpStream::from_std(std_stream) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(%error, "could not register client stream with Tokio");
+                    continue;
+                }
+            };
+            let monitor = match TcpStream::from_std(monitor_stream) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(%error, "could not register client monitor with Tokio");
+                    continue;
+                }
+            };
+            let disconnect = ClientDisconnect::new(monitor);
+            return (
+                DisconnectAwareIo {
+                    stream,
+                    disconnect: disconnect.clone(),
+                },
+                ClientConnectionInfo {
+                    peer_addr,
+                    disconnect,
+                },
+            );
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        Ok(ClientConnectionInfo {
+            peer_addr: self.inner.local_addr()?,
+            disconnect: ClientDisconnect::unmonitored(),
+        })
+    }
+}
+
+impl Connected<IncomingStream<'_, DisconnectAwareListener>> for ClientConnectionInfo {
+    fn connect_info(stream: IncomingStream<'_, DisconnectAwareListener>) -> Self {
+        stream.remote_addr().clone()
+    }
+}
 
 pub fn init_tracing(json: bool) {
     let filter = EnvFilter::try_from_default_env()
@@ -172,11 +315,14 @@ where
 {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let mut server_task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await
+        axum::serve(
+            DisconnectAwareListener::new(listener),
+            app.into_make_service_with_connect_info::<ClientConnectionInfo>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
     });
 
     // Keep serving normally until either the server exits unexpectedly or an

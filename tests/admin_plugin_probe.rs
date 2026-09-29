@@ -153,6 +153,7 @@ async fn account_probe_uses_registered_plugin_adapter() {
         allow_insecure_tls: true,
         data_dir: paths.data_dir.clone(),
         shutdown_grace_secs: 1,
+        max_inflight_inferences: kinetix::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
         alert_webhook_url: None,
         alert_fallback_rate: 1.0,
         alert_error_rate: 1.0,

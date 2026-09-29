@@ -253,6 +253,7 @@ async fn setup(
             sticky_routing: false,
             cache_affinity: false,
             max_attempts: Some(2),
+            max_concurrent_requests: None,
         },
     )
     .await
@@ -278,6 +279,7 @@ async fn setup(
             log_json: false,
             bootstrap_file: None,
             allow_private_upstreams: true,
+            max_inflight_inferences: kinetix::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
             allow_insecure_tls: true,
             data_dir: paths.data_dir.clone(),
             shutdown_grace_secs: 1,
