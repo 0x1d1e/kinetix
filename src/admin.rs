@@ -10465,6 +10465,68 @@ fn normalize_import_config(mut config: Value) -> Result<(Value, u64, Vec<String>
     Ok((config, version, warnings))
 }
 
+async fn installed_integration_ceilings(
+    state: &AppState,
+    provider_name: &str,
+    source_plugin_id: Option<&str>,
+    source_integration_id: Option<&str>,
+) -> Result<
+    Option<(
+        Option<crate::plugins::types::IntegrationFeaturesV1>,
+        Option<crate::plugins::types::IntegrationProtocolsV1>,
+    )>,
+    String,
+> {
+    let (Some(plugin_id), Some(integration_id), Some(manager)) = (
+        source_plugin_id.filter(|value| !value.trim().is_empty()),
+        source_integration_id.filter(|value| !value.trim().is_empty()),
+        state.plugin_manager(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(plugin) = manager
+        .get(plugin_id)
+        .await
+        .map_err(|error| format!("provider '{provider_name}': {error}"))?
+    else {
+        return Ok(None);
+    };
+    let manifest = plugin.manifest().ok_or_else(|| {
+        format!("provider '{provider_name}': source plugin manifest is unreadable")
+    })?;
+    let integration = manifest
+        .integrations
+        .iter()
+        .find(|integration| integration.id == integration_id)
+        .ok_or_else(|| {
+            format!(
+                "provider '{provider_name}': source integration '{integration_id}' is unavailable"
+            )
+        })?;
+    let features = integration.features.clone();
+    let protocols = integration.protocols.clone();
+    if features.is_some() != protocols.is_some() {
+        return Err(format!(
+            "provider '{provider_name}': source integration '{integration_id}' has incomplete feature/protocol declarations"
+        ));
+    }
+    if let Some(features) = &features {
+        features.validate().map_err(|problem| {
+            format!(
+                "provider '{provider_name}': source integration '{integration_id}' has invalid features: {problem}"
+            )
+        })?;
+    }
+    if let Some(protocols) = &protocols {
+        protocols.validate().map_err(|problem| {
+            format!(
+                "provider '{provider_name}': source integration '{integration_id}' has invalid protocols: {problem}"
+            )
+        })?;
+    }
+    Ok(Some((features, protocols)))
+}
+
 #[derive(Deserialize)]
 pub struct ImportBody {
     pub config: Value,
@@ -10605,30 +10667,64 @@ pub async fn import_config(
         let existing_provider = existing_providers
             .iter()
             .find(|provider| provider.name == name);
-        let integration_features = match imported_integration_features(
-            p.get("integration_features"),
-            existing_provider.as_ref(),
-        ) {
-            Ok(features) => features,
+        let source_plugin_id = if p.get("source_plugin_id").is_some() {
+            p["source_plugin_id"].as_str()
+        } else {
+            existing_provider
+                .as_ref()
+                .and_then(|provider| provider.source_plugin_id.as_deref())
+        };
+        let source_integration_id = if p.get("source_integration_id").is_some() {
+            p["source_integration_id"].as_str()
+        } else {
+            existing_provider
+                .as_ref()
+                .and_then(|provider| provider.source_integration_id.as_deref())
+        };
+        let installed_ceilings = match installed_integration_ceilings(
+            &state,
+            name,
+            source_plugin_id,
+            source_integration_id,
+        )
+        .await
+        {
+            Ok(ceilings) => ceilings,
             Err(problem) => {
-                problems.push(format!(
-                    "provider '{name}': invalid integration_features: {problem}"
-                ));
+                problems.push(problem);
                 None
             }
         };
-        let integration_protocols = match imported_integration_protocols(
-            p.get("integration_protocols"),
-            existing_provider.as_ref(),
-        ) {
-            Ok(protocols) => protocols,
-            Err(problem) => {
-                problems.push(format!(
-                    "provider '{name}': invalid integration_protocols: {problem}"
-                ));
-                None
-            }
-        };
+        let (integration_features, integration_protocols) =
+            if let Some(ceilings) = installed_ceilings {
+                ceilings
+            } else {
+                let features = match imported_integration_features(
+                    p.get("integration_features"),
+                    existing_provider.as_ref(),
+                ) {
+                    Ok(features) => features,
+                    Err(problem) => {
+                        problems.push(format!(
+                            "provider '{name}': invalid integration_features: {problem}"
+                        ));
+                        None
+                    }
+                };
+                let protocols = match imported_integration_protocols(
+                    p.get("integration_protocols"),
+                    existing_provider.as_ref(),
+                ) {
+                    Ok(protocols) => protocols,
+                    Err(problem) => {
+                        problems.push(format!(
+                            "provider '{name}': invalid integration_protocols: {problem}"
+                        ));
+                        None
+                    }
+                };
+                (features, protocols)
+            };
         if let Some(protocols) = integration_protocols.as_ref() {
             if let Some(wire) = WireFormat::parse(p["wire_format"].as_str().unwrap_or("")) {
                 let result = if protocols
@@ -10684,20 +10780,6 @@ pub async fn import_config(
                 })
             })
             .unwrap_or(crate::plugins::CredentialMode::Manual);
-        let source_plugin_id = if p.get("source_plugin_id").is_some() {
-            p["source_plugin_id"].as_str()
-        } else {
-            existing_provider
-                .as_ref()
-                .and_then(|provider| provider.source_plugin_id.as_deref())
-        };
-        let source_integration_id = if p.get("source_integration_id").is_some() {
-            p["source_integration_id"].as_str()
-        } else {
-            existing_provider
-                .as_ref()
-                .and_then(|provider| provider.source_integration_id.as_deref())
-        };
         let wire_plugin = p["wire_plugin"].as_str().unwrap_or("");
         let credential_plugin = p["credential_plugin"].as_str().unwrap_or("");
         let model_source_plugin = p["model_source_plugin"].as_str().unwrap_or("");
@@ -22798,6 +22880,211 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
+
+        let protocol_veto = pipeline::dry_run(
+            &target,
+            "limited-provider/vision-model",
+            &pipeline::DryRunRequest {
+                frontend: Some("openai".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(protocol_veto["would_select"], Value::Null);
+        assert!(protocol_veto["candidates"][0]["not_selected_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("input_protocol")));
+
+        let feature_veto = pipeline::dry_run(
+            &target,
+            "limited-provider/vision-model",
+            &pipeline::DryRunRequest {
+                frontend: Some("anthropic".into()),
+                has_images: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(feature_veto["would_select"], Value::Null);
+        assert!(feature_veto["candidates"][0]["not_selected_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("capabilities")));
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn config_import_uses_installed_manifest_integration_ceilings() {
+        let (source, source_root) = test_state("manifest-authority-export-source").await;
+        let provider_id = insert_provider(
+            &source,
+            "limited-provider",
+            crate::plugins::CredentialMode::Manual,
+            Some("plugin.test"),
+            Some("limited"),
+        )
+        .await;
+        db::set_provider_integration_features(
+            &source.pool,
+            &provider_id,
+            Some(&crate::plugins::types::IntegrationFeaturesV1 {
+                schema_version: 1,
+                streaming: true,
+                tools: true,
+                parallel_tools: true,
+                vision: false,
+                reasoning: true,
+                structured_output: true,
+                model_discovery: true,
+                quota_probe: false,
+                health_probe: false,
+            }),
+        )
+        .await
+        .unwrap();
+        db::set_provider_integration_protocols(
+            &source.pool,
+            &provider_id,
+            Some(&crate::plugins::types::IntegrationProtocolsV1 {
+                input: vec!["anthropic".into()],
+                upstream: vec!["openai-chat".into()],
+            }),
+        )
+        .await
+        .unwrap();
+        db::insert_model(
+            &source.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "vision-model",
+                display_name: "Vision Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({"vision": true}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let encrypted = source.crypto.encrypt("test-secret").unwrap();
+        db::insert_account(
+            &source.pool,
+            &provider_id,
+            "primary",
+            &encrypted,
+            &crate::crypto::mask_secret("test-secret"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+
+        let mut exported = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let exported_provider = exported["providers"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|provider| provider["name"] == "limited-provider")
+            .unwrap();
+        exported_provider["integration_features"]["vision"] = json!(true);
+        exported_provider["integration_protocols"]["input"] = json!(["anthropic", "openai-chat"]);
+
+        let (target, target_root) =
+            test_state_with_plugins("manifest-authority-export-target").await;
+        install_test_plugin_manifest(
+            &target,
+            json!({
+                "manifest_version": crate::plugins::MANIFEST_VERSION,
+                "id": "plugin.test",
+                "name": "Current Capability Contract",
+                "version": "1.0.0",
+                "plugin_api": format!("{}.0.0", crate::plugins::PLUGIN_API_MAJOR),
+                "integrations": [{
+                    "id": "limited",
+                    "name": "Limited Provider",
+                    "credential_mode": "manual",
+                    "features": {
+                        "schema_version": 1,
+                        "streaming": true,
+                        "tools": true,
+                        "parallel_tools": true,
+                        "vision": false,
+                        "reasoning": true,
+                        "structured_output": true,
+                        "model_discovery": true,
+                        "quota_probe": false,
+                        "health_probe": false
+                    },
+                    "protocols": {
+                        "input": ["anthropic"],
+                        "upstream": ["openai-chat"]
+                    },
+                    "provider": {
+                        "base_url": "https://provider.example/v1",
+                        "wire_format": "openai",
+                        "auth_scheme": "bearer"
+                    }
+                }]
+            }),
+        )
+        .await;
+        let import_result = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(import_result["ok"], true);
+
+        let provider = db::list_providers(&target.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "limited-provider")
+            .unwrap();
+        assert!(
+            !provider
+                .integration_feature_ceiling()
+                .unwrap()
+                .unwrap()
+                .vision
+        );
+        assert_eq!(
+            provider
+                .integration_protocol_ceiling()
+                .unwrap()
+                .unwrap()
+                .input,
+            vec!["anthropic"]
+        );
 
         let protocol_veto = pipeline::dry_run(
             &target,
