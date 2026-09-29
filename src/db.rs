@@ -4201,8 +4201,8 @@ pub async fn insert_route_trace(pool: &Pool, t: &crate::trace::RouteTrace) -> Re
     sqlx::query(
         "INSERT INTO route_traces
          (id, request_id, opaque_route_id, ts, requested_model, route_id, route_name, final_target,
-          commit_state, outcome, steps, warnings)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+          commit_state, outcome, steps, warnings, stream_outcome, terminal_failure_kind, fallback_allowed)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&t.opaque_route_id)
     .bind(&t.request_id)
@@ -4216,6 +4216,9 @@ pub async fn insert_route_trace(pool: &Pool, t: &crate::trace::RouteTrace) -> Re
     .bind(&t.outcome)
     .bind(t.steps_json())
     .bind(t.warnings_json())
+    .bind(&t.stream_outcome)
+    .bind(&t.terminal_failure_kind)
+    .bind(t.fallback_allowed.map(i64::from))
     .execute(pool)
     .await?;
     Ok(())
@@ -4235,6 +4238,9 @@ pub struct RouteTraceRow {
     pub outcome: String,
     pub steps: String,
     pub warnings: String,
+    pub stream_outcome: Option<String>,
+    pub terminal_failure_kind: Option<String>,
+    pub fallback_allowed: Option<i64>,
 }
 
 pub async fn get_route_trace_by_request(

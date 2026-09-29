@@ -817,6 +817,19 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
     assert_eq!(failed_event["type"], "response.failed");
     assert_eq!(failed_event["response"]["status"], "failed");
     assert_eq!(failed_event["response"]["error"]["code"], "server_error");
+    let (stream_outcome, terminal_failure_kind, commit_state, fallback_allowed) =
+        sqlx::query_as::<_, (Option<String>, Option<String>, String, Option<i64>)>(
+            "SELECT stream_outcome, terminal_failure_kind, commit_state, fallback_allowed \
+             FROM route_traces WHERE requested_model = ? ORDER BY ts DESC LIMIT 1",
+        )
+        .bind("responses-translated-route")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(stream_outcome.as_deref(), Some("upstream_clean_eof"));
+    assert_eq!(terminal_failure_kind.as_deref(), Some("malformed_upstream"));
+    assert_eq!(commit_state, "committed");
+    assert_eq!(fallback_allowed, Some(0));
     assert!(failed_event["response"]["parallel_tool_calls"]
         .as_bool()
         .unwrap());

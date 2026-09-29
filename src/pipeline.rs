@@ -30,6 +30,7 @@ use crate::passthrough;
 use crate::pool;
 use crate::predicate::{self, PluginFacts, RequestFacts, TargetFacts, TargetPredicate};
 use crate::registry::{Resolved, ResolvedTarget};
+use crate::stream_outcome::{CommitState, StreamOutcome, StreamTermination};
 use crate::trace::RouteTrace;
 use crate::types::{
     FailureKind, InternalRequest, ProxyError, StreamEvent, TokenUsage, UpstreamFailure,
@@ -95,6 +96,7 @@ pub struct RequestMeta {
     pub fallback_hops: i64,
     pub retry_count: i64,
     pub fallback_path: Vec<String>,
+    fallback_enabled: bool,
     pub cache_status: &'static str,
     pub commit_state: &'static str,
     pub session: Option<String>,
@@ -115,7 +117,12 @@ pub struct RequestMeta {
 }
 
 impl RequestMeta {
-    pub fn new(request_id: String, format: FrontendFormat, requested_model: String) -> Self {
+    pub fn new(
+        request_id: String,
+        format: FrontendFormat,
+        requested_model: String,
+        fallback_enabled: bool,
+    ) -> Self {
         RequestMeta {
             request_id,
             key_id: None,
@@ -128,6 +135,7 @@ impl RequestMeta {
             fallback_hops: 0,
             retry_count: 0,
             fallback_path: Vec::new(),
+            fallback_enabled,
             cache_status: "bypass",
             commit_state: "",
             session: None,
@@ -545,7 +553,12 @@ pub(crate) async fn run_with_disconnect(
         None => None,
     };
     let mut trace = RouteTrace::new(request_id.clone(), req.requested_model.clone());
-    let mut meta = RequestMeta::new(request_id.clone(), format, req.requested_model.clone());
+    let mut meta = RequestMeta::new(
+        request_id.clone(),
+        format,
+        req.requested_model.clone(),
+        allow_fallback,
+    );
     meta.session = session.clone();
     meta.client_disconnect = client_disconnect;
     meta.admission = admission;
@@ -1640,26 +1653,58 @@ pub(crate) async fn run_with_disconnect(
                     let upstream_request_id = extract_upstream_request_id(&resp);
                     let first_event_remaining =
                         phase_deadline.saturating_duration_since(Instant::now());
+                    let is_sse = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .split(';')
+                        .next()
+                        .map(str::trim)
+                        == Some("text/event-stream");
+                    let aggregate_sse = !req.stream && is_sse;
                     let prepared_result = if first_event_remaining.is_zero() {
-                        Err(timeout_failure(
+                        Err(PreparedResponseFailure::from(timeout_failure(
                             "upstream timed out before first valid event",
-                        ))
+                        )))
+                    } else if aggregate_sse {
+                        prepare_success_response(
+                            resp,
+                            &adapter,
+                            true,
+                            first_event_remaining,
+                            provider_timeout,
+                        )
+                        .await
                     } else {
                         match tokio::time::timeout(
                             first_event_remaining,
-                            prepare_success_response(resp, &adapter),
+                            prepare_success_response(
+                                resp,
+                                &adapter,
+                                false,
+                                first_event_remaining,
+                                provider_timeout,
+                            ),
                         )
                         .await
                         {
                             Ok(result) => result,
-                            Err(_) => Err(timeout_failure(
+                            Err(_) => Err(PreparedResponseFailure::from(timeout_failure(
                                 "upstream timed out before first valid event",
-                            )),
+                            ))),
                         }
                     };
                     let prepared = match prepared_result {
                         Ok(prepared) => prepared,
-                        Err(failure) => {
+                        Err(prepared_failure) => {
+                            let failure = prepared_failure.failure;
+                            let termination = StreamTermination::new(
+                                prepared_failure.outcome,
+                                CommitState::PreCommit,
+                                Some(failure.kind),
+                                failure.status,
+                            );
                             if let Some(permit) = traffic_permit.as_ref() {
                                 permit.finish(traffic_outcome_for_failure(failure.kind));
                             }
@@ -1671,8 +1716,10 @@ pub(crate) async fn run_with_disconnect(
                             );
                             handle_key_failure(state, target, &failure, &mut meta, &mut trace)
                                 .await;
-                            let can_fallback = allow_fallback
-                                && route_allows_fallback(route.as_ref(), failure.kind);
+                            let can_fallback = termination.fallback_allowed(|kind| {
+                                allow_fallback && route_allows_fallback(route.as_ref(), kind)
+                            });
+                            trace.stream_termination(termination, Some(can_fallback));
                             if failure.kind == FailureKind::QuotaExhausted {
                                 state.quota.observe_exhausted(
                                     &target.provider.id,
@@ -1960,6 +2007,15 @@ pub(crate) async fn run_with_disconnect(
                             );
                             let can_fallback = allow_fallback
                                 && route_allows_fallback(route.as_ref(), FailureKind::AuthError);
+                            trace.stream_termination(
+                                StreamTermination::new(
+                                    stream_outcome_for_failure(failure.kind),
+                                    CommitState::PreCommit,
+                                    Some(failure.kind),
+                                    failure.status,
+                                ),
+                                Some(can_fallback),
+                            );
                             record_target_telemetry(
                                 state,
                                 target,
@@ -2001,6 +2057,15 @@ pub(crate) async fn run_with_disconnect(
                 );
                 let can_fallback =
                     allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
+                trace.stream_termination(
+                    StreamTermination::new(
+                        stream_outcome_for_failure(failure.kind),
+                        CommitState::PreCommit,
+                        Some(failure.kind),
+                        failure.status,
+                    ),
+                    Some(can_fallback),
+                );
                 record_target_telemetry(
                     state,
                     target,
@@ -2058,6 +2123,15 @@ pub(crate) async fn run_with_disconnect(
                 handle_key_failure(state, target, &failure, &mut meta, &mut trace).await;
                 let can_fallback =
                     allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
+                trace.stream_termination(
+                    StreamTermination::new(
+                        stream_outcome_for_failure(failure.kind),
+                        CommitState::PreCommit,
+                        Some(failure.kind),
+                        failure.status,
+                    ),
+                    Some(can_fallback),
+                );
                 record_target_telemetry(
                     state,
                     target,
@@ -2787,6 +2861,29 @@ struct PreparedUpstream {
     is_sse: bool,
 }
 
+struct PreparedResponseFailure {
+    failure: UpstreamFailure,
+    outcome: StreamOutcome,
+}
+
+impl PreparedResponseFailure {
+    fn new(failure: UpstreamFailure, outcome: StreamOutcome) -> Self {
+        Self { failure, outcome }
+    }
+}
+
+impl From<UpstreamFailure> for PreparedResponseFailure {
+    fn from(failure: UpstreamFailure) -> Self {
+        let outcome = match failure.kind {
+            FailureKind::Timeout => StreamOutcome::Timeout,
+            FailureKind::MalformedUpstream => StreamOutcome::ProtocolViolation,
+            FailureKind::ClientCancelled => StreamOutcome::ClientCancelled,
+            _ => StreamOutcome::UpstreamError,
+        };
+        Self::new(failure, outcome)
+    }
+}
+
 fn is_semantic_event(event: &StreamEvent) -> bool {
     !matches!(event, StreamEvent::Start { .. } | StreamEvent::Usage(_))
 }
@@ -2824,7 +2921,10 @@ fn payload_error_failure(adapter: &Arc<dyn Adapter>, payload: &str) -> Option<Up
 async fn prepare_success_response(
     mut response: reqwest::Response,
     adapter: &Arc<dyn Adapter>,
-) -> Result<PreparedUpstream, UpstreamFailure> {
+    aggregate_sse: bool,
+    first_event_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<PreparedUpstream, PreparedResponseFailure> {
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -2832,6 +2932,10 @@ async fn prepare_success_response(
         .unwrap_or("")
         .to_ascii_lowercase();
     let is_sse = content_type.split(';').next().map(str::trim) == Some("text/event-stream");
+
+    if is_sse && aggregate_sse {
+        return prepare_aggregated_sse(response, adapter, first_event_timeout, idle_timeout).await;
+    }
 
     if !is_sse {
         if response
@@ -2845,7 +2949,8 @@ async fn prepare_success_response(
                 retry_after_secs: None,
                 message: "upstream JSON response exceeds size limit".into(),
                 quota_reset_at: None,
-            });
+            }
+            .into());
         }
         let body = response.bytes().await.map_err(|error| UpstreamFailure {
             kind: if error.is_timeout() {
@@ -2865,11 +2970,12 @@ async fn prepare_success_response(
                 retry_after_secs: None,
                 message: "upstream JSON response exceeds size limit".into(),
                 quota_reset_at: None,
-            });
+            }
+            .into());
         }
         let body_text = String::from_utf8_lossy(&body);
         if let Some(failure) = payload_error_failure(adapter, &body_text) {
-            return Err(failure);
+            return Err(failure.into());
         }
         let value: Value = serde_json::from_slice(&body).map_err(|error| UpstreamFailure {
             kind: FailureKind::MalformedUpstream,
@@ -2886,7 +2992,8 @@ async fn prepare_success_response(
                 retry_after_secs: None,
                 message: "upstream JSON response contained no model result".into(),
                 quota_reset_at: None,
-            });
+            }
+            .into());
         }
         let mut precommit_usage = TokenUsage::default();
         for event in &events {
@@ -2922,7 +3029,7 @@ async fn prepare_success_response(
                         continue;
                     };
                     if let Some(failure) = payload_error_failure(adapter, &payload) {
-                        return Err(failure);
+                        return Err(failure.into());
                     }
                     if payload.trim() == "[DONE]" {
                         return Err(UpstreamFailure {
@@ -2931,7 +3038,8 @@ async fn prepare_success_response(
                             retry_after_secs: None,
                             message: "upstream SSE ended before any model event".into(),
                             quota_reset_at: None,
-                        });
+                        }
+                        .into());
                     }
                     let events = adapter.parse_stream_chunk(&payload)?;
                     for event in &events {
@@ -2956,13 +3064,19 @@ async fn prepare_success_response(
                 } else {
                     "upstream SSE ended before any model event"
                 };
-                return Err(UpstreamFailure {
+                let failure = UpstreamFailure {
                     kind: FailureKind::MalformedUpstream,
                     status: Some(502),
                     retry_after_secs: None,
                     message: message.into(),
                     quota_reset_at: None,
-                });
+                };
+                let outcome = if framer.pending_bytes() > 0 {
+                    StreamOutcome::ProtocolViolation
+                } else {
+                    StreamOutcome::UpstreamCleanEof
+                };
+                return Err(PreparedResponseFailure::new(failure, outcome));
             }
             Err(error) => {
                 return Err(UpstreamFailure {
@@ -2975,6 +3089,130 @@ async fn prepare_success_response(
                     retry_after_secs: None,
                     message: classify_reqwest(&error),
                     quota_reset_at: None,
+                }
+                .into());
+            }
+        }
+    }
+}
+
+async fn prepare_aggregated_sse(
+    mut response: reqwest::Response,
+    adapter: &Arc<dyn Adapter>,
+    first_event_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<PreparedUpstream, PreparedResponseFailure> {
+    let first_event_deadline = Instant::now() + first_event_timeout;
+    let mut framer = crate::sse::SseFramer::new();
+    let mut events_out = Vec::new();
+    let mut precommit_usage = TokenUsage::default();
+    let mut semantic_seen = false;
+    let mut terminal_seen = false;
+
+    loop {
+        let timeout = if semantic_seen {
+            idle_timeout
+        } else {
+            first_event_deadline.saturating_duration_since(Instant::now())
+        };
+        match tokio::time::timeout(timeout, response.chunk()).await {
+            Err(_) => {
+                return Err(UpstreamFailure {
+                    kind: FailureKind::Timeout,
+                    status: None,
+                    retry_after_secs: None,
+                    message: "timeout waiting for upstream SSE response".into(),
+                    quota_reset_at: None,
+                }
+                .into());
+            }
+            Ok(Err(error)) => {
+                return Err(UpstreamFailure {
+                    kind: if error.is_timeout() {
+                        FailureKind::Timeout
+                    } else {
+                        FailureKind::ConnectionError
+                    },
+                    status: None,
+                    retry_after_secs: None,
+                    message: classify_reqwest(&error),
+                    quota_reset_at: None,
+                }
+                .into());
+            }
+            Ok(Ok(Some(bytes))) => {
+                let frames = framer.push(&bytes).map_err(|error| UpstreamFailure {
+                    kind: FailureKind::MalformedUpstream,
+                    status: Some(502),
+                    retry_after_secs: None,
+                    message: error.to_string(),
+                    quota_reset_at: None,
+                })?;
+                for frame in frames {
+                    let Some(payload) = crate::sse::extract_data(&frame) else {
+                        continue;
+                    };
+                    if let Some(failure) = payload_error_failure(adapter, &payload) {
+                        return Err(failure.into());
+                    }
+                    if payload.trim() == "[DONE]" {
+                        terminal_seen = true;
+                        continue;
+                    }
+                    let events = adapter.parse_stream_chunk(&payload)?;
+                    terminal_seen |= payload_is_terminal(&payload, &events);
+                    semantic_seen |= events.iter().any(is_semantic_event);
+                    for event in &events {
+                        if let StreamEvent::Usage(value) = event {
+                            precommit_usage.merge(value);
+                        }
+                    }
+                    events_out.extend(events);
+                }
+            }
+            Ok(Ok(None)) => {
+                if framer.pending_bytes() > 0 {
+                    return Err(PreparedResponseFailure::new(
+                        UpstreamFailure {
+                            kind: FailureKind::MalformedUpstream,
+                            status: Some(502),
+                            retry_after_secs: None,
+                            message: "upstream SSE ended with an incomplete frame".into(),
+                            quota_reset_at: None,
+                        },
+                        StreamOutcome::ProtocolViolation,
+                    ));
+                }
+                if !terminal_seen {
+                    return Err(PreparedResponseFailure::new(
+                        UpstreamFailure {
+                            kind: FailureKind::MalformedUpstream,
+                            status: Some(502),
+                            retry_after_secs: None,
+                            message: "upstream SSE ended without a terminal event".into(),
+                            quota_reset_at: None,
+                        },
+                        StreamOutcome::UpstreamCleanEof,
+                    ));
+                }
+                if !semantic_seen {
+                    return Err(PreparedResponseFailure::new(
+                        UpstreamFailure {
+                            kind: FailureKind::MalformedUpstream,
+                            status: Some(502),
+                            retry_after_secs: None,
+                            message: "upstream SSE ended before any model event".into(),
+                            quota_reset_at: None,
+                        },
+                        StreamOutcome::ProtocolViolation,
+                    ));
+                }
+                return Ok(PreparedUpstream {
+                    stream: None,
+                    prefetched: Vec::new(),
+                    full_events: Some(events_out),
+                    precommit_usage,
+                    is_sse: true,
                 });
             }
         }
@@ -5107,8 +5345,7 @@ async fn drive_stream(
     let mut tool_stream = ToolStreamState::new(&meta.request_id);
     let mut usage = TokenUsage::default();
     let mut ttft_ms: Option<i64> = None;
-    let mut status = "success";
-    let mut status_code = 200i64;
+    let mut stream_outcome = StreamOutcome::Completed;
     let mut error_message: Option<String> = None;
     let mut provider_failure: Option<(FailureKind, Option<u16>)> = None;
     let mut committed = false;
@@ -5141,15 +5378,11 @@ async fn drive_stream(
         )
         .await
         {
-            record_cancel(&state, &meta, started);
-            status = "client_disconnect";
-            status_code = 499;
+            stream_outcome = output_abort_outcome(&state, &meta, started);
         } else {
             for frame in encoder.finalize() {
                 if tx.send(Ok(frame)).await.is_err() {
-                    record_cancel(&state, &meta, started);
-                    status = "client_disconnect";
-                    status_code = 499;
+                    stream_outcome = output_abort_outcome(&state, &meta, started);
                     break;
                 }
             }
@@ -5164,14 +5397,11 @@ async fn drive_stream(
             &model_display,
             started,
             ttft_ms,
-            status,
-            status_code,
+            stream_termination(stream_outcome, committed, provider_failure),
             usage,
             error_message,
             key,
             trace,
-            provider_failure,
-            committed,
         )
         .await;
         return;
@@ -5192,30 +5422,25 @@ async fn drive_stream(
     'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
             record_cancel(&state, &meta, started);
-            status = "client_disconnect";
-            status_code = 499;
+            stream_outcome = StreamOutcome::ClientCancelled;
             break;
         }
         tokio::select! {
             _ = notify.notified() => {
                 if meta.disconnected.load(Ordering::Relaxed) {
                     record_cancel(&state, &meta, started);
-                    status = "client_disconnect";
-                    status_code = 499;
+                    stream_outcome = StreamOutcome::ClientCancelled;
                     break;
                 }
             }
             _ = keepalive.tick() => {
                 if tx.send(Ok(frontends::sse_comment("keepalive"))).await.is_err() {
-                    record_cancel(&state, &meta, started);
-                    status = "client_disconnect";
-                    status_code = 499;
+                    stream_outcome = output_abort_outcome(&state, &meta, started);
                     break;
                 }
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
-                status = "stream_error";
-                status_code = 504;
+                stream_outcome = StreamOutcome::Timeout;
                 provider_failure = Some((FailureKind::Timeout, None));
                 error_message = Some("upstream stream idle timeout".into());
                 break 'outer;
@@ -5227,8 +5452,8 @@ async fn drive_stream(
                         let frames = match framer.push(&bytes) {
                             Ok(frames) => frames,
                             Err(error) => {
-                                status = "stream_error";
-                                status_code = 502;
+                                stream_outcome = StreamOutcome::ProtocolViolation;
+                                provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
                                 error_message = Some(error.to_string());
                                 break 'outer;
                             }
@@ -5242,8 +5467,7 @@ async fn drive_stream(
                                 continue;
                             }
                             if let Some(failure) = payload_error_failure(&adapter, &payload) {
-                                status = "stream_error";
-                                status_code = 502;
+                                stream_outcome = stream_outcome_for_failure(failure.kind);
                                 provider_failure = Some((failure.kind, failure.status));
                                 error_message = Some(failure.message.clone());
                                 for out in encoder.error_frame(&failure.message) {
@@ -5254,8 +5478,8 @@ async fn drive_stream(
                             let events = match adapter.parse_stream_chunk(&payload) {
                                 Ok(events) => events,
                                 Err(failure) => {
-                                    status = "stream_error";
-                                    status_code = 502;
+                                    stream_outcome = StreamOutcome::ProtocolViolation;
+                                    provider_failure = Some((failure.kind, failure.status));
                                     error_message = Some(failure.message.clone());
                                     for out in encoder.error_frame(&failure.message) {
                                         let _ = tx.send(Ok(out)).await;
@@ -5287,21 +5511,18 @@ async fn drive_stream(
                             )
                             .await
                             {
-                                record_cancel(&state, &meta, started);
-                                status = "client_disconnect";
-                                status_code = 499;
+                                stream_outcome = output_abort_outcome(&state, &meta, started);
                                 break 'outer;
                             }
                         }
                     }
                     Some(Err(error)) => {
-                        status = "stream_error";
-                        status_code = 502;
                         let kind = if error.is_timeout() {
                             FailureKind::Timeout
                         } else {
                             FailureKind::ConnectionError
                         };
+                        stream_outcome = stream_outcome_for_failure(kind);
                         provider_failure = Some((kind, None));
                         error_message = Some(classify_reqwest(&error));
                         break;
@@ -5312,17 +5533,17 @@ async fn drive_stream(
         }
     }
 
-    if status == "success" && framer.pending_bytes() > 0 {
-        status = "stream_error";
-        status_code = 502;
+    if stream_outcome == StreamOutcome::Completed && framer.pending_bytes() > 0 {
+        stream_outcome = StreamOutcome::ProtocolViolation;
+        provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
         error_message = Some("upstream SSE ended with an incomplete frame".into());
-    } else if status == "success" && !terminal_seen {
-        status = "stream_error";
-        status_code = 502;
+    } else if stream_outcome == StreamOutcome::Completed && !terminal_seen {
+        stream_outcome = StreamOutcome::UpstreamCleanEof;
+        provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
         error_message = Some("upstream SSE ended before a terminal event".into());
     }
 
-    if status == "stream_error" {
+    if stream_outcome.is_upstream_failure() {
         if committed {
             state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
         }
@@ -5332,12 +5553,10 @@ async fn drive_stream(
         for frame in encoder.error_frame(message) {
             let _ = tx.send(Ok(frame)).await;
         }
-    } else if status == "success" {
+    } else if stream_outcome == StreamOutcome::Completed {
         for frame in encoder.finalize() {
             if tx.send(Ok(frame)).await.is_err() {
-                record_cancel(&state, &meta, started);
-                status = "client_disconnect";
-                status_code = 499;
+                stream_outcome = output_abort_outcome(&state, &meta, started);
                 break;
             }
         }
@@ -5352,14 +5571,11 @@ async fn drive_stream(
         &model_display,
         started,
         ttft_ms,
-        status,
-        status_code,
+        stream_termination(stream_outcome, committed, provider_failure),
         usage,
         error_message,
         key,
         trace,
-        provider_failure,
-        committed,
     )
     .await;
 }
@@ -5386,8 +5602,7 @@ async fn drive_stream_passthrough(
 ) {
     let mut usage = TokenUsage::default();
     let mut ttft_ms: Option<i64> = None;
-    let mut status = "success";
-    let mut status_code = 200i64;
+    let mut stream_outcome = StreamOutcome::Completed;
     let mut error_message: Option<String> = None;
     let mut provider_failure: Option<(FailureKind, Option<u16>)> = None;
     let mut committed = false;
@@ -5411,30 +5626,25 @@ async fn drive_stream_passthrough(
     'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
             record_cancel(&state, &meta, started);
-            status = "client_disconnect";
-            status_code = 499;
+            stream_outcome = StreamOutcome::ClientCancelled;
             break;
         }
         tokio::select! {
             _ = notify.notified() => {
                 if meta.disconnected.load(Ordering::Relaxed) {
                     record_cancel(&state, &meta, started);
-                    status = "client_disconnect";
-                    status_code = 499;
+                    stream_outcome = StreamOutcome::ClientCancelled;
                     break;
                 }
             }
             _ = keepalive.tick(), if committed => {
                 if tx.send(Ok(frontends::sse_comment("keepalive"))).await.is_err() {
-                    record_cancel(&state, &meta, started);
-                    status = "client_disconnect";
-                    status_code = 499;
+                    stream_outcome = output_abort_outcome(&state, &meta, started);
                     break;
                 }
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
-                status = "stream_error";
-                status_code = 504;
+                stream_outcome = StreamOutcome::Timeout;
                 provider_failure = Some((FailureKind::Timeout, None));
                 error_message = Some("upstream stream idle timeout".into());
                 break 'outer;
@@ -5446,8 +5656,8 @@ async fn drive_stream_passthrough(
                         let frames = match framer.push(&bytes) {
                             Ok(frames) => frames,
                             Err(error) => {
-                                status = "stream_error";
-                                status_code = 502;
+                                stream_outcome = StreamOutcome::ProtocolViolation;
+                                provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
                                 error_message = Some(error.to_string());
                                 break 'outer;
                             }
@@ -5460,8 +5670,7 @@ async fn drive_stream_passthrough(
                                     terminal_seen = true;
                                 } else {
                                     if let Some(failure) = payload_error_failure(&adapter, payload) {
-                                        status = "stream_error";
-                                        status_code = 502;
+                                        stream_outcome = stream_outcome_for_failure(failure.kind);
                                         provider_failure = Some((failure.kind, failure.status));
                                         error_message = Some(failure.message);
                                         break 'outer;
@@ -5510,8 +5719,8 @@ async fn drive_stream_passthrough(
                                             }
                                         }
                                         Err(failure) => {
-                                            status = "stream_error";
-                                            status_code = 502;
+                                            stream_outcome = StreamOutcome::ProtocolViolation;
+                                            provider_failure = Some((failure.kind, failure.status));
                                             error_message = Some(failure.message);
                                             break 'outer;
                                         }
@@ -5542,9 +5751,7 @@ async fn drive_stream_passthrough(
                                         .await
                                         .is_err()
                                     {
-                                        record_cancel(&state, &meta, started);
-                                        status = "client_disconnect";
-                                        status_code = 499;
+                                        stream_outcome = output_abort_outcome(&state, &meta, started);
                                         break 'outer;
                                     }
                                 }
@@ -5553,21 +5760,18 @@ async fn drive_stream_passthrough(
                                 .await
                                 .is_err()
                             {
-                                record_cancel(&state, &meta, started);
-                                status = "client_disconnect";
-                                status_code = 499;
+                                stream_outcome = output_abort_outcome(&state, &meta, started);
                                 break 'outer;
                             }
                         }
                     }
                     Some(Err(error)) => {
-                        status = "stream_error";
-                        status_code = 502;
                         let kind = if error.is_timeout() {
                             FailureKind::Timeout
                         } else {
                             FailureKind::ConnectionError
                         };
+                        stream_outcome = stream_outcome_for_failure(kind);
                         provider_failure = Some((kind, None));
                         error_message = Some(classify_reqwest(&error));
                         break;
@@ -5578,17 +5782,17 @@ async fn drive_stream_passthrough(
         }
     }
 
-    if status == "success" && framer.pending_bytes() > 0 {
-        status = "stream_error";
-        status_code = 502;
+    if stream_outcome == StreamOutcome::Completed && framer.pending_bytes() > 0 {
+        stream_outcome = StreamOutcome::ProtocolViolation;
+        provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
         error_message = Some("upstream SSE ended with an incomplete frame".into());
-    } else if status == "success" && !terminal_seen {
-        status = "stream_error";
-        status_code = 502;
+    } else if stream_outcome == StreamOutcome::Completed && !terminal_seen {
+        stream_outcome = StreamOutcome::UpstreamCleanEof;
+        provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
         error_message = Some("upstream SSE ended before a terminal event".into());
     }
 
-    if status == "stream_error" && committed {
+    if stream_outcome.is_upstream_failure() && committed {
         state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
         let message = error_message
             .as_deref()
@@ -5625,14 +5829,11 @@ async fn drive_stream_passthrough(
         &model_display,
         started,
         ttft_ms,
-        status,
-        status_code,
+        stream_termination(stream_outcome, committed, provider_failure),
         usage,
         error_message,
         key,
         trace,
-        provider_failure,
-        committed,
     )
     .await;
 }
@@ -5651,6 +5852,41 @@ impl Drop for DisconnectGuard {
         *self.at.lock() = Some(Instant::now());
         self.flag.store(true, Ordering::Relaxed);
         self.notify.notify_waiters();
+    }
+}
+
+fn stream_outcome_for_failure(kind: FailureKind) -> StreamOutcome {
+    match kind {
+        FailureKind::ClientCancelled => StreamOutcome::ClientCancelled,
+        FailureKind::Timeout => StreamOutcome::Timeout,
+        FailureKind::MalformedUpstream => StreamOutcome::ProtocolViolation,
+        _ => StreamOutcome::UpstreamError,
+    }
+}
+
+fn stream_termination(
+    outcome: StreamOutcome,
+    committed: bool,
+    failure: Option<(FailureKind, Option<u16>)>,
+) -> StreamTermination {
+    StreamTermination::new(
+        outcome,
+        if committed {
+            CommitState::PostCommit
+        } else {
+            CommitState::PreCommit
+        },
+        failure.map(|(kind, _)| kind),
+        failure.and_then(|(_, status)| status),
+    )
+}
+
+fn output_abort_outcome(state: &AppState, meta: &RequestMeta, started: Instant) -> StreamOutcome {
+    if meta.disconnected.load(Ordering::Relaxed) {
+        record_cancel(state, meta, started);
+        StreamOutcome::ClientCancelled
+    } else {
+        StreamOutcome::GatewayAbort
     }
 }
 
@@ -5701,6 +5937,7 @@ async fn drive_aggregate(
     let mut usage = TokenUsage::default();
     let mut status = "success";
     let mut status_code = 200i64;
+    let mut stream_outcome = StreamOutcome::Completed;
     let mut error_message: Option<String> = None;
     let mut provider_failure: Option<(FailureKind, Option<u16>)> = None;
     let mut committed = false;
@@ -5732,6 +5969,7 @@ async fn drive_aggregate(
             let next = match tokio::time::timeout(attempt.idle_timeout, chunks.next()).await {
                 Ok(next) => next,
                 Err(_) => {
+                    stream_outcome = StreamOutcome::Timeout;
                     status = "stream_error";
                     status_code = 504;
                     provider_failure = Some((FailureKind::Timeout, None));
@@ -5747,8 +5985,10 @@ async fn drive_aggregate(
                     let frames = match framer.push(&bytes) {
                         Ok(frames) => frames,
                         Err(error) => {
+                            stream_outcome = StreamOutcome::ProtocolViolation;
                             status = "stream_error";
                             status_code = 502;
+                            provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
                             error_message = Some(error.to_string());
                             break;
                         }
@@ -5762,6 +6002,7 @@ async fn drive_aggregate(
                             continue;
                         }
                         if let Some(failure) = payload_error_failure(&adapter, &payload) {
+                            stream_outcome = stream_outcome_for_failure(failure.kind);
                             status = "stream_error";
                             status_code = 502;
                             provider_failure = Some((failure.kind, failure.status));
@@ -5785,8 +6026,10 @@ async fn drive_aggregate(
                                 }
                             }
                             Err(failure) => {
+                                stream_outcome = StreamOutcome::ProtocolViolation;
                                 status = "stream_error";
                                 status_code = 502;
+                                provider_failure = Some((failure.kind, failure.status));
                                 error_message = Some(failure.message);
                                 break 'outer;
                             }
@@ -5794,12 +6037,17 @@ async fn drive_aggregate(
                     }
                 }
                 Err(error) => {
-                    status = "stream_error";
-                    status_code = 502;
                     let kind = if error.is_timeout() {
                         FailureKind::Timeout
                     } else {
                         FailureKind::ConnectionError
+                    };
+                    stream_outcome = stream_outcome_for_failure(kind);
+                    status = "stream_error";
+                    status_code = if kind == FailureKind::Timeout {
+                        504
+                    } else {
+                        502
                     };
                     provider_failure = Some((kind, None));
                     error_message = Some(classify_reqwest(&error));
@@ -5809,12 +6057,16 @@ async fn drive_aggregate(
         }
 
         if status == "success" && framer.pending_bytes() > 0 {
+            stream_outcome = StreamOutcome::ProtocolViolation;
             status = "stream_error";
             status_code = 502;
+            provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
             error_message = Some("upstream SSE ended with an incomplete frame".into());
         } else if status == "success" && !terminal_seen {
+            stream_outcome = StreamOutcome::UpstreamCleanEof;
             status = "stream_error";
             status_code = 502;
+            provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
             error_message = Some("upstream SSE ended before a terminal event".into());
         }
 
@@ -5826,6 +6078,7 @@ async fn drive_aggregate(
         }
     }
 
+    let termination = stream_termination(stream_outcome, committed, provider_failure);
     finalize_log(
         &state,
         &snap,
@@ -5835,14 +6088,11 @@ async fn drive_aggregate(
         &model_name,
         started,
         None,
-        status,
-        status_code,
+        termination,
         usage.clone(),
         error_message.clone(),
         key.clone(),
         trace,
-        provider_failure,
-        committed,
     )
     .await;
 
@@ -5909,46 +6159,52 @@ async fn finalize_log(
     model_display: &str,
     started: Instant,
     ttft_ms: Option<i64>,
-    status: &str,
-    status_code: i64,
+    termination: StreamTermination,
     usage: TokenUsage,
     error_message: Option<String>,
     key: Option<db::VirtualKeyRow>,
     mut trace: RouteTrace,
-    provider_failure: Option<(FailureKind, Option<u16>)>,
-    committed: bool,
 ) {
+    let status = termination.request_status();
+    let status_code = termination.status_code();
+    let provider_failure = termination
+        .outcome
+        .is_upstream_failure()
+        .then_some(termination.failure_kind)
+        .flatten()
+        .map(|kind| (kind, termination.upstream_status));
+
     if let Some(permit) = attempt.traffic_permit.as_ref() {
-        let outcome = match (status, status_code) {
-            ("success", _) => crate::upstream_traffic::TrafficOutcome::Success,
-            ("client_disconnect", _) => crate::upstream_traffic::TrafficOutcome::Cancelled,
-            (_, 504) => crate::upstream_traffic::TrafficOutcome::Timeout,
+        let outcome = match termination.outcome {
+            StreamOutcome::Completed => crate::upstream_traffic::TrafficOutcome::Success,
+            StreamOutcome::ClientCancelled => crate::upstream_traffic::TrafficOutcome::Cancelled,
+            StreamOutcome::GatewayAbort => crate::upstream_traffic::TrafficOutcome::Neutral,
+            StreamOutcome::Timeout => crate::upstream_traffic::TrafficOutcome::Timeout,
             _ => crate::upstream_traffic::TrafficOutcome::Error,
         };
         permit.finish(outcome);
     }
 
-    let telemetry_outcome = if status == "success" {
-        crate::target_telemetry::TelemetryOutcome::Success
-    } else if status == "client_disconnect" {
-        crate::target_telemetry::TelemetryOutcome::Cancelled
-    } else if let Some((kind, _)) = provider_failure {
-        telemetry_outcome_for_failure(kind)
-    } else {
-        // Framing/adapter/local stream-controller errors remain visible as
-        // terminal target failures but are not provider-outage evidence.
-        crate::target_telemetry::TelemetryOutcome::TargetError
+    let telemetry_outcome = match termination.outcome {
+        StreamOutcome::Completed => crate::target_telemetry::TelemetryOutcome::Success,
+        StreamOutcome::ClientCancelled => crate::target_telemetry::TelemetryOutcome::Cancelled,
+        StreamOutcome::GatewayAbort => crate::target_telemetry::TelemetryOutcome::Neutral,
+        _ => provider_failure
+            .map(|(kind, _)| telemetry_outcome_for_failure(kind))
+            .unwrap_or(crate::target_telemetry::TelemetryOutcome::Neutral),
     };
-    let terminal_circuit_transition = if status == "success" {
-        attempt.provider_attempt.finish_success()
-    } else if status == "client_disconnect" {
-        attempt.provider_attempt.finish_neutral()
-    } else if let Some((kind, upstream_status)) = provider_failure {
-        attempt
-            .provider_attempt
-            .finish_failure(kind, upstream_status)
-    } else {
-        attempt.provider_attempt.finish_neutral()
+    let terminal_circuit_transition = match termination.outcome {
+        StreamOutcome::Completed => attempt.provider_attempt.finish_success(),
+        StreamOutcome::ClientCancelled | StreamOutcome::GatewayAbort => {
+            attempt.provider_attempt.finish_neutral()
+        }
+        _ => provider_failure
+            .map(|(kind, upstream_status)| {
+                attempt
+                    .provider_attempt
+                    .finish_failure(kind, upstream_status)
+            })
+            .unwrap_or_else(|| attempt.provider_attempt.finish_neutral()),
     };
     let circuit_transition = attempt
         .provider_circuit_transition
@@ -5961,17 +6217,51 @@ async fn finalize_log(
     let target_ttft_ms = persisted_ttft_ms(attempt.is_sse, ttft_ms)
         .and_then(|value| value.checked_sub(attempt_offset_ms))
         .map(|value| value.max(0) as u64);
-    record_target_telemetry(
-        state,
-        &attempt.target,
-        telemetry_outcome,
-        attempt.attempt_started,
-        target_ttft_ms,
-        meta.fallback_hops > 0,
-        false,
-        circuit_transition,
-        &mut trace,
-    );
+    if termination.outcome == StreamOutcome::GatewayAbort {
+        trace_provider_circuit_transition(
+            &mut trace,
+            &attempt.target.provider.name,
+            circuit_transition,
+        );
+    } else {
+        record_target_telemetry(
+            state,
+            &attempt.target,
+            telemetry_outcome,
+            attempt.attempt_started,
+            target_ttft_ms,
+            meta.fallback_hops > 0,
+            false,
+            circuit_transition,
+            &mut trace,
+        );
+    }
+
+    if let Some((kind, upstream_status)) = provider_failure {
+        let failure = UpstreamFailure {
+            kind,
+            status: upstream_status,
+            retry_after_secs: None,
+            message: error_message
+                .clone()
+                .unwrap_or_else(|| "upstream stream failed".into()),
+            quota_reset_at: None,
+        };
+        handle_key_failure(state, &attempt.target, &failure, meta, &mut trace).await;
+    }
+    let route = meta
+        .route_id
+        .as_ref()
+        .and_then(|route_id| snap.routes.get(route_id));
+    let fallback_allowed =
+        match termination.outcome {
+            StreamOutcome::Completed => None,
+            StreamOutcome::ClientCancelled | StreamOutcome::GatewayAbort => Some(false),
+            _ => Some(termination.fallback_allowed(|kind| {
+                meta.fallback_enabled && route_allows_fallback(route, kind)
+            })),
+        };
+    trace.stream_termination(termination, fallback_allowed);
 
     let prices = attempt.target.model.prices();
     let computed_cost = cost::compute_cost(&prices, &usage);
@@ -6038,11 +6328,7 @@ async fn finalize_log(
         }
     }
 
-    meta.commit_state = if committed {
-        "post_commit"
-    } else {
-        "pre_commit"
-    };
+    meta.commit_state = termination.commit_state.as_usage_str();
     if status != "success" && status != "client_disconnect" {
         if let Some((kind, upstream_status)) = provider_failure {
             trace.failure(

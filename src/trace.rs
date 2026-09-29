@@ -89,6 +89,12 @@ pub struct RouteTrace {
     pub commit_state: String,
     /// success | failed | cancelled
     pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_failure_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_allowed: Option<bool>,
     pub steps: Vec<TraceStep>,
     /// Client-visible warnings (e.g. strip_with_warning portability actions).
     pub warnings: Vec<String>,
@@ -113,6 +119,9 @@ impl RouteTrace {
             final_target: None,
             commit_state: "not_committed".into(),
             outcome: "failed".into(),
+            stream_outcome: None,
+            terminal_failure_kind: None,
+            fallback_allowed: None,
             steps: Vec::new(),
             warnings: Vec::new(),
             plugin_facts: Vec::new(),
@@ -213,6 +222,29 @@ impl RouteTrace {
     pub fn finish(&mut self, outcome: &str) {
         self.outcome = outcome.to_string();
         self.step("result", None, format!("outcome={outcome}"));
+    }
+
+    /// Record the canonical stream terminal state and its routing effects.
+    pub fn stream_termination(
+        &mut self,
+        termination: crate::stream_outcome::StreamTermination,
+        fallback_allowed: Option<bool>,
+    ) {
+        self.stream_outcome = Some(termination.outcome.as_str().to_string());
+        self.terminal_failure_kind = termination
+            .failure_kind
+            .map(|kind| kind.as_str().to_string());
+        self.fallback_allowed = fallback_allowed;
+        let detail = format!(
+            "stream_outcome={} commit_state={} terminal_failure_kind={} fallback_allowed={}",
+            termination.outcome.as_str(),
+            termination.commit_state.as_trace_str(),
+            self.terminal_failure_kind.as_deref().unwrap_or("none"),
+            fallback_allowed
+                .map(|allowed| allowed.to_string())
+                .unwrap_or_else(|| "n/a".into()),
+        );
+        self.step("stream_termination", None, detail);
     }
 
     pub fn plugin_fact(

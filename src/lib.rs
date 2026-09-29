@@ -61,6 +61,7 @@ pub mod route_validation;
 pub mod router;
 pub mod server;
 pub mod sse;
+pub mod stream_outcome;
 pub mod target_telemetry;
 #[cfg(test)]
 mod torture;
