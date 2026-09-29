@@ -957,23 +957,26 @@ pub(crate) async fn run_with_disconnect(
         }
         all_accounts.push(target.account.clone());
 
-        // Health check (disabled/cooldown/exhausted/circuit-open).
+        // Shared pre-dispatch planning preserves runtime gate order. Request
+        // eligibility was applied before Route strategy ordering; account
+        // health and quota are resolved before provider-circuit availability.
         let status = pool::effective_status(&target.account);
-        let mut probing = false;
-        if !matches!(status, pool::AccountStatus::Healthy) {
-            // Half-open recovery probe (FR-4.7): an account whose circuit has
-            // opened may be retried once per bounded interval so it can recover
-            // without an operator action. Success clears the circuit; failure
-            // re-arms it. The probe is a normal attempt (so it refreshes account
-            // state) rather than a synthetic one.
-            if pool::should_probe(&target.account) {
-                probing = true;
-                trace.step(
-                    "candidate",
-                    Some(target.account.label.clone()),
-                    format!("half-open recovery probe ({})", status.as_str()),
-                );
-            } else {
+        let account_probe_eligible =
+            matches!(status, pool::AccountStatus::Healthy) || pool::should_probe(&target.account);
+        let mut pre_dispatch_facts = crate::pre_dispatch::PreDispatchFacts {
+            request_eligible: true,
+            account_eligible: account_probe_eligible,
+            account_quota_reached: None,
+            quota_fallback_allowed: allow_fallback
+                && route_allows_fallback(route.as_ref(), FailureKind::QuotaExhausted),
+            provider_circuit_available: None,
+            route_capacity_available: true,
+            quota_override_available: true,
+            adaptive_capacity_available: true,
+        };
+        match crate::pre_dispatch::plan_candidate(pre_dispatch_facts) {
+            crate::pre_dispatch::PreDispatchDecision::CheckAccountQuota => {}
+            crate::pre_dispatch::PreDispatchDecision::AccountUnavailable => {
                 let why = account_skip_detail(target, status);
                 meta.fallback_path
                     .push(format!("{}:{why}", target.account.label));
@@ -981,47 +984,70 @@ pub(crate) async fn run_with_disconnect(
                 state.record_skip();
                 continue;
             }
+            other => unreachable!("unexpected pre-quota planning result: {other:?}"),
+        }
+        let probing = !matches!(status, pool::AccountStatus::Healthy);
+        if probing {
+            // Half-open recovery probe (FR-4.7): an account whose circuit has
+            // opened may be retried once per bounded interval so it can recover
+            // without an operator action. Success clears the circuit; failure
+            // re-arms it. The probe is a normal attempt (so it refreshes account
+            // state) rather than a synthetic one.
+            trace.step(
+                "candidate",
+                Some(target.account.label.clone()),
+                format!("half-open recovery probe ({})", status.as_str()),
+            );
         }
 
-        // Soft quota check (FR-12.8).
-        if let Ok(true) = pool::soft_quota_reached(&state.pool, &target.account).await {
-            let reset_at = (chrono::Utc::now()
-                + chrono::Duration::seconds(default_quota_window(&target.account)))
-            .to_rfc3339();
-            let _ = db::set_account_status_if_version(
-                &state.pool,
-                &target.account.id,
-                target.account.account_state_version,
-                "exhausted",
-                "account_quota_exhausted",
-                None,
-                Some(&reset_at),
-                Some("soft quota reached"),
-            )
-            .await;
-            meta.fallback_path
-                .push(format!("{}:soft_quota", target.account.label));
-            trace.step(
-                "skip",
-                Some(target.account.label.clone()),
-                format!("model={} soft quota reached", target.model.display_name),
-            );
-            state.record_skip();
-            if !allow_fallback
-                || !route_allows_fallback(route.as_ref(), FailureKind::QuotaExhausted)
-            {
-                trace.finish("failed");
-                state.live.finish(
-                    &meta.request_id,
-                    "failed",
-                    started.elapsed().as_millis() as u64,
+        // Soft quota check (FR-12.8). The planner decides whether this quota
+        // ends the request before any provider-circuit check is performed.
+        pre_dispatch_facts.account_quota_reached = Some(
+            pool::soft_quota_reached(&state.pool, &target.account)
+                .await
+                .unwrap_or(false),
+        );
+        match crate::pre_dispatch::plan_candidate(pre_dispatch_facts) {
+            crate::pre_dispatch::PreDispatchDecision::SkipAfterQuota
+            | crate::pre_dispatch::PreDispatchDecision::RateLimited => {
+                let reset_at = (chrono::Utc::now()
+                    + chrono::Duration::seconds(default_quota_window(&target.account)))
+                .to_rfc3339();
+                let _ = db::set_account_status_if_version(
+                    &state.pool,
+                    &target.account.id,
+                    target.account.account_state_version,
+                    "exhausted",
+                    "account_quota_exhausted",
                     None,
-                    None,
+                    Some(&reset_at),
+                    Some("soft quota reached"),
+                )
+                .await;
+                meta.fallback_path
+                    .push(format!("{}:soft_quota", target.account.label));
+                trace.step(
+                    "skip",
+                    Some(target.account.label.clone()),
+                    format!("model={} soft quota reached", target.model.display_name),
                 );
-                let _ = db::insert_route_trace(&state.pool, &trace).await;
-                return Err(ProxyError::rate_limited("account soft quota reached", None));
+                state.record_skip();
+                if !pre_dispatch_facts.quota_fallback_allowed {
+                    trace.finish("failed");
+                    state.live.finish(
+                        &meta.request_id,
+                        "failed",
+                        started.elapsed().as_millis() as u64,
+                        None,
+                        None,
+                    );
+                    let _ = db::insert_route_trace(&state.pool, &trace).await;
+                    return Err(ProxyError::rate_limited("account soft quota reached", None));
+                }
+                continue;
             }
-            continue;
+            crate::pre_dispatch::PreDispatchDecision::CheckProviderCircuit => {}
+            other => unreachable!("unexpected post-quota planning result: {other:?}"),
         }
 
         // Resolve target transport and its execution metadata before any
@@ -1060,11 +1086,20 @@ pub(crate) async fn run_with_disconnect(
 
         // Check provider eligibility before credential work, but do not reserve
         // the exclusive HALF_OPEN network probe until immediately before dispatch.
-        if let Err(reject) = state.provider_circuits.check_available(&target.provider.id) {
-            last_error = Some(record_provider_circuit_reject(
-                state, target, &mut meta, &mut trace, reject,
-            ));
-            continue;
+        let provider_circuit = state.provider_circuits.check_available(&target.provider.id);
+        pre_dispatch_facts.provider_circuit_available = Some(provider_circuit.is_ok());
+        match crate::pre_dispatch::plan_candidate(pre_dispatch_facts) {
+            crate::pre_dispatch::PreDispatchDecision::ProviderCircuitUnavailable => {
+                let Err(reject) = provider_circuit else {
+                    unreachable!("planner rejected an available provider circuit")
+                };
+                last_error = Some(record_provider_circuit_reject(
+                    state, target, &mut meta, &mut trace, reject,
+                ));
+                continue;
+            }
+            crate::pre_dispatch::PreDispatchDecision::Dispatchable => {}
+            other => unreachable!("unexpected post-circuit planning result: {other:?}"),
         }
         let correlation_policy = if target.provider.credential_mode == "none" {
             crate::provider_circuit::ProviderCorrelationPolicy::AccountlessTargets
@@ -6391,6 +6426,9 @@ pub async fn dry_run(
 
     let mut candidates = Vec::new();
     let mut selection_candidates = Vec::new();
+    let allow_fallback = descriptor.allow_fallback.unwrap_or(true);
+    let quota_fallback_allowed =
+        allow_fallback && route_allows_fallback(route.as_ref(), FailureKind::QuotaExhausted);
     for t in &targets {
         let (decision, protocol_ok) = evaluations
             .get(&adaptive_candidate_key(t))
@@ -6424,18 +6462,39 @@ pub async fn dry_run(
             })
             .unwrap_or(true);
         let request_eligible = decision.eligible() && protocol_ok;
-        let eligible_without_account_quota = request_eligible
-            && account_eligible
-            && provider_circuit.available
-            && route_capacity
-            && quota_override_available
-            && adaptive_capacity_ok;
-        let would_select = eligible_without_account_quota && !account_quota_reached;
+        let pre_dispatch_facts = crate::pre_dispatch::PreDispatchFacts {
+            request_eligible,
+            account_eligible,
+            account_quota_reached: Some(account_quota_reached),
+            quota_fallback_allowed,
+            provider_circuit_available: Some(provider_circuit.available),
+            route_capacity_available: route_capacity,
+            quota_override_available,
+            adaptive_capacity_available: adaptive_capacity_ok,
+        };
+        let would_select = matches!(
+            crate::pre_dispatch::plan_candidate(pre_dispatch_facts),
+            crate::pre_dispatch::PreDispatchDecision::Dispatchable
+        );
+        let eligible_without_account_quota = matches!(
+            crate::pre_dispatch::plan_candidate(crate::pre_dispatch::PreDispatchFacts {
+                account_quota_reached: Some(false),
+                ..pre_dispatch_facts
+            }),
+            crate::pre_dispatch::PreDispatchDecision::Dispatchable
+        );
+        let quota_check_reached = matches!(
+            crate::pre_dispatch::plan_candidate(crate::pre_dispatch::PreDispatchFacts {
+                account_quota_reached: None,
+                provider_circuit_available: None,
+                ..pre_dispatch_facts
+            }),
+            crate::pre_dispatch::PreDispatchDecision::CheckAccountQuota
+        );
         let candidate_id = adaptive_candidate_key(t);
         let rank = route_rank
             .as_ref()
             .and_then(|ranks| ranks.get(&candidate_id).copied());
-        let quota_check_reached = eligible_without_account_quota;
         if let Some(rank) = rank {
             selection_candidates.push((
                 rank,
@@ -6521,9 +6580,6 @@ pub async fn dry_run(
     }
 
     selection_candidates.sort_by_key(|candidate| candidate.0);
-    let allow_fallback = descriptor.allow_fallback.unwrap_or(true);
-    let quota_fallback_allowed =
-        allow_fallback && route_allows_fallback(route.as_ref(), FailureKind::QuotaExhausted);
     let stochastic_selection = route_selection_is_stochastic(
         route.as_ref(),
         &targets,
@@ -8154,6 +8210,183 @@ mod route_policy_tests {
             None,
             runtime_request,
             "quota-fallback-disabled-runtime".into(),
+            true,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert!(matches!(
+            runtime,
+            Err(error) if error.kind == crate::types::ErrorKind::RateLimited
+        ));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dry_run_quota_stop_precedes_open_provider_circuit_like_runtime() {
+        let (state, root, provider_id, _model_id, account_ids) = adaptive_dry_run_state().await;
+        let fallback_provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "healthy-fallback-provider",
+                base_url: "https://fallback.example.com",
+                wire_format: crate::types::WireFormat::Openai,
+                auth_scheme: crate::types::AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: serde_json::json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: serde_json::json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let fallback_model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &fallback_provider_id,
+                upstream_id: "fallback-model",
+                display_name: "Healthy Fallback",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: serde_json::json!({}),
+                prices: serde_json::json!({}),
+                parameters: serde_json::json!({}),
+                thinking_map: serde_json::json!({}),
+                extra_request: serde_json::json!({}),
+                discovery: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let fallback_account_id = db::insert_account(
+            &state.pool,
+            &fallback_provider_id,
+            "healthy-fallback",
+            "",
+            "",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let route_id = state
+            .registry
+            .snapshot()
+            .routes
+            .values()
+            .find(|route| route.name == "adaptive-dry-run")
+            .unwrap()
+            .id
+            .clone();
+        sqlx::query("UPDATE routes SET strategy='priority', fallback_triggers=? WHERE id=?")
+            .bind(r#"{"onQuota":false}"#)
+            .bind(&route_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE route_targets SET model_id=?, account_id=?, priority=2 WHERE route_id=? AND account_id=?",
+        )
+        .bind(&fallback_model_id)
+        .bind(&fallback_account_id)
+        .bind(&route_id)
+        .bind(&account_ids[1])
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let quota_account = &account_ids[0];
+        sqlx::query("UPDATE accounts SET soft_quota_usd=0.5, quota_type='daily' WHERE id=?")
+            .bind(quota_account)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(db::now_iso())
+        .bind(quota_account)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        for (account_id, target_id) in [
+            (account_ids[0].as_str(), "primary-target"),
+            (account_ids[1].as_str(), "sibling-target"),
+        ] {
+            state
+                .provider_circuits
+                .begin_attempt(&provider_id, account_id, target_id)
+                .unwrap()
+                .finish_failure(FailureKind::ServerError, Some(503));
+        }
+        assert_eq!(
+            state.provider_circuits.snapshot(&provider_id).state,
+            crate::provider_circuit::ProviderCircuitState::Open
+        );
+        state.registry.reload(&state.pool).await.unwrap();
+
+        let simulation = dry_run(&state, "adaptive-dry-run", &DryRunRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(simulation["outcome"], "rate_limited");
+        assert!(simulation["would_select"].is_null());
+        assert_eq!(
+            simulation["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|candidate| candidate["account_id"] == *quota_account)
+                .unwrap()["decision_reason"],
+            "quota_fallback_disabled"
+        );
+        assert_eq!(
+            simulation["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|candidate| candidate["account_id"] == fallback_account_id)
+                .unwrap()["decision_reason"],
+            "unreachable_after_quota_failure"
+        );
+
+        let runtime_request = InternalRequest {
+            requested_model: "adaptive-dry-run".into(),
+            system: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            tool_choice_name: None,
+            params: crate::types::SamplingParams::default(),
+            stream: false,
+            include_usage: false,
+            thinking: None,
+            extra: serde_json::Map::new(),
+            raw_body: None,
+        };
+        let runtime = run(
+            &state,
+            FrontendFormat::OpenAi,
+            None,
+            runtime_request,
+            "quota-before-provider-circuit-runtime".into(),
             true,
             None,
             Vec::new(),

@@ -104,7 +104,7 @@ Route creation, updates, and config imports apply the same semantic validation b
 | `GET /admin/api/config/export` | Export version 2 config (secret-free; `?include_secrets=true` adds encrypted blobs and opaque account references). |
 | `POST /admin/api/config/import` | Accepts version 1 and 2; unversioned configs are treated as version 1. `apply:false` validates without writes and reports problems, conflicts, warnings, and missing resources. `apply:true` applies all upserts in one transaction and rolls back on failure. Imported secrets do not replace existing credentials; changing a provider to `credential_mode: none` may remove its credential accounts. |
 
-Import dry-run semantically validates proposed Routes against an isolated snapshot containing the imported providers, accounts, models, Routes, and aliases. Apply rejects validation failures before writing to live state.
+Import dry-run semantically validates proposed Routes against an isolated snapshot containing the imported providers, accounts, models, Routes, and aliases. Exported pinned targets use opaque account references that import remaps to regenerated account IDs; unresolved references are rejected rather than widened to an account pool. Apply rejects validation failures before writing to live state.
 
 ## Usage, requests, traces
 
