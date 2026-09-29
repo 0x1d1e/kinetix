@@ -356,14 +356,18 @@ impl AdmissionController {
     }
 
     /// Client-safe aggregate view of settled spend and active budget reservations.
-    pub async fn budget_snapshot(&self, pool: &Pool, key_id: &str) -> AdmissionBudgetSnapshot {
+    pub async fn budget_snapshot(
+        &self,
+        pool: &Pool,
+        key_id: &str,
+    ) -> anyhow::Result<AdmissionBudgetSnapshot> {
         let entry = self.entry(key_id);
-        self.ensure_initialized(pool, key_id, &entry).await;
+        self.ensure_initialized(pool, key_id, &entry).await?;
         let snapshot = entry
             .ledger
             .lock()
             .budget_snapshot(Utc::now(), Instant::now());
-        snapshot
+        Ok(snapshot)
     }
 
     pub fn reserve_concurrency(
@@ -431,9 +435,14 @@ impl AdmissionController {
             .clone()
     }
 
-    async fn ensure_initialized(&self, pool: &Pool, key_id: &str, entry: &Arc<KeyAdmission>) {
+    async fn ensure_initialized(
+        &self,
+        pool: &Pool,
+        key_id: &str,
+        entry: &Arc<KeyAdmission>,
+    ) -> anyhow::Result<()> {
         self.ensure_initialized_at(pool, key_id, entry, Utc::now(), Instant::now())
-            .await;
+            .await
     }
 
     async fn ensure_initialized_at(
@@ -443,14 +452,14 @@ impl AdmissionController {
         entry: &Arc<KeyAdmission>,
         wall_now: chrono::DateTime<Utc>,
         instant_now: Instant,
-    ) {
+    ) -> anyhow::Result<()> {
         if entry.initialized.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
 
         let _guard = entry.init_lock.lock().await;
         if entry.initialized.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
 
         let minute_since = (wall_now - chrono::Duration::seconds(60)).to_rfc3339();
@@ -468,44 +477,34 @@ impl AdmissionController {
             .unwrap_or(wall_now)
             .to_rfc3339();
 
-        let (minute, daily, monthly) = tokio::join!(
+        let (minute, daily, monthly) = tokio::try_join!(
             db::key_usage_entries_since(pool, key_id, &minute_since),
             db::key_admission_budget_spend_since(pool, key_id, &daily_since),
             db::key_admission_budget_spend_since(pool, key_id, &monthly_since),
-        );
+        )?;
 
         let mut ledger = entry.ledger.lock();
         ledger.roll_periods(wall_now);
-        match minute {
-            Ok(rows) => {
-                for (ts, tokens) in rows {
-                    let Some(at) = db::parse_dt(&ts) else {
-                        continue;
-                    };
-                    let age = wall_now
-                        .signed_duration_since(at)
-                        .to_std()
-                        .unwrap_or_default()
-                        .min(MINUTE_WINDOW);
-                    ledger.minute.push_back(MinuteUse {
-                        at: instant_now.checked_sub(age).unwrap_or(instant_now),
-                        // Keep persisted unknown token counts unknown.
-                        tokens: tokens.map(|tokens| tokens.max(0) as u64),
-                    });
-                }
-            }
-            Err(error) => tracing::warn!(%error, key_id, "could not seed admission minute window"),
+        for (ts, tokens) in minute {
+            let Some(at) = db::parse_dt(&ts) else {
+                continue;
+            };
+            let age = wall_now
+                .signed_duration_since(at)
+                .to_std()
+                .unwrap_or_default()
+                .min(MINUTE_WINDOW);
+            ledger.minute.push_back(MinuteUse {
+                at: instant_now.checked_sub(age).unwrap_or(instant_now),
+                // Keep persisted unknown token counts unknown.
+                tokens: tokens.map(|tokens| tokens.max(0) as u64),
+            });
         }
-        match daily {
-            Ok(spend) => ledger.daily_spend = spend.max(0.0),
-            Err(error) => tracing::warn!(%error, key_id, "could not seed daily admission spend"),
-        }
-        match monthly {
-            Ok(spend) => ledger.monthly_spend = spend.max(0.0),
-            Err(error) => tracing::warn!(%error, key_id, "could not seed monthly admission spend"),
-        }
+        ledger.daily_spend = daily.max(0.0);
+        ledger.monthly_spend = monthly.max(0.0);
         ledger.prune(instant_now);
         entry.initialized.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub async fn reserve(
@@ -517,13 +516,23 @@ impl AdmissionController {
     ) -> Result<AdmissionReservation, ProxyError> {
         let estimate = estimate_request(snapshot, key, req)?;
         let entry = self.entry(&key.id);
-        self.ensure_initialized(pool, &key.id, &entry).await;
+        self.ensure_initialized(pool, &key.id, &entry)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, key_id = %key.id, "could not initialize key admission state");
+                ProxyError::unavailable("admission state temporarily unavailable")
+            })?;
         self.reserve_initialized(entry, key, estimate)
     }
 
     pub async fn check_current(&self, pool: &Pool, key: &VirtualKeyRow) -> Result<(), ProxyError> {
         let entry = self.entry(&key.id);
-        self.ensure_initialized(pool, &key.id, &entry).await;
+        self.ensure_initialized(pool, &key.id, &entry)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, key_id = %key.id, "could not initialize key admission state");
+                ProxyError::unavailable("admission state temporarily unavailable")
+            })?;
         let result = entry
             .ledger
             .lock()
@@ -1225,7 +1234,8 @@ mod tests {
                 after_midnight,
                 after_instant,
             )
-            .await;
+            .await
+            .unwrap();
         let restored = restarted_entry
             .ledger
             .lock()
@@ -1420,7 +1430,10 @@ mod tests {
 
         let controller = AdmissionController::default();
         let entry = controller.entry("key");
-        controller.ensure_initialized(&pool, "key", &entry).await;
+        controller
+            .ensure_initialized(&pool, "key", &entry)
+            .await
+            .unwrap();
         let mut key = key();
         key.tpm_limit = Some(100);
         let next = controller.reserve_initialized(
@@ -1479,7 +1492,10 @@ mod tests {
 
         let controller = AdmissionController::default();
         let entry = controller.entry("key");
-        controller.ensure_initialized(&pool, "key", &entry).await;
+        controller
+            .ensure_initialized(&pool, "key", &entry)
+            .await
+            .unwrap();
         let mut key = key();
         key.daily_budget = Some(1.0);
         let next = controller.reserve_initialized(

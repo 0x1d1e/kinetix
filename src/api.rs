@@ -568,7 +568,17 @@ pub async fn client_usage(State(state): State<AppState>, headers: HeaderMap) -> 
         }
     };
 
-    let budget = state.admission.budget_snapshot(&state.pool, &key.id).await;
+    let budget = match state.admission.budget_snapshot(&state.pool, &key.id).await {
+        Ok(budget) => budget,
+        Err(error) => {
+            tracing::error!(%error, key_id = %key.id, "client usage admission snapshot failed");
+            return error_response(
+                format,
+                &request_id,
+                ProxyError::unavailable("usage temporarily unavailable"),
+            );
+        }
+    };
     let remaining =
         |limit: Option<f64>,
          summary: &db::ClientUsageSummary,
@@ -1014,6 +1024,116 @@ mod client_usage_tests {
         let body = response_json(response).await;
         assert_eq!(body["remaining"]["daily_budget_usd"], 3.75);
         assert_eq!(body["remaining"]["monthly_budget_usd"], 48.75);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn usage_admission_seed_failure_returns_503_and_retries_before_inference() {
+        let (state, root) = test_state("admission-seed-retry").await;
+        let mut key = test_key("seed-retry-key", "seed-retry-client-key", "active");
+        key.rpm_limit = Some(1);
+        key.daily_budget = Some(0.5);
+        key.monthly_budget = Some(0.5);
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        db::insert_usage_log(
+            &state.pool,
+            &usage_row(&key.id, Some(10), Some(10), Some(0.8)),
+        )
+        .await
+        .unwrap();
+
+        let mut snapshot = crate::registry::Snapshot::default();
+        let model = crate::db::ModelRow {
+            id: "seed-model".into(),
+            provider_id: "seed-provider".into(),
+            upstream_id: "seed-model".into(),
+            display_name: "Seed model".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: Some(50),
+            capabilities: "{}".into(),
+            prices: serde_json::to_string(&crate::types::Prices {
+                input_per_1m: Some(1_000_000.0),
+                output_per_1m: Some(1_000_000.0),
+                ..Default::default()
+            })
+            .unwrap(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: String::new(),
+            opaque_state_plugin: String::new(),
+        };
+        snapshot.models.insert(model.id.clone(), model);
+        let request = crate::types::InternalRequest {
+            requested_model: "seed-model".into(),
+            system: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            tool_choice_name: None,
+            params: crate::types::SamplingParams {
+                max_tokens: Some(50),
+                ..Default::default()
+            },
+            stream: false,
+            include_usage: false,
+            thinking: None,
+            extra: Default::default(),
+            raw_body: None,
+        };
+
+        sqlx::query(
+            "ALTER TABLE usage_logs RENAME COLUMN admission_cost_usd TO broken_admission_cost_usd",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let app = crate::router::build(state.clone());
+        let response = request_usage(&app, "/v1/usage", Some("seed-retry-client-key")).await;
+        let status = response.status();
+        let body = response_json(response).await.to_string();
+        let inference_error = state
+            .admission
+            .reserve(&state.pool, &snapshot, &key, &request)
+            .await
+            .err()
+            .expect("inference must fail closed while admission seeds are unavailable");
+        assert_eq!(
+            inference_error.kind,
+            crate::types::ErrorKind::ServiceUnavailable
+        );
+        sqlx::query(
+            "ALTER TABLE usage_logs RENAME COLUMN broken_admission_cost_usd TO admission_cost_usd",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("usage temporarily unavailable"));
+        assert!(!body.contains("broken_admission_cost_usd"));
+        assert!(!body.contains("admission_cost_usd"));
+        assert!(!body.contains(&state.config.database_url));
+        assert!(!body.contains("SELECT"));
+
+        let rpm_error = state
+            .admission
+            .reserve(&state.pool, &snapshot, &key, &request)
+            .await
+            .err()
+            .expect("persisted RPM usage must be re-seeded");
+        assert_eq!(rpm_error.kind, crate::types::ErrorKind::RateLimited);
+
+        key.rpm_limit = None;
+        let budget_error = state
+            .admission
+            .reserve(&state.pool, &snapshot, &key, &request)
+            .await
+            .err()
+            .expect("persisted budget spend must be re-seeded");
+        assert_eq!(budget_error.kind, crate::types::ErrorKind::BudgetExceeded);
         let _ = std::fs::remove_dir_all(root);
     }
 
