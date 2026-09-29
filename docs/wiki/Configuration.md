@@ -127,8 +127,10 @@ curl -b cookie.txt -X POST http://127.0.0.1:8080/admin/api/config/import \
 Exports use config version 2 and contain opaque account references so Route
 targets do not depend on source database IDs. Refs distinguish accounts even
 when their labels match. Account policy includes `enabled`, quota settings
-(including `quota_window_s`), priority, and weight. Exported `status` is
-informational: restore preserves manual enablement but does not restore transient
+(including `quota_window_s`), priority, and weight. Version 2 imports require a
+boolean `enabled`; exported `status` is informational. Export derives `enabled`
+from `status_reason`, leaving unknown operator intent as `null` for manual
+resolution. Restore preserves manual enablement but does not restore transient
 cooldown or circuit state. Version 1 and unversioned imports remain supported.
 Run with `apply:false` first to review validation problems, conflicts, warnings,
 and missing resources. Ambiguous existing account labels are conflicts. Applying

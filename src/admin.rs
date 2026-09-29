@@ -9944,7 +9944,7 @@ pub async fn export_config(
                 "label": a.label,
                 "key_mask": a.key_mask,
                 "status": a.status,
-                "enabled": account_export_enabled(&a.status),
+                "enabled": account_export_enabled(&a.status, &a.status_reason),
                 "quota_type": a.quota_type,
                 "quota_window_s": a.quota_window_s,
                 "soft_quota_usd": a.soft_quota_usd,
@@ -10243,15 +10243,31 @@ async fn write_route_targets_in_transaction(
     Ok(())
 }
 
-fn account_export_enabled(status: &str) -> Option<bool> {
-    match status {
-        "disabled" => Some(false),
-        "healthy" | "cooldown" | "exhausted" => Some(true),
+fn account_export_enabled(status: &str, status_reason: &str) -> Option<bool> {
+    if !matches!(status, "healthy" | "cooldown" | "exhausted" | "disabled") {
+        return None;
+    }
+    match status_reason {
+        "operator_disabled" => Some(false),
+        "operator_enabled"
+        | "account_created"
+        | "operator_reset"
+        | "healthy"
+        | "credential_rejected"
+        | "rate_limited"
+        | "account_quota_exhausted"
+        | "probe_healthy"
+        | "probe_degraded"
+        | "probe_unavailable"
+        | "circuit_open"
+        | "circuit_recovered"
+        | "cooldown_elapsed"
+        | "quota_reset" => Some(true),
         _ => None,
     }
 }
 
-fn imported_account_enabled(account: &Value) -> Result<bool, String> {
+fn imported_account_enabled(account: &Value, source_version: u64) -> Result<bool, String> {
     let status_enabled = match account.get("status") {
         None | Some(Value::Null) => None,
         Some(Value::String(status)) => match status.as_str() {
@@ -10267,14 +10283,25 @@ fn imported_account_enabled(account: &Value) -> Result<bool, String> {
             return Err("account status must be a string".into());
         }
     };
-    if let Some(enabled) = account.get("enabled").filter(|value| !value.is_null()) {
-        let enabled = enabled
-            .as_bool()
-            .ok_or_else(|| "account enabled must be a boolean".to_string())?;
-        if status_enabled.is_some_and(|status_enabled| status_enabled != enabled) {
-            return Err("account enabled conflicts with status".into());
+    if let Some(value) = account.get("enabled") {
+        if value.is_null() {
+            if source_version == 2 {
+                return Err("account enabled must be a boolean in config version 2".into());
+            }
+        } else {
+            let enabled = value
+                .as_bool()
+                .ok_or_else(|| "account enabled must be a boolean".to_string())?;
+            if source_version == 1
+                && status_enabled.is_some_and(|status_enabled| status_enabled != enabled)
+            {
+                return Err("account enabled conflicts with status".into());
+            }
+            return Ok(enabled);
         }
-        return Ok(enabled);
+    }
+    if source_version == 2 {
+        return Err("account enabled is required in config version 2".into());
     }
     Ok(status_enabled.unwrap_or(true))
 }
@@ -10933,7 +10960,7 @@ pub async fn import_config(
                 )),
             }
         }
-        if let Err(problem) = imported_account_enabled(account) {
+        if let Err(problem) = imported_account_enabled(account, source_version) {
             problems.push(format!("account '{provider}/{label}' {problem}"));
         }
         if account
@@ -11377,7 +11404,7 @@ pub async fn import_config(
         let secret_enc = account["secret_enc"]
             .as_str()
             .expect("validated encrypted secret");
-        let enabled = imported_account_enabled(account).map_err(ApiError::bad)?;
+        let enabled = imported_account_enabled(account, source_version).map_err(ApiError::bad)?;
         let account_id = db::insert_account_in_transaction(
             &mut tx,
             &provider_id,
@@ -20603,6 +20630,12 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
+        let noauth_account = db::list_accounts_for_provider(&source.pool, &noauth_provider)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|account| account.label == "__kinetix_noauth__")
+            .unwrap();
         let route_id = db::insert_route(
             &source.pool,
             &db::NewRoute {
@@ -20622,7 +20655,7 @@ mod credential_enrollment_regression_tests {
         db::insert_route_target(
             &source.pool,
             &route_id,
-            None,
+            Some(&noauth_account.id),
             &source_model_id,
             1,
             1,
@@ -20670,11 +20703,27 @@ mod credential_enrollment_regression_tests {
             .iter()
             .all(|account| account["label"] != "__kinetix_noauth__"));
         assert_eq!(
+            exported["routes"][0]["targets"][0]["account_ref"],
+            Value::Null
+        );
+        assert_eq!(
             exported["models"][0]["transport_override"],
             "openai-responses"
         );
 
         let (target, target_root) = test_state("export-target").await;
+        let dry_run = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true);
         let _ = import_config(
             State(target.clone()),
             auth(),
@@ -20731,6 +20780,18 @@ mod credential_enrollment_regression_tests {
             .unwrap()
             .unwrap();
         assert_eq!(imported_route.max_concurrent_requests, Some(4));
+        let imported_route_targets = db::route_targets(&target.pool, &imported_route.id)
+            .await
+            .unwrap();
+        assert_eq!(imported_route_targets.len(), 1);
+        assert_eq!(imported_route_targets[0].account_id, None);
+        match target.registry.resolve("limited-route").unwrap() {
+            crate::registry::Resolved::Route { targets, .. } => {
+                assert_eq!(targets.len(), 1);
+                assert_eq!(targets[0].account.label, "__kinetix_noauth__");
+            }
+            _ => panic!("expected an imported route"),
+        }
 
         let public_accounts = db::accounts_for_provider(&target.pool, &public.id)
             .await
@@ -21138,6 +21199,26 @@ mod credential_enrollment_regression_tests {
         .execute(&source.pool)
         .await
         .unwrap();
+        let rejected_id = db::insert_account(
+            &source.pool,
+            &provider_id,
+            "runtime-disabled-credential",
+            &source.crypto.encrypt("rejected-secret").unwrap(),
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE accounts SET status='disabled', status_reason='credential_rejected' WHERE id=?",
+        )
+        .bind(&rejected_id)
+        .execute(&source.pool)
+        .await
+        .unwrap();
 
         let exported = export_config(
             State(source.clone()),
@@ -21164,8 +21245,26 @@ mod credential_enrollment_regression_tests {
             .unwrap();
         assert_eq!(cooling["enabled"], true);
         assert_eq!(cooling["status"], "cooldown");
+        let rejected = exported_accounts
+            .iter()
+            .find(|account| account["label"] == "runtime-disabled-credential")
+            .unwrap();
+        assert_eq!(rejected["status"], "disabled");
+        assert_eq!(rejected["enabled"], true);
 
         let (target, target_root) = test_state("account-policy-target").await;
+        let dry_run = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true);
         let _ = import_config(
             State(target.clone()),
             auth(),
@@ -21203,6 +21302,12 @@ mod credential_enrollment_regression_tests {
         assert_eq!(cooling.status, "healthy");
         assert_eq!(cooling.cooldown_until, None);
         assert_eq!(cooling.circuit_open_until, None);
+        let rejected = restored
+            .iter()
+            .find(|account| account.label == "runtime-disabled-credential")
+            .unwrap();
+        assert_eq!(rejected.status, "healthy");
+        assert_eq!(rejected.status_reason, "account_created");
 
         drop(source);
         drop(target);
@@ -21578,6 +21683,31 @@ mod credential_enrollment_regression_tests {
 
         let error = normalize_import_config(json!({"kinetix_config_version": 99})).unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn config_v2_enabled_is_operator_authoritative_and_unknown_intent_stays_unknown() {
+        assert_eq!(
+            imported_account_enabled(&json!({"status": "disabled", "enabled": true}), 2),
+            Ok(true)
+        );
+        assert!(imported_account_enabled(&json!({"status": "disabled"}), 2).is_err());
+        assert_eq!(
+            imported_account_enabled(&json!({"status": "disabled"}), 1),
+            Ok(false)
+        );
+        assert_eq!(
+            account_export_enabled("disabled", "credential_rejected"),
+            Some(true)
+        );
+        assert_eq!(
+            account_export_enabled("disabled", "operator_disabled"),
+            Some(false)
+        );
+        assert_eq!(
+            account_export_enabled("disabled", "existing_disabled"),
+            None
+        );
     }
 
     #[tokio::test]
