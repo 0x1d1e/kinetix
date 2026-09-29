@@ -612,6 +612,7 @@ impl Adapter for AnthropicAdapter {
         let mut events = Vec::new();
         match event_type {
             "content_block_delta" => {
+                let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
                 let delta = v.get("delta").cloned().unwrap_or(Value::Null);
                 match delta.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                     "text_delta" => {
@@ -622,6 +623,7 @@ impl Adapter for AnthropicAdapter {
                     "thinking_delta" => {
                         if let Some(t) = delta.get("thinking").and_then(|x| x.as_str()) {
                             events.push(StreamEvent::ThinkingDelta {
+                                block_index: Some(index),
                                 text: t.to_string(),
                                 signature: None,
                             });
@@ -630,6 +632,7 @@ impl Adapter for AnthropicAdapter {
                     "signature_delta" => {
                         if let Some(s) = delta.get("signature").and_then(|x| x.as_str()) {
                             events.push(StreamEvent::ThinkingDelta {
+                                block_index: Some(index),
                                 text: String::new(),
                                 signature: Some(s.to_string()),
                             });
@@ -650,21 +653,57 @@ impl Adapter for AnthropicAdapter {
             "content_block_start" => {
                 let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
                 if let Some(block) = v.get("content_block") {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        let id = block.get("id").and_then(|i| i.as_str()).map(String::from);
-                        let name = block
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("tool")
-                            .to_string();
-                        events.push(StreamEvent::ToolCallStart {
+                    match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                        "tool_use" => {
+                            let id = block.get("id").and_then(|i| i.as_str()).map(String::from);
+                            let name = block
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("tool")
+                                .to_string();
+                            events.push(StreamEvent::ToolCallStart {
+                                index,
+                                id,
+                                name,
+                                signature: None,
+                            });
+                        }
+                        "thinking" => events.push(StreamEvent::ThinkingBlockStart {
                             index,
-                            id,
-                            name,
-                            signature: None,
-                        });
+                            thinking: block
+                                .get("thinking")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            signature: block
+                                .get("signature")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        }),
+                        "redacted_thinking" => {
+                            let data =
+                                block.get("data").and_then(Value::as_str).ok_or_else(|| {
+                                    UpstreamFailure {
+                                        kind: FailureKind::ServerError,
+                                        status: Some(502),
+                                        retry_after_secs: None,
+                                        message: "redacted_thinking block is missing string data"
+                                            .into(),
+                                        quota_reset_at: None,
+                                    }
+                                })?;
+                            events.push(StreamEvent::RedactedThinking {
+                                index,
+                                data: data.to_string(),
+                            });
+                        }
+                        _ => {}
                     }
                 }
+            }
+            "content_block_stop" => {
+                let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                events.push(StreamEvent::ThinkingBlockStop { index });
             }
             "message_delta" => {
                 if let Some(usage) = v.get("usage") {
@@ -687,8 +726,8 @@ impl Adapter for AnthropicAdapter {
     fn parse_full_response(&self, body: &Value) -> Result<Vec<StreamEvent>, UpstreamFailure> {
         let mut events = Vec::new();
         if let Some(blocks) = body.get("content").and_then(|c| c.as_array()) {
-            let mut idx = 0u32;
-            for b in blocks {
+            for (idx, b) in blocks.iter().enumerate() {
+                let idx = idx as u32;
                 match b.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                     "text" => {
                         if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
@@ -696,15 +735,34 @@ impl Adapter for AnthropicAdapter {
                         }
                     }
                     "thinking" => {
-                        if let Some(t) = b.get("thinking").and_then(|x| x.as_str()) {
-                            events.push(StreamEvent::ThinkingDelta {
-                                text: t.to_string(),
-                                signature: b
-                                    .get("signature")
-                                    .and_then(|s| s.as_str())
-                                    .map(String::from),
-                            });
-                        }
+                        events.push(StreamEvent::ThinkingBlockStart {
+                            index: idx,
+                            thinking: b
+                                .get("thinking")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            signature: b
+                                .get("signature")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        });
+                        events.push(StreamEvent::ThinkingBlockStop { index: idx });
+                    }
+                    "redacted_thinking" => {
+                        let data = b.get("data").and_then(Value::as_str).ok_or_else(|| {
+                            UpstreamFailure {
+                                kind: FailureKind::ServerError,
+                                status: Some(502),
+                                retry_after_secs: None,
+                                message: "redacted_thinking block is missing string data".into(),
+                                quota_reset_at: None,
+                            }
+                        })?;
+                        events.push(StreamEvent::RedactedThinking {
+                            index: idx,
+                            data: data.to_string(),
+                        });
                     }
                     "tool_use" => {
                         let id = b.get("id").and_then(|i| i.as_str()).map(String::from);
@@ -724,7 +782,6 @@ impl Adapter for AnthropicAdapter {
                             index: idx,
                             args: input.to_string(),
                         });
-                        idx += 1;
                     }
                     _ => {}
                 }
@@ -767,6 +824,79 @@ impl Adapter for AnthropicAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_and_redacted_blocks_retain_stream_boundaries_and_data() {
+        let adapter = AnthropicAdapter::new();
+        let start = adapter
+            .parse_stream_chunk(
+                r#"{"type":"content_block_start","index":4,"content_block":{"type":"thinking","thinking":""}}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            start.as_slice(),
+            [StreamEvent::ThinkingBlockStart { index: 4, thinking, signature: None }] if thinking.is_empty()
+        ));
+
+        let thinking = adapter
+            .parse_stream_chunk(
+                r#"{"type":"content_block_delta","index":4,"delta":{"type":"thinking_delta","thinking":"foo"}}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            thinking.as_slice(),
+            [StreamEvent::ThinkingDelta { block_index: Some(4), text, signature: None }] if text == "foo"
+        ));
+        let signature = adapter
+            .parse_stream_chunk(
+                r#"{"type":"content_block_delta","index":4,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            signature.as_slice(),
+            [StreamEvent::ThinkingDelta { block_index: Some(4), text, signature: Some(sig) }]
+                if text.is_empty() && sig == "sig"
+        ));
+        let stop = adapter
+            .parse_stream_chunk(r#"{"type":"content_block_stop","index":4}"#)
+            .unwrap();
+        assert!(matches!(
+            stop.as_slice(),
+            [StreamEvent::ThinkingBlockStop { index: 4 }]
+        ));
+        let redacted = adapter
+            .parse_stream_chunk(
+                r#"{"type":"content_block_start","index":5,"content_block":{"type":"redacted_thinking","data":"opaque"}}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            redacted.as_slice(),
+            [StreamEvent::RedactedThinking { index: 5, data }] if data == "opaque"
+        ));
+    }
+
+    #[test]
+    fn full_response_preserves_redacted_thinking_blocks() {
+        let events = AnthropicAdapter::new()
+            .parse_full_response(&serde_json::json!({
+                "content": [
+                    {"type": "thinking", "thinking": "reasoning", "signature": "sig"},
+                    {"type": "redacted_thinking", "data": "opaque"}
+                ],
+                "stop_reason": "end_turn"
+            }))
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                StreamEvent::ThinkingBlockStart { index: 0, thinking, signature: Some(sig) },
+                StreamEvent::ThinkingBlockStop { index: 0 },
+                StreamEvent::RedactedThinking { index: 1, data },
+                StreamEvent::Finish(FinishReason::Stop),
+                ..
+            ] if thinking == "reasoning" && sig == "sig" && data == "opaque"
+        ));
+    }
 
     #[test]
     fn model_context_window_exceeded_maps_to_length_in_full_and_streaming() {

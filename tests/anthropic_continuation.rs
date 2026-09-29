@@ -63,13 +63,25 @@ async fn upstream(
             "event: content_block_start\r\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\r\n\r\n",
             "event: content_block_delta\r\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"streamed thought\"}}\r\n\r\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"foo\"}}\r\n\r\n",
             "event: content_block_delta\r\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"streamed-signature\"}}\r\n\r\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"bar\"}}\r\n\r\n",
+            "event: content_block_delta\r\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\r\n\r\n",
             "event: content_block_stop\r\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\r\n\r\n",
+            "event: content_block_start\r\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-redacted-state\"}}\r\n\r\n",
+            "event: content_block_stop\r\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\r\n\r\n",
+            "event: content_block_start\r\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_mock\",\"name\":\"lookup\",\"input\":{}}}\r\n\r\n",
+            "event: content_block_delta\r\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}\r\n\r\n",
+            "event: content_block_stop\r\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":2}\r\n\r\n",
             "event: message_delta\r\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\r\n\r\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\r\n\r\n",
             "event: message_stop\r\n",
             "data: {\"type\":\"message_stop\"}\r\n\r\n",
         );
@@ -98,6 +110,7 @@ struct Harness {
     mock: MockUpstream,
     server: tokio::task::JoinHandle<()>,
     root: std::path::PathBuf,
+    history_origin_key: String,
 }
 
 async fn setup(
@@ -137,7 +150,8 @@ async fn setup(
     let base_url = format!("http://{addr}");
 
     let mut model_ids = Vec::new();
-    for provider_name in ["anthropic-a", "anthropic-b"] {
+    let mut account_ids = Vec::new();
+    for provider_name in ["anthropic-a", "anthropic-b", "anthropic-s"] {
         let provider_id = db::insert_provider(
             &pool,
             &db::NewProvider {
@@ -165,35 +179,37 @@ async fn setup(
         )
         .await
         .unwrap();
-        db::insert_account(
-            &pool,
-            &provider_id,
-            provider_name,
-            &crypto
-                .encrypt(if provider_name == "anthropic-a" {
-                    "key-a"
-                } else {
-                    "key-b"
-                })
-                .unwrap(),
-            if provider_name == "anthropic-a" {
-                "key-a"
-            } else {
-                "key-b"
-            },
-            1,
-            1,
-            None,
-            "none",
-        )
-        .await
-        .unwrap();
-        let upstream_id = if provider_name == "anthropic-a" {
-            "claude-sonnet-5"
-        } else {
-            fallback_model
+        account_ids.push(
+            db::insert_account(
+                &pool,
+                &provider_id,
+                provider_name,
+                &crypto
+                    .encrypt(match provider_name {
+                        "anthropic-a" => "key-a",
+                        "anthropic-b" => "key-b",
+                        _ => "key-s",
+                    })
+                    .unwrap(),
+                match provider_name {
+                    "anthropic-a" => "key-a",
+                    "anthropic-b" => "key-b",
+                    _ => "key-s",
+                },
+                1,
+                1,
+                None,
+                "none",
+            )
+            .await
+            .unwrap(),
+        );
+        let upstream_id = match provider_name {
+            "anthropic-a" => "claude-sonnet-5",
+            "anthropic-b" => fallback_model,
+            _ => "claude-history-5",
         };
-        let capabilities = if share_continuation_family {
+        let capabilities = if share_continuation_family && provider_name != "anthropic-s" {
             json!({"continuation_families": ["anthropic_thinking_signature:v1"]})
         } else {
             json!({})
@@ -236,7 +252,7 @@ async fn setup(
     )
     .await
     .unwrap();
-    for (model_id, priority) in model_ids.iter().zip([1, 2]) {
+    for (model_id, priority) in model_ids.iter().zip([1, 2, 3]) {
         db::insert_route_target(&pool, &route_id, None, model_id, priority, 1, "{}", "{}")
             .await
             .unwrap();
@@ -285,6 +301,7 @@ async fn setup(
         mock,
         server,
         root,
+        history_origin_key: format!("{route_id}|{}|{}", account_ids[2], model_ids[2]),
     }
 }
 
@@ -294,6 +311,14 @@ async fn cleanup(harness: Harness) {
 }
 
 async fn dispatch(harness: &Harness, body: Value) -> Response {
+    dispatch_with_session(harness, body, None).await
+}
+
+async fn dispatch_with_session(
+    harness: &Harness,
+    body: Value,
+    session: Option<String>,
+) -> Response {
     let raw = serde_json::to_string(&body).unwrap();
     let mut request = kinetix::frontends::anthropic::decode_request(body).unwrap();
     request.raw_body = Some(raw);
@@ -304,7 +329,7 @@ async fn dispatch(harness: &Harness, body: Value) -> Response {
         request,
         "req_anthropic_continuation".into(),
         true,
-        None,
+        session,
         vec![],
     )
     .await
@@ -378,6 +403,40 @@ async fn compatible_anthropic_fallback_preserves_thinking_and_redacted_state() {
 }
 
 #[tokio::test]
+async fn failed_candidate_does_not_replace_session_continuation_origin() {
+    let harness = setup("strip_with_warning", "claude-sonnet-5", true).await;
+    harness
+        .state
+        .sticky_remember("session-s", harness.history_origin_key.clone());
+    let response =
+        dispatch_with_session(&harness, continuation_request(), Some("session-s".into())).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key("x-kinetix-warning"));
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    let requests = harness.mock.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].authorization.as_deref(), Some("Bearer key-a"));
+    assert_eq!(requests[1].authorization.as_deref(), Some("Bearer key-b"));
+    let fallback_content = requests[1].body["messages"][1]["content"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !fallback_content.iter().any(|part| {
+            matches!(
+                part["type"].as_str(),
+                Some("thinking" | "redacted_thinking")
+            )
+        }),
+        "B must use session origin S, not failed candidate A, for portability"
+    );
+    drop(requests);
+    cleanup(harness).await;
+}
+
+#[tokio::test]
 async fn native_anthropic_sse_preserves_payload_and_normalizes_crlf_framing() {
     let harness = setup("strip_with_warning", "claude-sonnet-5", true).await;
     let mut request = continuation_request();
@@ -389,12 +448,38 @@ async fn native_anthropic_sse_preserves_payload_and_normalizes_crlf_framing() {
         .unwrap();
     let body = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(body.contains(
-        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"streamed thought\"}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"foo\"}}\n\n"
     ));
     assert!(body.contains(
-        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"streamed-signature\"}}\n\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"bar\"}}\n\n"
     ));
+    assert!(body.contains(
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\n"
+    ));
+    assert!(body.contains("opaque-redacted-state"));
+    assert!(body.contains("toolu_mock"));
     assert!(!body.contains('\r'), "SSE framing is normalized to LF");
+    cleanup(harness).await;
+}
+
+#[tokio::test]
+async fn non_streaming_anthropic_aggregation_reassembles_continuation_blocks() {
+    let harness = setup("strip_with_warning", "claude-sonnet-5", true).await;
+    let response = dispatch(&harness, continuation_request()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["content"],
+        json!([
+            {"type": "thinking", "thinking": "foobar", "signature": "sig"},
+            {"type": "redacted_thinking", "data": "opaque-redacted-state"},
+            {"type": "tool_use", "id": "toolu_mock", "name": "lookup", "input": {"city": "Paris"}}
+        ])
+    );
+    assert_eq!(body["stop_reason"], "tool_use");
     cleanup(harness).await;
 }
 

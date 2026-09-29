@@ -541,6 +541,7 @@ fn openai_events(v: &Value) -> Vec<StreamEvent> {
                 {
                     if !reasoning.is_empty() {
                         events.push(StreamEvent::ThinkingDelta {
+                            block_index: None,
                             text: reasoning.to_string(),
                             signature: None,
                         });

@@ -413,6 +413,7 @@ impl OpenAiResponsesAdapter {
                             if let Some(text) = part.get("text").and_then(Value::as_str) {
                                 if !text.is_empty() {
                                     events.push(StreamEvent::ThinkingDelta {
+                                        block_index: None,
                                         text: text.to_string(),
                                         signature: None,
                                     });
@@ -621,6 +622,7 @@ impl Adapter for OpenAiResponsesAdapter {
                 .filter(|delta| !delta.is_empty())
                 .map(|delta| {
                     vec![StreamEvent::ThinkingDelta {
+                        block_index: None,
                         text: delta.to_string(),
                         signature: None,
                     }]

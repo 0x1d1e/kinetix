@@ -787,6 +787,9 @@ pub async fn run(
         })
     });
     let initial_origin = targets.first().map(continuation_origin);
+    // Anthropic continuation state was produced by successful conversation
+    // history, not by any fallback candidate dispatched during this request.
+    let history_origin = session_origin.as_ref().or(initial_origin.as_ref());
 
     // Sticky routing and prompt-cache affinity share the same bounded session
     // mapping: both prefer the last successful target while still allowing
@@ -1030,7 +1033,7 @@ pub async fn run(
         // Portability applies on cross-format translation, on fallback across
         // providers, and on the first attempt when session provenance shows the
         // previous turn came from a different provider.
-        let source_origin = previous_origin
+        let attempt_origin = previous_origin
             .as_ref()
             .or(if attempts_done == 0 {
                 session_origin.as_ref()
@@ -1039,7 +1042,7 @@ pub async fn run(
             })
             .or(initial_origin.as_ref());
         let cross_provider =
-            source_origin.is_some_and(|origin| origin.provider_id != target.provider.id);
+            attempt_origin.is_some_and(|origin| origin.provider_id != target.provider.id);
         let cross_format = !passthrough::is_transport_passthrough(format, &profile.transport);
 
         // Anthropic continuation is safe for the same provider/model, or when
@@ -1047,7 +1050,7 @@ pub async fn run(
         // Wire-format and upstream model-name equality alone are insufficient.
         let preserves_anthropic_thinking = format == FrontendFormat::Anthropic
             && adapter.wire_format() == "anthropic"
-            && anthropic_continuation_is_compatible(source_origin, target);
+            && anthropic_continuation_is_compatible(history_origin, target);
         // Evaluate inline opaque state before hydration so a signature about to
         // be restored for a compatible target is not mistaken for client state.
         let inline_opaque = request_has_nonportable_inline_state(
@@ -3898,21 +3901,55 @@ impl ToolStreamState {
         let mut out = Vec::with_capacity(events.len());
         for event in events {
             let normalized = match event {
-                StreamEvent::ThinkingDelta { text, signature }
-                    if text.is_empty() && signature.is_some() =>
-                {
+                StreamEvent::ThinkingDelta {
+                    block_index,
+                    text,
+                    signature,
+                } if text.is_empty() && signature.is_some() => {
                     // Signature-only part: remember it for the tool call that
                     // should follow, but still emit the raw event unchanged so
                     // the client encoder behaves exactly as before.
                     self.pending_signature = signature.clone();
-                    StreamEvent::ThinkingDelta { text, signature }
+                    StreamEvent::ThinkingDelta {
+                        block_index,
+                        text,
+                        signature,
+                    }
                 }
-                StreamEvent::ThinkingDelta { text, signature } => {
+                StreamEvent::ThinkingDelta {
+                    block_index,
+                    text,
+                    signature,
+                } => {
                     // Real thinking content is not a signature-only marker;
                     // drop any stale pending signature so it cannot leak onto
                     // an unrelated later tool call.
                     self.pending_signature = None;
-                    StreamEvent::ThinkingDelta { text, signature }
+                    StreamEvent::ThinkingDelta {
+                        block_index,
+                        text,
+                        signature,
+                    }
+                }
+                StreamEvent::ThinkingBlockStart {
+                    index,
+                    thinking,
+                    signature,
+                } => {
+                    self.pending_signature = None;
+                    StreamEvent::ThinkingBlockStart {
+                        index,
+                        thinking,
+                        signature,
+                    }
+                }
+                StreamEvent::ThinkingBlockStop { index } => {
+                    self.pending_signature = None;
+                    StreamEvent::ThinkingBlockStop { index }
+                }
+                StreamEvent::RedactedThinking { index, data } => {
+                    self.pending_signature = None;
+                    StreamEvent::RedactedThinking { index, data }
                 }
                 StreamEvent::TextDelta(text) => {
                     self.pending_signature = None;
@@ -7003,13 +7040,14 @@ mod route_policy_tests {
     fn signature_only_then_function_call_attaches_pending_signature() {
         let mut state = ToolStreamState::new("req_test");
         let first = state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("SIG".into()),
         }]);
         // The raw thinking event is passed through unchanged.
         assert!(matches!(
             &first[0],
-            StreamEvent::ThinkingDelta { text, signature: Some(sig) }
+            StreamEvent::ThinkingDelta { text, signature: Some(sig), .. }
                 if text.is_empty() && sig == "SIG"
         ));
 
@@ -7054,10 +7092,12 @@ mod route_policy_tests {
         let mut thinking_state = ToolStreamState::new("req_thinking");
         let thinking_events = thinking_state.normalize(vec![
             StreamEvent::ThinkingDelta {
+                block_index: None,
                 text: "reasoning...".into(),
                 signature: None,
             },
             StreamEvent::ThinkingDelta {
+                block_index: None,
                 text: String::new(),
                 signature: Some("SIG_THINK".into()),
             },
@@ -7087,6 +7127,7 @@ mod route_policy_tests {
         let text_events = text_state.normalize(vec![
             StreamEvent::TextDelta("visible response".into()),
             StreamEvent::ThinkingDelta {
+                block_index: None,
                 text: String::new(),
                 signature: Some("SIG_TEXT".into()),
             },
@@ -7117,6 +7158,7 @@ mod route_policy_tests {
     fn pending_signature_not_copied_to_parallel_calls() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("SIG_A".into()),
         }]);
@@ -7150,6 +7192,7 @@ mod route_policy_tests {
     fn explicit_tool_call_signature_wins_over_pending() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("PENDING".into()),
         }]);
@@ -7171,6 +7214,7 @@ mod route_policy_tests {
         // unrelated tool call) must not leak the earlier signature onward.
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("STALE".into()),
         }]);
@@ -7194,6 +7238,7 @@ mod route_policy_tests {
     fn pending_signature_cleared_by_refusal_delta() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("STALE".into()),
         }]);
@@ -7218,10 +7263,12 @@ mod route_policy_tests {
     fn pending_signature_cleared_by_real_thinking_delta() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("STALE".into()),
         }]);
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: "real reasoning".into(),
             signature: None,
         }]);

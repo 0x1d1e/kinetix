@@ -893,6 +893,7 @@ fn events_from_gemini(v: &Value) -> Vec<StreamEvent> {
                         .map(String::from);
                     if is_thought && (!text.is_empty() || signature.is_some()) {
                         events.push(StreamEvent::ThinkingDelta {
+                            block_index: None,
                             text: text.to_string(),
                             signature,
                         });
@@ -1081,7 +1082,8 @@ mod schema_tests {
             &events[0],
             StreamEvent::ThinkingDelta {
                 text,
-                signature: Some(signature)
+                signature: Some(signature),
+                ..
             } if text.is_empty() && signature == "sig-only"
         ));
     }

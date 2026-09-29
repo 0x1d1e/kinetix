@@ -572,6 +572,7 @@ mod tests {
                 upstream_request_id: Some("req_1".into()),
             },
             StreamEvent::ThinkingDelta {
+                block_index: None,
                 text: "hmm".into(),
                 signature: Some("sig".into()),
             },

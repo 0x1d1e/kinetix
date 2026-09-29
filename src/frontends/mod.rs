@@ -311,21 +311,75 @@ pub fn aggregate_with_responses_fields(
                     }));
                 }
             };
+            let mut cur_thinking: Option<(u32, String, String)> = None;
+            let push_thinking = |cur: &mut Option<(u32, String, String)>,
+                                 blocks: &mut Vec<Value>| {
+                if let Some((_, thinking, signature)) = cur.take() {
+                    blocks.push(serde_json::json!({
+                        "type": "thinking", "thinking": thinking, "signature": signature
+                    }));
+                }
+            };
             for ev in events {
                 match ev {
                     StreamEvent::TextDelta(t) | StreamEvent::RefusalDelta(t) => {
+                        push_thinking(&mut cur_thinking, &mut blocks);
                         push_tool(&mut cur_tool, &mut blocks);
                         blocks.push(serde_json::json!({"type": "text", "text": t}));
                     }
-                    StreamEvent::ThinkingDelta { text, signature } => {
+                    StreamEvent::ThinkingBlockStart {
+                        index,
+                        thinking,
+                        signature,
+                    } => {
+                        push_thinking(&mut cur_thinking, &mut blocks);
+                        push_tool(&mut cur_tool, &mut blocks);
+                        cur_thinking = Some((index, thinking, signature.unwrap_or_default()));
+                    }
+                    StreamEvent::ThinkingDelta {
+                        block_index,
+                        text,
+                        signature,
+                    } => {
+                        if block_index.is_some_and(|index| {
+                            cur_thinking
+                                .as_ref()
+                                .is_some_and(|(current, _, _)| *current != index)
+                        }) {
+                            push_thinking(&mut cur_thinking, &mut blocks);
+                        }
+                        let index = block_index.unwrap_or_else(|| {
+                            cur_thinking
+                                .as_ref()
+                                .map(|(index, _, _)| *index)
+                                .unwrap_or(u32::MAX)
+                        });
+                        let current = cur_thinking
+                            .get_or_insert_with(|| (index, String::new(), String::new()));
+                        current.1.push_str(&text);
+                        if let Some(signature) = signature {
+                            current.2.push_str(&signature);
+                        }
+                    }
+                    StreamEvent::ThinkingBlockStop { index } => {
+                        if cur_thinking
+                            .as_ref()
+                            .is_some_and(|(current, _, _)| *current == index)
+                        {
+                            push_thinking(&mut cur_thinking, &mut blocks);
+                        }
+                    }
+                    StreamEvent::RedactedThinking { data, .. } => {
+                        push_thinking(&mut cur_thinking, &mut blocks);
+                        push_tool(&mut cur_tool, &mut blocks);
                         blocks.push(serde_json::json!({
-                            "type": "thinking", "thinking": text,
-                            "signature": signature.unwrap_or_default()
+                            "type": "redacted_thinking", "data": data
                         }));
                     }
                     StreamEvent::ToolCallStart {
                         index, id, name, ..
                     } => {
+                        push_thinking(&mut cur_thinking, &mut blocks);
                         push_tool(&mut cur_tool, &mut blocks);
                         cur_tool = Some((
                             index,
@@ -339,10 +393,15 @@ pub fn aggregate_with_responses_fields(
                             cur.3.push_str(&args);
                         }
                     }
-                    StreamEvent::Finish(f) => finish = f,
+                    StreamEvent::Finish(f) => {
+                        push_thinking(&mut cur_thinking, &mut blocks);
+                        push_tool(&mut cur_tool, &mut blocks);
+                        finish = f;
+                    }
                     _ => {}
                 }
             }
+            push_thinking(&mut cur_thinking, &mut blocks);
             push_tool(&mut cur_tool, &mut blocks);
             let stop_reason = match finish {
                 FinishReason::Length => "max_tokens",
