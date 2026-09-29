@@ -256,17 +256,8 @@ fn validate_warning(value: &Value) -> Result<(), UpstreamFailure> {
 
 fn error_event_to_failure(value: &Value) -> Result<UpstreamFailure, UpstreamFailure> {
     let kind_name = required_str(value, "kind")?;
-    let kind = match kind_name {
-        "rate_limit" => FailureKind::RateLimit,
-        "quota_exhausted" => FailureKind::QuotaExhausted,
-        "auth_error" => FailureKind::AuthError,
-        "target_error" => FailureKind::TargetError,
-        "server_error" => FailureKind::ServerError,
-        "connection_error" => FailureKind::ConnectionError,
-        "timeout" => FailureKind::Timeout,
-        "bad_request" => FailureKind::BadRequest,
-        other => return Err(contract_failure(format!("unknown error.kind '{other}'"))),
-    };
+    let kind = FailureKind::parse(kind_name)
+        .ok_or_else(|| contract_failure(format!("unknown error.kind '{kind_name}'")))?;
 
     let message = required_str(value, "message")?;
     if message.is_empty() {
@@ -349,7 +340,7 @@ fn optional_u16(value: &Value, field: &str) -> Result<Option<u16>, UpstreamFailu
 
 fn contract_failure(message: impl Into<String>) -> UpstreamFailure {
     UpstreamFailure {
-        kind: FailureKind::ServerError,
+        kind: FailureKind::PluginFailure,
         status: None,
         retry_after_secs: None,
         message: format!("plugin response contract: {}", message.into()),

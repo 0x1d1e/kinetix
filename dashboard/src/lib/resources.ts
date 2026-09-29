@@ -339,11 +339,17 @@ export interface PluginLimits {
   storage: string;
 }
 
+export interface PluginCompatibility {
+  min_host_version: string | null;
+  max_host_version: string | null;
+}
+
 export interface PluginSummary {
   id: string;
   name: string;
   version: string;
   plugin_api_major: number;
+  compatibility: PluginCompatibility;
   sha256: string;
   signature: string;
   status: string;

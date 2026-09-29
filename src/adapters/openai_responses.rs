@@ -30,6 +30,16 @@ impl OpenAiResponsesAdapter {
         }
     }
 
+    fn malformed(message: impl Into<String>) -> UpstreamFailure {
+        UpstreamFailure {
+            kind: FailureKind::MalformedUpstream,
+            status: None,
+            retry_after_secs: None,
+            message: message.into(),
+            quota_reset_at: None,
+        }
+    }
+
     fn bad_request(message: impl Into<String>) -> UpstreamFailure {
         UpstreamFailure {
             kind: FailureKind::BadRequest,
@@ -598,7 +608,7 @@ impl Adapter for OpenAiResponsesAdapter {
             return Ok(Vec::new());
         }
         let value: Value = serde_json::from_str(data)
-            .map_err(|error| Self::failure(format!("invalid OpenAI Responses event: {error}")))?;
+            .map_err(|error| Self::malformed(format!("invalid OpenAI Responses event: {error}")))?;
         let event_type = value
             .get("type")
             .and_then(Value::as_str)

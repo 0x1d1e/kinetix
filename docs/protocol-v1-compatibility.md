@@ -32,12 +32,12 @@ not a claim that every field of every upstream vendor API is implemented.
 | assistant reasoning history/signature | passthrough | portable only on compatible path; otherwise route portability policy applies | Opaque state is stripped-with-warning or rejected at the first cross-format/provider boundary. | `chat.fallback.opaque_reasoning` |
 | stream | passthrough | translated | Streaming is normalized through canonical events on translation. | `chat.native.openai.sync`<br>`chat.native.openai.stream`<br>`chat.translate.gemini.sync`<br>`chat.translate.gemini.stream`<br>`chat.translate.anthropic.sync`<br>`chat.translate.anthropic.stream` |
 | stream_options.include_usage | passthrough | client preference preserved on translation | Internal accounting may request upstream usage even when client did not. | `chat.native.openai.stream`<br>`chat.translate.gemini.stream`<br>`chat.translate.anthropic.stream` |
-| n > 1 | passthrough | rejected (422) | Multiple completions cannot be represented faithfully on translated paths. | `chat.native.openai.provider_extensions`<br>`chat.translate.gemini.unsupported_fields.reject` |
-| logprobs / top_logprobs | passthrough | rejected (422) | No canonical cross-format representation. | `chat.translate.gemini.unsupported_fields.reject` |
-| response_format.json_schema | passthrough | rejected (422) | Structured schema enforcement cannot be guaranteed cross-format. | `chat.translate.gemini.unsupported_fields.reject` |
-| modalities / audio output | passthrough | rejected (422) | Audio output is not in the v1 canonical model. | `chat.translate.gemini.unsupported_fields.reject` |
-| prediction | passthrough | rejected (422) | Prediction semantics are not portable. | `chat.translate.gemini.unsupported_fields.reject` |
-| unsupported nested content (file/audio/refusal/reasoning_details) | passthrough | rejected (422) | Behaviorally significant nested content is never silently dropped. | `chat.translate.gemini.nested_content.reject` |
+| n > 1 | passthrough | rejected (400) | Multiple completions cannot be represented faithfully on translated paths. | `chat.native.openai.provider_extensions`<br>`chat.translate.gemini.unsupported_fields.reject` |
+| logprobs / top_logprobs | passthrough | rejected (400) | No canonical cross-format representation. | `chat.translate.gemini.unsupported_fields.reject` |
+| response_format.json_schema | passthrough | rejected (400) | Structured schema enforcement cannot be guaranteed cross-format. | `chat.translate.gemini.unsupported_fields.reject` |
+| modalities / audio output | passthrough | rejected (400) | Audio output is not in the v1 canonical model. | `chat.translate.gemini.unsupported_fields.reject` |
+| prediction | passthrough | rejected (400) | Prediction semantics are not portable. | `chat.translate.gemini.unsupported_fields.reject` |
+| unsupported nested content (file/audio/refusal/reasoning_details) | passthrough | rejected (400) | Behaviorally significant nested content is never silently dropped. | `chat.translate.gemini.nested_content.reject` |
 | unknown/provider-specific top-level fields | passthrough verbatim | not guaranteed; cosmetic unknowns may be ignored | Use a same-format provider when vendor extensions are required. | `chat.native.openai.provider_extensions` |
 
 ## POST /v1/messages
@@ -56,7 +56,7 @@ not a claim that every field of every upstream vendor API is implemented.
 | thinking control | passthrough | translated only with model thinking_map | Thinking budget maps to configured low/medium/high levels. | `messages.native.anthropic.sync`<br>`messages.translate.gemini.sync`<br>`messages.translate.openai.sync` |
 | thinking history/signature | passthrough | portable only on compatible path | Cross-provider/cross-format portability policy applies before dispatch. | `messages.translate.gemini.opaque_reasoning` |
 | stream | passthrough | translated | Translated streams emit Anthropic event lifecycle. | `messages.native.anthropic.sync`<br>`messages.native.anthropic.stream`<br>`messages.translate.gemini.sync`<br>`messages.translate.gemini.stream`<br>`messages.translate.openai.sync`<br>`messages.translate.openai.stream` |
-| multimodal tool_result / documents / server-tool-only blocks | passthrough when upstream supports them | rejected (422) | Unsupported semantic content fails explicitly. | `messages.translate.multimodal_tool_result.reject` |
+| multimodal tool_result / documents / server-tool-only blocks | passthrough when upstream supports them | rejected (400) | Unsupported semantic content fails explicitly. | `messages.translate.multimodal_tool_result.reject` |
 | unknown/provider-specific fields | passthrough verbatim | not guaranteed | Same-format passthrough is the extension-preserving path. | `messages.native.anthropic.provider_extensions` |
 
 ## POST /v1/messages/count_tokens

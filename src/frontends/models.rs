@@ -721,6 +721,7 @@ pub fn error_body(format: FrontendFormat, err: &ProxyError) -> Value {
                 ErrorKind::Upstream => "upstream_error",
                 ErrorKind::Internal => "internal_error",
                 ErrorKind::ServiceUnavailable => "service_unavailable",
+                ErrorKind::ClientCancelled => "server_error",
             };
             json!({
                 "error": {
@@ -743,6 +744,7 @@ pub fn error_body(format: FrontendFormat, err: &ProxyError) -> Value {
                 ErrorKind::Upstream => "api_error",
                 ErrorKind::Internal => "api_error",
                 ErrorKind::ServiceUnavailable => "overloaded_error",
+                ErrorKind::ClientCancelled => "api_error",
             };
             json!({
                 "type": "error",

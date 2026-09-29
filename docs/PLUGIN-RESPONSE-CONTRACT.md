@@ -45,7 +45,9 @@ Version 2 adds block-aware thinking events:
 | `thinking_block_stop` | `index: u32` | - | Ends a thinking block. |
 | `redacted_thinking` | `index: u32`, `data: string` | - | Opaque redacted-thinking payload. Preserve the data unchanged. |
 
-Valid `error.kind` values are `rate_limit`, `quota_exhausted`, `auth_error`, `target_error`, `server_error`, `connection_error`, `timeout`, and `bad_request`.
+Valid `error.kind` values are `rate_limit`, `quota_exhausted`, `auth_error`, `target_error`, `server_error`, `connection_error`, `timeout`, `bad_request`, `malformed_upstream`, `plugin_failure`, `policy_rejected`, and `client_cancelled`.
+
+`malformed_upstream` reports invalid upstream JSON, SSE framing, or response structure. `plugin_failure` reports plugin execution or contract failures. `policy_rejected` reports a host compatibility/routing rejection; core portability, parameter, and translation policies use this same kind, with HTTP 400 and structured Route Trace fields. `client_cancelled` records a client disconnect and must not be treated as provider or plugin health failure.
 
 ## Validation
 

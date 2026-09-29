@@ -587,44 +587,320 @@ pub enum StreamEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
-    /// Key-level: rate limit. Cooldown + retry another target.
+    /// Account-level rate limit.
     RateLimit,
-    /// Key-level: quota exhausted. Mark exhausted until reset + retry another target.
+    /// Account-level quota exhaustion.
     QuotaExhausted,
-    /// Credential-global: invalid/revoked credential. Refreshable plugin
-    /// credentials get one forced rotation/retry before the account is disabled.
+    /// Credential-global invalid or revoked credential.
     AuthError,
-    /// Provider/model-local: entitlement, model/project/region permission, or
-    /// missing model/resource. Retry another logical target, but never poison
-    /// the credential/account.
+    /// Provider/model-local entitlement or missing resource.
     TargetError,
-    /// Transient upstream failure. Retry another target without treating it as
-    /// a credential defect.
+    /// Transient upstream response failure.
     ServerError,
+    /// Transient connection failure.
     ConnectionError,
+    /// Upstream timeout.
     Timeout,
-    /// Request-level: bad request / unsupported feature. Never retried.
+    /// Request-local malformed or unsupported request.
     BadRequest,
+    /// Invalid upstream JSON, SSE framing, or response structure.
+    MalformedUpstream,
+    /// Plugin execution, trap, permission, or contract failure.
+    PluginFailure,
+    /// Request rejected by an explicit compatibility or routing policy.
+    PolicyRejected,
+    /// The client disconnected before the response completed.
+    ClientCancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureCategory {
+    CredentialGlobal,
+    AccountQuota,
+    TargetModelLocal,
+    RequestLocal,
+    RateLimited,
+    TransientUpstream,
+    Timeout,
+    MalformedUpstream,
+    Plugin,
+    PolicyRejection,
+    ClientCancellation,
+}
+
+impl FailureCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CredentialGlobal => "credential_global",
+            Self::AccountQuota => "account_quota",
+            Self::TargetModelLocal => "target_model_local",
+            Self::RequestLocal => "request_local",
+            Self::RateLimited => "rate_limited",
+            Self::TransientUpstream => "transient_upstream",
+            Self::Timeout => "timeout",
+            Self::MalformedUpstream => "malformed_upstream",
+            Self::Plugin => "plugin",
+            Self::PolicyRejection => "policy_rejection",
+            Self::ClientCancellation => "client_cancellation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackRule {
+    Always,
+    On429,
+    OnQuota,
+    On5xx,
+    OnTimeout,
+    RouteTarget,
+    Never,
+}
+
+impl FallbackRule {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::On429 => "on429",
+            Self::OnQuota => "onQuota",
+            Self::On5xx => "on5xx",
+            Self::OnTimeout => "onTimeout",
+            Self::RouteTarget => "route_target",
+            Self::Never => "never",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountHealthEffect {
+    None,
+    Cooldown,
+    Exhausted,
+    DisableCredential,
+}
+
+impl AccountHealthEffect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Cooldown => "cooldown",
+            Self::Exhausted => "exhausted",
+            Self::DisableCredential => "disable_credential",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryHint {
+    None,
+    RetryAfter,
+    QuotaReset,
+}
+
+impl RetryHint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::RetryAfter => "retry_after",
+            Self::QuotaReset => "quota_reset",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailurePolicy {
+    pub category: FailureCategory,
+    pub fallback: FallbackRule,
+    pub account_health: AccountHealthEffect,
+    pub client_status: Option<u16>,
+    pub retry_hint: RetryHint,
 }
 
 impl FailureKind {
-    /// Whether another candidate may be attempted before client commit.
-    pub fn is_retryable(&self) -> bool {
-        !matches!(self, FailureKind::BadRequest)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::AuthError => "auth_error",
+            Self::TargetError => "target_error",
+            Self::ServerError => "server_error",
+            Self::ConnectionError => "connection_error",
+            Self::Timeout => "timeout",
+            Self::BadRequest => "bad_request",
+            Self::MalformedUpstream => "malformed_upstream",
+            Self::PluginFailure => "plugin_failure",
+            Self::PolicyRejected => "policy_rejected",
+            Self::ClientCancelled => "client_cancelled",
+        }
     }
 
-    /// Whether the failure is evidence that the selected account/credential
-    /// itself is unavailable. Request-local transport/backend failures remain
-    /// retryable without mutating shared account health.
-    pub fn is_account_scoped(&self) -> bool {
-        matches!(
-            self,
-            FailureKind::RateLimit | FailureKind::QuotaExhausted | FailureKind::AuthError
-        )
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "rate_limit" => Self::RateLimit,
+            "quota_exhausted" => Self::QuotaExhausted,
+            "auth_error" => Self::AuthError,
+            "target_error" => Self::TargetError,
+            "server_error" => Self::ServerError,
+            "connection_error" => Self::ConnectionError,
+            "timeout" => Self::Timeout,
+            "bad_request" => Self::BadRequest,
+            "malformed_upstream" => Self::MalformedUpstream,
+            "plugin_failure" => Self::PluginFailure,
+            "policy_rejected" => Self::PolicyRejected,
+            "client_cancelled" => Self::ClientCancelled,
+            _ => return None,
+        })
+    }
+
+    /// The shared policy contract used by retries, health transitions, client
+    /// mapping, and Route Trace. Route fallback triggers can further restrict
+    /// the fallback rule for a concrete Route.
+    pub fn policy(self) -> FailurePolicy {
+        use AccountHealthEffect as Health;
+        use FailureCategory as Category;
+        use FallbackRule as Fallback;
+        use RetryHint as Retry;
+
+        let (category, fallback, account_health, client_status, retry_hint) = match self {
+            Self::RateLimit => (
+                Category::RateLimited,
+                Fallback::On429,
+                Health::Cooldown,
+                Some(429),
+                Retry::RetryAfter,
+            ),
+            Self::QuotaExhausted => (
+                Category::AccountQuota,
+                Fallback::OnQuota,
+                Health::Exhausted,
+                Some(429),
+                Retry::QuotaReset,
+            ),
+            Self::AuthError => (
+                Category::CredentialGlobal,
+                Fallback::Always,
+                Health::DisableCredential,
+                Some(502),
+                Retry::None,
+            ),
+            Self::TargetError => (
+                Category::TargetModelLocal,
+                Fallback::RouteTarget,
+                Health::None,
+                Some(502),
+                Retry::None,
+            ),
+            Self::ServerError | Self::ConnectionError => (
+                Category::TransientUpstream,
+                Fallback::On5xx,
+                Health::None,
+                Some(502),
+                Retry::None,
+            ),
+            Self::Timeout => (
+                Category::Timeout,
+                Fallback::OnTimeout,
+                Health::None,
+                Some(504),
+                Retry::None,
+            ),
+            Self::BadRequest => (
+                Category::RequestLocal,
+                Fallback::Never,
+                Health::None,
+                Some(400),
+                Retry::None,
+            ),
+            Self::MalformedUpstream => (
+                Category::MalformedUpstream,
+                Fallback::On5xx,
+                Health::None,
+                Some(502),
+                Retry::None,
+            ),
+            Self::PluginFailure => (
+                Category::Plugin,
+                Fallback::On5xx,
+                Health::None,
+                Some(502),
+                Retry::None,
+            ),
+            Self::PolicyRejected => (
+                Category::PolicyRejection,
+                Fallback::Never,
+                Health::None,
+                Some(400),
+                Retry::None,
+            ),
+            Self::ClientCancelled => (
+                Category::ClientCancellation,
+                Fallback::Never,
+                Health::None,
+                None,
+                Retry::None,
+            ),
+        };
+        FailurePolicy {
+            category,
+            fallback,
+            account_health,
+            client_status,
+            retry_hint,
+        }
+    }
+
+    pub fn client_status(self, upstream_status: Option<u16>) -> Option<u16> {
+        if self == Self::TargetError {
+            return match upstream_status {
+                Some(status @ (403 | 404)) => Some(status),
+                _ => self.policy().client_status,
+            };
+        }
+        self.policy().client_status
+    }
+
+    pub fn reason_code(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limited",
+            Self::QuotaExhausted => "account_quota_exhausted",
+            Self::AuthError => "credential_rejected",
+            Self::TargetError => "target_model_unavailable",
+            Self::ServerError => "upstream_server_error",
+            Self::ConnectionError => "upstream_connection_error",
+            Self::Timeout => "upstream_timeout",
+            Self::BadRequest => "request_invalid",
+            Self::MalformedUpstream => "malformed_upstream_response",
+            Self::PluginFailure => "plugin_failure",
+            Self::PolicyRejected => "policy_rejected",
+            Self::ClientCancelled => "client_cancelled",
+        }
+    }
+
+    /// Whether another candidate may be attempted before client commit.
+    pub fn is_retryable(self) -> bool {
+        self.policy().fallback != FallbackRule::Never
+    }
+
+    pub fn retry_after_secs(self, failure: &UpstreamFailure) -> Option<u64> {
+        match self.policy().retry_hint {
+            RetryHint::None => None,
+            RetryHint::RetryAfter => failure.retry_after_secs,
+            RetryHint::QuotaReset => failure.retry_after_secs.or_else(|| {
+                failure.quota_reset_at.as_ref().map(|reset| {
+                    (reset.to_owned() - chrono::Utc::now()).num_seconds().max(1) as u64
+                })
+            }),
+        }
+    }
+
+    /// Whether the failure is direct evidence that the selected credential is
+    /// unavailable. Target-local and request-local failures never poison it.
+    pub fn is_account_scoped(self) -> bool {
+        self.policy().account_health != AccountHealthEffect::None
     }
 
     /// Backwards-compatible helper used by older tests/callers.
-    pub fn is_key_level(&self) -> bool {
+    pub fn is_key_level(self) -> bool {
         self.is_account_scoped()
     }
 }
@@ -654,6 +930,7 @@ pub enum ErrorKind {
     Internal,
     /// Control-plane/administrative surface is degraded (NFR-2.7).
     ServiceUnavailable,
+    ClientCancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -739,6 +1016,7 @@ impl ProxyError {
             ErrorKind::Unsupported => 422,
             ErrorKind::RateLimited | ErrorKind::BudgetExceeded => 429,
             ErrorKind::AllTargetsUnavailable | ErrorKind::ServiceUnavailable => 503,
+            ErrorKind::ClientCancelled => 499,
             ErrorKind::Upstream | ErrorKind::Internal => 502,
         }
     }
@@ -754,6 +1032,125 @@ impl std::error::Error for ProxyError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_policy_covers_every_taxonomy_category() {
+        let cases = [
+            (
+                FailureKind::AuthError,
+                "credential_global",
+                "always",
+                "disable_credential",
+                Some(502),
+                "none",
+            ),
+            (
+                FailureKind::QuotaExhausted,
+                "account_quota",
+                "onQuota",
+                "exhausted",
+                Some(429),
+                "quota_reset",
+            ),
+            (
+                FailureKind::TargetError,
+                "target_model_local",
+                "route_target",
+                "none",
+                Some(502),
+                "none",
+            ),
+            (
+                FailureKind::BadRequest,
+                "request_local",
+                "never",
+                "none",
+                Some(400),
+                "none",
+            ),
+            (
+                FailureKind::RateLimit,
+                "rate_limited",
+                "on429",
+                "cooldown",
+                Some(429),
+                "retry_after",
+            ),
+            (
+                FailureKind::ServerError,
+                "transient_upstream",
+                "on5xx",
+                "none",
+                Some(502),
+                "none",
+            ),
+            (
+                FailureKind::Timeout,
+                "timeout",
+                "onTimeout",
+                "none",
+                Some(504),
+                "none",
+            ),
+            (
+                FailureKind::MalformedUpstream,
+                "malformed_upstream",
+                "on5xx",
+                "none",
+                Some(502),
+                "none",
+            ),
+            (
+                FailureKind::PluginFailure,
+                "plugin",
+                "on5xx",
+                "none",
+                Some(502),
+                "none",
+            ),
+            (
+                FailureKind::PolicyRejected,
+                "policy_rejection",
+                "never",
+                "none",
+                Some(400),
+                "none",
+            ),
+            (
+                FailureKind::ClientCancelled,
+                "client_cancellation",
+                "never",
+                "none",
+                None,
+                "none",
+            ),
+        ];
+        for (kind, category, fallback, health, client_status, retry_hint) in cases {
+            let policy = kind.policy();
+            assert_eq!(policy.category.as_str(), category, "{kind:?}");
+            assert_eq!(policy.fallback.as_str(), fallback, "{kind:?}");
+            assert_eq!(policy.account_health.as_str(), health, "{kind:?}");
+            assert_eq!(policy.client_status, client_status, "{kind:?}");
+            assert_eq!(policy.retry_hint.as_str(), retry_hint, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn target_and_client_failures_never_mutate_account_health() {
+        for kind in [
+            FailureKind::TargetError,
+            FailureKind::BadRequest,
+            FailureKind::MalformedUpstream,
+            FailureKind::PluginFailure,
+            FailureKind::PolicyRejected,
+            FailureKind::ClientCancelled,
+        ] {
+            assert!(!kind.is_account_scoped(), "{kind:?}");
+        }
+        assert_eq!(FailureKind::ClientCancelled.client_status(None), None);
+        assert_eq!(FailureKind::TargetError.client_status(Some(403)), Some(403));
+        assert_eq!(FailureKind::TargetError.client_status(Some(404)), Some(404));
+    }
 
     #[test]
     fn satisfies_enforces_reasoning_capability() {

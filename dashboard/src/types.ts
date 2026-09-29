@@ -63,7 +63,10 @@ export interface Account {
   providerName: string;
   label: string;
   keyMasked: string;
-  status: 'healthy' | 'cooldown' | 'exhausted' | 'disabled';
+  status: 'healthy' | 'cooldown' | 'exhausted' | 'disabled' | 'degraded';
+  statusReason?: string;
+  statusChangedAt?: string | null;
+  retryAt?: string | null;
   cooldownUntil?: string | null;
   quotaResetTime?: string | null;
   quotaType: 'daily' | 'monthly' | 'rolling' | 'none';

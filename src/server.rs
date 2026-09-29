@@ -15,7 +15,7 @@ use crate::logqueue::UsageLogQueue;
 use crate::opaque_state::OpaqueStateStore;
 use crate::plugins::{HostPolicy, PluginManager};
 use crate::registry::Registry;
-use crate::{alerts, bootstrap, db, export, pool, router};
+use crate::{alerts, bootstrap, db, export, router};
 
 pub fn init_tracing(json: bool) {
     let filter = EnvFilter::try_from_default_env()
@@ -44,10 +44,8 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         eprintln!("Generated admin password (shown once — store it now):\n  {pw}");
     }
 
-    // Database + migrations (with a pre-migration backup, NFR-2.4).
-    let pool = db::connect(&config.database_url).await?;
-    db::backup_before_migration(&config.database_url, &config.data_dir);
-    db::migrate(&pool).await?;
+    // Open and migrate with a pre-migration backup when existing data will change.
+    let pool = db::open_and_migrate(&config.database_url, &config.data_dir).await?;
 
     let crypto = Arc::new(Crypto::new(&config.master_key));
 
@@ -121,17 +119,23 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         }
     };
 
-    // Re-register capabilities for plugins that were already enabled in a
-    // previous run, so their credential strategies and adapters are available
-    // without a re-enable. (Install/enable-time registration covers the rest.)
+    // Disable persisted plugins that fail the current manifest or permission
+    // contract before re-registering previously enabled capabilities. This also
+    // ensures invalid legacy rows cannot activate credential strategies or adapters.
     if let Some(manager) = state.plugin_manager().cloned() {
-        match manager.list().await {
-            Ok(rows) => {
-                for row in rows.iter().filter(|r| r.status().is_enabled()) {
-                    crate::admin::register_enabled_plugin_capabilities(&state, &row.id).await;
+        match manager.reconcile_enabled_plugins().await {
+            Ok(()) => match manager.list().await {
+                Ok(rows) => {
+                    for row in rows.iter().filter(|r| r.status().is_enabled()) {
+                        crate::admin::register_enabled_plugin_capabilities(&state, &row.id).await;
+                    }
                 }
-            }
-            Err(e) => tracing::warn!(error = %e, "could not enumerate plugins at startup"),
+                Err(e) => tracing::warn!(error = %e, "could not enumerate plugins at startup"),
+            },
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not reconcile enabled plugins at startup; plugin capabilities unavailable"
+            ),
         }
     }
 
@@ -517,28 +521,37 @@ async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>
             );
             if let Some(observation) = quota_observation.filter(|observation| observation.exhausted)
             {
-                let _ = pool::mark_exhausted(
-                    &state.pool,
-                    &account.id,
-                    plugin_quota_reset_at(
-                        observation.reset_at,
-                        obs.retry_after,
-                        chrono::Utc::now(),
-                    ),
-                    3600,
-                    "plugin health probe: quota exhausted",
-                )
-                .await;
-                let _ = state.registry.reload(&state.pool).await;
+                let now = chrono::Utc::now();
+                let reset_at = plugin_quota_reset_at(observation.reset_at, obs.retry_after, now)
+                    .unwrap_or_else(|| now + chrono::Duration::seconds(3600))
+                    .to_rfc3339();
+                if matches!(
+                    db::set_account_status_if_version(
+                        &state.pool,
+                        &account.id,
+                        account.account_state_version,
+                        "exhausted",
+                        "account_quota_exhausted",
+                        None,
+                        Some(&reset_at),
+                        Some("plugin health probe: quota exhausted"),
+                    )
+                    .await,
+                    Ok(true)
+                ) {
+                    let _ = state.registry.reload(&state.pool).await;
+                }
                 continue;
             }
             match obs.state.as_str() {
                 "healthy" => {
                     if account.status != "healthy" {
-                        let _ = db::set_account_status(
+                        let _ = db::set_account_status_if_version(
                             &state.pool,
                             &account.id,
+                            account.account_state_version,
                             "healthy",
+                            "probe_healthy",
                             None,
                             None,
                             None,
@@ -553,10 +566,12 @@ async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>
                         .reset_at
                         .clone()
                         .unwrap_or_else(|| "plugin reports degraded".into());
-                    let _ = db::set_account_status(
+                    let _ = db::set_account_status_if_version(
                         &state.pool,
                         &account.id,
+                        account.account_state_version,
                         "healthy",
+                        "probe_degraded",
                         None,
                         None,
                         Some(&note),
@@ -571,10 +586,12 @@ async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>
                             (chrono::Utc::now() + chrono::Duration::seconds(s as i64)).to_rfc3339()
                         })
                     });
-                    let _ = db::set_account_status(
+                    let _ = db::set_account_status_if_version(
                         &state.pool,
                         &account.id,
+                        account.account_state_version,
                         "cooldown",
+                        "probe_unavailable",
                         until.as_deref(),
                         None,
                         Some("plugin health probe: unavailable"),

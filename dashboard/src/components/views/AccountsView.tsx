@@ -284,13 +284,15 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
             const healthy = poolAccounts.filter((acc) => acc.status === 'healthy').length;
             const cooldown = poolAccounts.filter((acc) => acc.status === 'cooldown').length;
             const exhausted = poolAccounts.filter((acc) => acc.status === 'exhausted').length;
+            const disabled = poolAccounts.filter((acc) => acc.status === 'disabled').length;
+            const degraded = poolAccounts.filter((acc) => acc.status === 'degraded').length;
             return (
               <section key={provider.id} className="space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b-2 border-dashed border-[var(--ink)]/25 pb-2">
                   <div>
                     <h3 className="text-xl font-heading font-bold text-[var(--ink)]">{provider.name} Pool</h3>
                     <p className="text-xs font-mono text-[var(--ink)]/65">
-                      {poolAccounts.length} credential(s) · {healthy} healthy · {cooldown} cooldown · {exhausted} exhausted
+                      {poolAccounts.length} credential(s) · {healthy} healthy · {cooldown} cooldown · {exhausted} exhausted · {degraded} degraded · {disabled} disabled
                     </p>
                   </div>
                   {provider.credentialMode === 'manual' ? (
@@ -336,6 +338,8 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
                   {poolAccounts.map((acc, idx) => {
                     const isCooldown = acc.status === 'cooldown';
                     const isExhausted = acc.status === 'exhausted';
+                    const isDisabled = acc.status === 'disabled';
+                    const isDegraded = acc.status === 'degraded';
                     const rotation = idx % 2 === 0 ? '-0.5deg' : '0.5deg';
 
                     return (
@@ -344,7 +348,11 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
                 decoration={isCooldown ? 'tack' : idx % 2 === 0 ? 'tape' : 'none'}
                 rotation={rotation}
                 className={`p-5 flex flex-col justify-between ${
-                  isCooldown ? 'bg-[var(--tint-red)]' : isExhausted ? 'bg-[var(--tint-yellow)]' : 'bg-[var(--surface)]'
+                  isCooldown || isDisabled
+                    ? 'bg-[var(--tint-red)]'
+                    : isExhausted || isDegraded
+                      ? 'bg-[var(--tint-yellow)]'
+                      : 'bg-[var(--surface)]'
                 }`}
               >
                 <div>
@@ -367,12 +375,28 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
                       <SketchBadge variant="red" rotation="-1deg">
                         In Cooldown (429)
                       </SketchBadge>
-                    ) : (
+                    ) : acc.status === 'exhausted' ? (
                       <SketchBadge variant="yellow" rotation="1deg">
                         Quota Exhausted
                       </SketchBadge>
+                    ) : acc.status === 'disabled' ? (
+                      <SketchBadge variant="red" rotation="1deg">
+                        Disabled
+                      </SketchBadge>
+                    ) : (
+                      <SketchBadge variant="yellow" rotation="1deg">
+                        Degraded
+                      </SketchBadge>
                     )}
                   </div>
+
+                  {acc.status !== 'healthy' && (
+                    <div className="mb-4 rounded border border-[var(--ink)]/25 bg-[var(--surface)]/75 px-3 py-2 text-xs font-mono text-[var(--ink)]/75">
+                      <div>Reason: <strong>{acc.statusReason || 'unknown'}</strong></div>
+                      {acc.retryAt && <div>Retry at: <time dateTime={acc.retryAt}>{new Date(acc.retryAt).toLocaleString()}</time></div>}
+                      {acc.statusChangedAt && <div>Changed: <time dateTime={acc.statusChangedAt}>{new Date(acc.statusChangedAt).toLocaleString()}</time></div>}
+                    </div>
+                  )}
 
                   {/* Key masked preview */}
                   <div className="flex items-center justify-between bg-[var(--paper)] p-2 border-2 border-dashed border-[var(--ink)] text-xs font-mono mb-4">
@@ -387,7 +411,6 @@ export const AccountsView: React.FC<AccountsViewProps> = ({
                         <AlertTriangle className="w-4 h-4" />
                         <span>{acc.lastError || 'Rate Limit (HTTP 429)'}</span>
                       </div>
-                      <div>Cooling down: {acc.cooldownUntil || 'until Retry-After passes'}</div>
                       <button
                         onClick={() => void probeAccount(acc, true)}
                         disabled={testingAccountId === acc.id}

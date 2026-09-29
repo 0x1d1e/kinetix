@@ -485,7 +485,7 @@ impl Adapter for OpenAiAdapter {
             return Ok(Vec::new());
         }
         let v: Value = serde_json::from_str(data).map_err(|e| UpstreamFailure {
-            kind: FailureKind::ServerError,
+            kind: FailureKind::MalformedUpstream,
             status: None,
             retry_after_secs: None,
             message: format!("invalid upstream chunk: {e}"),

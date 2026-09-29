@@ -891,12 +891,18 @@ pub async fn run(
 
         // Soft quota check (FR-12.8).
         if let Ok(true) = pool::soft_quota_reached(&state.pool, &target.account).await {
-            let _ = pool::mark_exhausted(
+            let reset_at = (chrono::Utc::now()
+                + chrono::Duration::seconds(default_quota_window(&target.account)))
+            .to_rfc3339();
+            let _ = db::set_account_status_if_version(
                 &state.pool,
                 &target.account.id,
+                target.account.account_state_version,
+                "exhausted",
+                "account_quota_exhausted",
                 None,
-                default_quota_window(&target.account),
-                "soft quota reached",
+                Some(&reset_at),
+                Some("soft quota reached"),
             )
             .await;
             meta.fallback_path
@@ -1111,7 +1117,7 @@ pub async fn run(
             // decides whether the Route policy allows proceeding.
             let placeholder = adapter.opaque_state_placeholder(&target.model);
             if let Some(route) = &route {
-                apply_portability(
+                if let Err(error) = apply_portability(
                     &mut target_req,
                     route,
                     target,
@@ -1120,7 +1126,17 @@ pub async fn run(
                     placeholder,
                     preserves_anthropic_thinking,
                     &mut trace,
-                )?;
+                ) {
+                    return Err(finish_policy_rejection(
+                        state,
+                        &meta,
+                        &mut trace,
+                        Some(target.account.label.clone()),
+                        error.message,
+                        started,
+                    )
+                    .await);
+                }
             } else if let Some(placeholder) =
                 placeholder.filter(|_| opaque_report.nonportable() && !inline_opaque)
             {
@@ -1141,9 +1157,17 @@ pub async fn run(
             } else if inline_opaque || opaque_report.nonportable() {
                 // A direct target with no Route policy must not silently drop
                 // known non-portable continuation state (§24).
-                return Err(ProxyError::unsupported(
-                    "non-portable provider continuation state cannot be sent to a direct cross-format target",
-                ));
+                return Err(
+                    finish_policy_rejection(
+                        state,
+                        &meta,
+                        &mut trace,
+                        Some(target.account.label.clone()),
+                        "non-portable provider continuation state cannot be sent to a direct cross-format target",
+                        started,
+                    )
+                    .await,
+                );
             }
         }
 
@@ -1196,13 +1220,16 @@ pub async fn run(
         };
 
         // Parameter policy reject (FR-10.6): a request-level failure, never retried.
-        if let Err(e) = check_param_policy(target, &profile, &target_req) {
-            trace.finish("rejected");
-            state
-                .live
-                .finish(&meta.request_id, "rejected", 0, None, None);
-            let _ = db::insert_route_trace(&state.pool, &trace).await;
-            return Err(e);
+        if let Err(error) = check_param_policy(target, &profile, &target_req) {
+            return Err(finish_policy_rejection(
+                state,
+                &meta,
+                &mut trace,
+                Some(target.account.label.clone()),
+                error.message,
+                started,
+            )
+            .await);
         }
 
         // Same-format passthrough (FR-2.7).
@@ -1213,25 +1240,28 @@ pub async fn run(
         // translating path (FR-2.8). A request-level failure; never retried.
         if !use_passthrough {
             if let Some(msg) = crate::frontends::translation_unsupported(&target_req.extra) {
-                trace.finish("rejected");
-                state
-                    .live
-                    .finish(&meta.request_id, "rejected", 0, None, None);
-                let _ = db::insert_route_trace(&state.pool, &trace).await;
-                return Err(ProxyError::new(
-                    crate::types::ErrorKind::Unsupported,
+                return Err(finish_policy_rejection(
+                    state,
+                    &meta,
+                    &mut trace,
+                    Some(target.account.label.clone()),
                     format!("request uses a feature that cannot be translated: {msg}"),
-                ));
+                    started,
+                )
+                .await);
             }
             if let Err(error) =
                 check_resolved_thinking_translation(adapter.as_ref(), target, &profile, &target_req)
             {
-                trace.finish("rejected");
-                state
-                    .live
-                    .finish(&meta.request_id, "rejected", 0, None, None);
-                let _ = db::insert_route_trace(&state.pool, &trace).await;
-                return Err(error);
+                return Err(finish_policy_rejection(
+                    state,
+                    &meta,
+                    &mut trace,
+                    Some(target.account.label.clone()),
+                    error.message,
+                    started,
+                )
+                .await);
             }
         }
 
@@ -1315,6 +1345,44 @@ pub async fn run(
             }
         };
 
+        if probing {
+            match db::claim_half_open_probe_at(
+                &state.pool,
+                &target.account.id,
+                target.account.account_state_version,
+                chrono::Utc::now(),
+                pool::HALF_OPEN_PROBE_MIN_GAP_SECS,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    provider_attempt.finish_neutral();
+                    let detail =
+                        "half-open recovery probe already claimed or account state changed";
+                    trace.step("skip", Some(target.account.label.clone()), detail);
+                    meta.fallback_path
+                        .push(format!("{}:probe_claimed", target.account.label));
+                    state.record_skip();
+                    last_error = Some(ProxyError::all_unavailable(detail, None));
+                    continue;
+                }
+                Err(error) => {
+                    provider_attempt.finish_neutral();
+                    tracing::warn!(
+                        account_id = %target.account.id,
+                        error = %error,
+                        "failed to claim half-open account probe"
+                    );
+                    let detail = "half-open recovery probe could not be claimed";
+                    trace.step("skip", Some(target.account.label.clone()), detail);
+                    state.record_skip();
+                    last_error = Some(ProxyError::all_unavailable(detail, None));
+                    continue;
+                }
+            }
+        }
+
         let attempt_started = Instant::now();
         attempts_done += 1;
         previous_origin = Some(continuation_origin(target));
@@ -1338,11 +1406,6 @@ pub async fn run(
                 }
             ),
         );
-
-        if probing {
-            // Record that we are actively probing this account (FR-4.7).
-            let _ = db::touch_probe_at(&state.pool, &target.account.id).await;
-        }
 
         let send_result = match tokio::time::timeout(
             send_budget,
@@ -1489,8 +1552,16 @@ pub async fn run(
                         "upstream_validated",
                         if prepared.is_sse { "sse" } else { "json" },
                     );
-                    // Only validated responses clear the circuit-breaker counter.
-                    let _ = pool::clear_circuit(&state.pool, &target.account.id).await;
+                    // A validated response may recover only the account state
+                    // version it observed; half-open probes explicitly authorize
+                    // clearing an open circuit.
+                    recover_successful_account(
+                        state,
+                        &target.account.id,
+                        target.account.account_state_version,
+                        probing,
+                    )
+                    .await;
                     let provider_circuit_transition =
                         mark_provider_probe_validated(&provider_attempt);
                     let attempt = Attempt {
@@ -1632,20 +1703,45 @@ pub async fn run(
                                 .unwrap_or(if error.retryable { 5 } else { 30 })
                                 .min(3600);
                             let message = format!("credential refresh failed: {}", error.message);
-                            let _ = pool::mark_rate_limited(
+                            let cooldown_until = (chrono::Utc::now()
+                                + chrono::Duration::seconds(cooldown as i64))
+                            .to_rfc3339();
+                            let cooldown_applied = match db::set_account_status_if_version(
                                 &state.pool,
                                 &target.account.id,
-                                cooldown,
-                                &message,
+                                target.account.account_state_version,
+                                "cooldown",
+                                "rate_limited",
+                                Some(&cooldown_until),
+                                None,
+                                Some(&crate::crypto::redact(&message)),
                             )
-                            .await;
-                            // Keep the request planner's in-memory snapshot in
-                            // sync with the cooldown written above.
-                            let _ = state.registry.reload(&state.pool).await;
-                            let detail = format!(
-                                "{}:credential_refresh(cooldown {}s)",
-                                target.account.label, cooldown
-                            );
+                            .await
+                            {
+                                Ok(applied) => applied,
+                                Err(persist_error) => {
+                                    tracing::error!(
+                                        account = %target.account.id,
+                                        error = %persist_error,
+                                        "failed to persist credential refresh cooldown"
+                                    );
+                                    false
+                                }
+                            };
+                            if cooldown_applied {
+                                let _ = state.registry.reload(&state.pool).await;
+                            }
+                            let detail = if cooldown_applied {
+                                format!(
+                                    "{}:credential_refresh(cooldown {}s)",
+                                    target.account.label, cooldown
+                                )
+                            } else {
+                                format!(
+                                    "{}:credential_refresh(stale lifecycle update ignored)",
+                                    target.account.label
+                                )
+                            };
                             meta.fallback_path.push(detail.clone());
                             trace.step("attempt", Some(target.account.label.clone()), detail);
                             tracing::warn!(
@@ -2082,11 +2178,16 @@ fn traffic_outcome_for_failure(kind: FailureKind) -> crate::upstream_traffic::Tr
     match kind {
         FailureKind::RateLimit => TrafficOutcome::Overload,
         FailureKind::Timeout => TrafficOutcome::Timeout,
-        FailureKind::ServerError | FailureKind::ConnectionError => TrafficOutcome::Error,
+        FailureKind::ServerError
+        | FailureKind::ConnectionError
+        | FailureKind::MalformedUpstream => TrafficOutcome::Error,
+        FailureKind::PluginFailure => TrafficOutcome::Neutral,
+        FailureKind::ClientCancelled => TrafficOutcome::Cancelled,
         FailureKind::QuotaExhausted
         | FailureKind::AuthError
         | FailureKind::TargetError
-        | FailureKind::BadRequest => TrafficOutcome::Neutral,
+        | FailureKind::BadRequest
+        | FailureKind::PolicyRejected => TrafficOutcome::Neutral,
     }
 }
 
@@ -2095,12 +2196,14 @@ fn telemetry_outcome_for_failure(kind: FailureKind) -> crate::target_telemetry::
     match kind {
         FailureKind::RateLimit => TelemetryOutcome::RateLimit,
         FailureKind::QuotaExhausted => TelemetryOutcome::QuotaExhausted,
-        FailureKind::ServerError => TelemetryOutcome::ServerError,
+        FailureKind::ServerError | FailureKind::MalformedUpstream => TelemetryOutcome::ServerError,
+        FailureKind::PluginFailure => TelemetryOutcome::TargetError,
         FailureKind::ConnectionError => TelemetryOutcome::ConnectionError,
         FailureKind::Timeout => TelemetryOutcome::Timeout,
         FailureKind::AuthError => TelemetryOutcome::AuthError,
-        FailureKind::TargetError => TelemetryOutcome::TargetError,
+        FailureKind::TargetError | FailureKind::PolicyRejected => TelemetryOutcome::TargetError,
         FailureKind::BadRequest => TelemetryOutcome::BadRequest,
+        FailureKind::ClientCancelled => TelemetryOutcome::Cancelled,
     }
 }
 
@@ -2159,12 +2262,17 @@ fn route_allows_fallback(route: Option<&db::RouteRow>, kind: FailureKind) -> boo
     match kind {
         FailureKind::RateLimit => enabled("on429"),
         FailureKind::QuotaExhausted => enabled("onQuota"),
-        FailureKind::ServerError | FailureKind::ConnectionError => enabled("on5xx"),
+        FailureKind::ServerError
+        | FailureKind::ConnectionError
+        | FailureKind::MalformedUpstream
+        | FailureKind::PluginFailure => enabled("on5xx"),
         FailureKind::Timeout => enabled("onTimeout"),
         // Credential-global failures should try another account. Target-local
         // failures should try another logical route target.
         FailureKind::AuthError | FailureKind::TargetError => true,
-        FailureKind::BadRequest => false,
+        FailureKind::BadRequest | FailureKind::PolicyRejected | FailureKind::ClientCancelled => {
+            false
+        }
     }
 }
 
@@ -2507,7 +2615,7 @@ async fn prepare_success_response(
             .unwrap_or(false)
         {
             return Err(UpstreamFailure {
-                kind: FailureKind::ServerError,
+                kind: FailureKind::MalformedUpstream,
                 status: Some(502),
                 retry_after_secs: None,
                 message: "upstream JSON response exceeds size limit".into(),
@@ -2527,7 +2635,7 @@ async fn prepare_success_response(
         })?;
         if body.len() > MAX_FULL_RESPONSE_BYTES {
             return Err(UpstreamFailure {
-                kind: FailureKind::ServerError,
+                kind: FailureKind::MalformedUpstream,
                 status: Some(502),
                 retry_after_secs: None,
                 message: "upstream JSON response exceeds size limit".into(),
@@ -2539,7 +2647,7 @@ async fn prepare_success_response(
             return Err(failure);
         }
         let value: Value = serde_json::from_slice(&body).map_err(|error| UpstreamFailure {
-            kind: FailureKind::ServerError,
+            kind: FailureKind::MalformedUpstream,
             status: Some(502),
             retry_after_secs: None,
             message: format!("invalid upstream JSON response: {error}"),
@@ -2548,7 +2656,7 @@ async fn prepare_success_response(
         let events = adapter.parse_full_response(&value)?;
         if !events.iter().any(is_semantic_event) {
             return Err(UpstreamFailure {
-                kind: FailureKind::ServerError,
+                kind: FailureKind::MalformedUpstream,
                 status: Some(502),
                 retry_after_secs: None,
                 message: "upstream JSON response contained no model result".into(),
@@ -2578,7 +2686,7 @@ async fn prepare_success_response(
             Ok(Some(bytes)) => {
                 prefetched.push(bytes.clone());
                 let frames = framer.push(&bytes).map_err(|error| UpstreamFailure {
-                    kind: FailureKind::ServerError,
+                    kind: FailureKind::MalformedUpstream,
                     status: Some(502),
                     retry_after_secs: None,
                     message: error.to_string(),
@@ -2593,7 +2701,7 @@ async fn prepare_success_response(
                     }
                     if payload.trim() == "[DONE]" {
                         return Err(UpstreamFailure {
-                            kind: FailureKind::ServerError,
+                            kind: FailureKind::MalformedUpstream,
                             status: Some(502),
                             retry_after_secs: None,
                             message: "upstream SSE ended before any model event".into(),
@@ -2624,7 +2732,7 @@ async fn prepare_success_response(
                     "upstream SSE ended before any model event"
                 };
                 return Err(UpstreamFailure {
-                    kind: FailureKind::ServerError,
+                    kind: FailureKind::MalformedUpstream,
                     status: Some(502),
                     retry_after_secs: None,
                     message: message.into(),
@@ -2677,44 +2785,101 @@ async fn handle_key_failure(
 ) {
     let account_id = &target.account.id;
     let label = target.account.label.clone();
+    let (status, reason_code, cooldown_until, quota_reset_at) = match failure.kind {
+        FailureKind::RateLimit => {
+            let cooldown = failure.retry_after_secs.unwrap_or(30).min(3600);
+            let until =
+                (chrono::Utc::now() + chrono::Duration::seconds(cooldown as i64)).to_rfc3339();
+            (Some("cooldown"), "rate_limited", Some(until), None)
+        }
+        FailureKind::QuotaExhausted => {
+            let reset = failure.quota_reset_at.clone().unwrap_or_else(|| {
+                chrono::Utc::now()
+                    + chrono::Duration::seconds(default_quota_window(&target.account))
+            });
+            (
+                Some("exhausted"),
+                "account_quota_exhausted",
+                None,
+                Some(reset.to_rfc3339()),
+            )
+        }
+        FailureKind::AuthError => (Some("disabled"), failure.kind.reason_code(), None, None),
+        _ => (None, failure.kind.reason_code(), None, None),
+    };
+    let mut persistence_failed = false;
+    let failure_count = if let Some(status) = status {
+        match db::apply_account_failure(
+            &state.pool,
+            account_id,
+            target.account.account_state_version,
+            status,
+            reason_code,
+            cooldown_until.as_deref(),
+            quota_reset_at.as_deref(),
+            &failure.message,
+            CIRCUIT_THRESHOLD,
+            CIRCUIT_OPEN_SECS,
+        )
+        .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                persistence_failed = true;
+                tracing::error!(
+                    account = %account_id,
+                    error = %error,
+                    "failed to persist account-scoped upstream failure"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let transition_applied = failure_count.is_some();
+    let n = failure_count.unwrap_or(0);
     let detail = match failure.kind {
         FailureKind::RateLimit => {
             let cooldown = failure.retry_after_secs.unwrap_or(30).min(3600);
-            let _ =
-                pool::mark_rate_limited(&state.pool, account_id, cooldown, &failure.message).await;
-            let d = format!("{label}:429(cooldown {cooldown}s)");
+            let d = if transition_applied {
+                format!("{label}:429(cooldown {cooldown}s)")
+            } else if persistence_failed {
+                format!("{label}:429(lifecycle update failed)")
+            } else {
+                format!("{label}:429(stale failure ignored)")
+            };
             meta.fallback_path.push(d.clone());
             d
         }
         FailureKind::QuotaExhausted => {
-            let _ = pool::mark_exhausted(
-                &state.pool,
-                account_id,
-                failure.quota_reset_at,
-                default_quota_window(&target.account),
-                &failure.message,
-            )
-            .await;
-            let d = format!("{label}:quota_exhausted");
+            let d = if transition_applied {
+                format!("{label}:quota_exhausted")
+            } else if persistence_failed {
+                format!("{label}:quota_exhausted(lifecycle update failed)")
+            } else {
+                format!("{label}:quota_exhausted(stale failure ignored)")
+            };
             meta.fallback_path.push(d.clone());
             d
         }
         FailureKind::AuthError => {
-            let _ = db::set_account_status(
-                &state.pool,
-                account_id,
-                "disabled",
-                None,
-                None,
-                Some(&failure.message),
-            )
-            .await;
-            let d = format!("{label}:auth_error(disabled)");
+            let d = if transition_applied {
+                format!("{label}:auth_error(disabled)")
+            } else if persistence_failed {
+                format!("{label}:auth_error(lifecycle update failed)")
+            } else {
+                format!("{label}:auth_error(stale failure ignored)")
+            };
             meta.fallback_path.push(d.clone());
             d
         }
-        FailureKind::ServerError | FailureKind::ConnectionError | FailureKind::Timeout => {
-            let d = format!("{label}:transient(request-local)");
+        FailureKind::ServerError
+        | FailureKind::ConnectionError
+        | FailureKind::Timeout
+        | FailureKind::MalformedUpstream
+        | FailureKind::PluginFailure => {
+            let d = format!("{label}:{}", failure.kind.reason_code());
             meta.fallback_path.push(d.clone());
             d
         }
@@ -2723,33 +2888,22 @@ async fn handle_key_failure(
             meta.fallback_path.push(d.clone());
             d
         }
-        FailureKind::BadRequest => format!("{label}:bad_request"),
+        FailureKind::BadRequest | FailureKind::PolicyRejected => {
+            format!("{label}:{}", failure.kind.reason_code())
+        }
+        FailureKind::ClientCancelled => "client_cancelled".into(),
     };
 
-    let n = if failure.kind.is_account_scoped() {
-        // Circuit breaker (FR-4.7) only tracks failures with direct evidence
-        // that the selected account/credential itself is unavailable.
-        pool::record_failure(
-            &state.pool,
-            account_id,
-            CIRCUIT_THRESHOLD,
-            CIRCUIT_OPEN_SECS,
-        )
-        .await
-        .unwrap_or(0)
-    } else {
-        0
-    };
-    trace.step("attempt", Some(label), detail);
-    if n >= CIRCUIT_THRESHOLD {
+    trace.failure(Some(label), detail, failure.kind, failure.status);
+    if transition_applied && n >= CIRCUIT_THRESHOLD {
         trace.step(
             "skip",
             None,
             format!("circuit opened for account after {n} consecutive failures"),
         );
     }
-    if failure.kind.is_account_scoped() {
-        // Refresh the registry snapshot so later requests see the new status.
+    if transition_applied {
+        // Refresh only after this request successfully mutated account state.
         let _ = state.registry.reload(&state.pool).await;
     }
 }
@@ -2834,12 +2988,83 @@ fn apply_header_reset_to_rate_limit(
     failure
 }
 
+async fn recover_successful_account(
+    state: &AppState,
+    account_id: &str,
+    observed_state_version: i64,
+    is_half_open_probe: bool,
+) {
+    match pool::recover_after_success(
+        &state.pool,
+        account_id,
+        observed_state_version,
+        is_half_open_probe,
+    )
+    .await
+    {
+        Ok(true) => {
+            if let Err(error) = state.registry.reload(&state.pool).await {
+                tracing::warn!(
+                    account = %account_id,
+                    %error,
+                    "account circuit recovered but registry reload failed"
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            account = %account_id,
+            %error,
+            "failed to recover account circuit after successful response"
+        ),
+    }
+}
+
+fn policy_rejection(
+    trace: &mut RouteTrace,
+    target: Option<String>,
+    message: impl Into<String>,
+) -> ProxyError {
+    let message = message.into();
+    trace.failure(target, message.clone(), FailureKind::PolicyRejected, None);
+    let mut error = ProxyError::bad_request(message);
+    error.http_status_override = FailureKind::PolicyRejected.client_status(None);
+    error
+}
+
+async fn finish_policy_rejection(
+    state: &AppState,
+    meta: &RequestMeta,
+    trace: &mut RouteTrace,
+    target: Option<String>,
+    message: impl Into<String>,
+    started: Instant,
+) -> ProxyError {
+    let error = policy_rejection(trace, target, message);
+    trace.finish("rejected");
+    state.live.finish(
+        &meta.request_id,
+        "rejected",
+        started.elapsed().as_millis() as u64,
+        None,
+        None,
+    );
+    let _ = db::insert_route_trace(&state.pool, trace).await;
+    error
+}
+
 fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> ProxyError {
     match failure.kind {
-        FailureKind::RateLimit | FailureKind::QuotaExhausted => {
-            ProxyError::rate_limited(failure.message.clone(), failure.retry_after_secs)
-        }
+        FailureKind::RateLimit | FailureKind::QuotaExhausted => ProxyError::rate_limited(
+            failure.message.clone(),
+            failure.kind.retry_after_secs(failure),
+        ),
         FailureKind::BadRequest => ProxyError::bad_request(failure.message.clone()),
+        FailureKind::PolicyRejected => {
+            let mut error = ProxyError::bad_request(failure.message.clone());
+            error.http_status_override = failure.kind.client_status(failure.status);
+            error
+        }
         FailureKind::AuthError => ProxyError::upstream(format!(
             "upstream authentication failed for provider '{}'",
             target.provider.name
@@ -2851,10 +3076,19 @@ fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> Proxy
             Some(404) => ProxyError::not_found(failure.message.clone()),
             _ => ProxyError::upstream(failure.message.clone()),
         },
-        FailureKind::Timeout => ProxyError::upstream("upstream request timed out".to_string()),
-        FailureKind::ConnectionError | FailureKind::ServerError => {
-            ProxyError::upstream(failure.message.clone())
+        FailureKind::Timeout => {
+            let mut error = ProxyError::upstream("upstream request timed out".to_string());
+            error.http_status_override = failure.kind.client_status(failure.status);
+            error
         }
+        FailureKind::ConnectionError
+        | FailureKind::ServerError
+        | FailureKind::MalformedUpstream
+        | FailureKind::PluginFailure => ProxyError::upstream(failure.message.clone()),
+        FailureKind::ClientCancelled => ProxyError::new(
+            crate::types::ErrorKind::ClientCancelled,
+            "client cancelled request",
+        ),
     }
 }
 
@@ -2889,12 +3123,16 @@ fn record_provider_circuit_reject(
 }
 
 fn account_skip_detail(target: &ResolvedTarget, status: pool::AccountStatus) -> String {
+    let lifecycle = pool::lifecycle_at(&target.account, chrono::Utc::now());
     let mut detail = format!(
-        "model={} skipped({}); effective_status={}",
+        "model={} skipped({}); reason_code={}",
         target.model.display_name,
-        status.as_str(),
-        status.as_str()
+        status.as_admin_str(),
+        lifecycle.reason_code
     );
+    if let Some(retry_at) = lifecycle.retry_at {
+        detail.push_str(&format!("; retry_at={retry_at}"));
+    }
     match status {
         pool::AccountStatus::Cooldown => {
             if let Some(until) = target.account.cooldown_until.as_deref() {
@@ -5199,6 +5437,16 @@ async fn finalize_log(
     } else {
         "pre_commit"
     };
+    if status != "success" && status != "client_disconnect" {
+        if let Some((kind, upstream_status)) = provider_failure {
+            trace.failure(
+                Some(attempt.target.account.label.clone()),
+                error_message.as_deref().unwrap_or("upstream stream failed"),
+                kind,
+                upstream_status,
+            );
+        }
+    }
     trace.finish(match status {
         "success" => "success",
         "client_disconnect" => "cancelled",
@@ -5754,6 +6002,36 @@ mod route_policy_tests {
         }
     }
 
+    #[test]
+    fn final_direct_timeout_uses_the_shared_policy_status() {
+        let error = failure_to_error(&timeout_failure("timed out"), &target());
+        assert_eq!(
+            error.http_status(),
+            FailureKind::Timeout.policy().client_status.unwrap()
+        );
+        assert_eq!(error.http_status(), 504);
+    }
+
+    #[test]
+    fn host_policy_rejection_has_structured_trace_and_policy_status() {
+        let mut trace = RouteTrace::new("req_test".into(), "model".into());
+        let error = policy_rejection(
+            &mut trace,
+            Some("account-test".into()),
+            "request feature is unsupported",
+        );
+
+        assert_eq!(error.http_status(), 400);
+        let step = trace.steps.last().unwrap();
+        assert_eq!(step.failure_kind.as_deref(), Some("policy_rejected"));
+        assert_eq!(step.failure_category.as_deref(), Some("policy_rejection"));
+        assert_eq!(step.failure_reason.as_deref(), Some("policy_rejected"));
+        assert_eq!(step.fallback_rule.as_deref(), Some("never"));
+        assert_eq!(step.account_health_effect.as_deref(), Some("none"));
+        assert_eq!(step.client_status, Some(400));
+        assert_eq!(step.retry_hint.as_deref(), Some("none"));
+    }
+
     fn route(triggers: Value) -> db::RouteRow {
         db::RouteRow {
             id: "route_test".into(),
@@ -5845,6 +6123,9 @@ mod route_policy_tests {
             secret_enc: String::new(),
             key_mask: String::new(),
             status: "healthy".into(),
+            status_reason: "healthy".into(),
+            status_changed_at: None,
+            account_state_version: 0,
             cooldown_until: None,
             quota_reset_at: None,
             quota_type: "none".into(),
@@ -6584,6 +6865,55 @@ mod route_policy_tests {
         state.registry.reload(&state.pool).await.unwrap();
 
         (state, root, provider_id, model_id, account_ids)
+    }
+
+    #[tokio::test]
+    async fn successful_recovery_reloads_registry_only_after_a_transition() {
+        let (state, root, _, _, account_ids) = adaptive_dry_run_state().await;
+        let account_id = &account_ids[0];
+
+        let initial_state_version = state
+            .registry
+            .account(account_id)
+            .unwrap()
+            .account_state_version;
+        sqlx::query("UPDATE accounts SET last_probe_at='db-only' WHERE id=?")
+            .bind(account_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        recover_successful_account(&state, account_id, initial_state_version, false).await;
+        assert!(state
+            .registry
+            .account(account_id)
+            .unwrap()
+            .last_probe_at
+            .is_none());
+
+        db::record_account_failure(&state.pool, account_id, 1, 30)
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        assert!(state
+            .registry
+            .account(account_id)
+            .unwrap()
+            .circuit_open_until
+            .is_some());
+
+        let probe_state_version = state
+            .registry
+            .account(account_id)
+            .unwrap()
+            .account_state_version;
+        recover_successful_account(&state, account_id, probe_state_version, true).await;
+        let recovered = state.registry.account(account_id).unwrap();
+        assert!(recovered.circuit_open_until.is_none());
+        assert_eq!(recovered.consecutive_failures, 0);
+        assert_eq!(recovered.last_probe_at.as_deref(), Some("db-only"));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
