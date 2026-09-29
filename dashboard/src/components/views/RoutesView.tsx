@@ -25,8 +25,24 @@ const DRY_RUN_REASON_LABELS: Record<string, string> = {
   context_window: 'Input exceeds context window',
   higher_ranked_candidate_selected: 'Another eligible target ranked first',
   another_account_ordered_first: 'Another account was ordered first',
+  selected_by_route_strategy: 'Selected by route strategy',
+  selected_by_account_pool: 'Selected from account pool',
 };
 
+const formatDryRunReason = (reason: string) => {
+  const label = DRY_RUN_REASON_LABELS[reason];
+  if (label) return label;
+
+  const capabilityReason = reason.match(
+    /^required (vision|tool_calling|reasoning) capability is (unknown|unsupported)( under strict capability mode)?$/,
+  );
+  if (capabilityReason) {
+    const [, capability, status, strictMode] = capabilityReason;
+    return `Required ${capability.replace('_', ' ')} support is ${status}${strictMode ? ' (strict mode)' : ''}`;
+  }
+
+  return reason.replaceAll('_', ' ');
+};
 
 interface RoutesViewProps {
   routes: Route[];
@@ -763,15 +779,15 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                         <strong>{dryRunResult.would_select ?? '(no eligible target)'}</strong>
                       </div>
                       <div className="overflow-x-auto">
-                        <table className="min-w-[900px] w-full text-xs">
+                        <table className="min-w-[800px] w-full table-fixed text-xs">
                           <thead>
                             <tr className="text-left border-b border-[var(--ink)]/30">
-                              <th scope="col" className="py-1">Candidate</th>
-                              <th scope="col">Predicate</th>
-                              <th scope="col">Capabilities</th>
-                              <th scope="col">Availability</th>
-                              <th scope="col">Decision</th>
-                              <th scope="col">Reason</th>
+                              <th scope="col" className="w-[22%] whitespace-nowrap px-2 py-1">Candidate</th>
+                              <th scope="col" className="w-[12%] whitespace-nowrap px-2">Predicate</th>
+                              <th scope="col" className="w-[18%] whitespace-nowrap px-2">Capabilities</th>
+                              <th scope="col" className="w-[18%] whitespace-nowrap px-2">Availability</th>
+                              <th scope="col" className="w-[12%] whitespace-nowrap px-2">Decision</th>
+                              <th scope="col" className="w-[18%] whitespace-nowrap px-2">Reason</th>
                             </tr>
                           </thead>
                           <tbody>
@@ -783,32 +799,28 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                                     : `${detail.required ? '* ' : ''}${name}: ${detail.status}`,
                                 )
                                 .join(', ');
-                              const reasons = candidate.not_selected_reasons.map(
-                                (reason) => DRY_RUN_REASON_LABELS[reason] || reason,
-                              );
+                              const reasons = candidate.not_selected_reasons.map(formatDryRunReason);
                               return (
                                 <tr key={candidate.candidate_id || index} className={`border-b border-[var(--ink)]/10 ${candidate.selected ? 'bg-[var(--tint-blue)] font-bold' : ''}`}>
-                                  <td className="py-1">
+                                  <td className="px-2 py-2 align-top break-words">
                                     {candidate.strategy_rank == null ? '-' : `#${candidate.strategy_rank + 1}`} · {candidate.model} @ {candidate.account || '-'}
                                   </td>
-                                  <td title={candidate.predicate_explanation || undefined}>
+                                  <td className="px-2 py-2 align-top break-words" title={candidate.predicate_explanation || undefined}>
                                     {candidate.predicate_result || '-'}
                                   </td>
-                                  <td>{capabilitySummary || (candidate.capability_eligible ? 'ok' : 'unknown')}</td>
-                                  <td>
+                                  <td className="px-2 py-2 align-top break-words">{capabilitySummary || (candidate.capability_eligible ? 'ok' : 'unknown')}</td>
+                                  <td className="px-2 py-2 align-top break-words">
                                     {candidate.account_status} · circuit {candidate.provider_circuit_state}
                                     {candidate.route_capacity_available === false ? ' · route full' : ''}
                                     {candidate.account_quota_available === false ? ' · account quota' : ''}
                                   </td>
-                                  <td style={{ color: candidate.selected ? 'var(--pen-blue)' : candidate.eligible ? 'var(--pen-green)' : 'var(--danger-text)' }}>
+                                  <td className="px-2 py-2 align-top break-words" style={{ color: candidate.selected ? 'var(--pen-blue)' : candidate.eligible ? 'var(--pen-green)' : 'var(--danger-text)' }}>
                                     {candidate.selected ? 'selected' : candidate.eligible ? 'eligible' : 'skipped'}
                                   </td>
-                                  <td>
+                                  <td className="px-2 py-2 align-top break-words">
                                     {reasons.length
                                       ? reasons.join('; ')
-                                      : candidate.selected
-                                        ? 'Selected by route strategy'
-                                        : candidate.decision_reason}
+                                      : formatDryRunReason(candidate.decision_reason)}
                                   </td>
                                 </tr>
                               );
