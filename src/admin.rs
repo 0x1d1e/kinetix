@@ -10527,6 +10527,39 @@ async fn installed_source_integration(
     Ok(Some(integration.clone()))
 }
 
+fn validate_imported_plugin_binding_owners(
+    provider_name: &str,
+    source_plugin_id: &str,
+    wire_plugin: &str,
+    credential_plugin: &str,
+    model_source_plugin: &str,
+) -> Result<(), String> {
+    let source_plugin_id = source_plugin_id.trim();
+    if source_plugin_id.is_empty() {
+        return Err(format!(
+            "provider '{provider_name}': source_plugin_id must not be empty"
+        ));
+    }
+    for (field, value) in [
+        ("wire_plugin", wire_plugin),
+        ("model_source_plugin", model_source_plugin),
+        ("credential_plugin", credential_plugin),
+    ] {
+        if value.trim().is_empty() {
+            continue;
+        }
+        let binding = crate::plugins::PluginRef::parse(value).ok_or_else(|| {
+            format!("provider '{provider_name}': {field} must be a valid plugin binding")
+        })?;
+        if binding.plugin_id != source_plugin_id {
+            return Err(format!(
+                "provider '{provider_name}': {field} must reference source plugin '{source_plugin_id}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_imported_integration_bindings(
     provider_name: &str,
     plugin_id: &str,
@@ -10771,16 +10804,60 @@ pub async fn import_config(
                 };
                 (features, protocols)
             };
+        let wire_plugin = p["wire_plugin"].as_str().unwrap_or("");
+        let credential_plugin = p["credential_plugin"].as_str().unwrap_or("");
+        let model_source_plugin = p["model_source_plugin"].as_str().unwrap_or("");
+        let source_bindings_valid = if let Some(plugin_id) = source_plugin_id {
+            match validate_imported_plugin_binding_owners(
+                name,
+                plugin_id,
+                wire_plugin,
+                credential_plugin,
+                model_source_plugin,
+            ) {
+                Err(problem) => {
+                    problems.push(problem);
+                    false
+                }
+                Ok(()) => match installed_integration.as_ref() {
+                    Some(integration) => {
+                        match validate_imported_integration_bindings(
+                            name,
+                            plugin_id,
+                            integration,
+                            p["wire_format"].as_str().unwrap_or(""),
+                            wire_plugin,
+                            credential_plugin,
+                            model_source_plugin,
+                        ) {
+                            Ok(()) => true,
+                            Err(problem) => {
+                                problems.push(problem);
+                                false
+                            }
+                        }
+                    }
+                    None => true,
+                },
+            }
+        } else {
+            true
+        };
         if let Some(protocols) = integration_protocols.as_ref() {
             if let Some(wire) = WireFormat::parse(p["wire_format"].as_str().unwrap_or("")) {
                 // Installed manifests stay authoritative; defer only live adapter checks
                 // until the bound plugin is enabled and its grants are approved.
-                let result = if protocols
+                let result = if !source_bindings_valid {
+                    validate_imported_upstream_protocols_structurally(
+                        protocols,
+                        wire.as_str(),
+                        wire_plugin,
+                    )
+                } else if protocols
                     .upstream
                     .iter()
                     .any(|protocol| protocol == "plugin-native")
                 {
-                    let wire_plugin = p["wire_plugin"].as_str().unwrap_or("");
                     if let (Some(manager), Some(binding)) = (
                         state.plugin_manager(),
                         crate::plugins::PluginRef::parse(wire_plugin),
@@ -10843,24 +10920,6 @@ pub async fn import_config(
                 })
             })
             .unwrap_or(crate::plugins::CredentialMode::Manual);
-        let wire_plugin = p["wire_plugin"].as_str().unwrap_or("");
-        let credential_plugin = p["credential_plugin"].as_str().unwrap_or("");
-        let model_source_plugin = p["model_source_plugin"].as_str().unwrap_or("");
-        if let (Some(plugin_id), Some(integration)) =
-            (source_plugin_id, installed_integration.as_ref())
-        {
-            if let Err(problem) = validate_imported_integration_bindings(
-                name,
-                plugin_id,
-                integration,
-                p["wire_format"].as_str().unwrap_or(""),
-                wire_plugin,
-                credential_plugin,
-                model_source_plugin,
-            ) {
-                problems.push(problem);
-            }
-        }
         if let Err(problem) = validate_imported_provider_credential_semantics(
             &state,
             name,
@@ -23299,6 +23358,74 @@ mod credential_enrollment_regression_tests {
         .unwrap()
         .0;
         let (target, target_root) = test_state_with_plugins("plugin-native-export-target").await;
+        let foreign_manifest = format!(
+            r#"
+manifest_version = 1
+id = "plugin.other"
+name = "Foreign Native Adapter"
+version = "0.1.0"
+plugin_api = "{}.0.0"
+
+[provides]
+provider_adapters = ["session-echo"]
+
+[limits]
+memory = "128MiB"
+storage = "2MiB"
+"#,
+            crate::plugins::PLUGIN_API_MAJOR
+        );
+        let mut foreign_archive = tar::Builder::new(Vec::new());
+        for (path, data) in [
+            ("plugin.toml", foreign_manifest.as_bytes()),
+            (
+                "plugin.wasm",
+                include_bytes!("../tests/fixtures/plugin-api-v2-session-echo.component.wasm")
+                    .as_slice(),
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            foreign_archive
+                .append_data(&mut header, path, data)
+                .unwrap();
+        }
+        let foreign_package = foreign_archive.into_inner().unwrap();
+        let foreign_manager = target.plugin_manager().unwrap().clone();
+        foreign_manager
+            .install(&foreign_package, None, &[], false)
+            .await
+            .unwrap();
+        foreign_manager.enable("plugin.other").await.unwrap();
+        assert!(foreign_manager.is_usable("plugin.other").await);
+        assert!(!foreign_manager
+            .adapter_wire_format("plugin.other")
+            .await
+            .unwrap()
+            .trim()
+            .is_empty());
+
+        for binding_field in ["wire_plugin", "model_source_plugin", "credential_plugin"] {
+            let mut cross_plugin_export = exported.clone();
+            cross_plugin_export["providers"][0][binding_field] =
+                json!("plugin:plugin.other/session-echo");
+            let error = import_config(
+                State(target.clone()),
+                auth(),
+                Json(ImportBody {
+                    config: cross_plugin_export,
+                    apply: true,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(error
+                .1
+                .contains("must reference source plugin 'plugin.test'"));
+        }
+        assert!(db::list_providers(&target.pool).await.unwrap().is_empty());
 
         let imported = import_config(
             State(target.clone()),
@@ -23403,9 +23530,15 @@ storage = "2MiB"
             .status()
             .is_enabled());
 
-        for invalid_wire_plugin in [
-            "plugin:plugin.other/other-adapter",
-            "plugin:plugin.test/stale-adapter",
+        for (invalid_wire_plugin, expected_problem) in [
+            (
+                "plugin:plugin.other/other-adapter",
+                "wire_plugin must reference source plugin 'plugin.test'",
+            ),
+            (
+                "plugin:plugin.test/stale-adapter",
+                "wire_plugin does not match source integration 'native'",
+            ),
         ] {
             let mut mismatched_export = exported.clone();
             mismatched_export["providers"][0]["wire_plugin"] = json!(invalid_wire_plugin);
@@ -23419,9 +23552,7 @@ storage = "2MiB"
             )
             .await
             .unwrap_err();
-            assert!(mismatch_error
-                .1
-                .contains("wire_plugin does not match source integration 'native'"));
+            assert!(mismatch_error.1.contains(expected_problem));
         }
         let provider_after_rejected_mismatch = db::list_providers(&target.pool)
             .await
