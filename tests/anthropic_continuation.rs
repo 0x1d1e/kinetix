@@ -110,8 +110,12 @@ struct Harness {
     mock: MockUpstream,
     server: tokio::task::JoinHandle<()>,
     root: std::path::PathBuf,
+    route_id: String,
     initial_origin_key: String,
+    fallback_origin_key: String,
     history_origin_key: String,
+    fallback_model_id: String,
+    history_model_id: String,
 }
 
 async fn setup(
@@ -302,14 +306,40 @@ async fn setup(
         mock,
         server,
         root,
+        route_id: route_id.clone(),
         initial_origin_key: format!("{route_id}|{}|{}", account_ids[0], model_ids[0]),
+        fallback_origin_key: format!("{route_id}|{}|{}", account_ids[1], model_ids[1]),
         history_origin_key: format!("{route_id}|{}|{}", account_ids[2], model_ids[2]),
+        fallback_model_id: model_ids[1].clone(),
+        history_model_id: model_ids[2].clone(),
     }
 }
 
 async fn cleanup(harness: Harness) {
     harness.server.abort();
     let _ = std::fs::remove_dir_all(&harness.root);
+}
+
+async fn filter_out_fallback_and_history_when_tools_are_present(harness: &Harness) {
+    let predicate = json!({
+        "expr": {"fact": "has_tools", "op": "eq", "value": false}
+    })
+    .to_string();
+    for model_id in [&harness.fallback_model_id, &harness.history_model_id] {
+        sqlx::query("UPDATE route_targets SET predicate = ? WHERE route_id = ? AND model_id = ?")
+            .bind(&predicate)
+            .bind(&harness.route_id)
+            .bind(model_id)
+            .execute(&harness.state.pool)
+            .await
+            .unwrap();
+    }
+    harness
+        .state
+        .registry
+        .reload(&harness.state.pool)
+        .await
+        .unwrap();
 }
 
 async fn dispatch(harness: &Harness, body: Value) -> Response {
@@ -419,6 +449,65 @@ async fn compatible_anthropic_fallback_preserves_thinking_and_redacted_state() {
             "type": "redacted_thinking",
             "data": "opaque-redacted-state"
         })));
+    drop(requests);
+    cleanup(harness).await;
+}
+
+#[tokio::test]
+async fn filtered_session_origin_remains_provenance_for_continuation_portability() {
+    let harness = setup("strip_with_warning", "claude-opus-5", false).await;
+    let session = "session-filtered-origin";
+
+    // A fails and B succeeds, recording B as this session's actual history origin.
+    let first_response =
+        dispatch_with_session(&harness, first_turn_request(), Some(session.to_owned())).await;
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(first_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        harness
+            .state
+            .sticky_lookup(session, std::time::Duration::from_secs(60)),
+        Some(harness.fallback_origin_key.clone())
+    );
+
+    // Current request eligibility removes B and S. It must not erase the
+    // successful B provenance stored for the session.
+    filter_out_fallback_and_history_when_tools_are_present(&harness).await;
+    let mut next_request = continuation_request();
+    next_request["tools"] = json!([{
+        "name": "lookup",
+        "description": "Look up a location",
+        "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+    }]);
+    let second_response =
+        dispatch_with_session(&harness, next_request, Some(session.to_owned())).await;
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let warning = second_response
+        .headers()
+        .get("x-kinetix-warning")
+        .and_then(|value| value.to_str().ok())
+        .expect("B continuation sent to incompatible A must be reported as stripped");
+    assert!(warning.contains("omitted"));
+    let _ = axum::body::to_bytes(second_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    let requests = harness.mock.requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].authorization.as_deref(), Some("Bearer key-a"));
+    assert_eq!(requests[1].authorization.as_deref(), Some("Bearer key-b"));
+    assert_eq!(requests[2].authorization.as_deref(), Some("Bearer key-a"));
+    let content = requests[2].body["messages"][1]["content"]
+        .as_array()
+        .unwrap();
+    assert!(!content.iter().any(|part| {
+        matches!(
+            part["type"].as_str(),
+            Some("thinking" | "redacted_thinking")
+        )
+    }));
     drop(requests);
     cleanup(harness).await;
 }

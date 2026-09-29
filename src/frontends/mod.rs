@@ -233,7 +233,8 @@ pub fn aggregate_with_responses_fields(
             for ev in events {
                 match ev {
                     StreamEvent::TextDelta(t) | StreamEvent::RefusalDelta(t) => text.push_str(&t),
-                    StreamEvent::ThinkingDelta { text: t, .. } => reasoning.push_str(&t),
+                    StreamEvent::ThinkingBlockStart { thinking: t, .. }
+                    | StreamEvent::ThinkingDelta { text: t, .. } => reasoning.push_str(&t),
                     StreamEvent::ToolCallStart {
                         index, id, name, ..
                     } => tool_calls.push((

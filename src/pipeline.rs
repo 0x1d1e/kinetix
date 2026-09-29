@@ -557,7 +557,7 @@ pub async fn run(
         });
     }
 
-    let (mut targets, route) = match resolved {
+    let (mut targets, route, route_target_origins) = match resolved {
         Resolved::Single {
             provider_id,
             model_id,
@@ -586,7 +586,7 @@ pub async fn run(
                     param_overrides: Value::Null,
                 })
                 .collect();
-            (targets, None)
+            (targets, None, Vec::new())
         }
         Resolved::Route { route, targets } => {
             meta.route_id = Some(route.id.clone());
@@ -603,6 +603,12 @@ pub async fn run(
             } else {
                 order_route_targets(state, &route, targets).await.targets
             };
+            // Retain route-wide producer provenance before request-specific
+            // predicates and other eligibility filters remove candidates.
+            let route_target_origins = ordered
+                .iter()
+                .map(|target| (target_key(&route, target), continuation_origin(target)))
+                .collect::<Vec<_>>();
             // Read-only target hook (§6.6): observe each candidate target before
             // eligibility filtering. Fire-and-forget; never blocks routing.
             if let Some(manager) = state.plugin_manager().cloned() {
@@ -674,7 +680,7 @@ pub async fn run(
                     kept.push(t);
                 }
             }
-            (kept, Some(route))
+            (kept, Some(route), route_target_origins)
         }
     };
 
@@ -778,23 +784,30 @@ pub async fn run(
     let session_origin_key = session
         .as_deref()
         .and_then(|session| state.sticky_lookup(session, STICKY_TTL));
-    let session_origin = route.as_ref().and_then(|route| {
-        session_origin_key.as_ref().and_then(|key| {
-            targets
-                .iter()
-                .find(|target| target_key(route, target) == *key)
-                .map(continuation_origin)
-        })
+    let session_origin = session_origin_key.as_ref().and_then(|key| {
+        route_target_origins
+            .iter()
+            .find(|(candidate_key, _)| candidate_key == key)
+            .map(|(_, origin)| origin.clone())
     });
-    let possible_history_origins = targets.iter().map(continuation_origin).collect::<Vec<_>>();
-    let initial_origin = possible_history_origins.first().cloned();
+    let possible_history_origins = if route.is_some() {
+        route_target_origins
+            .iter()
+            .map(|(_, origin)| origin.clone())
+            .collect::<Vec<_>>()
+    } else {
+        targets.iter().map(continuation_origin).collect::<Vec<_>>()
+    };
+    let initial_origin = targets.first().map(continuation_origin);
+    let session_origin_unknown = session_origin_key.is_some() && session_origin.is_none();
     // Anthropic continuation state was produced by successful conversation
     // history, not by any fallback candidate dispatched during this request.
     // Without a session, a multi-target Route has no known producer; only
-    // preserve reasoning when every candidate is explicitly compatible.
-    let history_origin = session_origin
-        .as_ref()
-        .or_else(|| (possible_history_origins.len() == 1).then(|| &possible_history_origins[0]));
+    // preserve reasoning when every possible producer is explicitly compatible.
+    let history_origin = session_origin.as_ref().or_else(|| {
+        (!session_origin_unknown && possible_history_origins.len() == 1)
+            .then(|| &possible_history_origins[0])
+    });
 
     // Sticky routing and prompt-cache affinity share the same bounded session
     // mapping: both prefer the last successful target while still allowing
@@ -1053,14 +1066,15 @@ pub async fn run(
         // Anthropic continuation is safe for the same provider/model, or when
         // both models explicitly share an operator-declared continuation family.
         // Wire-format and upstream model-name equality alone are insufficient.
-        let history_is_compatible = history_origin.map_or_else(
-            || {
-                possible_history_origins
-                    .iter()
-                    .all(|origin| anthropic_continuation_is_compatible(Some(origin), target))
-            },
-            |origin| anthropic_continuation_is_compatible(Some(origin), target),
-        );
+        let history_is_compatible = !session_origin_unknown
+            && history_origin.map_or_else(
+                || {
+                    possible_history_origins
+                        .iter()
+                        .all(|origin| anthropic_continuation_is_compatible(Some(origin), target))
+                },
+                |origin| anthropic_continuation_is_compatible(Some(origin), target),
+            );
         let preserves_anthropic_thinking = format == FrontendFormat::Anthropic
             && adapter.wire_format() == "anthropic"
             && history_is_compatible;

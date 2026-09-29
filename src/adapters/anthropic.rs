@@ -899,6 +899,32 @@ mod tests {
     }
 
     #[test]
+    fn full_response_thinking_survives_non_streaming_openai_aggregation() {
+        let events = AnthropicAdapter::new()
+            .parse_full_response(&serde_json::json!({
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "private chain of thought",
+                    "signature": "opaque-signature"
+                }],
+                "stop_reason": "end_turn"
+            }))
+            .unwrap();
+        let response = crate::frontends::aggregate(
+            crate::frontends::FrontendFormat::OpenAi,
+            "test-model",
+            "req-thinking-aggregate",
+            events,
+            &TokenUsage::default(),
+        );
+
+        assert_eq!(
+            response["choices"][0]["message"]["reasoning_content"],
+            "private chain of thought"
+        );
+    }
+
+    #[test]
     fn model_context_window_exceeded_maps_to_length_in_full_and_streaming() {
         let adapter = AnthropicAdapter::new();
         for stop_reason in ["max_tokens", "model_context_window_exceeded"] {
