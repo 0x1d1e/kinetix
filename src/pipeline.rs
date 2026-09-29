@@ -2599,6 +2599,15 @@ fn enqueue_precommit_failure(
 ) {
     let retries = attempts_done.saturating_sub(1) as i64;
     let upstream_dispatched = meta.upstream_dispatched.load(Ordering::Acquire);
+    let not_dispatched = !upstream_dispatched;
+    let usage = TokenUsage {
+        input: not_dispatched.then_some(0),
+        output: not_dispatched.then_some(0),
+        cached: not_dispatched.then_some(0),
+        cache_write: not_dispatched.then_some(0),
+        thinking: not_dispatched.then_some(0),
+    };
+    let cost = not_dispatched.then_some(0.0);
     let admission_cost_usd = upstream_dispatched
         .then(|| {
             meta.admission
@@ -2624,13 +2633,13 @@ fn enqueue_precommit_failure(
             status_code: i64::from(error.http_status()),
             latency_ms: Some(started.elapsed().as_millis() as i64),
             ttft_ms: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_tokens: None,
-            cache_write_tokens: None,
-            thinking_tokens: None,
-            cost_usd: None,
-            cost_known: 0,
+            input_tokens: usage.input.map(|tokens| tokens as i64),
+            output_tokens: usage.output.map(|tokens| tokens as i64),
+            cached_tokens: usage.cached.map(|tokens| tokens as i64),
+            cache_write_tokens: usage.cache_write.map(|tokens| tokens as i64),
+            thinking_tokens: usage.thinking.map(|tokens| tokens as i64),
+            cost_usd: cost,
+            cost_known: i64::from(cost.is_some()),
             price_version_id: None,
             cache_status: "bypass".into(),
             serving_account_id: None,
@@ -2639,7 +2648,12 @@ fn enqueue_precommit_failure(
             upstream_request_id: None,
             flagged: 0,
             error_message: None,
-            usage_confidence: "unknown".into(),
+            usage_confidence: if not_dispatched {
+                "not_dispatched"
+            } else {
+                "unknown"
+            }
+            .into(),
             commit_state: "pre_commit".into(),
             retry_count: retries,
             route_trace_id: None,
@@ -2647,9 +2661,12 @@ fn enqueue_precommit_failure(
             admission_cost_usd,
         });
     }
-    if upstream_dispatched {
-        if let Some(admission) = meta.admission.take() {
-            let (usage, cost) = aggregate_admission_accounting(meta, None, None);
+    if let Some(admission) = meta.admission.take() {
+        if upstream_dispatched {
+            let (admission_usage, admission_cost) =
+                aggregate_admission_accounting(meta, None, None);
+            admission.reconcile(&admission_usage, admission_cost);
+        } else {
             admission.reconcile(&usage, cost);
         }
     }

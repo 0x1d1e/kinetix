@@ -20,10 +20,12 @@ account/provider (admin-only), the opaque Route id, the upstream request id, a
 | `usage_confidence` | `provider_reported` | The upstream reported complete input and output totals. |
 | | `estimated` | A count was derived rather than reported. |
 | | `unknown` | A required total is missing or unavailable (including partial reports). |
-| `cost_known` | `1` / `0` | Whether cost was computed from configured prices and complete canonical totals. |
+| | `not_dispatched` | No upstream request was dispatched; token counts and cost are known zero. |
+| `cost_known` | `1` / `0` | Whether cost is known from complete priced totals or because no request was dispatched. |
 
 Unknown token counts are **omitted** from client responses rather than coerced to
-zero. A spend total is never presented as complete when some usage is unpriced —
+zero. A request that failed before dispatch contributes known zero tokens and
+cost. A spend total is never presented as complete when some usage is unpriced —
 the overview/metrics also expose `unknown_usage_requests`, `estimated_usage_requests`,
 and `unknown_cost_requests`.
 
@@ -49,10 +51,12 @@ a conservative token allowance, and conservative priced spend before dispatch.
 Active reservations participate in later admission decisions immediately, so a
 concurrent burst cannot all observe the same stale counter. Complete provider
 usage reconciles the reservation after the request. If token usage is unknown,
-the live TPM ledger retains the conservative pre-dispatch estimate. After a
-restart, a persisted unknown token total fails closed for the rest of that
-60-second window because the estimate is not part of reported usage. Unknown
-token values remain unknown in reports; they are never counted as zero.
+the live TPM ledger retains the conservative estimate. After a restart, a
+persisted unknown token total fails closed for the rest of that 60-second
+window because the estimate is not part of reported usage. Failures before
+upstream dispatch reconcile RPM with known zero tokens and cost, both live and
+after restart. Unknown token values remain unknown in reports; they are never
+counted as zero.
 
 The in-memory ledger is seeded once from durable usage history. After that,
 usage-log writes are for reporting/accounting durability rather than admission

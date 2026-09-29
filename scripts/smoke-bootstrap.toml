@@ -43,6 +43,24 @@ tag = "partial-usage-budget"
 allowed_models = ["syn-openai-partial"]
 daily_budget = 1.0
 
+[[virtual_keys]]
+name = "Pre-dispatch RPM Key"
+key = "__PRE_DISPATCH_RPM_KEY__"
+owner = "smoke"
+tag = "pre-dispatch-rpm"
+allowed_models = ["syn-pre-dispatch"]
+rpm_limit = 1
+tpm_limit = 100000000
+
+[[virtual_keys]]
+name = "Pre-dispatch TPM Key"
+key = "__PRE_DISPATCH_TPM_KEY__"
+owner = "smoke"
+tag = "pre-dispatch-tpm"
+allowed_models = ["syn-pre-dispatch"]
+rpm_limit = 100000
+tpm_limit = 6000
+
 [[providers]]
 name = "Synth OpenAI"
 base_url = "http://127.0.0.1:9199/openai/v1"
@@ -207,6 +225,28 @@ capability_mode = "permissive"
   max_output_tokens = 8192
   capabilities = ["text"]
   prices = { input_per_1m = 100.0, output_per_1m = 100.0 }
+
+[[providers]]
+name = "Synth DNS Failure"
+base_url = "http://kinetix-smoke-no-dns.invalid/openai/v1"
+wire_format = "openai"
+auth_scheme = "bearer"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-dns-failure"
+  api_key = "smoke-dns-failure-key"
+  priority = 1
+  quota_type = "none"
+
+  [[providers.models]]
+  upstream_id = "syn-pre-dispatch"
+  display_name = "Synthetic Pre-dispatch DNS Failure"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 5000
+  capabilities = ["text"]
 
 [[providers]]
 name = "Synth Anthropic"

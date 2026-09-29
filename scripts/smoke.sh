@@ -22,6 +22,24 @@ WORK="$(mktemp -d)"
 DB="$WORK/kinetix.db"
 LOG="$WORK/kinetix.log"
 UP_LOG="$WORK/upstream.log"
+SMOKE_BOOTSTRAP="$WORK/smoke-bootstrap.toml"
+PRE_DISPATCH_RPM_KEY="sk-kinetix-$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+PRE_DISPATCH_TPM_KEY="sk-kinetix-$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+cp "$ROOT/scripts/smoke-bootstrap.toml" "$SMOKE_BOOTSTRAP" || { echo "failed to prepare smoke bootstrap"; exit 1; }
+PRE_DISPATCH_RPM_KEY="$PRE_DISPATCH_RPM_KEY" \
+PRE_DISPATCH_TPM_KEY="$PRE_DISPATCH_TPM_KEY" \
+python3 - "$SMOKE_BOOTSTRAP" <<'PY' || { echo "failed to prepare smoke bootstrap"; exit 1; }
+import os, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+text = path.read_text()
+for name in ("PRE_DISPATCH_RPM_KEY", "PRE_DISPATCH_TPM_KEY"):
+    placeholder = f"__{name}__"
+    if text.count(placeholder) != 1:
+        raise SystemExit(f"expected one {placeholder} placeholder")
+    text = text.replace(placeholder, os.environ[name])
+path.write_text(text)
+PY
 FAILURES=0
 
 cleanup() {
@@ -63,7 +81,7 @@ restart_kinetix() {
   KINETIX_DATA_DIR="$WORK" \
   KINETIX_ALLOW_PRIVATE_UPSTREAMS=true \
   KINETIX_ALLOW_INSECURE_TLS=true \
-  KINETIX_BOOTSTRAP_FILE="$ROOT/scripts/smoke-bootstrap.toml" \
+  KINETIX_BOOTSTRAP_FILE="$SMOKE_BOOTSTRAP" \
   KINETIX_HOME="$WORK" \
     ./target/release/kinetix serve >>"$LOG" 2>&1 &
   KPID=$!
@@ -90,7 +108,7 @@ KINETIX_ADMIN_TOKEN="$ADMIN_TOKEN" \
 KINETIX_DATA_DIR="$WORK" \
 KINETIX_ALLOW_PRIVATE_UPSTREAMS=true \
 KINETIX_ALLOW_INSECURE_TLS=true \
-KINETIX_BOOTSTRAP_FILE="$ROOT/scripts/smoke-bootstrap.toml" \
+KINETIX_BOOTSTRAP_FILE="$SMOKE_BOOTSTRAP" \
 KINETIX_HOME="$WORK" \
   ./target/release/kinetix serve >"$LOG" 2>&1 &
 KPID=$!
@@ -209,6 +227,49 @@ check "partial usage retains conservative admission cost" "$PARTIAL_USAGE_RESERV
 PARTIAL_USAGE_SECOND_CODE="$(curl -s --max-time 20 -o "$WORK/partial-usage-second" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $PARTIAL_USAGE_KEY" -H 'content-type: application/json' -d "$PARTIAL_USAGE_REQUEST")"
 check "partial usage consumes live budget reservation" "$PARTIAL_USAGE_SECOND_CODE" '429'
 
+# DNS failures happen before the upstream request is dispatched. They count as
+# a known zero-usage RPM attempt, not unknown TPM usage.
+PRE_DISPATCH_REQUEST='{"model":"syn-pre-dispatch","stream":false,"max_tokens":5000,"messages":[{"role":"user","content":"dns failure"}]}'
+PRE_DISPATCH_RPM_FIRST_CODE="$(curl -s --max-time 20 -o "$WORK/pre-dispatch-rpm-first" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $PRE_DISPATCH_RPM_KEY" -H 'content-type: application/json' -d "$PRE_DISPATCH_REQUEST")"
+check "pre-dispatch RPM request fails before dispatch" "$PRE_DISPATCH_RPM_FIRST_CODE" '502'
+PRE_DISPATCH_RPM_SECOND_CODE="$(curl -s --max-time 20 -o "$WORK/pre-dispatch-rpm-second" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $PRE_DISPATCH_RPM_KEY" -H 'content-type: application/json' -d "$PRE_DISPATCH_REQUEST")"
+check "pre-dispatch failure consumes live RPM slot" "$PRE_DISPATCH_RPM_SECOND_CODE" '429'
+for _ in $(seq 1 50); do
+  PRE_DISPATCH_RPM_USAGE="$(curl -s "$BASE/v1/usage" -H "authorization: Bearer $PRE_DISPATCH_RPM_KEY")"
+  if python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["usage"]["daily"]["requests"] >= 1 else 1)' <<<"$PRE_DISPATCH_RPM_USAGE"; then
+    break
+  fi
+  sleep 0.1
+done
+check "pre-dispatch request records zero input tokens" "$PRE_DISPATCH_RPM_USAGE" '"input_tokens":0'
+check "pre-dispatch request records zero output tokens" "$PRE_DISPATCH_RPM_USAGE" '"output_tokens":0'
+check "pre-dispatch zero cost is known" "$PRE_DISPATCH_RPM_USAGE" '"unknown_cost_requests":0'
+check "pre-dispatch zero usage is not unknown" "$PRE_DISPATCH_RPM_USAGE" '"unknown_usage_requests":0'
+PRE_DISPATCH_DB_ROW="$(python3 - "$DB" <<'PY'
+import json, sqlite3, sys
+row = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT input_tokens, output_tokens, cost_usd, cost_known, usage_confidence FROM usage_logs WHERE key_name = ? ORDER BY ts DESC LIMIT 1",
+    ("Pre-dispatch RPM Key",),
+).fetchone()
+print(json.dumps(row))
+PY
+)"
+check "pre-dispatch failure persists known zero usage and cost" "$PRE_DISPATCH_DB_ROW" '[0, 0, 0.0, 1, "not_dispatched"]'
+
+PRE_DISPATCH_TPM_FIRST_CODE="$(curl -s --max-time 20 -o "$WORK/pre-dispatch-tpm-first" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $PRE_DISPATCH_TPM_KEY" -H 'content-type: application/json' -d "$PRE_DISPATCH_REQUEST")"
+check "pre-dispatch TPM request fails before dispatch" "$PRE_DISPATCH_TPM_FIRST_CODE" '502'
+PRE_DISPATCH_TPM_SECOND_CODE="$(curl -s --max-time 20 -o "$WORK/pre-dispatch-tpm-second" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $PRE_DISPATCH_TPM_KEY" -H 'content-type: application/json' -d "$PRE_DISPATCH_REQUEST")"
+check "zero-token pre-dispatch failure leaves live TPM capacity" "$PRE_DISPATCH_TPM_SECOND_CODE" '502'
+for _ in $(seq 1 50); do
+  PRE_DISPATCH_TPM_USAGE="$(curl -s "$BASE/v1/usage" -H "authorization: Bearer $PRE_DISPATCH_TPM_KEY")"
+  if python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["usage"]["daily"]["requests"] >= 2 else 1)' <<<"$PRE_DISPATCH_TPM_USAGE"; then
+    break
+  fi
+  sleep 0.1
+done
+check "pre-dispatch TPM records zero tokens" "$PRE_DISPATCH_TPM_USAGE" '"input_tokens":0'
+check "pre-dispatch TPM rows remain known" "$PRE_DISPATCH_TPM_USAGE" '"unknown_usage_requests":0'
+
 restart_kinetix
 check "healthz after restart" "$(curl -s "$BASE/healthz")" '"data_plane":"serving"'
 FAIL_RPM_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/failure-rpm-after-restart" -w '%{http_code}' \
@@ -220,6 +281,10 @@ FAIL_BUDGET_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/failure-budget-after
 check "failed request keeps budget reservation after restart" "$FAIL_BUDGET_RESTART_CODE" '429'
 PARTIAL_USAGE_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/partial-usage-after-restart" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $PARTIAL_USAGE_KEY" -H 'content-type: application/json' -d "$PARTIAL_USAGE_REQUEST")"
 check "partial usage keeps budget reservation after restart" "$PARTIAL_USAGE_RESTART_CODE" '429'
+PRE_DISPATCH_RPM_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/pre-dispatch-rpm-after-restart" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $PRE_DISPATCH_RPM_KEY" -H 'content-type: application/json' -d "$PRE_DISPATCH_REQUEST")"
+check "pre-dispatch failure consumes RPM after restart" "$PRE_DISPATCH_RPM_RESTART_CODE" '429'
+PRE_DISPATCH_TPM_RESTART_CODE="$(curl -s --max-time 20 -o "$WORK/pre-dispatch-tpm-after-restart" -w '%{http_code}' -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $PRE_DISPATCH_TPM_KEY" -H 'content-type: application/json' -d "$PRE_DISPATCH_REQUEST")"
+check "zero-token pre-dispatch failure preserves TPM capacity after restart" "$PRE_DISPATCH_TPM_RESTART_CODE" '502'
 
 # translation (OpenAI inbound -> Gemini outbound)
 TRANSL="$(curl -s -N --max-time 20 -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"model":"syn-gemini-3","stream":true,"messages":[{"role":"user","content":"hi"}]}')"
