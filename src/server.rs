@@ -947,8 +947,13 @@ mod tests {
                 &pool,
                 &account_id,
                 status,
-                Some(reset_at),
-                Some(reset_at),
+                if status == "cooldown" {
+                    "rate_limited"
+                } else {
+                    "account_quota_exhausted"
+                },
+                (status == "cooldown").then_some(reset_at),
+                (status == "exhausted").then_some(reset_at),
                 Some("runtime-owned failure"),
             )
             .await
