@@ -253,6 +253,21 @@ impl Adapter for OpenAiAdapter {
         ctx: &UpstreamContext<'_>,
         req: &InternalRequest,
     ) -> Result<Value, UpstreamFailure> {
+        if req
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .any(|part| matches!(part, Part::RedactedThinking { .. }))
+        {
+            return Err(UpstreamFailure {
+                kind: FailureKind::BadRequest,
+                status: None,
+                retry_after_secs: None,
+                message: "redacted Anthropic thinking state cannot be translated to OpenAI input"
+                    .into(),
+                quota_reset_at: None,
+            });
+        }
         let mut body = serde_json::Map::new();
         body.insert("model".to_string(), json!(ctx.model.upstream_id));
         body.insert("messages".to_string(), json!(Self::build_messages(req)));
@@ -526,6 +541,7 @@ fn openai_events(v: &Value) -> Vec<StreamEvent> {
                 {
                     if !reasoning.is_empty() {
                         events.push(StreamEvent::ThinkingDelta {
+                            block_index: None,
                             text: reasoning.to_string(),
                             signature: None,
                         });
@@ -694,6 +710,31 @@ mod tests {
             extra: Default::default(),
             raw_body: None,
         }
+    }
+
+    #[test]
+    fn redacted_anthropic_thinking_is_not_silently_translated_to_openai() {
+        let p = provider();
+        let m = model();
+        let ctx = UpstreamContext {
+            provider: &p,
+            model: &m,
+            account_id: None,
+            credential: "k".into(),
+        };
+        let mut req = base_request();
+        req.messages.push(crate::types::Message {
+            role: crate::types::Role::Assistant,
+            parts: vec![Part::RedactedThinking {
+                data: "opaque".into(),
+            }],
+        });
+
+        let failure = OpenAiAdapter.build_body(&ctx, &req).unwrap_err();
+        assert_eq!(failure.kind, FailureKind::BadRequest);
+        assert!(failure
+            .message
+            .contains("redacted Anthropic thinking state"));
     }
 
     #[test]

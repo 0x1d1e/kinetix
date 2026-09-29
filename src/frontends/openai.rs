@@ -484,12 +484,14 @@ impl OpenAiEncoder {
                 self.ensure_role(&mut out);
                 out.push(self.chunk(json!({ "content": t }), None));
             }
-            StreamEvent::ThinkingDelta { text, .. } => {
+            StreamEvent::ThinkingBlockStart { thinking, .. }
+            | StreamEvent::ThinkingDelta { text: thinking, .. } => {
                 self.ensure_role(&mut out);
-                if !text.is_empty() {
-                    out.push(self.chunk(json!({ "reasoning_content": text }), None));
+                if !thinking.is_empty() {
+                    out.push(self.chunk(json!({ "reasoning_content": thinking }), None));
                 }
             }
+            StreamEvent::ThinkingBlockStop { .. } | StreamEvent::RedactedThinking { .. } => {}
             StreamEvent::ToolCallStart {
                 index, id, name, ..
             } => {

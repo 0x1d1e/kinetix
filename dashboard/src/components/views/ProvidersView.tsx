@@ -377,6 +377,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [capReasoning, setCapReasoning] = useState<boolean | undefined>(false);
   const [capTools, setCapTools] = useState<boolean | undefined>(true);
   const [capStructuredOutput, setCapStructuredOutput] = useState<boolean | undefined>(false);
+  const [modelContinuationFamilies, setModelContinuationFamilies] = useState('');
   const [modelThinkingOff, setModelThinkingOff] = useState('');
   const [modelThinkingMinimal, setModelThinkingMinimal] = useState('');
   const [modelThinkingLow, setModelThinkingLow] = useState('');
@@ -896,6 +897,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setCapReasoning(m.capabilities.reasoning);
     setCapTools(m.capabilities.toolCalling);
     setCapStructuredOutput(m.capabilities.structuredOutput);
+    setModelContinuationFamilies((m.capabilities.continuationFamilies ?? []).join('\n'));
     const { off, minimal, low, medium, high, xhigh, max, ...extraLevels } = m.thinkingMap.levels;
     setModelThinkingOff(thinkingValueToInput(off));
     setModelThinkingMinimal(thinkingValueToInput(minimal));
@@ -929,6 +931,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     setCapReasoning(false);
     setCapTools(true);
     setCapStructuredOutput(false);
+    setModelContinuationFamilies('');
     setModelThinkingOff('');
     setModelThinkingMinimal('');
     setModelThinkingLow('');
@@ -945,6 +948,16 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
 
   const normalizedPrice = (value: number | null): number | null =>
     typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+
+  const continuationFamilyList = () =>
+    Array.from(
+      new Set(
+        modelContinuationFamilies
+          .split('\n')
+          .map((family) => family.trim())
+          .filter(Boolean),
+      ),
+    );
 
   const handleCreateCustomModel = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -972,6 +985,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         toolCalling: capTools,
         audio: editingModelId ? editingModel?.capabilities.audio : false,
         structuredOutput: capStructuredOutput,
+        continuationFamilies: continuationFamilyList(),
       },
       prices: {
         inputPer1M: normalizedPrice(modelInputPrice),
@@ -1014,6 +1028,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         tool_calling: capTools,
         audio: editingModelId ? editingModel?.capabilities.audio : false,
         structured_output: capStructuredOutput,
+        continuation_families: continuationFamilyList(),
       },
       prices: {
         input_per_1m: normalizedPrice(modelInputPrice),
@@ -2414,6 +2429,33 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                       />
                     </div>
                   ))}
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="model-continuation-families"
+                    className="block text-sm font-heading font-bold text-[var(--ink)] mb-1"
+                  >
+                    Continuation Compatibility Families
+                  </label>
+                  <textarea
+                    id="model-continuation-families"
+                    aria-describedby="model-continuation-families-hint"
+                    rows={2}
+                    value={modelContinuationFamilies}
+                    onChange={(e) => setModelContinuationFamilies(e.target.value)}
+                    placeholder="e.g. anthropic_thinking_signature:v1"
+                    className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-sm font-mono sketch-shadow-sm focus:outline-none"
+                    style={{ borderRadius: DESIGN_TOKENS.radii.wobblyMd }}
+                  />
+                  <p
+                    id="model-continuation-families-hint"
+                    className="text-xs font-body text-[var(--ink)]/60 mt-1"
+                  >
+                    One operator-verified family per line. Anthropic thinking history
+                    is preserved on the same provider and upstream model, or when
+                    both models share a family.
+                  </p>
                 </div>
 
                 {/* Capabilities */}

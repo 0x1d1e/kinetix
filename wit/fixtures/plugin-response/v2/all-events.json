@@ -1,0 +1,65 @@
+{
+  "schema": "kinetix.plugin.response",
+  "schema_version": 2,
+  "events": [
+    {
+      "type": "start",
+      "upstream_request_id": "req_1"
+    },
+    {
+      "type": "thinking_delta",
+      "block_index": null,
+      "text": "hmm",
+      "signature": "sig"
+    },
+    {
+      "type": "thinking_block_start",
+      "index": 7,
+      "thinking": "initial thought",
+      "signature": null
+    },
+    {
+      "type": "thinking_delta",
+      "block_index": 7,
+      "text": "continued thought",
+      "signature": "sig-v2"
+    },
+    {
+      "type": "thinking_block_stop",
+      "index": 7
+    },
+    {
+      "type": "redacted_thinking",
+      "index": 8,
+      "data": "opaque-v2"
+    },
+    {
+      "type": "text_delta",
+      "text": "hi"
+    },
+    {
+      "type": "tool_call_start",
+      "index": 2,
+      "id": "call_1",
+      "name": "fn",
+      "signature": null
+    },
+    {
+      "type": "tool_call_args_delta",
+      "index": 2,
+      "args": "{\"path\":\"src/main.rs\"}"
+    },
+    {
+      "type": "usage",
+      "input": 10,
+      "output": 4,
+      "cached": 2,
+      "cache_write": 1,
+      "thinking": 2
+    },
+    {
+      "type": "finish",
+      "reason": "tool_calls"
+    }
+  ]
+}

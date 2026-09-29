@@ -185,7 +185,7 @@ fn nested_translation_issues(obj: &serde_json::Map<String, Value>) -> Vec<String
                         let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
                         let path = format!("messages[{message_index}].content[{block_index}]");
                         match kind {
-                            "text" | "tool_use" | "thinking" => {}
+                            "text" | "tool_use" | "thinking" | "redacted_thinking" => {}
                             "image" => {
                                 let source_type = block
                                     .get("source")
@@ -364,6 +364,14 @@ fn decode_content(content: Option<&Value>) -> Vec<Part> {
                             .map(String::from);
                         out.push(Part::Thinking { text, signature });
                     }
+                    "redacted_thinking" => {
+                        let data = b
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        out.push(Part::RedactedThinking { data });
+                    }
                     _ => {}
                 }
             }
@@ -429,6 +437,7 @@ pub struct AnthropicEncoder {
     started: bool,
     next_index: u32,
     open_block: Option<(u32, BlockState)>,
+    thinking_source_index: Option<u32>,
     /// internal tool index -> (anthropic block index, tool id, name)
     tool_blocks: std::collections::HashMap<u32, (u32, String, String)>,
     usage: crate::types::TokenUsage,
@@ -443,6 +452,7 @@ impl AnthropicEncoder {
             started: false,
             next_index: 0,
             open_block: None,
+            thinking_source_index: None,
             tool_blocks: Default::default(),
             usage: Default::default(),
             finish: None,
@@ -476,6 +486,7 @@ impl AnthropicEncoder {
     }
 
     fn close_open_block(&mut self, out: &mut Vec<Bytes>) {
+        self.thinking_source_index = None;
         if let Some((idx, _)) = self.open_block.take() {
             let frame = json!({ "type": "content_block_stop", "index": idx });
             out.push(sse_frame(Some("content_block_stop"), &frame.to_string()));
@@ -514,6 +525,26 @@ impl AnthropicEncoder {
         self.open_block = Some((idx, BlockState::Thinking));
     }
 
+    fn emit_thinking_delta(&self, out: &mut Vec<Bytes>, text: String, signature: Option<String>) {
+        let idx = self.open_block.as_ref().map(|(i, _)| *i).unwrap_or(0);
+        if !text.is_empty() {
+            let frame = json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": { "type": "thinking_delta", "thinking": text }
+            });
+            out.push(sse_frame(Some("content_block_delta"), &frame.to_string()));
+        }
+        if let Some(signature) = signature.filter(|signature| !signature.is_empty()) {
+            let frame = json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": { "type": "signature_delta", "signature": signature }
+            });
+            out.push(sse_frame(Some("content_block_delta"), &frame.to_string()));
+        }
+    }
+
     fn open_tool_block(&mut self, out: &mut Vec<Bytes>, index: u32, id: &str, name: &str) {
         // Tool calls use their own blocks; close any open text/thinking block.
         self.close_open_block(out);
@@ -547,28 +578,44 @@ impl AnthropicEncoder {
                 });
                 out.push(sse_frame(Some("content_block_delta"), &frame.to_string()));
             }
-            StreamEvent::ThinkingDelta { text, signature } => {
+            StreamEvent::ThinkingBlockStart {
+                index,
+                thinking,
+                signature,
+            } => {
+                self.emit_start(&mut out);
+                if self.thinking_source_index != Some(index) {
+                    self.close_open_block(&mut out);
+                    self.open_thinking_block(&mut out);
+                    self.thinking_source_index = Some(index);
+                }
+                self.emit_thinking_delta(&mut out, thinking, signature);
+            }
+            StreamEvent::ThinkingDelta {
+                text, signature, ..
+            } => {
                 self.emit_start(&mut out);
                 self.open_thinking_block(&mut out);
-                let idx = self.open_block.as_ref().map(|(i, _)| *i).unwrap_or(0);
-                if !text.is_empty() {
-                    let frame = json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": { "type": "thinking_delta", "thinking": text }
-                    });
-                    out.push(sse_frame(Some("content_block_delta"), &frame.to_string()));
+                self.emit_thinking_delta(&mut out, text, signature);
+            }
+            StreamEvent::ThinkingBlockStop { index } => {
+                if self.thinking_source_index == Some(index) {
+                    self.close_open_block(&mut out);
                 }
-                if let Some(sig) = signature {
-                    if !sig.is_empty() {
-                        let frame = json!({
-                            "type": "content_block_delta",
-                            "index": idx,
-                            "delta": { "type": "signature_delta", "signature": sig }
-                        });
-                        out.push(sse_frame(Some("content_block_delta"), &frame.to_string()));
-                    }
-                }
+            }
+            StreamEvent::RedactedThinking { data, .. } => {
+                self.emit_start(&mut out);
+                self.close_open_block(&mut out);
+                let idx = self.next_index;
+                self.next_index += 1;
+                let start = json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": { "type": "redacted_thinking", "data": data }
+                });
+                out.push(sse_frame(Some("content_block_start"), &start.to_string()));
+                let stop = json!({ "type": "content_block_stop", "index": idx });
+                out.push(sse_frame(Some("content_block_stop"), &stop.to_string()));
             }
             StreamEvent::ToolCallStart {
                 index, id, name, ..

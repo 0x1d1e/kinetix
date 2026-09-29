@@ -86,6 +86,7 @@ export interface ModelCapability {
   toolCalling?: boolean;
   audio?: boolean;
   structuredOutput?: boolean;
+  continuationFamilies?: string[];
 }
 
 export interface ModelPrice {

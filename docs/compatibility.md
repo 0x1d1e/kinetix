@@ -269,16 +269,31 @@ not a Kinetix bug. Raise `max_tokens` or lower the thinking level.
   represent a `thoughtSignature`, Kinetix also persists each function-call signature
   server-side keyed by the client-visible tool-call id and replays it on the next
   turn; see [Opaque provider state](#opaque-provider-state) below.
-- **OpenAI-compatible:** same-format passthrough forwards the upstream's frames
-  verbatim, preserving unknown/vendor fields — e.g. vendor `cost` or
-  `reasoning_details` fields Kinetix itself never produces.
+- **OpenAI-compatible and Anthropic:** same-format SSE passthrough forwards
+  event fields and payloads without JSON re-encoding, preserving unknown/vendor
+  fields such as `cost`, `reasoning_details`, `thinking_delta`, and
+  `signature_delta`. It is not byte-transparent: Kinetix normalizes line
+  endings to LF and reconstructs frame delimiters.
 - **Anthropic:** inbound `anthropic-version` and `anthropic-beta` are forwarded
   to Anthropic upstreams; Kinetix does not invent hidden version/beta defaults.
 
 ## Opaque provider state
 
-Some providers attach state to a tool call that the client protocol cannot
-represent. Gemini's `thoughtSignature` is the canonical example: the model
+Some providers attach state to a tool call or reasoning block that clients
+must replay unchanged. Anthropic `thinking` signatures and `redacted_thinking`
+blocks are represented canonically. They can be replayed to the same provider
+and upstream model, or across other targets whose
+`capabilities.continuation_families` explicitly share an operator-verified
+family. Kinetix does not infer continuation compatibility from provider, wire
+format, or upstream model name. For other targets without a matching family,
+the Route's `reject` or `strip_with_warning` policy applies.
+
+For example, configure `anthropic_thinking_signature:v1` on both models only
+when both upstream targets accept the same historical thinking and redacted
+thinking blocks unchanged. Family names are operator assertions, not automatic
+provider capability detection.
+
+Gemini's `thoughtSignature` is the canonical hidden-state example: the model
 returns it beside a `functionCall`, and requires it back on the *same*
 historical function-call part when the conversation is continued. An OpenAI
 Chat Completions or Anthropic Messages client never sees it and therefore never

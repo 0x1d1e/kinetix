@@ -7446,6 +7446,43 @@ fn default_true() -> bool {
     true
 }
 
+const MAX_CONTINUATION_FAMILIES: usize = 32;
+const MAX_CONTINUATION_FAMILY_LENGTH: usize = 128;
+
+fn validate_continuation_families(value: &Value) -> Result<Vec<String>, ApiError> {
+    let Some(families) = value.get("continuation_families") else {
+        return Ok(Vec::new());
+    };
+    let families = families.as_array().ok_or_else(|| {
+        ApiError::bad("capabilities.continuation_families must be an array of strings")
+    })?;
+    if families.len() > MAX_CONTINUATION_FAMILIES {
+        return Err(ApiError::bad(format!(
+            "capabilities.continuation_families may contain at most {MAX_CONTINUATION_FAMILIES} values"
+        )));
+    }
+
+    let mut normalized = Vec::with_capacity(families.len());
+    for family in families {
+        let family = family.as_str().ok_or_else(|| {
+            ApiError::bad("capabilities.continuation_families must contain only strings")
+        })?;
+        let family = family.trim();
+        if family.is_empty()
+            || family.len() > MAX_CONTINUATION_FAMILY_LENGTH
+            || family.chars().any(char::is_control)
+        {
+            return Err(ApiError::bad(
+                "continuation family names must be non-empty, at most 128 bytes, and contain no control characters",
+            ));
+        }
+        if !normalized.iter().any(|existing| existing == family) {
+            normalized.push(family.to_string());
+        }
+    }
+    Ok(normalized)
+}
+
 fn normalize_model_capabilities(value: &Value) -> Value {
     let Some(input) = value.as_object() else {
         return json!({});
@@ -7473,7 +7510,42 @@ fn normalize_model_capabilities(value: &Value) -> Value {
             out.insert(canonical.to_string(), Value::Bool(value));
         }
     }
+    if let Ok(families) = validate_continuation_families(value) {
+        if !families.is_empty() {
+            out.insert("continuation_families".into(), json!(families));
+        }
+    }
     Value::Object(out)
+}
+
+#[cfg(test)]
+mod continuation_family_tests {
+    use super::*;
+
+    #[test]
+    fn continuation_families_are_trimmed_and_deduplicated() {
+        let capabilities = json!({"continuation_families": [" example:v1 ", "example:v1"]});
+        assert_eq!(
+            validate_continuation_families(&capabilities).unwrap(),
+            vec!["example:v1"]
+        );
+        assert_eq!(
+            normalize_model_capabilities(&capabilities)["continuation_families"],
+            json!(["example:v1"])
+        );
+    }
+
+    #[test]
+    fn invalid_continuation_families_are_rejected() {
+        for capabilities in [
+            json!({"continuation_families": "example:v1"}),
+            json!({"continuation_families": [" "]}),
+            json!({"continuation_families": [1]}),
+            json!({"continuation_families": ["invalid\nfamily"]}),
+        ] {
+            assert!(validate_continuation_families(&capabilities).is_err());
+        }
+    }
 }
 
 fn validate_thinking_map(thinking_map: &ThinkingMap) -> Result<(), ApiError> {
@@ -7532,6 +7604,7 @@ pub async fn create_model(
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
     let transport_override =
         validate_model_transport_override(&provider, body.transport_override.as_deref())?;
+    validate_continuation_families(&body.capabilities)?;
     let caps = normalize_model_capabilities(&body.capabilities);
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     validate_thinking_map(&body.thinking_map)?;
@@ -7676,6 +7749,7 @@ pub async fn update_model(
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
     let transport_override =
         validate_model_transport_override(&provider, body.transport_override.as_deref())?;
+    validate_continuation_families(&body.capabilities)?;
     let caps = normalize_model_capabilities(&body.capabilities);
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     let existing_discovery = discovery_object(&model);
@@ -8488,6 +8562,9 @@ pub async fn validate_model_edit(
         &body.parameters,
     );
     let mut validation_problems = body.thinking_map.validation_errors();
+    if let Err(error) = validate_continuation_families(&body.capabilities) {
+        validation_problems.push(error.1);
+    }
     if let Some(transport) = body
         .transport_override
         .as_deref()
@@ -10422,6 +10499,7 @@ pub async fn import_config(
         let Some(pid) = provider_ids.get(provider) else {
             continue;
         };
+        validate_continuation_families(&m["capabilities"])?;
         let caps = normalize_model_capabilities(&m["capabilities"]);
         let prices: Prices = serde_json::from_value(m["prices"].clone()).unwrap_or_default();
         let parameters = m["parameters"].clone();

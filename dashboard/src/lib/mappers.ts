@@ -130,6 +130,11 @@ export function mapModel(j: any): ModelConfig {
       toolCalling: optionalBool(c.tool_calling),
       audio: optionalBool(c.audio),
       structuredOutput: optionalBool(c.structured_output),
+      continuationFamilies: Array.isArray(c.continuation_families)
+        ? c.continuation_families.filter(
+            (family: unknown): family is string => typeof family === 'string',
+          )
+        : [],
     },
     prices,
     parameters: (j.parameters && typeof j.parameters === 'object'

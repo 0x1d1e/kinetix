@@ -71,7 +71,7 @@ impl OpenAiResponsesAdapter {
                         "tool state must be serialized as Responses function-call input items",
                     ));
                 }
-                Part::Thinking { .. } => {
+                Part::Thinking { .. } | Part::RedactedThinking { .. } => {
                     return Err(Self::bad_request(
                         "provider reasoning state is not supported as Responses input",
                     ));
@@ -90,7 +90,7 @@ impl OpenAiResponsesAdapter {
                     for part in &message.parts {
                         match part {
                             Part::Text(text) => texts.push(text.as_str()),
-                            Part::Thinking { .. } => {
+                            Part::Thinking { .. } | Part::RedactedThinking { .. } => {
                                 return Err(Self::bad_request(
                                     "provider reasoning state is not supported as Responses input",
                                 ));
@@ -423,6 +423,7 @@ impl OpenAiResponsesAdapter {
                             if let Some(text) = part.get("text").and_then(Value::as_str) {
                                 if !text.is_empty() {
                                     events.push(StreamEvent::ThinkingDelta {
+                                        block_index: None,
                                         text: text.to_string(),
                                         signature: None,
                                     });
@@ -631,6 +632,7 @@ impl Adapter for OpenAiResponsesAdapter {
                 .filter(|delta| !delta.is_empty())
                 .map(|delta| {
                     vec![StreamEvent::ThinkingDelta {
+                        block_index: None,
                         text: delta.to_string(),
                         signature: None,
                     }]

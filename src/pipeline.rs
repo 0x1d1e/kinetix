@@ -6,6 +6,7 @@
 //! the commit point (the first client response bytes). A failure after commit
 //! terminates the stream with a format-correct error and is never spliced.
 
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -556,7 +557,7 @@ pub async fn run(
         });
     }
 
-    let (mut targets, route) = match resolved {
+    let (mut targets, route, route_target_origins) = match resolved {
         Resolved::Single {
             provider_id,
             model_id,
@@ -585,7 +586,7 @@ pub async fn run(
                     param_overrides: Value::Null,
                 })
                 .collect();
-            (targets, None)
+            (targets, None, Vec::new())
         }
         Resolved::Route { route, targets } => {
             meta.route_id = Some(route.id.clone());
@@ -602,6 +603,12 @@ pub async fn run(
             } else {
                 order_route_targets(state, &route, targets).await.targets
             };
+            // Retain route-wide producer provenance before request-specific
+            // predicates and other eligibility filters remove candidates.
+            let route_target_origins = ordered
+                .iter()
+                .map(|target| (target_key(&route, target), continuation_origin(target)))
+                .collect::<Vec<_>>();
             // Read-only target hook (§6.6): observe each candidate target before
             // eligibility filtering. Fire-and-forget; never blocks routing.
             if let Some(manager) = state.plugin_manager().cloned() {
@@ -673,7 +680,7 @@ pub async fn run(
                     kept.push(t);
                 }
             }
-            (kept, Some(route))
+            (kept, Some(route), route_target_origins)
         }
     };
 
@@ -777,13 +784,26 @@ pub async fn run(
     let session_origin_key = session
         .as_deref()
         .and_then(|session| state.sticky_lookup(session, STICKY_TTL));
-    let session_origin_provider = route.as_ref().and_then(|route| {
-        session_origin_key.as_ref().and_then(|key| {
-            targets
-                .iter()
-                .find(|target| target_key(route, target) == *key)
-                .map(|target| target.provider.id.clone())
-        })
+    let session_origin = session_origin_key
+        .as_ref()
+        .and_then(|key| resolve_session_origin(key, &route_target_origins));
+    let possible_history_origins = if route.is_some() {
+        route_target_origins
+            .iter()
+            .map(|(_, origin)| origin.clone())
+            .collect::<Vec<_>>()
+    } else {
+        targets.iter().map(continuation_origin).collect::<Vec<_>>()
+    };
+    let initial_origin = targets.first().map(continuation_origin);
+    let session_origin_unknown = session_origin_key.is_some() && session_origin.is_none();
+    // Anthropic continuation state was produced by successful conversation
+    // history, not by any fallback candidate dispatched during this request.
+    // Without a session, a multi-target Route has no known producer; only
+    // preserve reasoning when every possible producer is explicitly compatible.
+    let history_origin = session_origin.as_ref().or_else(|| {
+        (!session_origin_unknown && possible_history_origins.len() == 1)
+            .then(|| &possible_history_origins[0])
     });
 
     // Sticky routing and prompt-cache affinity share the same bounded session
@@ -813,7 +833,7 @@ pub async fn run(
     let mut last_error: Option<ProxyError> = None;
     let mut all_accounts: Vec<db::AccountRow> = Vec::new();
     let mut attempts_done = 0usize;
-    let mut previous_provider_id: Option<String> = None;
+    let mut previous_origin: Option<ContinuationOrigin> = None;
     let mut skip_logical_target: Option<String> = None;
     let deadline = started + MAX_PRE_COMMIT_DEADLINE;
 
@@ -1034,21 +1054,40 @@ pub async fn run(
         // Portability applies on cross-format translation, on fallback across
         // providers, and on the first attempt when session provenance shows the
         // previous turn came from a different provider.
-        let cross_provider = previous_provider_id
-            .as_deref()
+        let attempt_origin = previous_origin
+            .as_ref()
             .or(if attempts_done == 0 {
-                session_origin_provider.as_deref()
+                session_origin.as_ref()
             } else {
                 None
             })
-            .map(|id| id != target.provider.id)
-            .unwrap_or(false);
+            .or(initial_origin.as_ref());
+        let cross_provider =
+            attempt_origin.is_some_and(|origin| origin.provider_id != target.provider.id);
         let cross_format = !passthrough::is_transport_passthrough(format, &profile.transport);
 
-        // Inline opaque state is evaluated *before* hydration so a signature we
-        // are about to restore for a compatible target is never mistaken for
-        // non-portable client state and stripped.
-        let inline_opaque = request_has_opaque_state(&target_req);
+        // Anthropic continuation is safe for the same provider/model, or when
+        // both models explicitly share an operator-declared continuation family.
+        // Wire-format and upstream model-name equality alone are insufficient.
+        let history_is_compatible = !session_origin_unknown
+            && history_origin.map_or_else(
+                || {
+                    possible_history_origins
+                        .iter()
+                        .all(|origin| anthropic_continuation_is_compatible(Some(origin), target))
+                },
+                |origin| anthropic_continuation_is_compatible(Some(origin), target),
+            );
+        let preserves_anthropic_thinking = format == FrontendFormat::Anthropic
+            && adapter.wire_format() == "anthropic"
+            && history_is_compatible;
+        // Evaluate inline opaque state before hydration so a signature about to
+        // be restored for a compatible target is not mistaken for client state.
+        let inline_opaque = request_has_nonportable_inline_state(
+            &target_req,
+            preserves_anthropic_thinking,
+            cross_provider || cross_format,
+        );
 
         // Resolve host-owned stored continuation state for this candidate
         // target. Compatible signatures are restored only after portability is
@@ -1071,7 +1110,7 @@ pub async fn run(
         // an OpenAI target with no session provenance). Without this, the
         // Route's reject/strip_with_warning policy would be bypassed and the
         // state silently dropped.
-        if cross_provider || cross_format || opaque_report.nonportable() {
+        if cross_provider || cross_format || inline_opaque || opaque_report.nonportable() {
             // A target that cannot carry the real stored state may still have a
             // documented placeholder for it (e.g. Gemini's cross-model
             // sentinel). The adapter owns that wire detail; the pipeline only
@@ -1085,6 +1124,7 @@ pub async fn run(
                     inline_opaque,
                     &opaque_report,
                     placeholder,
+                    preserves_anthropic_thinking,
                     &mut trace,
                 ) {
                     return Err(finish_policy_rejection(
@@ -1105,8 +1145,12 @@ pub async fn run(
                 // substitute for the stored state it cannot carry (e.g. Gemini's
                 // cross-model function-call placeholder). Translate with it
                 // rather than failing the request; never strip silently.
-                let placed =
-                    strip_nonportable_state(&mut target_req, &opaque_report, Some(placeholder));
+                let placed = strip_nonportable_state(
+                    &mut target_req,
+                    &opaque_report,
+                    Some(placeholder),
+                    preserves_anthropic_thinking,
+                );
                 let warning = portability_warning(target, placed);
                 trace.warn(warning.clone());
                 tracing::warn!("{}", warning);
@@ -1341,7 +1385,7 @@ pub async fn run(
 
         let attempt_started = Instant::now();
         attempts_done += 1;
-        previous_provider_id = Some(target.provider.id.clone());
+        previous_origin = Some(continuation_origin(target));
         state.live.set_fallback_hops(
             &meta.request_id,
             (attempts_done - 1) as u32,
@@ -1894,6 +1938,36 @@ pub async fn run(
 
 fn target_key(route: &db::RouteRow, t: &ResolvedTarget) -> String {
     format!("{}|{}|{}", route.id, t.account.id, t.model.id)
+}
+
+fn target_route_model_identity(key: &str) -> Option<(&str, &str)> {
+    let (route_id, remainder) = key.split_once('|')?;
+    let (_, model_id) = remainder.split_once('|')?;
+    Some((route_id, model_id))
+}
+
+fn resolve_session_origin(
+    sticky_key: &str,
+    route_target_origins: &[(String, ContinuationOrigin)],
+) -> Option<ContinuationOrigin> {
+    if let Some((_, origin)) = route_target_origins
+        .iter()
+        .find(|(candidate_key, _)| candidate_key == sticky_key)
+    {
+        return Some(origin.clone());
+    }
+
+    // Account identity is used for affinity, but an account rotation does not
+    // change who produced continuation state when the Route/model still resolves
+    // unambiguously to the same provider, upstream model, and family metadata.
+    let identity = target_route_model_identity(sticky_key)?;
+    let mut candidates = route_target_origins
+        .iter()
+        .filter(|(candidate_key, _)| target_route_model_identity(candidate_key) == Some(identity));
+    let (_, origin) = candidates.next()?;
+    candidates
+        .all(|(_, candidate)| candidate == origin)
+        .then(|| origin.clone())
 }
 
 fn traffic_key(t: &ResolvedTarget) -> crate::upstream_traffic::TargetKey {
@@ -3433,22 +3507,76 @@ async fn order_route_targets(
 /// * `strip_with_warning` — remove the non-portable state, record it in the
 ///   Route Trace, and emit a client-visible warning. Silent stripping is
 ///   forbidden.
-fn request_has_opaque_state(req: &InternalRequest) -> bool {
+#[derive(Clone, PartialEq, Eq)]
+struct ContinuationOrigin {
+    provider_id: String,
+    upstream_model_id: String,
+    families: HashSet<String>,
+}
+
+fn continuation_origin(target: &ResolvedTarget) -> ContinuationOrigin {
+    let capabilities =
+        serde_json::from_str::<Value>(&target.model.capabilities).unwrap_or(Value::Null);
+    let families = capabilities
+        .get("continuation_families")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|family| !family.is_empty())
+        .map(str::to_owned)
+        .collect();
+    ContinuationOrigin {
+        provider_id: target.provider.id.clone(),
+        upstream_model_id: target.model.upstream_id.clone(),
+        families,
+    }
+}
+
+fn anthropic_continuation_is_compatible(
+    source: Option<&ContinuationOrigin>,
+    target: &ResolvedTarget,
+) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    if source.provider_id == target.provider.id
+        && source.upstream_model_id == target.model.upstream_id
+    {
+        return true;
+    }
+
+    let target_families = continuation_origin(target).families;
+    source
+        .families
+        .iter()
+        .any(|family| target_families.contains(family))
+}
+
+fn request_has_nonportable_inline_state(
+    req: &InternalRequest,
+    preserves_anthropic_thinking: bool,
+    include_generic_opaque: bool,
+) -> bool {
     req.messages.iter().any(|message| {
-        message.parts.iter().any(|part| {
-            matches!(part, crate::types::Part::Thinking { .. })
-                || matches!(
-                    part,
-                    crate::types::Part::ToolCall {
-                        signature: Some(_),
-                        ..
-                    }
-                )
+        message.parts.iter().any(|part| match part {
+            crate::types::Part::Thinking { signature, .. } => {
+                !preserves_anthropic_thinking
+                    || !signature
+                        .as_deref()
+                        .is_some_and(|signature| !signature.is_empty())
+            }
+            crate::types::Part::RedactedThinking { .. } => !preserves_anthropic_thinking,
+            crate::types::Part::ToolCall {
+                signature: Some(_), ..
+            } => include_generic_opaque,
+            _ => false,
         })
     })
 }
 
-fn strip_opaque_raw_body(req: &mut InternalRequest) {
+fn strip_opaque_raw_body(req: &mut InternalRequest, preserves_anthropic_thinking: bool) {
     let Some(raw) = req.raw_body.as_deref() else {
         return;
     };
@@ -3470,11 +3598,28 @@ fn strip_opaque_raw_body(req: &mut InternalRequest) {
         let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
-        parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("thinking"));
+        parts.retain(|part| match part.get("type").and_then(Value::as_str) {
+            Some("thinking") => {
+                preserves_anthropic_thinking
+                    && part
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .is_some_and(|signature| !signature.is_empty())
+            }
+            Some("redacted_thinking") => {
+                preserves_anthropic_thinking && part.get("data").and_then(Value::as_str).is_some()
+            }
+            _ => true,
+        });
         for part in parts {
-            if let Some(object) = part.as_object_mut() {
-                object.remove("signature");
-                object.remove("thoughtSignature");
+            let block_type = part.get("type").and_then(Value::as_str);
+            if !preserves_anthropic_thinking
+                || !matches!(block_type, Some("thinking" | "redacted_thinking"))
+            {
+                if let Some(object) = part.as_object_mut() {
+                    object.remove("signature");
+                    object.remove("thoughtSignature");
+                }
             }
         }
     }
@@ -3627,10 +3772,9 @@ fn hydrate_opaque_state(req: &mut InternalRequest, report: &OpaqueHydrationRepor
 ///   Route Trace, and emit a client-visible warning. Silent stripping is
 ///   forbidden.
 ///
-/// `inline_opaque` reflects opaque state already present in the decoded request
-/// (thinking parts, tool-call signatures) and `report` reflects host-owned
-/// stored continuation state resolved for this target. Either source can make
-/// the conversation non-portable for the candidate target.
+/// `inline_opaque` reflects state that this target cannot carry; `report` reflects
+/// host-owned stored continuation state resolved for this target. Either source
+/// can make the conversation non-portable for the candidate target.
 ///
 /// `placeholder` is the target adapter's documented stand-in for a historical
 /// call whose real signature cannot be carried (e.g. a different model in the
@@ -3645,6 +3789,7 @@ fn apply_portability(
     inline_opaque: bool,
     report: &OpaqueHydrationReport,
     placeholder: Option<&'static str>,
+    preserves_anthropic_thinking: bool,
     trace: &mut RouteTrace,
 ) -> Result<(), ProxyError> {
     if !inline_opaque && !report.nonportable() {
@@ -3659,7 +3804,7 @@ fn apply_portability(
     }
 
     // portability=strip_with_warning
-    let placed = strip_nonportable_state(req, report, placeholder);
+    let placed = strip_nonportable_state(req, report, placeholder, preserves_anthropic_thinking);
     let warning = portability_warning(target, placed);
     trace.warn(warning.clone());
     tracing::warn!(route = %route.name, "{}", warning);
@@ -3669,6 +3814,7 @@ fn apply_portability(
 /// Remove non-portable continuation state (thinking parts and tool-call
 /// signatures) from the request and, where the target adapter documents a
 /// substitute, paint its placeholder onto the historical calls it cannot carry.
+/// Explicitly compatible Anthropic thinking blocks remain unchanged.
 /// Returns the number of placeholders applied. Shared by Route-based
 /// `strip_with_warning` fallback and a direct target that has a protocol-valid
 /// same-family translation.
@@ -3676,11 +3822,20 @@ fn strip_nonportable_state(
     req: &mut InternalRequest,
     report: &OpaqueHydrationReport,
     placeholder: Option<&'static str>,
+    preserves_anthropic_thinking: bool,
 ) -> usize {
     let mut placed = 0usize;
     for msg in &mut req.messages {
-        msg.parts
-            .retain(|p| !matches!(p, crate::types::Part::Thinking { .. }));
+        msg.parts.retain(|part| match part {
+            crate::types::Part::Thinking { signature, .. } => {
+                preserves_anthropic_thinking
+                    && signature
+                        .as_deref()
+                        .is_some_and(|signature| !signature.is_empty())
+            }
+            crate::types::Part::RedactedThinking { .. } => preserves_anthropic_thinking,
+            _ => true,
+        });
         for part in &mut msg.parts {
             if let crate::types::Part::ToolCall { id, signature, .. } = part {
                 *signature = None;
@@ -3696,7 +3851,7 @@ fn strip_nonportable_state(
             }
         }
     }
-    strip_opaque_raw_body(req);
+    strip_opaque_raw_body(req, preserves_anthropic_thinking);
     placed
 }
 
@@ -4053,21 +4208,55 @@ impl ToolStreamState {
         let mut out = Vec::with_capacity(events.len());
         for event in events {
             let normalized = match event {
-                StreamEvent::ThinkingDelta { text, signature }
-                    if text.is_empty() && signature.is_some() =>
-                {
+                StreamEvent::ThinkingDelta {
+                    block_index,
+                    text,
+                    signature,
+                } if text.is_empty() && signature.is_some() => {
                     // Signature-only part: remember it for the tool call that
                     // should follow, but still emit the raw event unchanged so
                     // the client encoder behaves exactly as before.
                     self.pending_signature = signature.clone();
-                    StreamEvent::ThinkingDelta { text, signature }
+                    StreamEvent::ThinkingDelta {
+                        block_index,
+                        text,
+                        signature,
+                    }
                 }
-                StreamEvent::ThinkingDelta { text, signature } => {
+                StreamEvent::ThinkingDelta {
+                    block_index,
+                    text,
+                    signature,
+                } => {
                     // Real thinking content is not a signature-only marker;
                     // drop any stale pending signature so it cannot leak onto
                     // an unrelated later tool call.
                     self.pending_signature = None;
-                    StreamEvent::ThinkingDelta { text, signature }
+                    StreamEvent::ThinkingDelta {
+                        block_index,
+                        text,
+                        signature,
+                    }
+                }
+                StreamEvent::ThinkingBlockStart {
+                    index,
+                    thinking,
+                    signature,
+                } => {
+                    self.pending_signature = None;
+                    StreamEvent::ThinkingBlockStart {
+                        index,
+                        thinking,
+                        signature,
+                    }
+                }
+                StreamEvent::ThinkingBlockStop { index } => {
+                    self.pending_signature = None;
+                    StreamEvent::ThinkingBlockStop { index }
+                }
+                StreamEvent::RedactedThinking { index, data } => {
+                    self.pending_signature = None;
+                    StreamEvent::RedactedThinking { index, data }
                 }
                 StreamEvent::TextDelta(text) => {
                     self.pending_signature = None;
@@ -4570,9 +4759,10 @@ async fn drive_stream(
     .await;
 }
 
-/// Same-format passthrough streaming (FR-2.7, FR-2.10). Raw frames are
-/// preserved, but no client bytes are emitted until a semantic upstream event
-/// has been validated.
+/// Same-format passthrough streaming (FR-2.7, FR-2.10). Event payloads are
+/// forwarded without JSON re-encoding, but the SSE framer normalizes line
+/// endings and this driver reconstructs frame delimiters. No client bytes are
+/// emitted until a semantic upstream event has been validated.
 #[allow(clippy::too_many_arguments)]
 async fn drive_stream_passthrough(
     state: AppState,
@@ -7249,13 +7439,14 @@ mod route_policy_tests {
     fn signature_only_then_function_call_attaches_pending_signature() {
         let mut state = ToolStreamState::new("req_test");
         let first = state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("SIG".into()),
         }]);
         // The raw thinking event is passed through unchanged.
         assert!(matches!(
             &first[0],
-            StreamEvent::ThinkingDelta { text, signature: Some(sig) }
+            StreamEvent::ThinkingDelta { text, signature: Some(sig), .. }
                 if text.is_empty() && sig == "SIG"
         ));
 
@@ -7300,10 +7491,12 @@ mod route_policy_tests {
         let mut thinking_state = ToolStreamState::new("req_thinking");
         let thinking_events = thinking_state.normalize(vec![
             StreamEvent::ThinkingDelta {
+                block_index: None,
                 text: "reasoning...".into(),
                 signature: None,
             },
             StreamEvent::ThinkingDelta {
+                block_index: None,
                 text: String::new(),
                 signature: Some("SIG_THINK".into()),
             },
@@ -7333,6 +7526,7 @@ mod route_policy_tests {
         let text_events = text_state.normalize(vec![
             StreamEvent::TextDelta("visible response".into()),
             StreamEvent::ThinkingDelta {
+                block_index: None,
                 text: String::new(),
                 signature: Some("SIG_TEXT".into()),
             },
@@ -7363,6 +7557,7 @@ mod route_policy_tests {
     fn pending_signature_not_copied_to_parallel_calls() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("SIG_A".into()),
         }]);
@@ -7396,6 +7591,7 @@ mod route_policy_tests {
     fn explicit_tool_call_signature_wins_over_pending() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("PENDING".into()),
         }]);
@@ -7417,6 +7613,7 @@ mod route_policy_tests {
         // unrelated tool call) must not leak the earlier signature onward.
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("STALE".into()),
         }]);
@@ -7440,6 +7637,7 @@ mod route_policy_tests {
     fn pending_signature_cleared_by_refusal_delta() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("STALE".into()),
         }]);
@@ -7464,10 +7662,12 @@ mod route_policy_tests {
     fn pending_signature_cleared_by_real_thinking_delta() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("STALE".into()),
         }]);
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: "real reasoning".into(),
             signature: None,
         }]);
@@ -7517,9 +7717,12 @@ mod route_policy_tests {
         let target = target();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         let report = OpaqueHydrationReport::default();
-        apply_portability(&mut req, &route, &target, true, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, true, &report, None, false, &mut trace,
+        )
+        .unwrap();
 
-        assert!(!request_has_opaque_state(&req));
+        assert!(!request_has_nonportable_inline_state(&req, false, true));
         assert!(!trace.warnings.is_empty());
         let raw: Value = serde_json::from_str(req.raw_body.as_deref().unwrap()).unwrap();
         assert_eq!(raw["messages"][0]["content"].as_array().unwrap().len(), 1);
@@ -7540,10 +7743,17 @@ mod route_policy_tests {
         route.portability_policy = "reject".into();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         let report = OpaqueHydrationReport::default();
-        assert!(
-            apply_portability(&mut req, &route, &target(), true, &report, None, &mut trace)
-                .is_err()
-        );
+        assert!(apply_portability(
+            &mut req,
+            &route,
+            &target(),
+            true,
+            &report,
+            None,
+            false,
+            &mut trace,
+        )
+        .is_err());
     }
 
     #[test]
@@ -7558,7 +7768,10 @@ mod route_policy_tests {
             incompatible: 1,
             ..Default::default()
         };
-        apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, false, &report, None, false, &mut trace,
+        )
+        .unwrap();
         assert_eq!(trace.warnings.len(), 1);
     }
 
@@ -7603,6 +7816,7 @@ mod route_policy_tests {
             false,
             &report,
             Some("PLACEHOLDER"),
+            false,
             &mut trace,
         )
         .unwrap();
@@ -7650,7 +7864,10 @@ mod route_policy_tests {
             ..Default::default()
         };
 
-        apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, false, &report, None, false, &mut trace,
+        )
+        .unwrap();
 
         assert!(matches!(
             &req.messages[0].parts[0],
@@ -7674,9 +7891,10 @@ mod route_policy_tests {
             incompatible: 1,
             ..Default::default()
         };
-        assert!(
-            apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).is_err()
-        );
+        assert!(apply_portability(
+            &mut req, &route, &target, false, &report, None, false, &mut trace,
+        )
+        .is_err());
     }
 
     #[test]
@@ -7686,7 +7904,10 @@ mod route_policy_tests {
         let target = target();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         let report = OpaqueHydrationReport::default();
-        apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, false, &report, None, false, &mut trace,
+        )
+        .unwrap();
         assert!(trace.warnings.is_empty());
     }
 
@@ -7760,9 +7981,12 @@ mod route_policy_tests {
             ..Default::default()
         };
 
-        let inline = request_has_opaque_state(&req);
+        let inline = request_has_nonportable_inline_state(&req, false, true);
         assert!(inline);
-        apply_portability(&mut req, &route, &target, inline, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, inline, &report, None, false, &mut trace,
+        )
+        .unwrap();
         hydrate_opaque_state(&mut req, &report);
 
         assert_eq!(req.messages[0].parts.len(), 1);

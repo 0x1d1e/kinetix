@@ -416,6 +416,9 @@ pub fn request_to_json(req: &InternalRequest) -> String {
                     Part::Thinking { text, signature } => {
                         json!({ "type": "thinking", "text": text, "signature": signature })
                     }
+                    Part::RedactedThinking { data } => {
+                        json!({ "type": "redacted_thinking", "data": data })
+                    }
                 })
                 .collect();
             json!({ "role": format!("{:?}", m.role).to_lowercase(), "parts": parts })
@@ -550,6 +553,7 @@ mod tests {
                 upstream_request_id: Some("req_1".into()),
             },
             StreamEvent::ThinkingDelta {
+                block_index: None,
                 text: "hmm".into(),
                 signature: Some("sig".into()),
             },

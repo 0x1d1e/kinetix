@@ -374,6 +374,10 @@ pub enum Part {
         text: String,
         signature: Option<String>,
     },
+    /// Opaque Anthropic block payload, replayable only unchanged to a compatible target.
+    RedactedThinking {
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -457,6 +461,7 @@ impl InternalRequest {
                 chars += match p {
                     Part::Text(t) => t.len() as u64,
                     Part::Thinking { text, .. } => text.len() as u64,
+                    Part::RedactedThinking { data } => data.len() as u64,
                     Part::ToolCall {
                         name, arguments, ..
                     } => (name.len() + arguments.len()) as u64,
@@ -535,9 +540,27 @@ pub enum StreamEvent {
     Start {
         upstream_request_id: Option<String>,
     },
+    /// A complete thinking content block has begun. The index is the source
+    /// protocol's content-block identity; following deltas belong to this block.
+    ThinkingBlockStart {
+        index: u32,
+        thinking: String,
+        signature: Option<String>,
+    },
     ThinkingDelta {
+        /// Present when the source protocol identifies content-block deltas.
+        block_index: Option<u32>,
         text: String,
         signature: Option<String>,
+    },
+    /// The source thinking content block is complete.
+    ThinkingBlockStop {
+        index: u32,
+    },
+    /// An opaque Anthropic reasoning block that must not be reconstructed.
+    RedactedThinking {
+        index: u32,
+        data: String,
     },
     TextDelta(String),
     /// User-visible refusal text, kept distinct so Responses frontends can
