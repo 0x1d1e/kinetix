@@ -10695,6 +10695,7 @@ pub async fn import_config(
                 None
             }
         };
+        let source_integration_installed = installed_ceilings.is_some();
         let (integration_features, integration_protocols) =
             if let Some(ceilings) = installed_ceilings {
                 ceilings
@@ -10732,17 +10733,25 @@ pub async fn import_config(
                     .iter()
                     .any(|protocol| protocol == "plugin-native")
                 {
-                    match state.plugin_manager() {
-                        Some(manager) => {
-                            validate_integration_upstream_protocols(
-                                manager,
-                                Some(protocols),
-                                wire.as_str(),
-                                p["wire_plugin"].as_str().unwrap_or(""),
-                            )
-                            .await
+                    if source_integration_installed {
+                        match state.plugin_manager() {
+                            Some(manager) => {
+                                validate_integration_upstream_protocols(
+                                    manager,
+                                    Some(protocols),
+                                    wire.as_str(),
+                                    p["wire_plugin"].as_str().unwrap_or(""),
+                                )
+                                .await
+                            }
+                            None => Err("plugin-native requires the plugin host".to_string()),
                         }
-                        None => Err("plugin-native requires the plugin host".to_string()),
+                    } else {
+                        validate_imported_upstream_protocols_structurally(
+                            protocols,
+                            wire.as_str(),
+                            p["wire_plugin"].as_str().unwrap_or(""),
+                        )
                     }
                 } else {
                     protocols.validate_upstream_wire_format(wire.as_str(), false)
@@ -12444,6 +12453,26 @@ async fn reconcile_provider_credential_semantics(
     .map_err(ApiError::internal)?;
 
     reconcile_provider_account_mode(state, provider_id, credential_mode).await
+}
+
+fn validate_imported_upstream_protocols_structurally(
+    protocols: &crate::plugins::types::IntegrationProtocolsV1,
+    wire_format: &str,
+    wire_plugin: &str,
+) -> Result<(), String> {
+    let uses_plugin_native = protocols
+        .upstream
+        .iter()
+        .any(|protocol| protocol == "plugin-native");
+    let has_provider_adapter = if uses_plugin_native {
+        if crate::plugins::PluginRef::parse(wire_plugin).is_none() {
+            return Err("plugin-native requires a valid provider adapter binding".into());
+        }
+        true
+    } else {
+        false
+    };
+    protocols.validate_upstream_wire_format(wire_format, has_provider_adapter)
 }
 
 async fn validate_integration_upstream_protocols(
@@ -23118,6 +23147,203 @@ mod credential_enrollment_regression_tests {
             .as_array()
             .unwrap()
             .contains(&json!("capabilities")));
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn config_import_preserves_plugin_native_provider_until_plugin_reconciliation() {
+        let (source, source_root) = test_state("plugin-native-export-source").await;
+        let provider_id = db::insert_provider(
+            &source.pool,
+            &db::NewProvider {
+                name: "native-provider",
+                base_url: "https://native.example/v1",
+                wire_format: WireFormat::Plugin,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "plugin:plugin.test/session-echo",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: Some("plugin.test"),
+                source_integration_id: Some("native"),
+            },
+        )
+        .await
+        .unwrap();
+        let features = crate::plugins::types::IntegrationFeaturesV1 {
+            schema_version: 1,
+            streaming: true,
+            tools: true,
+            parallel_tools: true,
+            vision: true,
+            reasoning: true,
+            structured_output: true,
+            model_discovery: false,
+            quota_probe: false,
+            health_probe: false,
+        };
+        let protocols = crate::plugins::types::IntegrationProtocolsV1 {
+            input: vec!["openai-chat".into()],
+            upstream: vec!["plugin-native".into()],
+        };
+        assert!(validate_imported_upstream_protocols_structurally(
+            &protocols,
+            "openai",
+            "plugin:plugin.test/session-echo",
+        )
+        .is_err());
+        assert!(validate_imported_upstream_protocols_structurally(
+            &protocols,
+            "plugin",
+            "not-a-plugin-reference",
+        )
+        .is_err());
+        db::set_provider_integration_features(&source.pool, &provider_id, Some(&features))
+            .await
+            .unwrap();
+        db::set_provider_integration_protocols(&source.pool, &provider_id, Some(&protocols))
+            .await
+            .unwrap();
+
+        let exported = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let (target, target_root) = test_state_with_plugins("plugin-native-export-target").await;
+
+        let imported = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(imported["ok"], true);
+
+        let provider = db::list_providers(&target.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "native-provider")
+            .unwrap();
+        assert_eq!(provider.wire_plugin, "plugin:plugin.test/session-echo");
+        assert_eq!(provider.source_plugin_id.as_deref(), Some("plugin.test"));
+        assert_eq!(provider.source_integration_id.as_deref(), Some("native"));
+        let restored_features = provider.integration_feature_ceiling().unwrap().unwrap();
+        assert!(restored_features.vision && restored_features.parallel_tools);
+        let restored_protocols = provider.integration_protocol_ceiling().unwrap().unwrap();
+        assert_eq!(restored_protocols.input, vec!["openai-chat"]);
+        assert_eq!(restored_protocols.upstream, vec!["plugin-native"]);
+        let transport = crate::adapters::TargetTransport::parse(&provider.wire_plugin).unwrap();
+        assert!(target.adapters.for_transport(&transport).is_err());
+
+        let manifest = format!(
+            r#"
+manifest_version = 1
+id = "plugin.test"
+name = "Test Native Adapter"
+version = "0.1.0"
+plugin_api = "{}.0.0"
+
+[provides]
+provider_adapters = ["session-echo"]
+
+[[integrations]]
+id = "native"
+name = "Native Provider"
+credential_mode = "manual"
+provider_adapter = "session-echo"
+
+[integrations.features]
+schema_version = 1
+streaming = true
+tools = true
+parallel_tools = true
+vision = false
+reasoning = true
+structured_output = true
+model_discovery = false
+quota_probe = false
+health_probe = false
+
+[integrations.protocols]
+input = ["anthropic"]
+upstream = ["plugin-native"]
+
+[integrations.provider]
+base_url = "https://native.example/v1"
+wire_format = "plugin"
+auth_scheme = "bearer"
+
+[limits]
+memory = "128MiB"
+storage = "2MiB"
+"#,
+            crate::plugins::PLUGIN_API_MAJOR
+        );
+        let mut archive = tar::Builder::new(Vec::new());
+        for (path, data) in [
+            ("plugin.toml", manifest.as_bytes()),
+            (
+                "plugin.wasm",
+                include_bytes!("../tests/fixtures/plugin-api-v2-session-echo.component.wasm")
+                    .as_slice(),
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, data).unwrap();
+        }
+        let package = archive.into_inner().unwrap();
+        let manager = target.plugin_manager().unwrap().clone();
+        manager.install(&package, None, &[], false).await.unwrap();
+        manager.approve_permissions("plugin.test").await.unwrap();
+        manager.enable("plugin.test").await.unwrap();
+        register_enabled_plugin_capabilities(&target, "plugin.test").await;
+
+        assert!(target.adapters.for_transport(&transport).is_ok());
+        let reconciled = db::list_providers(&target.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "native-provider")
+            .unwrap();
+        assert!(
+            !reconciled
+                .integration_feature_ceiling()
+                .unwrap()
+                .unwrap()
+                .vision
+        );
+        let reconciled_protocols = reconciled.integration_protocol_ceiling().unwrap().unwrap();
+        assert_eq!(reconciled_protocols.input, vec!["anthropic"]);
+        assert_eq!(reconciled_protocols.upstream, vec!["plugin-native"]);
 
         drop(source);
         drop(target);
