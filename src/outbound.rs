@@ -5,6 +5,7 @@
 //! explicitly so SSRF and credential-host policy is re-applied on every hop.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -270,6 +271,49 @@ pub async fn send_provider_request(
     ctx: &UpstreamContext<'_>,
     request: ProviderRequest,
 ) -> Result<reqwest::Response, OutboundError> {
+    send_provider_request_inner(
+        cache,
+        allow_private,
+        allow_insecure_global,
+        adapter,
+        ctx,
+        request,
+        None,
+    )
+    .await
+}
+
+/// Send an inference request and mark it dispatched before starting network I/O.
+pub(crate) async fn send_provider_request_tracked(
+    cache: &DashMap<String, reqwest::Client>,
+    allow_private: bool,
+    allow_insecure_global: bool,
+    adapter: &Arc<dyn Adapter>,
+    ctx: &UpstreamContext<'_>,
+    request: ProviderRequest,
+    dispatched: &AtomicBool,
+) -> Result<reqwest::Response, OutboundError> {
+    send_provider_request_inner(
+        cache,
+        allow_private,
+        allow_insecure_global,
+        adapter,
+        ctx,
+        request,
+        Some(dispatched),
+    )
+    .await
+}
+
+async fn send_provider_request_inner(
+    cache: &DashMap<String, reqwest::Client>,
+    allow_private: bool,
+    allow_insecure_global: bool,
+    adapter: &Arc<dyn Adapter>,
+    ctx: &UpstreamContext<'_>,
+    request: ProviderRequest,
+    dispatched: Option<&AtomicBool>,
+) -> Result<reqwest::Response, OutboundError> {
     let mut retries_done = 0usize;
     loop {
         let response = send_provider_request_once(
@@ -279,6 +323,7 @@ pub async fn send_provider_request(
             adapter,
             ctx,
             &request,
+            dispatched,
         )
         .await?;
 
@@ -310,6 +355,7 @@ async fn send_provider_request_once(
     adapter: &Arc<dyn Adapter>,
     ctx: &UpstreamContext<'_>,
     request: &ProviderRequest,
+    dispatched: Option<&AtomicBool>,
 ) -> Result<reqwest::Response, OutboundError> {
     let insecure_tls = allow_insecure_global || ctx.provider.insecure_tls();
     let mut current = request.url.clone();
@@ -365,6 +411,9 @@ async fn send_provider_request_once(
             }
         }
 
+        if let Some(dispatched) = dispatched {
+            dispatched.store(true, Ordering::Release);
+        }
         let response = builder
             .send()
             .await

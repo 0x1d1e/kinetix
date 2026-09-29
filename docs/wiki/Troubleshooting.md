@@ -78,9 +78,13 @@ builds used a deterministic token). Clear cookies and log in again.
 
 ## Client disconnect cancellation
 
-Kinetix cancels pre-commit upstream work when it observes the client connection
-close. After response commit, dropping the response stream cancels active stream
-work and releases its concurrency capacity.
+Kinetix cancels pre-commit work when it observes the client connection close.
+If cancellation happens before dispatch, it drops the RPM/TPM/budget reservation.
+After dispatch, Kinetix treats usage as incomplete and keeps the conservative
+reservation; it does not infer whether the upstream processed or billed the
+request. Concurrency capacity is released either way. After response commit,
+dropping the response stream cancels active stream work and releases its
+concurrency capacity.
 
 ## Test/throwaway instances write to my real config
 

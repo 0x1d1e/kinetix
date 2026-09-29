@@ -193,7 +193,7 @@ async fn handle(
         request_started,
         client_disconnect.clone(),
     );
-    let pipeline_run = pipeline::run(
+    let pipeline_run = pipeline::run_with_disconnect(
         &state,
         format,
         Some(key),
@@ -202,6 +202,7 @@ async fn handle(
         true,
         session,
         protocol_headers,
+        client_disconnect.clone(),
     );
     let pipeline_result = if let Some(disconnect) = client_disconnect {
         tokio::select! {

@@ -28,6 +28,9 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 const CLIENT_KEY: &str = "sk-kinetix-responses-pipeline-test";
+const RPM_DISCONNECT_KEY: &str = "sk-kinetix-disconnect-rpm-test";
+const TPM_DISCONNECT_KEY: &str = "sk-kinetix-disconnect-tpm-test";
+const BUDGET_DISCONNECT_KEY: &str = "sk-kinetix-disconnect-budget-test";
 const UPSTREAM_MODEL: &str = "upstream-responses-model";
 
 #[derive(Clone)]
@@ -77,7 +80,7 @@ async fn upstream(
     });
 
     match test_case.as_str() {
-        "lease_lifecycle" => Response::builder()
+        test_case if test_case == "lease_lifecycle" || test_case.starts_with("constraint_probe") => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
             .body(Body::from(concat!(
@@ -86,7 +89,7 @@ async fn upstream(
                 "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n"
             )))
             .unwrap(),
-        "delayed_first_event" => Response::builder()
+        delayed_case if delayed_case.starts_with("delayed_first_event") => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
             .body(Body::from_stream(async_stream::stream! {
@@ -212,6 +215,35 @@ async fn call_raw_responses(state: &AppState, raw_body: String) -> Response {
     api::responses(State(state.clone()), None, headers, raw_body).await
 }
 
+fn test_key(
+    id: &str,
+    api_key: &str,
+    rpm_limit: Option<i64>,
+    tpm_limit: Option<i64>,
+    daily_budget: Option<f64>,
+) -> db::VirtualKeyRow {
+    db::VirtualKeyRow {
+        id: id.into(),
+        key_hash: crypto::hash_virtual_key(api_key),
+        name: id.into(),
+        owner: "test".into(),
+        tag: String::new(),
+        allowed_models: json!(["*"]).to_string(),
+        allowed_providers: json!([]).to_string(),
+        rpm_limit,
+        tpm_limit,
+        max_concurrent_requests: None,
+        daily_budget,
+        monthly_budget: None,
+        expires_at: None,
+        status: "active".into(),
+        allowed_ips: json!([]).to_string(),
+        body_logging: 0,
+        created_at: db::now_iso(),
+        revoked_at: None,
+    }
+}
+
 async fn call_chat(state: &AppState) -> (StatusCode, String) {
     let raw_body = json!({
         "model": "responses-route",
@@ -313,7 +345,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
             context_window: None,
             max_output_tokens: Some(1024),
             capabilities: json!({"text": true}),
-            prices: json!({}),
+            prices: json!({"input_per_1m": 1.0, "output_per_1m": 1.0}),
             parameters: json!({
                 "temperature": {"supported": true, "min": 0.0, "max": 1.0, "default": 0.25, "policy": "clamp"},
                 "top_p": {"supported": true, "min": 0.0, "max": 1.0, "default": 0.8, "policy": "clamp"},
@@ -460,6 +492,36 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
     )
     .await
     .unwrap();
+    for (id, api_key, rpm_limit, tpm_limit, daily_budget) in [
+        (
+            "responses-rpm-disconnect-key",
+            RPM_DISCONNECT_KEY,
+            Some(1),
+            None,
+            None,
+        ),
+        (
+            "responses-tpm-disconnect-key",
+            TPM_DISCONNECT_KEY,
+            None,
+            Some(15),
+            None,
+        ),
+        (
+            "responses-budget-disconnect-key",
+            BUDGET_DISCONNECT_KEY,
+            None,
+            None,
+            Some(0.000015),
+        ),
+    ] {
+        db::insert_virtual_key(
+            &pool,
+            &test_key(id, api_key, rpm_limit, tpm_limit, daily_budget),
+        )
+        .await
+        .unwrap();
+    }
 
     let registry = Arc::new(Registry::new());
     registry.reload(&pool).await.unwrap();
@@ -850,61 +912,98 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
         .pool_max_idle_per_host(0)
         .build()
         .unwrap();
-    let abandoned_client = client.clone();
-    let abandoned = tokio::spawn(async move {
-        abandoned_client
+    for (test_case, api_key, probe_input, rejection) in [
+        (
+            "delayed_first_event_rpm",
+            RPM_DISCONNECT_KEY,
+            "case:constraint_probe_rpm",
+            "rate limit exceeded: 1 requests per minute",
+        ),
+        (
+            "delayed_first_event_tpm",
+            TPM_DISCONNECT_KEY,
+            "case:constraint_probe_tpm",
+            "token rate limit exceeded",
+        ),
+        (
+            "delayed_first_event_budget",
+            BUDGET_DISCONNECT_KEY,
+            "case:constraint_probe_budget",
+            "daily budget would be exceeded",
+        ),
+    ] {
+        let before = state.admission.metrics_snapshot();
+        assert_eq!(before.inflight_inferences, 0);
+        let input = format!("case:{test_case}");
+        let abandoned_client = client.clone();
+        let abandoned_input = input.clone();
+        let abandoned = tokio::spawn(async move {
+            abandoned_client
+                .post(format!("http://{gateway_addr}/v1/responses"))
+                .header("authorization", format!("Bearer {api_key}"))
+                .json(&json!({
+                    "model": "responses-route",
+                    "input": abandoned_input,
+                    "max_output_tokens": 1,
+                    "stream": true
+                }))
+                .send()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if mock
+                    .requests
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|request| request.body["input"] == input)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("upstream did not receive {test_case}"));
+        assert_eq!(state.admission.metrics_snapshot().inflight_inferences, 1);
+
+        abandoned.abort();
+        let _ = abandoned.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.admission.metrics_snapshot().inflight_inferences != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("client disconnect did not release concurrency admission promptly");
+        let after = state.admission.metrics_snapshot();
+        assert_eq!(after.active_reservations, before.active_reservations);
+        assert_eq!(after.dropped_total, before.dropped_total);
+        assert_eq!(
+            after.reconciled_incomplete_total,
+            before.reconciled_incomplete_total + 1,
+            "{test_case} admission should reconcile conservatively"
+        );
+
+        let constrained = client
             .post(format!("http://{gateway_addr}/v1/responses"))
-            .header("authorization", format!("Bearer {CLIENT_KEY}"))
+            .header("authorization", format!("Bearer {api_key}"))
             .json(&json!({
                 "model": "responses-route",
-                "input": "case:delayed_first_event",
+                "input": probe_input,
+                "max_output_tokens": 1,
                 "stream": true
             }))
             .send()
             .await
-    });
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if mock
-                .requests
-                .lock()
-                .await
-                .iter()
-                .any(|request| request.body["input"] == "case:delayed_first_event")
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("delayed upstream request did not start");
-    assert_eq!(state.admission.metrics_snapshot().inflight_inferences, 1);
-
-    abandoned.abort();
-    let _ = abandoned.await;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while state.admission.metrics_snapshot().inflight_inferences != 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("client disconnect did not release admission promptly");
-
-    let admitted = client
-        .post(format!("http://{gateway_addr}/v1/responses"))
-        .header("authorization", format!("Bearer {CLIENT_KEY}"))
-        .json(&json!({
-            "model": "responses-route",
-            "input": "case:lease_lifecycle",
-            "stream": true
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(admitted.status().as_u16(), 200);
-    let _ = admitted.bytes().await.unwrap();
-    assert_eq!(state.admission.metrics_snapshot().inflight_inferences, 0);
+            .unwrap();
+        let status = constrained.status();
+        let body = constrained.text().await.unwrap();
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{test_case}: {body}");
+        assert!(body.contains(rejection), "{test_case}: {body}");
+        assert_eq!(state.admission.metrics_snapshot().inflight_inferences, 0);
+    }
 
     gateway_server.abort();
     server.abort();

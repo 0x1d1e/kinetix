@@ -6,7 +6,7 @@
 //! the commit point (the first client response bytes). A failure after commit
 //! terminates the stream with a format-correct error and is never spliced.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -97,11 +97,14 @@ pub struct RequestMeta {
     pub cache_status: &'static str,
     pub commit_state: &'static str,
     pub session: Option<String>,
-    /// Atomic RPM/TPM/budget reservation owned by this request. Dropping it
-    /// before finalization cancels the reservation.
+    /// Atomic RPM/TPM/budget reservation owned by this request. A disconnect
+    /// after upstream dispatch reconciles it as incomplete instead of canceling it.
     pub admission: Option<crate::admission::AdmissionReservation>,
     /// Bounded global, key, and Route in-flight admission; streaming transfers it to the response body.
     pub concurrency: Option<crate::admission::ConcurrencyReservation>,
+    /// Set immediately before the inference request is handed to the HTTP client.
+    upstream_dispatched: AtomicBool,
+    client_disconnect: Option<crate::client_disconnect::ClientDisconnect>,
     /// Set by a watchdog when the client disconnects, so an in-flight upstream
     /// response can be aborted even if the write channel still looks open.
     pub disconnected: Arc<std::sync::atomic::AtomicBool>,
@@ -129,8 +132,25 @@ impl RequestMeta {
             session: None,
             admission: None,
             concurrency: None,
-            disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            upstream_dispatched: AtomicBool::new(false),
+            client_disconnect: None,
+            disconnected: Arc::new(AtomicBool::new(false)),
             disconnect_at: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+}
+
+impl Drop for RequestMeta {
+    fn drop(&mut self) {
+        let disconnected_after_dispatch = self.upstream_dispatched.load(Ordering::Acquire)
+            && self
+                .client_disconnect
+                .as_ref()
+                .is_some_and(crate::client_disconnect::ClientDisconnect::is_cancelled);
+        if disconnected_after_dispatch {
+            if let Some(admission) = self.admission.take() {
+                admission.reconcile_incomplete();
+            }
         }
     }
 }
@@ -466,6 +486,31 @@ pub async fn run(
     session: Option<String>,
     protocol_headers: Vec<(String, String)>,
 ) -> Result<Response, ProxyError> {
+    run_with_disconnect(
+        state,
+        format,
+        key,
+        req,
+        request_id,
+        allow_fallback,
+        session,
+        protocol_headers,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_with_disconnect(
+    state: &AppState,
+    format: FrontendFormat,
+    key: Option<db::VirtualKeyRow>,
+    req: InternalRequest,
+    request_id: String,
+    allow_fallback: bool,
+    session: Option<String>,
+    protocol_headers: Vec<(String, String)>,
+    client_disconnect: Option<crate::client_disconnect::ClientDisconnect>,
+) -> Result<Response, ProxyError> {
     let started = Instant::now();
     let snap = state.registry.snapshot();
     let resolved_route = match crate::registry::Registry::resolve_in(&snap, &req.requested_model) {
@@ -488,6 +533,7 @@ pub async fn run(
     let mut trace = RouteTrace::new(request_id.clone(), req.requested_model.clone());
     let mut meta = RequestMeta::new(request_id.clone(), format, req.requested_model.clone());
     meta.session = session.clone();
+    meta.client_disconnect = client_disconnect;
     meta.admission = admission;
     meta.concurrency = Some(concurrency);
     if let Some(k) = &key {
@@ -1323,6 +1369,7 @@ pub async fn run(
                 use_passthrough,
                 &meta.request_id,
                 &protocol_headers,
+                &meta.upstream_dispatched,
             ),
         )
         .await
@@ -2322,6 +2369,7 @@ async fn send_upstream(
     use_passthrough: bool,
     request_id: &str,
     protocol_headers: &[(String, String)],
+    dispatched: &AtomicBool,
 ) -> Result<reqwest::Response, UpstreamFailure> {
     let url = adapter.build_url(ctx).map_err(|e| UpstreamFailure {
         kind: FailureKind::BadRequest,
@@ -2342,7 +2390,7 @@ async fn send_upstream(
     // accounting rewrites and adapter-owned model compatibility normalization.
     let body = build_upstream_body(adapter.as_ref(), ctx, req, use_passthrough)?;
 
-    crate::outbound::send_provider_request(
+    crate::outbound::send_provider_request_tracked(
         &state.outbound_clients,
         state.config.allow_private_upstreams,
         state.config.allow_insecure_tls,
@@ -2361,6 +2409,7 @@ async fn send_upstream(
             },
             total_timeout: None,
         },
+        dispatched,
     )
     .await
     .map_err(|e| {

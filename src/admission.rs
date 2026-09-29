@@ -244,6 +244,10 @@ pub struct AdmissionReservation {
 }
 
 impl AdmissionReservation {
+    pub(crate) fn reconcile_incomplete(self) {
+        self.reconcile(&TokenUsage::default(), None);
+    }
+
     pub fn reconcile(mut self, usage: &TokenUsage, actual_cost: Option<f64>) {
         let actual_tokens = match (usage.input, usage.output) {
             (Some(input), Some(output)) => Some(input.saturating_add(output)),

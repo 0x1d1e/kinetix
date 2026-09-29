@@ -110,6 +110,10 @@ impl ClientDisconnect {
         let _ = disconnected_at.changed().await;
     }
 
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.disconnected_at.borrow().is_some()
+    }
+
     pub fn cancellation_latency_ms(&self) -> u64 {
         self.inner
             .disconnected_at
