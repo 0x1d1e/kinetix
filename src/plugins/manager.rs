@@ -20,8 +20,8 @@ use crate::db::Pool;
 use super::manifest::{self, HostPolicy};
 use super::package::{self, Package, SignatureStatus};
 use super::runtime::{
-    adapter_bindings, adapter_v2_bindings, bindings, wit, DeadlineGuard, HostBacking, HostCtx,
-    PluginFault, PluginRuntime, CONFIG_PREFIX,
+    adapter_bindings, adapter_v2_bindings, bindings, health_v2_bindings, health_v2_wit, wit,
+    DeadlineGuard, HostBacking, HostCtx, PluginFault, PluginRuntime, CONFIG_PREFIX,
 };
 use super::store::{self, PermissionGrant, PluginRow};
 use super::types::{Capability, Manifest, Permissions, Provided};
@@ -1453,6 +1453,45 @@ impl PluginManager {
         Ok(())
     }
 
+    /// Prepare the optional v2 health world when exported, otherwise the legacy plugin world.
+    async fn prepare_health_probe(&self, id: &str) -> Result<HealthPrepared> {
+        let row = self
+            .get(id)
+            .await?
+            .ok_or_else(|| anyhow!("plugin '{id}' is not installed"))?;
+        if !row.status().is_enabled() {
+            bail!("plugin '{id}' is not enabled");
+        }
+        let manifest = row
+            .manifest()
+            .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
+        let (validated, grants) = self
+            .validated_manifest_with_approved_permissions(id, manifest)
+            .await?;
+        self.ensure_circuit_ready(id).await?;
+        let limits = validated.effective;
+        let component = self.compiled_component(&row)?;
+        let linker = self.inner.runtime.linker()?;
+        let mut store = self.new_store(&row, &limits, &grants, false, true, "health_probe");
+        let plugin = if self.inner.runtime.has_health_probe_v2(component.as_ref()) {
+            HealthProbePlugin::V2(
+                self.inner
+                    .runtime
+                    .instantiate_health_v2(&linker, &mut store, component.as_ref())
+                    .await?,
+            )
+        } else {
+            HealthProbePlugin::Legacy(
+                self.inner
+                    .runtime
+                    .instantiate(&linker, &mut store, component.as_ref())
+                    .await?,
+            )
+        };
+        self.claim_circuit_probe(id).await?;
+        Ok(HealthPrepared { store, plugin })
+    }
+
     /// Prepare a ready-to-call instance for a plugin.
     async fn prepare(
         &self,
@@ -2052,29 +2091,72 @@ impl PluginManager {
             .await
     }
 
-    /// HealthProbe::probe (§6.5).
+    /// HealthProbe::probe (§6.5), preferring structured v2 snapshots when exported.
+    pub async fn health_probe_with_snapshots(
+        &self,
+        id: &str,
+        provider_id: &str,
+        account_id: &str,
+    ) -> Result<HealthProbeObservation, PluginFault> {
+        let started = self.bump_invocation(id, "health_probe");
+        let _permits = self.acquire_invocation_permits(id).await;
+        let mut p = self
+            .prepare_health_probe(id)
+            .await
+            .map_err(|e| PluginFault::Internal(e.to_string()))?;
+        let rt = self.inner.runtime.clone();
+        let _guard = rt.arm_deadline(&mut p.store, Duration::from_secs(10));
+        let result = match p.plugin {
+            HealthProbePlugin::Legacy(plugin) => plugin
+                .health_probe()
+                .call_probe(&mut p.store, provider_id, account_id)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_plugin_result)
+                .map(|observation| HealthProbeObservation {
+                    observation,
+                    quota_snapshots: None,
+                }),
+            HealthProbePlugin::V2(plugin) => plugin
+                .health_probe_v2()
+                .call_probe(&mut p.store, provider_id, account_id)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_health_v2_result)
+                .map(|observation| {
+                    let health_v2_wit::types::HealthObservationV2 {
+                        state,
+                        quota_state,
+                        reset_at,
+                        retry_after,
+                        detail_code,
+                        quota_snapshots,
+                    } = observation;
+                    HealthProbeObservation {
+                        observation: wit::types::HealthObservation {
+                            state,
+                            quota_state,
+                            reset_at,
+                            retry_after,
+                            detail_code,
+                        },
+                        quota_snapshots: Some(quota_snapshots),
+                    }
+                }),
+        };
+        self.settle(id, "health_probe", started, result).await
+    }
+
+    /// Legacy health projection retained for credential-strategy callers.
     pub async fn health_probe(
         &self,
         id: &str,
         provider_id: &str,
         account_id: &str,
     ) -> Result<wit::types::HealthObservation, PluginFault> {
-        let started = self.bump_invocation(id, "health_probe");
-        let _permits = self.acquire_invocation_permits(id).await;
-        let mut p = self
-            .prepare(id, true, "health_probe")
+        self.health_probe_with_snapshots(id, provider_id, account_id)
             .await
-            .map_err(|e| PluginFault::Internal(e.to_string()))?;
-        let plugin = p.plugin;
-        let rt = self.inner.runtime.clone();
-        let _guard = rt.arm_deadline(&mut p.store, Duration::from_secs(10));
-        let res = plugin
-            .health_probe()
-            .call_probe(&mut p.store, provider_id, account_id)
-            .await
-            .map_err(map_call_error)
-            .and_then(map_plugin_result);
-        self.settle(id, "health_probe", started, res).await
+            .map(|result| result.observation)
     }
 
     /// RoutingFacts::facts (§6.4). `request_json` must carry only request/config
@@ -2452,6 +2534,21 @@ struct InvocationPermits {
     _global: OwnedSemaphorePermit,
 }
 
+pub struct HealthProbeObservation {
+    pub observation: wit::types::HealthObservation,
+    pub quota_snapshots: Option<Vec<health_v2_wit::types::QuotaSnapshotV1>>,
+}
+
+enum HealthProbePlugin {
+    Legacy(bindings::Plugin),
+    V2(health_v2_bindings::PluginHealthV2),
+}
+
+struct HealthPrepared {
+    store: wasmtime::Store<HostCtx>,
+    plugin: HealthProbePlugin,
+}
+
 struct Prepared {
     store: wasmtime::Store<HostCtx>,
     plugin: bindings::Plugin,
@@ -2660,6 +2757,17 @@ fn map_call_error(e: wasmtime::Error) -> PluginFault {
 /// Map the guest's `Result<T, PluginError>` into a [`PluginFault`].
 fn map_plugin_result<T>(r: Result<T, wit::types::PluginError>) -> Result<T, PluginFault> {
     r.map_err(|e| PluginFault::PluginError {
+        code: e.code,
+        message: e.message,
+        retryable: e.retryable,
+        retry_after: e.retry_after,
+    })
+}
+
+fn map_health_v2_result<T>(
+    result: Result<T, health_v2_wit::types::PluginError>,
+) -> Result<T, PluginFault> {
+    result.map_err(|e| PluginFault::PluginError {
         code: e.code,
         message: e.message,
         retryable: e.retryable,

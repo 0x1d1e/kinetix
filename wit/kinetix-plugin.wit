@@ -77,6 +77,49 @@ interface types {
     detail-code: option<string>,
   }
 
+  /// Scope of a quota snapshot. Model-scoped quota applies only to the exact
+  /// provider model id returned by the provider; it is not account-wide.
+  variant quota-scope-v1 {
+    /// Use only when the provider establishes account-wide scope.
+    account,
+    /// Exact provider model id; this quota must not be generalized.
+    model(string),
+    /// Scope is not established by the provider response.
+    unknown,
+  }
+
+  /// One provider-reported quota bucket. Missing values are unknown, never
+  /// zero or 100%. `remaining-fraction`, when present, is in the range [0, 1].
+  record quota-snapshot-v1 {
+    scope: quota-scope-v1,
+    /// Provider-defined group label; this does not imply account-wide scope.
+    group: option<string>,
+    /// Provider-defined identity for this bucket.
+    bucket-id: option<string>,
+    remaining-fraction: option<f64>,
+    /// Finite, non-negative amounts in `unit`; fractions are allowed.
+    remaining: option<f64>,
+    limit: option<f64>,
+    /// Canonical values include `requests`, `tokens`, and `credits`.
+    unit: option<string>,
+    /// Provider-reported window label, e.g. `5h`, `daily`, or `weekly`.
+    window: option<string>,
+    /// RFC3339 reset instant, if reported by the provider.
+    reset-at: option<string>,
+  }
+
+  /// Structured health evidence for the opt-in v2 probe world. An empty
+  /// `quota-snapshots` list means no quota data is known.
+  record health-observation-v2 {
+    /// healthy | degraded | unavailable | unknown
+    state: string,
+    quota-state: option<string>,
+    reset-at: option<string>,
+    retry-after: option<u64>,
+    detail-code: option<string>,
+    quota-snapshots: list<quota-snapshot-v1>,
+  }
+
   /// An opaque credential lease. The handle is meaningful only to the
   /// host.
   record credential-lease {
@@ -207,6 +250,15 @@ world plugin {
     on-request-normalized: func(request-json: string) -> result<_, plugin-error>;
     on-target-candidate: func(target-json: string) -> result<_, plugin-error>;
     on-usage-finalized: func(usage-json: string) -> result<_, plugin-error>;
+  }
+}
+
+/// Structured quota observations, versioned separately so existing API-v1
+/// components and the legacy health-probe contract remain unchanged.
+world plugin-health-v2 {
+  export health-probe-v2: interface {
+    use types.{plugin-error, health-observation-v2};
+    probe: func(provider-id: string, account-id: string) -> result<health-observation-v2, plugin-error>;
   }
 }
 

@@ -272,6 +272,50 @@ async fn a_real_guest_health_probe_is_declared_resolvable_and_invocable() {
     m.enable(id).await.unwrap();
     assert!(m.is_usable(id).await);
 
+    let provider_id = db::insert_provider(
+        &_pool,
+        &db::NewProvider {
+            name: "Antigravity health probe test",
+            base_url: "https://daily-cloudcode-pa.googleapis.com",
+            wire_format: WireFormat::Plugin,
+            auth_scheme: kinetix::types::AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: serde_json::json!({}),
+            timeout_ms: 30_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: serde_json::json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: false,
+            wire_plugin: "",
+            credential_plugin: "plugin:dev.kinetix.antigravity-oauth/antigravity-oauth",
+            model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let secret = Crypto::new(&[7u8; 32])
+        .encrypt(r#"{"access_token":"fixture-token","expiry":"2999-01-01T00:00:00Z"}"#)
+        .unwrap();
+    let account_id = db::insert_account(
+        &_pool,
+        &provider_id,
+        "health-probe-fixture",
+        &secret,
+        "fixture",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+
     let reference = format!("plugin:{id}/antigravity-oauth");
     assert_eq!(
         m.resolve_binding(&reference, Capability::HealthProbe)
@@ -281,16 +325,17 @@ async fn a_real_guest_health_probe_is_declared_resolvable_and_invocable() {
         "the installed .kxp manifest must resolve the health-probe capability"
     );
 
-    // Missing credentials return a structured guest error, proving that the
-    // installed package's health-probe export ran through the host boundary.
-    let result = m.health_probe(id, "provider_missing", "acc_missing").await;
-    match result {
-        Err(fault) => {
-            assert_eq!(fault.code(), "credential_expired", "got {fault:?}");
-            assert!(!fault.counts_against_circuit());
-        }
-        Ok(observation) => panic!("unexpected health observation: {observation:?}"),
-    }
+    // With a valid token but no cached project id, the real guest returns an
+    // empty structured observation without onboarding or making network calls.
+    // `Some([])` proves the manager invoked and decoded health-probe-v2 rather
+    // than falling back to the legacy projection.
+    let result = m
+        .health_probe_with_snapshots(id, &provider_id, &account_id)
+        .await
+        .unwrap();
+    assert_eq!(result.observation.state, "unknown");
+    let snapshots = result.quota_snapshots.expect("v2 snapshots are present");
+    assert!(snapshots.is_empty());
 }
 
 /// The second world (`plugin-adapter`, §6.3) is bound from the same component

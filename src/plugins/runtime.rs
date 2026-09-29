@@ -25,6 +25,19 @@ pub mod bindings {
     });
 }
 
+/// Optional structured health world. Legacy plugins continue to use `plugin`.
+pub mod health_v2_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit/kinetix-plugin.wit",
+        world: "plugin-health-v2",
+        imports: { default: async | trappable },
+        exports: { default: async },
+        anyhow: true,
+    });
+}
+
+pub use health_v2_bindings::kinetix::plugin as health_v2_wit;
+
 /// Optional account-authorization world. Separate binding preserves API-v1
 /// compatibility for components that do not provide browser auth.
 pub mod auth_bindings {
@@ -313,6 +326,26 @@ impl PluginRuntime {
         bindings::Plugin::instantiate_async(store, component, linker)
             .await
             .map_err(|e| anyhow::anyhow!("instantiating plugin component: {e}"))
+    }
+
+    /// Whether a component exports the optional structured health interface.
+    pub fn has_health_probe_v2(&self, component: &Component) -> bool {
+        component
+            .component_type()
+            .exports(&self.engine)
+            .any(|(name, _)| name == "health-probe-v2")
+    }
+
+    /// Instantiate the optional structured health world.
+    pub async fn instantiate_health_v2(
+        &self,
+        linker: &Linker<HostCtx>,
+        store: &mut Store<HostCtx>,
+        component: &Component,
+    ) -> Result<health_v2_bindings::PluginHealthV2> {
+        health_v2_bindings::PluginHealthV2::instantiate_async(store, component, linker)
+            .await
+            .map_err(|e| anyhow::anyhow!("instantiating plugin health-v2 component: {e}"))
     }
 
     /// Instantiate the optional browser/account authorization world.
