@@ -24,7 +24,7 @@ use kinetix::{
     paths::Paths,
     pipeline,
     registry::Registry,
-    types::{AuthScheme, FailureKind, InternalRequest, Message, Part, Role, WireFormat},
+    types::{AuthScheme, InternalRequest, Message, Part, Role, WireFormat},
 };
 use serde_json::json;
 use tokio::sync::{Barrier, Mutex};
@@ -601,7 +601,11 @@ async fn active_provider_work_backoff_does_not_block_inference_credential_resolu
         )
         .await
         .unwrap()
-        .finish_failure(Some((FailureKind::ServerError, None)))
+        .finish_failure(Some(
+            kinetix::provider_work::ProviderBackoffEvidence::Transient {
+                retry_after_secs: None,
+            },
+        ))
         .await;
 
     let response = pipeline::run(
@@ -663,6 +667,11 @@ async fn plugin_auth_error_rotates_and_retries_same_account_before_disable() {
 async fn retryable_rotation_failure_cools_down_and_falls_back_without_disabling() {
     let strategy = Arc::new(TestCredential::new(RotationMode::RetryableFailure));
     let harness = setup(strategy.clone(), None, 2).await;
+    let fallback_account = db::get_account(&harness.pool, &harness.fallback_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    strategy.resolve(&fallback_account).await.unwrap();
 
     let response = pipeline::run(
         &harness.state,

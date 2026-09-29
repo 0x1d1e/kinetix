@@ -35,7 +35,7 @@ type ApiResult = Result<Json<Value>, ApiError>;
 pub struct ApiError(
     StatusCode,
     String,
-    Option<(crate::types::FailureKind, Option<u64>)>,
+    Option<crate::provider_work::ProviderBackoffEvidence>,
 );
 
 impl ApiError {
@@ -51,7 +51,7 @@ impl ApiError {
 
     fn with_provider_backoff(
         mut self,
-        evidence: Option<(crate::types::FailureKind, Option<u64>)>,
+        evidence: Option<crate::provider_work::ProviderBackoffEvidence>,
     ) -> Self {
         self.2 = evidence;
         self
@@ -412,19 +412,49 @@ async fn run_model_lifecycle_lane(
         }
         ModelLifecycleLane::PricingSync => crate::provider_work::ProviderWorkClass::PricingRefresh,
     };
-    let lifecycle_state = state.clone();
-    let result = state
-        .provider_work
-        .run(
-            provider_id.clone(),
-            class,
-            Some(lane.name().to_string()),
-            move || async move {
-                run_model_lifecycle_lane_inner(&lifecycle_state, &provider_id, lane).await
-            },
-            |error: &ApiError| error.2,
-        )
-        .await;
+    let result = match lane {
+        ModelLifecycleLane::Reconciliation => {
+            let lifecycle_state = state.clone();
+            let lifecycle_provider_id = provider_id.clone();
+            state
+                .provider_work
+                .coalesce(
+                    provider_id.clone(),
+                    class,
+                    lane.name().to_string(),
+                    move || async move {
+                        run_model_lifecycle_lane_inner(
+                            &lifecycle_state,
+                            &lifecycle_provider_id,
+                            lane,
+                        )
+                        .await
+                    },
+                )
+                .await
+        }
+        ModelLifecycleLane::PricingSync => {
+            let lifecycle_state = state.clone();
+            let lifecycle_provider_id = provider_id.clone();
+            state
+                .provider_work
+                .run(
+                    provider_id.clone(),
+                    class,
+                    Some(lane.name().to_string()),
+                    move || async move {
+                        run_model_lifecycle_lane_inner(
+                            &lifecycle_state,
+                            &lifecycle_provider_id,
+                            lane,
+                        )
+                        .await
+                    },
+                    |error: &ApiError| error.2,
+                )
+                .await
+        }
+    };
     match result {
         Ok(payload) => Ok(payload.as_ref().clone()),
         Err(error) => match error.as_ref() {
@@ -3601,7 +3631,24 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
 
             let mut combined = Vec::new();
             for account in accounts {
-                let account_models = manager
+                let permit = state
+                    .provider_work
+                    .acquire(
+                        &provider.id,
+                        crate::provider_work::ProviderWorkClass::ModelDiscovery,
+                    )
+                    .await
+                    .map_err(|wait| {
+                        ApiError(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!(
+                                "provider work is temporarily backed off; retry in {}s",
+                                wait.as_secs().max(1)
+                            ),
+                            None,
+                        )
+                    })?;
+                let account_models = match manager
                     .account_model_discover(
                         &pref.plugin_id,
                         &provider.id,
@@ -3610,20 +3657,47 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                         &models_path,
                     )
                     .await
-                    .map_err(|fault| {
-                        let evidence = crate::provider_work::plugin_backoff_evidence(&fault);
-                        ApiError::bad(format!(
+                {
+                    Ok(models) => {
+                        permit.finish_success().await;
+                        models
+                    }
+                    Err(fault) => {
+                        let evidence = crate::provider_work::plugin_backoff_evidence_for_scope(
+                            &fault,
+                            crate::provider_work::RateLimitScope::Account,
+                        );
+                        permit.finish_failure(evidence).await;
+                        return Err(ApiError::bad(format!(
                             "plugin model discovery failed for account '{}': {}",
                             account.label,
                             crate::crypto::redact(&fault.message())
                         ))
-                        .with_provider_backoff(evidence)
-                    })?;
+                        .with_provider_backoff(evidence));
+                    }
+                };
                 extend_unique_by_id(&mut combined, account_models, |model| model.id.clone());
             }
             combined
         } else {
-            manager
+            let permit = state
+                .provider_work
+                .acquire(
+                    &provider.id,
+                    crate::provider_work::ProviderWorkClass::ModelDiscovery,
+                )
+                .await
+                .map_err(|wait| {
+                    ApiError(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "provider work is temporarily backed off; retry in {}s",
+                            wait.as_secs().max(1)
+                        ),
+                        None,
+                    )
+                })?;
+            match manager
                 .model_discover(
                     &pref.plugin_id,
                     &provider.id,
@@ -3631,14 +3705,24 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                     &models_path,
                 )
                 .await
-                .map_err(|fault| {
-                    let evidence = crate::provider_work::plugin_backoff_evidence(&fault);
-                    ApiError::bad(format!(
+            {
+                Ok(models) => {
+                    permit.finish_success().await;
+                    models
+                }
+                Err(fault) => {
+                    let evidence = crate::provider_work::plugin_backoff_evidence_for_scope(
+                        &fault,
+                        crate::provider_work::RateLimitScope::Provider,
+                    );
+                    permit.finish_failure(evidence).await;
+                    return Err(ApiError::bad(format!(
                         "plugin model discovery failed: {}",
                         crate::crypto::redact(&fault.message())
                     ))
-                    .with_provider_backoff(evidence)
-                })?
+                    .with_provider_backoff(evidence));
+                }
+            }
         };
 
         let models_dev =
@@ -5123,7 +5207,24 @@ async fn discover_models_native(
             session_context: None,
             credential,
         };
-        let resp = crate::outbound::send_provider_request(
+        let permit = state
+            .provider_work
+            .acquire(
+                &provider.id,
+                crate::provider_work::ProviderWorkClass::ModelDiscovery,
+            )
+            .await
+            .map_err(|wait| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "provider work is temporarily backed off; retry in {}s",
+                        wait.as_secs().max(1)
+                    ),
+                    None,
+                )
+            })?;
+        let resp = match crate::outbound::send_provider_request(
             &state.outbound_clients,
             state.config.allow_private_upstreams,
             state.config.allow_insecure_tls,
@@ -5142,15 +5243,22 @@ async fn discover_models_native(
             },
         )
         .await
-        .map_err(|e| {
-            let evidence = crate::provider_work::outbound_error_backoff_evidence(&e);
-            ApiError::bad(format!(
-                "discovery request failed for account '{}': {}",
-                account.label,
-                crate::crypto::redact(&e.message)
-            ))
-            .with_provider_backoff(evidence)
-        })?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let evidence = crate::provider_work::outbound_error_backoff_evidence(
+                    &error,
+                    crate::provider_work::RateLimitScope::Provider,
+                );
+                permit.finish_failure(evidence).await;
+                return Err(ApiError::bad(format!(
+                    "discovery request failed for account '{}': {}",
+                    account.label,
+                    crate::crypto::redact(&error.message)
+                ))
+                .with_provider_backoff(evidence));
+            }
+        };
         let status = resp.status();
         let headers = resp.headers().clone();
         let body_text = resp.text().await.unwrap_or_default();
@@ -5162,7 +5270,11 @@ async fn discover_models_native(
                 &body_text,
                 native,
             );
-            let evidence = crate::provider_work::upstream_backoff_evidence(&failure);
+            let evidence = crate::provider_work::upstream_backoff_evidence(
+                &failure,
+                crate::provider_work::RateLimitScope::Provider,
+            );
+            permit.finish_failure(evidence).await;
             return Err(ApiError::bad(format!(
                 "upstream returned HTTP {} for account '{}': {}",
                 status.as_u16(),
@@ -5171,6 +5283,7 @@ async fn discover_models_native(
             ))
             .with_provider_backoff(evidence));
         }
+        permit.finish_success().await;
         let parsed: Value = serde_json::from_str(&body_text)
             .map_err(|e| ApiError::bad(format!("invalid discovery response: {e}")))?;
         let account_observations = adapter
@@ -5362,12 +5475,16 @@ pub async fn test_provider(
             let status = resp.status().as_u16();
             let latency = started.elapsed().as_millis() as i64;
             if !(200..300).contains(&status) {
+                let response_headers = resp.headers().clone();
                 let text = resp.text().await.unwrap_or_default();
-                let native = adapter.classify_error(status, &text, &axum::http::HeaderMap::new());
+                let native = adapter.classify_error(status, &text, &response_headers);
                 let failure =
                     crate::pipeline::apply_provider_failure_rules(&provider, status, &text, native);
                 permit
-                    .finish_failure(crate::provider_work::upstream_backoff_evidence(&failure))
+                    .finish_failure(crate::provider_work::upstream_backoff_evidence(
+                        &failure,
+                        crate::provider_work::RateLimitScope::Provider,
+                    ))
                     .await;
                 return Ok(Json(json!({
                     "ok": false, "status": status, "latency_ms": latency,
@@ -5390,7 +5507,10 @@ pub async fn test_provider(
             })))
         }
         Err(e) => {
-            let evidence = crate::provider_work::outbound_error_backoff_evidence(&e);
+            let evidence = crate::provider_work::outbound_error_backoff_evidence(
+                &e,
+                crate::provider_work::RateLimitScope::Provider,
+            );
             permit.finish_failure(evidence).await;
             Ok(Json(json!({
                 "ok": false, "status": 0,
@@ -7865,7 +7985,10 @@ pub async fn probe_model_capability(
                     &text,
                     native,
                 );
-                failure_evidence = crate::provider_work::upstream_backoff_evidence(&failure);
+                failure_evidence = crate::provider_work::upstream_backoff_evidence(
+                    &failure,
+                    crate::provider_work::RateLimitScope::Provider,
+                );
                 let redacted = crypto::redact(&text);
                 let status = if deterministic_probe_rejection(
                     &body.capability,
@@ -7881,7 +8004,10 @@ pub async fn probe_model_capability(
             }
         }
         Err(error) => {
-            failure_evidence = crate::provider_work::outbound_error_backoff_evidence(&error);
+            failure_evidence = crate::provider_work::outbound_error_backoff_evidence(
+                &error,
+                crate::provider_work::RateLimitScope::Provider,
+            );
             (
                 "inconclusive",
                 0,
@@ -17889,6 +18015,120 @@ mod credential_enrollment_regression_tests {
             drop(state);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[tokio::test]
+    async fn provider_test_honors_retry_after_response_header() {
+        let (state, root) = test_state("provider-test-retry-after").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("retry-after", "120")],
+                    r#"{"error":{"message":"temporary outage"}}"#,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base_url = format!("http://{address}/v1");
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "retry-after-provider",
+                base_url: &base_url,
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 2_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "127.0.0.1",
+                allow_insecure_tls: true,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let encrypted = state.crypto.encrypt("probe-key").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "probe-account",
+            &encrypted,
+            "probe-key",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "probe-model",
+                display_name: "Probe Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: Some(64),
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = test_provider(
+            State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+            Json(TestBody {
+                model: Some("probe-model".into()),
+                account_id: Some(account_id),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["status"], 503);
+        let wait = match state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::HealthProbe,
+            )
+            .await
+        {
+            Err(wait) => wait,
+            Ok(permit) => {
+                drop(permit);
+                panic!("the provider probe should install provider backoff");
+            }
+        };
+        assert!(wait >= std::time::Duration::from_secs(100), "got {wait:?}");
+
+        server.abort();
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

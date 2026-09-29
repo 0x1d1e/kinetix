@@ -127,6 +127,29 @@ struct Flight<T, E> {
     result: tokio::sync::Mutex<SharedWork<T, E>>,
 }
 
+/// Scope assigned by the control-plane operation boundary when classifying
+/// 429 failures. Account-scoped limits never throttle sibling-account work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitScope {
+    Account,
+    Provider,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderBackoffEvidence {
+    Transient { retry_after_secs: Option<u64> },
+    ProviderRateLimited { retry_after_secs: Option<u64> },
+}
+
+impl ProviderBackoffEvidence {
+    fn retry_after_secs(self) -> Option<u64> {
+        match self {
+            Self::Transient { retry_after_secs }
+            | Self::ProviderRateLimited { retry_after_secs } => retry_after_secs,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ProviderWorkError<E> {
     /// An upstream failure installed provider backoff. The work was not run.
@@ -193,27 +216,72 @@ impl ProviderWorkCoordinator {
         E: Send + Sync + 'static,
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, E>> + Send + 'static,
-        C: Fn(&E) -> Option<(FailureKind, Option<u64>)> + Send + Sync + 'static,
+        C: Fn(&E) -> Option<ProviderBackoffEvidence> + Send + Sync + 'static,
     {
         self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
         let provider_id = provider_id.into();
-        let Some(key) = singleflight_key else {
-            return self
-                .execute(provider_id, class, work, classify_failure)
-                .await;
-        };
+        if let Some(key) = singleflight_key {
+            let coordinator = self.clone();
+            self.singleflight(provider_id.clone(), class, key, move || async move {
+                coordinator
+                    .execute(provider_id, class, work, classify_failure)
+                    .await
+            })
+            .await
+        } else {
+            self.execute(provider_id, class, work, classify_failure)
+                .await
+        }
+    }
 
-        // Bound the coordination table even if an operator submits many
-        // distinct model/account keys concurrently. Calls beyond the cap still
-        // use provider concurrency and rate budgets, but are not coalesced.
+    /// Coalesce provider-level orchestration without charging an operation
+    /// permit. The operation itself must acquire a permit for each upstream
+    /// request it performs.
+    pub async fn coalesce<T, E, F, Fut>(
+        &self,
+        provider_id: impl Into<String>,
+        class: ProviderWorkClass,
+        key: String,
+        work: F,
+    ) -> WorkResult<T, E>
+    where
+        T: Send + Sync + 'static,
+        E: Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+    {
+        self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
+        let work = move || async move {
+            work()
+                .await
+                .map(Arc::new)
+                .map_err(|error| Arc::new(ProviderWorkError::Operation(error)))
+        };
+        self.singleflight(provider_id.into(), class, key, work)
+            .await
+    }
+
+    async fn singleflight<T, E, F, Fut>(
+        &self,
+        provider_id: String,
+        class: ProviderWorkClass,
+        key: String,
+        work: F,
+    ) -> WorkResult<T, E>
+    where
+        T: Send + Sync + 'static,
+        E: Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = WorkResult<T, E>> + Send + 'static,
+    {
+        // Bound the coordination table. The caller still applies operation
+        // budgets inside the work closure if coalescing is unavailable.
         if self.flights.len() >= MAX_SINGLEFLIGHTS {
-            return self
-                .execute(provider_id, class, work, classify_failure)
-                .await;
+            return work().await;
         }
 
         let flight_key = FlightKey {
-            provider_id: provider_id.clone(),
+            provider_id,
             class,
             key,
             result_types: TypeId::of::<(T, E)>(),
@@ -244,9 +312,7 @@ impl ProviderWorkCoordinator {
                 let cleanup_key = flight_key.clone();
                 let cleanup_flight = erased.clone();
                 tokio::spawn(async move {
-                    let output = coordinator
-                        .execute(provider_id, class, work, classify_failure)
-                        .await;
+                    let output = work().await;
                     let _ = tx.send(Some(output));
                     coordinator.remove_flight(&cleanup_key, &cleanup_flight);
                 });
@@ -281,7 +347,7 @@ impl ProviderWorkCoordinator {
         E: Send + Sync + 'static,
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, E>> + Send + 'static,
-        C: Fn(&E) -> Option<(FailureKind, Option<u64>)> + Send + Sync + 'static,
+        C: Fn(&E) -> Option<ProviderBackoffEvidence> + Send + Sync + 'static,
     {
         let permit = match self.acquire_inner(&provider_id, class, false).await {
             Ok(permit) => permit,
@@ -409,21 +475,18 @@ impl ProviderWorkPermit {
         }
     }
 
-    pub async fn finish_failure(mut self, failure: Option<(FailureKind, Option<u64>)>) {
+    pub async fn finish_failure(mut self, evidence: Option<ProviderBackoffEvidence>) {
         self.completed = true;
         self.metrics.failed.fetch_add(1, Ordering::Relaxed);
-        if let Some((kind, retry_after)) = failure {
-            if provider_backoff_evidence(kind) {
-                let mut rate = self.gate.rate.lock().await;
-                rate.consecutive_failures = rate.consecutive_failures.saturating_add(1);
-                let backoff = backoff_delay(rate.consecutive_failures, retry_after);
-                let until = Instant::now() + backoff;
-                rate.backed_off_until =
-                    Some(rate.backed_off_until.map_or(until, |old| old.max(until)));
-                self.metrics
-                    .provider_throttled
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+        if let Some(evidence) = evidence {
+            let mut rate = self.gate.rate.lock().await;
+            rate.consecutive_failures = rate.consecutive_failures.saturating_add(1);
+            let backoff = backoff_delay(rate.consecutive_failures, evidence.retry_after_secs());
+            let until = Instant::now() + backoff;
+            rate.backed_off_until = Some(rate.backed_off_until.map_or(until, |old| old.max(until)));
+            self.metrics
+                .provider_throttled
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -436,18 +499,21 @@ impl Drop for ProviderWorkPermit {
     }
 }
 
-fn provider_backoff_evidence(kind: FailureKind) -> bool {
-    // Normalized RateLimit is explicitly account-scoped and keeps its existing
-    // account cooldown semantics; it is not evidence to throttle sibling accounts.
+fn normalized_backoff_evidence(
+    kind: FailureKind,
+    retry_after_secs: Option<u64>,
+    rate_limit_scope: RateLimitScope,
+) -> Option<ProviderBackoffEvidence> {
     if kind == FailureKind::RateLimit {
-        return false;
+        return (rate_limit_scope == RateLimitScope::Provider)
+            .then_some(ProviderBackoffEvidence::ProviderRateLimited { retry_after_secs });
     }
+
     matches!(
         kind.policy().category,
-        FailureCategory::RateLimited
-            | FailureCategory::TransientUpstream
-            | FailureCategory::Timeout
+        FailureCategory::TransientUpstream | FailureCategory::Timeout
     )
+    .then_some(ProviderBackoffEvidence::Transient { retry_after_secs })
 }
 
 fn backoff_delay(failures: u32, retry_after_secs: Option<u64>) -> Duration {
@@ -456,44 +522,76 @@ fn backoff_delay(failures: u32, retry_after_secs: Option<u64>) -> Duration {
     Duration::from_secs(seconds.max(1).min(MAX_BACKOFF.as_secs()))
 }
 
-/// Normalized adapter failures that are evidence of provider-wide throttling or
-/// transient unavailability. Request-local, account-quota, and target-local
-/// failures deliberately do not extend provider backoff.
-pub fn upstream_backoff_evidence(failure: &UpstreamFailure) -> Option<(FailureKind, Option<u64>)> {
-    provider_backoff_evidence(failure.kind).then_some((failure.kind, failure.retry_after_secs))
+/// Normalized adapter failures from a provider-scoped control-plane operation.
+/// Callers must identify whether a 429 applies to the provider or only the
+/// account used for that operation. Inference account-rate-limits never enter
+/// this coordinator.
+pub fn upstream_backoff_evidence(
+    failure: &UpstreamFailure,
+    rate_limit_scope: RateLimitScope,
+) -> Option<ProviderBackoffEvidence> {
+    normalized_backoff_evidence(failure.kind, failure.retry_after_secs, rate_limit_scope)
 }
 
 pub fn outbound_error_backoff_evidence(
     error: &OutboundError,
-) -> Option<(FailureKind, Option<u64>)> {
+    rate_limit_scope: RateLimitScope,
+) -> Option<ProviderBackoffEvidence> {
     if let Some(failure) = &error.adapter_failure {
-        return upstream_backoff_evidence(failure);
+        return upstream_backoff_evidence(failure, rate_limit_scope);
     }
-    error
-        .timeout
-        .then_some((FailureKind::Timeout, None))
-        .filter(|(kind, _)| provider_backoff_evidence(*kind))
+    error.timeout.then_some(ProviderBackoffEvidence::Transient {
+        retry_after_secs: None,
+    })
+}
+
+/// Canonical mapping for plugin and credential error codes. Plugin vocabulary
+/// has aliases that are not part of `FailureKind::parse`; rate-limit scope is
+/// supplied by the operation boundary rather than inferred from the string.
+fn plugin_code_backoff_evidence(
+    code: &str,
+    retryable: bool,
+    retry_after_secs: Option<u64>,
+    rate_limit_scope: RateLimitScope,
+) -> Option<ProviderBackoffEvidence> {
+    if !retryable {
+        return None;
+    }
+    let kind = match code {
+        "upstream_unavailable" => FailureKind::ServerError,
+        "rate_limited" => FailureKind::RateLimit,
+        code => FailureKind::parse(code)?,
+    };
+    normalized_backoff_evidence(kind, retry_after_secs, rate_limit_scope)
 }
 
 pub fn credential_backoff_evidence(
     error: &CredentialRotationError,
-) -> Option<(FailureKind, Option<u64>)> {
-    if !error.retryable {
-        return None;
-    }
-    let kind = FailureKind::parse(&error.code)?;
-    provider_backoff_evidence(kind).then_some((kind, error.retry_after_secs))
+) -> Option<ProviderBackoffEvidence> {
+    plugin_code_backoff_evidence(
+        &error.code,
+        error.retryable,
+        error.retry_after_secs,
+        RateLimitScope::Account,
+    )
 }
 
-pub fn plugin_backoff_evidence(error: &PluginFault) -> Option<(FailureKind, Option<u64>)> {
-    let PluginFault::PluginError {
-        code, retry_after, ..
-    } = error
-    else {
-        return None;
-    };
-    let kind = FailureKind::parse(code)?;
-    provider_backoff_evidence(kind).then_some((kind, *retry_after))
+pub fn plugin_backoff_evidence_for_scope(
+    error: &PluginFault,
+    rate_limit_scope: RateLimitScope,
+) -> Option<ProviderBackoffEvidence> {
+    match error {
+        PluginFault::PluginError {
+            code,
+            retryable,
+            retry_after,
+            ..
+        } => plugin_code_backoff_evidence(code, *retryable, *retry_after, rate_limit_scope),
+        PluginFault::Timeout => {
+            plugin_code_backoff_evidence("timeout", true, None, rate_limit_scope)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -561,15 +659,156 @@ mod tests {
             adapter_failure: None,
         };
         assert_eq!(
-            outbound_error_backoff_evidence(&timeout),
-            Some((FailureKind::Timeout, None))
+            outbound_error_backoff_evidence(&timeout, RateLimitScope::Provider),
+            Some(ProviderBackoffEvidence::Transient {
+                retry_after_secs: None,
+            })
         );
         let denied = OutboundError {
             message: "request denied".into(),
             timeout: false,
             adapter_failure: None,
         };
-        assert_eq!(outbound_error_backoff_evidence(&denied), None);
+        assert_eq!(
+            outbound_error_backoff_evidence(&denied, RateLimitScope::Provider),
+            None
+        );
+    }
+
+    #[test]
+    fn plugin_and_credential_codes_share_scoped_backoff_mapping() {
+        let plugin_error = |code: &str, retryable: bool, retry_after| PluginFault::PluginError {
+            code: code.into(),
+            message: "upstream request failed".into(),
+            retryable,
+            retry_after,
+        };
+
+        assert_eq!(
+            plugin_backoff_evidence_for_scope(
+                &plugin_error("upstream_unavailable", true, None),
+                RateLimitScope::Provider,
+            ),
+            Some(ProviderBackoffEvidence::Transient {
+                retry_after_secs: None,
+            })
+        );
+        assert_eq!(
+            plugin_backoff_evidence_for_scope(
+                &plugin_error("timeout", true, None),
+                RateLimitScope::Provider,
+            ),
+            Some(ProviderBackoffEvidence::Transient {
+                retry_after_secs: None,
+            })
+        );
+        assert_eq!(
+            plugin_backoff_evidence_for_scope(
+                &plugin_error("rate_limited", true, Some(17)),
+                RateLimitScope::Provider,
+            ),
+            Some(ProviderBackoffEvidence::ProviderRateLimited {
+                retry_after_secs: Some(17),
+            })
+        );
+        assert_eq!(
+            plugin_backoff_evidence_for_scope(
+                &plugin_error("rate_limited", true, Some(17)),
+                RateLimitScope::Account,
+            ),
+            None
+        );
+        assert_eq!(
+            plugin_backoff_evidence_for_scope(
+                &plugin_error("upstream_unavailable", false, None),
+                RateLimitScope::Provider,
+            ),
+            None
+        );
+        assert_eq!(
+            plugin_backoff_evidence_for_scope(&PluginFault::Timeout, RateLimitScope::Provider),
+            Some(ProviderBackoffEvidence::Transient {
+                retry_after_secs: None,
+            })
+        );
+
+        let credential_error =
+            CredentialRotationError::new("upstream_unavailable", "refresh failed", true, Some(9));
+        assert_eq!(
+            credential_backoff_evidence(&credential_error),
+            Some(ProviderBackoffEvidence::Transient {
+                retry_after_secs: Some(9),
+            })
+        );
+        let account_rate_limit =
+            CredentialRotationError::new("rate_limited", "account rate limited", true, Some(17));
+        assert_eq!(credential_backoff_evidence(&account_rate_limit), None);
+    }
+
+    #[tokio::test]
+    async fn plugin_failure_aliases_install_scoped_provider_backoff() {
+        let coordinator = ProviderWorkCoordinator::default();
+        let error = PluginFault::PluginError {
+            code: "upstream_unavailable".into(),
+            message: "discovery temporarily unavailable".into(),
+            retryable: true,
+            retry_after: None,
+        };
+        let first = coordinator
+            .run(
+                "provider-a",
+                ProviderWorkClass::RoutingFactsRefresh,
+                None,
+                move || async move { Err::<(), _>(error) },
+                |error| plugin_backoff_evidence_for_scope(error, RateLimitScope::Provider),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            first.as_ref(),
+            ProviderWorkError::Operation(PluginFault::PluginError { .. })
+        ));
+
+        let second = coordinator
+            .run(
+                "provider-a",
+                ProviderWorkClass::RoutingFactsRefresh,
+                None,
+                || async { Ok::<_, PluginFault>(()) },
+                |error| plugin_backoff_evidence_for_scope(error, RateLimitScope::Provider),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(second.as_ref(), ProviderWorkError::BackedOff(_)));
+        assert_eq!(coordinator.metrics_snapshot().provider_throttled, 1);
+
+        let provider_rate_limit = plugin_backoff_evidence_for_scope(
+            &PluginFault::PluginError {
+                code: "rate_limited".into(),
+                message: "provider is rate limited".into(),
+                retryable: true,
+                retry_after: Some(30),
+            },
+            RateLimitScope::Provider,
+        );
+        assert_eq!(
+            provider_rate_limit,
+            Some(ProviderBackoffEvidence::ProviderRateLimited {
+                retry_after_secs: Some(30),
+            })
+        );
+        assert_eq!(
+            plugin_backoff_evidence_for_scope(
+                &PluginFault::PluginError {
+                    code: "rate_limited".into(),
+                    message: "one account is rate limited".into(),
+                    retryable: true,
+                    retry_after: Some(30),
+                },
+                RateLimitScope::Account,
+            ),
+            None
+        );
     }
 
     #[tokio::test]
@@ -579,9 +818,10 @@ mod tests {
             .acquire("provider-a", ProviderWorkClass::ModelDiscovery)
             .await
             .unwrap();
-        account_a
-            .finish_failure(Some((FailureKind::RateLimit, Some(60))))
-            .await;
+        let account_rate_limit =
+            normalized_backoff_evidence(FailureKind::RateLimit, Some(60), RateLimitScope::Account);
+        assert_eq!(account_rate_limit, None);
+        account_a.finish_failure(account_rate_limit).await;
 
         let account_b = coordinator
             .acquire("provider-a", ProviderWorkClass::HealthProbe)
@@ -590,13 +830,19 @@ mod tests {
         account_b.finish_success().await;
         assert_eq!(coordinator.metrics_snapshot().provider_throttled, 0);
 
+        let provider_rate_limit =
+            normalized_backoff_evidence(FailureKind::RateLimit, Some(60), RateLimitScope::Provider);
+        assert_eq!(
+            provider_rate_limit,
+            Some(ProviderBackoffEvidence::ProviderRateLimited {
+                retry_after_secs: Some(60),
+            })
+        );
         let provider_error = coordinator
             .acquire("provider-b", ProviderWorkClass::ModelDiscovery)
             .await
             .unwrap();
-        provider_error
-            .finish_failure(Some((FailureKind::ServerError, None)))
-            .await;
+        provider_error.finish_failure(provider_rate_limit).await;
         assert!(coordinator
             .acquire("provider-b", ProviderWorkClass::HealthProbe)
             .await
@@ -640,22 +886,53 @@ mod tests {
         assert_eq!(coordinator.metrics_snapshot().coalesced, 1);
     }
 
+    #[tokio::test]
+    async fn coalesced_lifecycle_budgets_each_upstream_operation() {
+        let coordinator = ProviderWorkCoordinator::default();
+        let operation_coordinator = coordinator.clone();
+        coordinator
+            .coalesce(
+                "provider-a",
+                ProviderWorkClass::ModelDiscovery,
+                "reconciliation".into(),
+                move || async move {
+                    for _ in 0..2 {
+                        let permit = operation_coordinator
+                            .acquire("provider-a", ProviderWorkClass::ModelDiscovery)
+                            .await
+                            .map_err(|wait| format!("backed off for {wait:?}"))?;
+                        permit.finish_success().await;
+                    }
+                    Ok::<_, String>(())
+                },
+            )
+            .await
+            .unwrap();
+
+        let metrics = coordinator.metrics_snapshot();
+        assert_eq!(metrics.scheduled, 3);
+        assert_eq!(metrics.executed, 2);
+    }
+
     #[test]
-    fn only_provider_level_failure_categories_back_off() {
+    fn backoff_evidence_requires_explicit_rate_limit_scope() {
         for kind in [
             FailureKind::BadRequest,
             FailureKind::RateLimit,
             FailureKind::QuotaExhausted,
             FailureKind::TargetError,
         ] {
-            assert!(!provider_backoff_evidence(kind));
+            assert_eq!(
+                normalized_backoff_evidence(kind, None, RateLimitScope::Account),
+                None
+            );
         }
         for kind in [
             FailureKind::ServerError,
             FailureKind::ConnectionError,
             FailureKind::Timeout,
         ] {
-            assert!(provider_backoff_evidence(kind));
+            assert!(normalized_backoff_evidence(kind, None, RateLimitScope::Account).is_some());
         }
         assert_eq!(backoff_delay(1, None), Duration::from_secs(5));
         assert_eq!(backoff_delay(2, None), Duration::from_secs(10));
@@ -670,7 +947,9 @@ mod tests {
             .await
             .unwrap();
         first
-            .finish_failure(Some((FailureKind::ServerError, None)))
+            .finish_failure(Some(ProviderBackoffEvidence::Transient {
+                retry_after_secs: None,
+            }))
             .await;
 
         let gate = coordinator.gate("provider-a");
@@ -685,7 +964,9 @@ mod tests {
             .await
             .expect("expired backoff should permit the next attempt");
         retry
-            .finish_failure(Some((FailureKind::ServerError, None)))
+            .finish_failure(Some(ProviderBackoffEvidence::Transient {
+                retry_after_secs: None,
+            }))
             .await;
 
         let rate = gate.rate.lock().await;

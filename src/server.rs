@@ -530,7 +530,12 @@ pub fn spawn_background_tasks(state: AppState) {
                                         .refresh_cached_routing_facts(&refresh_plugin_id)
                                         .await
                                 },
-                                crate::provider_work::plugin_backoff_evidence,
+                                |error| {
+                                    crate::provider_work::plugin_backoff_evidence_for_scope(
+                                        error,
+                                        crate::provider_work::RateLimitScope::Provider,
+                                    )
+                                },
                             )
                             .await;
                         (plugin_id, result)
@@ -760,7 +765,12 @@ async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>
                             )
                             .await
                     },
-                    crate::provider_work::plugin_backoff_evidence,
+                    |error| {
+                        crate::provider_work::plugin_backoff_evidence_for_scope(
+                            error,
+                            crate::provider_work::RateLimitScope::Account,
+                        )
+                    },
                 )
                 .await
             {

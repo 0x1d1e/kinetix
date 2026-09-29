@@ -84,10 +84,13 @@ when it skips multiple targets behind an open provider circuit.
 
 Provider-work counters omit provider, account, and model labels. The coordinator
 budgets refresh-capable credential resolution, discovery, probes, pricing refresh,
-and cached routing-fact refresh. Cached credential reads bypass this coordinator
-on inference paths; probes, discovery, and routing-fact refresh stay off inference
-paths. Normalized account-level rate limits retain account cooldown behavior and
-do not trigger provider-wide backoff.
+and cached routing-fact refresh. Each actual per-account discovery operation gets
+its own permit while reconciliation remains singleflight. Cached credential reads
+bypass this coordinator on inference paths; probes, discovery, and routing-fact
+refresh stay off inference paths. The coordinator uses the scope assigned by
+Kinetix to each operation: account-scoped rate limits retain account cooldown
+behavior, while provider-scoped evidence can trigger bounded provider backoff.
+This describes Kinetix policy, not upstream quota semantics.
 
 Admission metrics omit key and Route identities to keep label cardinality bounded. Incomplete usage keeps the conservative token reservation; the oldest-reservation age is exposed without imposing a fixed stale threshold.
 
