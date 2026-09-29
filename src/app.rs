@@ -33,6 +33,8 @@ pub struct AppState {
     /// Host-owned proactive refresh scheduler and account-scoped rotation
     /// singleflight shared by scheduled refresh and reactive auth recovery.
     pub credential_refresh: crate::credential_refresh::RefreshCoordinator,
+    /// Provider-scoped budgets for background and control-plane work only.
+    pub provider_work: crate::provider_work::ProviderWorkCoordinator,
     pub adapters: AdapterRegistry,
     pub http: reqwest::Client,
     /// Pinned provider clients keyed by validated host/address set. This keeps
@@ -105,6 +107,26 @@ fn classify_refresh_lookup<T, E>(result: Result<Option<T>, E>) -> RefreshLookup<
     }
 }
 
+fn credential_work_error(
+    error: &crate::provider_work::ProviderWorkError<CredentialRotationError>,
+) -> CredentialRotationError {
+    match error {
+        crate::provider_work::ProviderWorkError::BackedOff(wait) => CredentialRotationError::new(
+            "provider_backoff",
+            "provider work is temporarily backed off",
+            true,
+            Some(wait.as_secs().max(1)),
+        ),
+        crate::provider_work::ProviderWorkError::Operation(error) => error.clone(),
+        crate::provider_work::ProviderWorkError::Aborted => CredentialRotationError::new(
+            "provider_work_aborted",
+            "provider work coordinator stopped before completion",
+            true,
+            None,
+        ),
+    }
+}
+
 #[derive(Clone)]
 pub struct StickyEntry {
     /// The selected route target key (route id + account id + model id).
@@ -163,6 +185,7 @@ impl AppState {
             credentials,
             plugin_credentials: Arc::new(DashMap::new()),
             credential_refresh: crate::credential_refresh::RefreshCoordinator::default(),
+            provider_work: crate::provider_work::ProviderWorkCoordinator::default(),
             adapters: AdapterRegistry::new(),
             http,
             outbound_clients: Arc::new(DashMap::new()),
@@ -281,10 +304,23 @@ impl AppState {
                 ));
             };
             let strategy = Arc::clone(strategy.value());
-            return self
-                .credential_refresh
-                .resolve(&provider.id, strategy, account)
+            let refresh = self.credential_refresh.clone();
+            let provider_id = provider.id.clone();
+            let account = account.clone();
+            let result = self
+                .provider_work
+                .run(
+                    provider_id.clone(),
+                    crate::provider_work::ProviderWorkClass::CredentialRefresh,
+                    Some(format!("account:{}", account.id)),
+                    move || async move { refresh.resolve(&provider_id, strategy, &account).await },
+                    crate::provider_work::credential_backoff_evidence,
+                )
                 .await;
+            return match result {
+                Ok(credential) => Ok(credential.as_ref().clone()),
+                Err(error) => Err(credential_work_error(error.as_ref())),
+            };
         }
         self.credentials.resolve(account).await
     }
@@ -363,9 +399,28 @@ impl AppState {
                 )
             })?;
 
-        self.credential_refresh
-            .rotate_after_auth_error(&provider.id, strategy, account, failed_secret)
-            .await
+        let refresh = self.credential_refresh.clone();
+        let provider_id = provider.id.clone();
+        let account = account.clone();
+        let failed_secret = failed_secret.to_string();
+        let result = self
+            .provider_work
+            .run(
+                provider_id.clone(),
+                crate::provider_work::ProviderWorkClass::CredentialRefresh,
+                None,
+                move || async move {
+                    refresh
+                        .rotate_after_auth_error(&provider_id, strategy, &account, &failed_secret)
+                        .await
+                },
+                crate::provider_work::credential_backoff_evidence,
+            )
+            .await;
+        match result {
+            Ok(rotated) => Ok(*rotated),
+            Err(error) => Err(credential_work_error(error.as_ref())),
+        }
     }
 
     /// Resolve every currently configured plugin-backed account once at
@@ -431,21 +486,26 @@ impl AppState {
             return;
         }
 
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REFRESHES));
-        let mut jobs = tokio::task::JoinSet::new();
-        for key in due {
-            let state = self.clone();
-            let semaphore = semaphore.clone();
+        fn spawn_refresh_job(
+            jobs: &mut tokio::task::JoinSet<()>,
+            state: AppState,
+            key: crate::credential_refresh::CredentialKey,
+        ) {
             jobs.spawn(async move {
-                let permit = semaphore.acquire_owned().await;
-                if permit.is_err() {
-                    return;
-                }
-                let _permit = permit.expect("checked above");
                 state.refresh_due_credential(key).await;
             });
         }
-        while jobs.join_next().await.is_some() {}
+
+        let mut due = due.into_iter();
+        let mut jobs = tokio::task::JoinSet::new();
+        for key in due.by_ref().take(MAX_CONCURRENT_REFRESHES) {
+            spawn_refresh_job(&mut jobs, self.clone(), key);
+        }
+        while jobs.join_next().await.is_some() {
+            if let Some(key) = due.next() {
+                spawn_refresh_job(&mut jobs, self.clone(), key);
+            }
+        }
     }
 
     async fn refresh_due_credential(&self, key: crate::credential_refresh::CredentialKey) {
@@ -508,11 +568,43 @@ impl AppState {
             return;
         };
 
-        match self
-            .credential_refresh
-            .rotate_scheduled(&provider.id, strategy, &account)
-            .await
-        {
+        let refresh = self.credential_refresh.clone();
+        let provider_id = provider.id.clone();
+        let account_for_refresh = account.clone();
+        let result = self
+            .provider_work
+            .run(
+                provider_id.clone(),
+                crate::provider_work::ProviderWorkClass::CredentialRefresh,
+                None,
+                move || async move {
+                    refresh
+                        .rotate_scheduled(&provider_id, strategy, &account_for_refresh)
+                        .await
+                },
+                crate::provider_work::credential_backoff_evidence,
+            )
+            .await;
+        let result = result
+            .map(|rotated| *rotated)
+            .map_err(|error| match error.as_ref() {
+                crate::provider_work::ProviderWorkError::BackedOff(wait) => {
+                    CredentialRotationError::new(
+                        "provider_backoff",
+                        "provider work is temporarily backed off",
+                        true,
+                        Some(wait.as_secs().max(1)),
+                    )
+                }
+                crate::provider_work::ProviderWorkError::Operation(error) => error.clone(),
+                crate::provider_work::ProviderWorkError::Aborted => CredentialRotationError::new(
+                    "provider_work_aborted",
+                    "provider work coordinator stopped before completion",
+                    true,
+                    None,
+                ),
+            });
+        match result {
             Ok(true) => tracing::debug!(
                 provider = %provider.id,
                 account = %account.id,

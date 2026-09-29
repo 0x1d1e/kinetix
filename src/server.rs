@@ -455,6 +455,7 @@ pub fn spawn_background_tasks(state: AppState) {
     // manifest-requested cadence. The request path only reads the last
     // host-stamped snapshot, so no plugin/network wall time enters routing.
     if let Some(manager) = state.plugin_manager().cloned() {
+        let st = state.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -489,17 +490,23 @@ pub fn spawn_background_tasks(state: AppState) {
                     }
 
                     active.insert(row.id.clone());
-                    let is_due = next_due
-                        .get(&row.id)
-                        .map(|deadline| *deadline <= now)
-                        .unwrap_or(true);
-                    if !is_due {
+                    let cadence = Duration::from_millis(manifest.routing_facts_refresh_ms);
+                    let Some(deadline) = next_due.get(&row.id).copied() else {
+                        next_due.insert(
+                            row.id.clone(),
+                            now + st.provider_work.scheduler_jitter(Duration::from_secs(30)),
+                        );
+                        continue;
+                    };
+                    if deadline > now {
                         continue;
                     }
 
                     next_due.insert(
                         row.id.clone(),
-                        now + Duration::from_millis(manifest.routing_facts_refresh_ms),
+                        now + cadence
+                            + st.provider_work
+                                .scheduler_jitter(cadence.min(Duration::from_secs(30))),
                     );
                     due.push(row.id);
                 }
@@ -509,8 +516,23 @@ pub fn spawn_background_tasks(state: AppState) {
                 let mut jobs = tokio::task::JoinSet::new();
                 for plugin_id in due {
                     let manager = manager.clone();
+                    let state = st.clone();
                     jobs.spawn(async move {
-                        let result = manager.refresh_cached_routing_facts(&plugin_id).await;
+                        let refresh_plugin_id = plugin_id.clone();
+                        let result = state
+                            .provider_work
+                            .run(
+                                format!("plugin:{plugin_id}"),
+                                crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+                                Some("cached_snapshot".into()),
+                                move || async move {
+                                    manager
+                                        .refresh_cached_routing_facts(&refresh_plugin_id)
+                                        .await
+                                },
+                                crate::provider_work::plugin_backoff_evidence,
+                            )
+                            .await;
                         (plugin_id, result)
                     });
                 }
@@ -520,17 +542,21 @@ pub fn spawn_background_tasks(state: AppState) {
                         Ok((plugin_id, Ok(count))) => {
                             tracing::debug!(
                                 plugin = %plugin_id,
-                                facts = count,
+                                facts = *count,
                                 "refreshed cached plugin routing facts"
                             );
                         }
-                        Ok((plugin_id, Err(error))) => {
-                            tracing::debug!(
-                                plugin = %plugin_id,
-                                error = %error.message(),
-                                "cached plugin routing fact refresh failed"
-                            );
-                        }
+                        Ok((plugin_id, Err(error))) => match error.as_ref() {
+                            crate::provider_work::ProviderWorkError::BackedOff(wait) => {
+                                tracing::debug!(plugin = %plugin_id, retry_after_secs = wait.as_secs(), "cached routing-fact refresh backed off");
+                            }
+                            crate::provider_work::ProviderWorkError::Operation(error) => {
+                                tracing::debug!(plugin = %plugin_id, error = %error.message(), "cached plugin routing fact refresh failed");
+                            }
+                            crate::provider_work::ProviderWorkError::Aborted => {
+                                tracing::debug!(plugin = %plugin_id, "cached routing-fact refresh task aborted");
+                            }
+                        },
                         Err(error) => {
                             tracing::debug!(
                                 error = %error,
@@ -549,6 +575,7 @@ pub fn spawn_background_tasks(state: AppState) {
     if let Some(manager) = state.plugin_manager().cloned() {
         let st = state.clone();
         tokio::spawn(async move {
+            tokio::time::sleep(st.provider_work.scheduler_jitter(Duration::from_secs(15))).await;
             let mut tick = tokio::time::interval(Duration::from_secs(15));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -714,54 +741,82 @@ async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>
             if account.status == "disabled" {
                 continue;
             }
-            let probe = match manager
-                .health_probe_with_snapshots(&pref.plugin_id, &provider.id, &account.id)
+            let probe_plugin = pref.plugin_id.clone();
+            let probe_provider = provider.id.clone();
+            let probe_account = account.id.clone();
+            let probe_manager = manager.clone();
+            let probe = match state
+                .provider_work
+                .run(
+                    provider.id.clone(),
+                    crate::provider_work::ProviderWorkClass::HealthProbe,
+                    Some(format!("account:{}", account.id)),
+                    move || async move {
+                        probe_manager
+                            .health_probe_with_snapshots(
+                                &probe_plugin,
+                                &probe_provider,
+                                &probe_account,
+                            )
+                            .await
+                    },
+                    crate::provider_work::plugin_backoff_evidence,
+                )
                 .await
             {
                 Ok(observation) => observation,
-                Err(e) => {
-                    tracing::debug!(plugin = %pref.plugin_id, account = %account.id,
-                        error = %e.message(), "plugin health probe failed");
+                Err(error) => {
+                    match error.as_ref() {
+                        crate::provider_work::ProviderWorkError::BackedOff(wait) => {
+                            tracing::debug!(plugin = %pref.plugin_id, account = %account.id, retry_after_secs = wait.as_secs(), "plugin health probe backed off");
+                        }
+                        crate::provider_work::ProviderWorkError::Operation(error) => {
+                            tracing::debug!(plugin = %pref.plugin_id, account = %account.id, error = %error.message(), "plugin health probe failed");
+                        }
+                        crate::provider_work::ProviderWorkError::Aborted => {
+                            tracing::debug!(plugin = %pref.plugin_id, account = %account.id, "plugin health probe task aborted");
+                        }
+                    }
                     continue;
                 }
             };
-            let quota_observation = match probe.quota_snapshots {
+            let obs = &probe.observation;
+            let quota_observation = match probe.quota_snapshots.as_ref() {
                 Some(snapshots) => state.quota.observe_plugin_snapshots(
                     &provider.id,
                     &account.id,
                     snapshots
-                        .into_iter()
+                        .iter()
                         .map(|snapshot| crate::quota::PluginQuotaSnapshot {
-                            scope: match snapshot.scope {
+                            scope: match &snapshot.scope {
                                 crate::plugins::runtime::health_v2_wit::types::QuotaScopeV1::Account => {
                                     crate::quota::PluginQuotaScope::Account
                                 }
                                 crate::plugins::runtime::health_v2_wit::types::QuotaScopeV1::Model(model) => {
-                                    crate::quota::PluginQuotaScope::Model(model)
+                                    crate::quota::PluginQuotaScope::Model(model.clone())
                                 }
                                 crate::plugins::runtime::health_v2_wit::types::QuotaScopeV1::Unknown => {
                                     crate::quota::PluginQuotaScope::Unknown
                                 }
                             },
-                            group: snapshot.group,
-                            bucket_id: snapshot.bucket_id,
+                            group: snapshot.group.clone(),
+                            bucket_id: snapshot.bucket_id.clone(),
                             remaining_fraction: snapshot.remaining_fraction,
                             remaining: snapshot.remaining,
                             limit: snapshot.limit,
-                            unit: snapshot.unit,
-                            window: snapshot.window,
-                            reset_at: snapshot.reset_at,
+                            unit: snapshot.unit.clone(),
+                            window: snapshot.window.clone(),
+                            reset_at: snapshot.reset_at.clone(),
                         })
                         .collect(),
                 ),
                 None => state.quota.observe_plugin(
                     &provider.id,
                     &account.id,
-                    probe.observation.quota_state.as_deref(),
-                    probe.observation.reset_at.as_deref(),
+                    obs.quota_state.as_deref(),
+                    obs.reset_at.as_deref(),
                 ),
             };
-            let obs = probe.observation;
             if let Some(observation) = quota_observation.filter(|observation| observation.exhausted)
             {
                 let now = chrono::Utc::now();

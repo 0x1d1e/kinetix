@@ -32,17 +32,29 @@ use crate::types::{AuthScheme, Prices, ThinkingMap, WireFormat};
 type ApiResult = Result<Json<Value>, ApiError>;
 
 #[derive(Debug)]
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(
+    StatusCode,
+    String,
+    Option<(crate::types::FailureKind, Option<u64>)>,
+);
 
 impl ApiError {
     fn bad(msg: impl Into<String>) -> Self {
-        ApiError(StatusCode::BAD_REQUEST, msg.into())
+        ApiError(StatusCode::BAD_REQUEST, msg.into(), None)
     }
     fn not_found(msg: impl Into<String>) -> Self {
-        ApiError(StatusCode::NOT_FOUND, msg.into())
+        ApiError(StatusCode::NOT_FOUND, msg.into(), None)
     }
     fn internal(e: impl std::fmt::Display) -> Self {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), None)
+    }
+
+    fn with_provider_backoff(
+        mut self,
+        evidence: Option<(crate::types::FailureKind, Option<u64>)>,
+    ) -> Self {
+        self.2 = evidence;
+        self
     }
 }
 
@@ -73,6 +85,7 @@ pub async fn login(
         return Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "admin authentication unavailable: control plane degraded".into(),
+            None,
         ));
     }
     if !auth::verify_admin_password(&state, &body.password).await {
@@ -89,6 +102,7 @@ pub async fn login(
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,
             "invalid admin password".into(),
+            None,
         ));
     }
     // Sessions are in-memory with a TTL: a restart drops them all, so a browser
@@ -159,12 +173,14 @@ pub async fn change_password(
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,
             "current password is incorrect".into(),
+            None,
         ));
     }
     if body.new_password.trim().len() < 8 {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "new password must be at least 8 characters".into(),
+            None,
         ));
     }
     auth::set_admin_password(&state, &body.new_password)
@@ -384,6 +400,53 @@ impl ModelLifecycleLane {
 }
 
 async fn run_model_lifecycle_lane(
+    state: &AppState,
+    provider_id: &str,
+    lane: ModelLifecycleLane,
+) -> Result<Value, ApiError> {
+    let state = state.clone();
+    let provider_id = provider_id.to_string();
+    let class = match lane {
+        ModelLifecycleLane::Reconciliation => {
+            crate::provider_work::ProviderWorkClass::ModelDiscovery
+        }
+        ModelLifecycleLane::PricingSync => crate::provider_work::ProviderWorkClass::PricingRefresh,
+    };
+    let lifecycle_state = state.clone();
+    let result = state
+        .provider_work
+        .run(
+            provider_id.clone(),
+            class,
+            Some(lane.name().to_string()),
+            move || async move {
+                run_model_lifecycle_lane_inner(&lifecycle_state, &provider_id, lane).await
+            },
+            |error: &ApiError| error.2,
+        )
+        .await;
+    match result {
+        Ok(payload) => Ok(payload.as_ref().clone()),
+        Err(error) => match error.as_ref() {
+            crate::provider_work::ProviderWorkError::BackedOff(wait) => Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "provider work is temporarily backed off; retry in {}s",
+                    wait.as_secs().max(1)
+                ),
+                None,
+            )),
+            crate::provider_work::ProviderWorkError::Operation(error) => {
+                Err(ApiError(error.0, error.1.clone(), error.2))
+            }
+            crate::provider_work::ProviderWorkError::Aborted => Err(ApiError::internal(
+                "provider work coordinator stopped before completion",
+            )),
+        },
+    }
+}
+
+async fn run_model_lifecycle_lane_inner(
     state: &AppState,
     provider_id: &str,
     lane: ModelLifecycleLane,
@@ -1023,6 +1086,7 @@ fn profile_policy_error(error: crate::types::ProxyError) -> ApiError {
     ApiError(
         StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
         error.message,
+        None,
     )
 }
 
@@ -1068,6 +1132,7 @@ pub async fn generate_client_profile(
             ApiError(
                 StatusCode::FORBIDDEN,
                 "selected model or Route is not currently available to this key".into(),
+                None,
             )
         })?;
 
@@ -3546,11 +3611,13 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                     )
                     .await
                     .map_err(|fault| {
+                        let evidence = crate::provider_work::plugin_backoff_evidence(&fault);
                         ApiError::bad(format!(
                             "plugin model discovery failed for account '{}': {}",
                             account.label,
                             crate::crypto::redact(&fault.message())
                         ))
+                        .with_provider_backoff(evidence)
                     })?;
                 extend_unique_by_id(&mut combined, account_models, |model| model.id.clone());
             }
@@ -3565,10 +3632,12 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                 )
                 .await
                 .map_err(|fault| {
+                    let evidence = crate::provider_work::plugin_backoff_evidence(&fault);
                     ApiError::bad(format!(
                         "plugin model discovery failed: {}",
                         crate::crypto::redact(&fault.message())
                     ))
+                    .with_provider_backoff(evidence)
                 })?
         };
 
@@ -5074,21 +5143,33 @@ async fn discover_models_native(
         )
         .await
         .map_err(|e| {
+            let evidence = crate::provider_work::outbound_error_backoff_evidence(&e);
             ApiError::bad(format!(
                 "discovery request failed for account '{}': {}",
                 account.label,
                 crate::crypto::redact(&e.message)
             ))
+            .with_provider_backoff(evidence)
         })?;
         let status = resp.status();
+        let headers = resp.headers().clone();
         let body_text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            let native = adapter.classify_error(status.as_u16(), &body_text, &headers);
+            let failure = crate::pipeline::apply_provider_failure_rules(
+                provider,
+                status.as_u16(),
+                &body_text,
+                native,
+            );
+            let evidence = crate::provider_work::upstream_backoff_evidence(&failure);
             return Err(ApiError::bad(format!(
                 "upstream returned HTTP {} for account '{}': {}",
                 status.as_u16(),
                 account.label,
                 crate::crypto::redact(&truncate(&body_text, 400))
-            )));
+            ))
+            .with_provider_backoff(evidence));
         }
         let parsed: Value = serde_json::from_str(&body_text)
             .map_err(|e| ApiError::bad(format!("invalid discovery response: {e}")))?;
@@ -5239,6 +5320,23 @@ pub async fn test_provider(
     let parsed_url =
         url::Url::parse(&url).map_err(|e| ApiError::bad(format!("invalid probe URL: {e}")))?;
 
+    let permit = state
+        .provider_work
+        .acquire(
+            &provider.id,
+            crate::provider_work::ProviderWorkClass::HealthProbe,
+        )
+        .await
+        .map_err(|wait| {
+            ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "provider work is temporarily backed off; retry in {}s",
+                    wait.as_secs().max(1)
+                ),
+                None,
+            )
+        })?;
     let started = std::time::Instant::now();
     match crate::outbound::send_provider_request(
         &state.outbound_clients,
@@ -5268,6 +5366,9 @@ pub async fn test_provider(
                 let native = adapter.classify_error(status, &text, &axum::http::HeaderMap::new());
                 let failure =
                     crate::pipeline::apply_provider_failure_rules(&provider, status, &text, native);
+                permit
+                    .finish_failure(crate::provider_work::upstream_backoff_evidence(&failure))
+                    .await;
                 return Ok(Json(json!({
                     "ok": false, "status": status, "latency_ms": latency,
                     "error": failure.message,
@@ -5282,15 +5383,20 @@ pub async fn test_provider(
                 .unwrap_or("")
                 .to_string();
             let preview = read_probe_preview(resp, content_type.contains("event-stream")).await;
+            permit.finish_success().await;
             Ok(Json(json!({
                 "ok": true, "status": status, "latency_ms": latency,
                 "response_preview": truncate(&preview, 400),
             })))
         }
-        Err(e) => Ok(Json(json!({
-            "ok": false, "status": 0,
-            "error": e.message,
-        }))),
+        Err(e) => {
+            let evidence = crate::provider_work::outbound_error_backoff_evidence(&e);
+            permit.finish_failure(evidence).await;
+            Ok(Json(json!({
+                "ok": false, "status": 0,
+                "error": e.message,
+            })))
+        }
     }
 }
 
@@ -7623,6 +7729,23 @@ pub async fn probe_model_capability(
     let parsed_url = url::Url::parse(&url)
         .map_err(|error| ApiError::bad(format!("invalid probe URL: {error}")))?;
 
+    let permit = state
+        .provider_work
+        .acquire(
+            &provider.id,
+            crate::provider_work::ProviderWorkClass::CapabilityProbe,
+        )
+        .await
+        .map_err(|wait| {
+            ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "provider work is temporarily backed off; retry in {}s",
+                    wait.as_secs().max(1)
+                ),
+                None,
+            )
+        })?;
     let started = std::time::Instant::now();
     let response = crate::outbound::send_provider_request(
         &state.outbound_clients,
@@ -7651,9 +7774,11 @@ pub async fn probe_model_capability(
         .filter(|value| *value > 0)
         .unwrap_or(30 * 24 * 3600);
     let fresh_until = verified_at + chrono::Duration::seconds(freshness_secs);
+    let mut failure_evidence = None;
     let (status, status_code, detail) = match response {
         Ok(response) => {
             let status_code = response.status().as_u16();
+            let response_headers = response.headers().clone();
             let (text, body_read_error) = match read_capability_probe_response(response).await {
                 Ok(text) => (text, None),
                 Err(error) => (String::new(), Some(error)),
@@ -7733,6 +7858,14 @@ pub async fn probe_model_capability(
                     }
                 }
             } else {
+                let native = adapter.classify_error(status_code, &text, &response_headers);
+                let failure = crate::pipeline::apply_provider_failure_rules(
+                    &provider,
+                    status_code,
+                    &text,
+                    native,
+                );
+                failure_evidence = crate::provider_work::upstream_backoff_evidence(&failure);
                 let redacted = crypto::redact(&text);
                 let status = if deterministic_probe_rejection(
                     &body.capability,
@@ -7747,12 +7880,21 @@ pub async fn probe_model_capability(
                 (status, status_code, Some(truncate(&redacted, 400)))
             }
         }
-        Err(error) => (
-            "inconclusive",
-            0,
-            Some(truncate(&crypto::redact(&error.message), 400)),
-        ),
+        Err(error) => {
+            failure_evidence = crate::provider_work::outbound_error_backoff_evidence(&error);
+            (
+                "inconclusive",
+                0,
+                Some(truncate(&crypto::redact(&error.message), 400)),
+            )
+        }
     };
+
+    if let Some(failure) = failure_evidence {
+        permit.finish_failure(Some(failure)).await;
+    } else {
+        permit.finish_success().await;
+    }
 
     let evidence_value = json!({
         "status": status,
@@ -9158,7 +9300,7 @@ pub async fn validate_provider(
     } else {
         match validate_outbound_url(&state, &body.base_url) {
             Ok(()) => security = Value::String("passed".into()),
-            Err(ApiError(_, msg)) => problems.push(msg),
+            Err(ApiError(_, msg, _)) => problems.push(msg),
         }
     }
     if body.wire_format == "anthropic"
@@ -9770,6 +9912,48 @@ pub async fn metrics(State(state): State<AppState>, _auth: AdminAuth) -> Respons
         body.push_str(&format!(
             "kinetix_error_rate {}\n",
             errs as f64 / reqs as f64
+        ));
+    }
+    let work = state.provider_work.metrics_snapshot();
+    for (name, help, value) in [
+        (
+            "scheduled",
+            "Provider control-plane work scheduled",
+            work.scheduled,
+        ),
+        (
+            "executed",
+            "Provider control-plane work started",
+            work.executed,
+        ),
+        (
+            "coalesced",
+            "Equivalent provider control-plane work calls coalesced",
+            work.coalesced,
+        ),
+        (
+            "rate_limited",
+            "Provider control-plane work delayed by local budgets",
+            work.rate_limited,
+        ),
+        (
+            "provider_throttled",
+            "Provider control-plane work failures classified as provider-wide transient evidence",
+            work.provider_throttled,
+        ),
+        (
+            "backed_off",
+            "Provider control-plane work suppressed by provider backoff",
+            work.backed_off,
+        ),
+        (
+            "failed",
+            "Provider control-plane work failures",
+            work.failed,
+        ),
+    ] {
+        body.push_str(&format!(
+            "# HELP kinetix_provider_work_{name}_total {help}\n# TYPE kinetix_provider_work_{name}_total counter\nkinetix_provider_work_{name}_total {value}\n"
         ));
     }
     let admission = state.admission.metrics_snapshot();
@@ -12860,6 +13044,7 @@ fn plugin_manager(
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "plugin host is not available".into(),
+            None,
         )
     })
 }
@@ -15025,6 +15210,7 @@ pub async fn plugin_auth_callback(
         return Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "plugin account authorization unavailable: control plane degraded".into(),
+            None,
         ));
     }
 
@@ -15094,6 +15280,7 @@ pub async fn complete_plugin_auth_manual(
         return Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "plugin account authorization unavailable: control plane degraded".into(),
+            None,
         ));
     }
 

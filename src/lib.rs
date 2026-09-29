@@ -52,6 +52,7 @@ pub mod plugins;
 pub mod pool;
 pub mod predicate;
 pub mod provider_circuit;
+pub mod provider_work;
 pub mod quota;
 pub mod ratelimit;
 pub mod registry;
