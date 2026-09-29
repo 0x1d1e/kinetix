@@ -2512,6 +2512,10 @@ async fn insert_model_observation_in_transaction(
     observation: &ModelObservationDraft<'_>,
 ) -> Result<()> {
     let id = format!("observation_{}", uuid::Uuid::new_v4().simple());
+    let observed_at = DateTime::parse_from_rfc3339(observation.observed_at)
+        .context("model observation timestamp must be RFC3339")?
+        .with_timezone(&Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     sqlx::query(
         "INSERT INTO model_observations
          (id, model_id, kind, source, observed_at, scope_json, value_json)
@@ -2521,7 +2525,7 @@ async fn insert_model_observation_in_transaction(
     .bind(model_id)
     .bind(observation.kind)
     .bind(observation.source)
-    .bind(observation.observed_at)
+    .bind(observed_at)
     .bind(observation.scope.to_string())
     .bind(observation.value.to_string())
     .execute(&mut **tx)
@@ -2533,20 +2537,36 @@ pub async fn list_model_observations(
     pool: &Pool,
     model_id: &str,
     limit: i64,
-    offset: i64,
+    cursor: Option<(&str, &str)>,
 ) -> Result<Vec<ModelObservationRow>> {
-    Ok(sqlx::query_as::<_, ModelObservationRow>(
-        "SELECT id, model_id, kind, source, observed_at, scope_json, value_json
-         FROM model_observations
-         WHERE model_id = ?
-         ORDER BY julianday(observed_at) DESC, id DESC
-         LIMIT ? OFFSET ?",
-    )
-    .bind(model_id)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(pool)
-    .await?)
+    let rows = if let Some((observed_at, id)) = cursor {
+        sqlx::query_as::<_, ModelObservationRow>(
+            "SELECT id, model_id, kind, source, observed_at, scope_json, value_json
+             FROM model_observations
+             WHERE model_id = ? AND (observed_at, id) < (?, ?)
+             ORDER BY observed_at DESC, id DESC
+             LIMIT ?",
+        )
+        .bind(model_id)
+        .bind(observed_at)
+        .bind(id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, ModelObservationRow>(
+            "SELECT id, model_id, kind, source, observed_at, scope_json, value_json
+             FROM model_observations
+             WHERE model_id = ?
+             ORDER BY observed_at DESC, id DESC
+             LIMIT ?",
+        )
+        .bind(model_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows)
 }
 
 pub struct NewModel<'a> {

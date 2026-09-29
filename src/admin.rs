@@ -2760,7 +2760,10 @@ fn model_discovery_observation(
         "upstream_id": upstream_id,
         "transport": observation.pointer("/transport/format"),
     });
-    let value = durable_model_discovery_value(observation);
+    let mut value = durable_model_discovery_value(observation);
+    if let Some(fields) = value.as_object_mut() {
+        fields.insert("present".into(), json!(true));
+    }
     (observed_at, source, scope, value)
 }
 
@@ -2769,14 +2772,32 @@ async fn persist_model_discovery_update(
     row: &db::ModelRow,
     fresh: Value,
 ) -> anyhow::Result<()> {
-    let Some(observation) = fresh
+    let (observed_at, source, scope, value) = if let Some(observation) = fresh
         .get("latest_observation")
         .filter(|observation| observation.is_object())
-    else {
+    {
+        model_discovery_observation(observation, &row.provider_id, &row.upstream_id)
+    } else if fresh.get("disappeared").and_then(Value::as_bool) == Some(true) {
+        let observed_at = fresh
+            .get("flagged_at")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(db::now_iso);
+        let scope = json!({
+            "provider_id": row.provider_id,
+            "upstream_id": row.upstream_id,
+            "transport": discovery_object(row)
+                .pointer("/latest_observation/transport/format"),
+        });
+        (
+            observed_at,
+            "upstream_discovery".to_string(),
+            scope,
+            json!({"present": false}),
+        )
+    } else {
         return db::merge_model_discovery(pool, &row.id, &fresh).await;
     };
-    let (observed_at, source, scope, value) =
-        model_discovery_observation(observation, &row.provider_id, &row.upstream_id);
     db::merge_model_discovery_with_observation(
         pool,
         &row.id,
@@ -6181,8 +6202,8 @@ mod model_lifecycle_regression_tests {
         let row = db::get_model(&pool, &model_id).await.unwrap().unwrap();
 
         for (observed_at, context_window) in [
-            ("2026-09-01T00:00:00Z", 8192),
-            ("2026-09-02T00:00:00Z", 16384),
+            ("2026-09-01T01:00:00+01:00", 8192),
+            ("2026-09-01T00:00:00.000000001Z", 16384),
         ] {
             persist_model_discovery_update(
                 &pool,
@@ -6223,7 +6244,7 @@ mod model_lifecycle_regression_tests {
         let latest = discovery_object(&updated)["latest_observation"].clone();
         assert_eq!(latest["context_window"], 16384);
 
-        let observations = db::list_model_observations(&pool, &model_id, 10, 0)
+        let observations = db::list_model_observations(&pool, &model_id, 10, None)
             .await
             .unwrap();
         assert_eq!(observations.len(), 2);
@@ -6233,6 +6254,14 @@ mod model_lifecycle_regression_tests {
             .collect();
         assert_eq!(values[0]["context_window"], 16384);
         assert_eq!(values[1]["context_window"], 8192);
+        assert_eq!(
+            observations[0].observed_at,
+            "2026-09-01T00:00:00.000000001Z"
+        );
+        assert_eq!(
+            observations[1].observed_at,
+            "2026-09-01T00:00:00.000000000Z"
+        );
         assert_eq!(
             values[0]["catalog"]["canonical"]["source"],
             "models.dev:canonical"
@@ -6262,6 +6291,53 @@ mod model_lifecycle_regression_tests {
             .execute(&pool)
             .await
             .is_err());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn model_presence_transitions_are_archived() {
+        let (pool, root, _provider_id, model_id) =
+            observation_test_fixture("presence-history", None, json!({}), json!({})).await;
+        let row = db::get_model(&pool, &model_id).await.unwrap().unwrap();
+        for (present, observed_at) in [
+            (true, "2026-09-01T00:00:00Z"),
+            (false, "2026-09-02T00:00:00Z"),
+            (false, "2026-09-03T00:00:00Z"),
+            (true, "2026-09-04T00:00:00Z"),
+        ] {
+            let update = if present {
+                json!({
+                    "latest_observation": {
+                        "observed_at": observed_at,
+                        "capability_sources": {}
+                    },
+                    "disappeared": false
+                })
+            } else {
+                json!({
+                    "disappeared": true,
+                    "flagged_at": observed_at,
+                    "reconciliation": {"status": "missing"}
+                })
+            };
+            persist_model_discovery_update(&pool, &row, update)
+                .await
+                .unwrap();
+        }
+
+        let rows = db::list_model_observations(&pool, &model_id, 10, None)
+            .await
+            .unwrap();
+        let presence: Vec<Value> = rows
+            .iter()
+            .map(|row| serde_json::from_str::<Value>(&row.value_json).unwrap()["present"].clone())
+            .collect();
+        assert_eq!(
+            presence,
+            vec![json!(true), json!(false), json!(false), json!(true)]
+        );
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);
@@ -6298,18 +6374,18 @@ mod model_lifecycle_regression_tests {
             .unwrap();
         }
 
-        let rows = db::list_model_observations(&pool, &model_id, 10, 0)
+        let rows = db::list_model_observations(&pool, &model_id, 10, None)
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].kind, "capability_probe");
         assert_eq!(rows[0].source, "probe");
         assert_eq!(
-            serde_json::from_str::<Value>(&rows[0].value_json).unwrap()["status"],
+            serde_json::from_str::<Value>(&rows[0].value_json).unwrap()["evidence"]["status"],
             "unsupported"
         );
         assert_eq!(
-            serde_json::from_str::<Value>(&rows[1].value_json).unwrap()["status"],
+            serde_json::from_str::<Value>(&rows[1].value_json).unwrap()["evidence"]["status"],
             "supported"
         );
         let current = db::get_model(&pool, &model_id).await.unwrap().unwrap();
@@ -7187,7 +7263,7 @@ async fn persist_probe_evidence_observation(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    upsert_probe_evidence(&mut evidence, key, evidence_value.clone());
+    upsert_probe_evidence(&mut evidence, key.clone(), evidence_value.clone());
     let observed_at = evidence_value
         .get("verified_at")
         .and_then(Value::as_str)
@@ -7197,6 +7273,10 @@ async fn persist_probe_evidence_observation(
         .get("scope")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let observation_value = json!({
+        "capability": key,
+        "evidence": evidence_value,
+    });
     db::merge_model_discovery_with_observation(
         pool,
         model_id,
@@ -7206,7 +7286,7 @@ async fn persist_probe_evidence_observation(
             source: "probe",
             observed_at: &observed_at,
             scope: &scope,
-            value: &evidence_value,
+            value: &observation_value,
         },
     )
     .await
@@ -7785,7 +7865,37 @@ pub async fn list_models(State(state): State<AppState>, _auth: AdminAuth) -> Api
 #[derive(Deserialize)]
 pub struct ModelObservationsQuery {
     pub limit: Option<i64>,
-    pub offset: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ModelObservationsCursor {
+    observed_at: String,
+    id: String,
+}
+
+fn decode_model_observations_cursor(encoded: &str) -> Result<ModelObservationsCursor, ApiError> {
+    use base64::Engine as _;
+
+    if encoded.len() > 2048 {
+        return Err(ApiError::bad("invalid observation cursor"));
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ApiError::bad("invalid observation cursor"))?;
+    let cursor: ModelObservationsCursor =
+        serde_json::from_slice(&bytes).map_err(|_| ApiError::bad("invalid observation cursor"))?;
+    if cursor.id.is_empty() || chrono::DateTime::parse_from_rfc3339(&cursor.observed_at).is_err() {
+        return Err(ApiError::bad("invalid observation cursor"));
+    }
+    Ok(cursor)
+}
+
+fn encode_model_observations_cursor(row: &db::ModelObservationRow) -> String {
+    use base64::Engine as _;
+
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(json!({ "observed_at": row.observed_at, "id": row.id }).to_string())
 }
 
 pub async fn list_model_observations(
@@ -7795,18 +7905,27 @@ pub async fn list_model_observations(
     Query(query): Query<ModelObservationsQuery>,
 ) -> ApiResult {
     let limit = query.limit.unwrap_or(100);
-    let offset = query.offset.unwrap_or(0);
     if !(1..=500).contains(&limit) {
         return Err(ApiError::bad("limit must be between 1 and 500"));
     }
-    if offset < 0 {
-        return Err(ApiError::bad("offset must be non-negative"));
-    }
-    let mut rows = db::list_model_observations(&state.pool, &id, limit + 1, offset)
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(decode_model_observations_cursor)
+        .transpose()?;
+    let db_cursor = cursor
+        .as_ref()
+        .map(|cursor| (cursor.observed_at.as_str(), cursor.id.as_str()));
+    let mut rows = db::list_model_observations(&state.pool, &id, limit + 1, db_cursor)
         .await
         .map_err(ApiError::internal)?;
     let has_more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
+    let next_cursor = if has_more {
+        rows.last().map(encode_model_observations_cursor)
+    } else {
+        None
+    };
     let observations = rows
         .into_iter()
         .map(|row| {
@@ -7824,8 +7943,7 @@ pub async fn list_model_observations(
     Ok(Json(json!({
         "observations": observations,
         "limit": limit,
-        "offset": offset,
-        "next_offset": has_more.then_some(offset + limit),
+        "next_cursor": next_cursor,
     })))
 }
 
@@ -16077,7 +16195,7 @@ mod reasoning_discovery_control_plane_tests {
             discovery["latest_observation"]["raw_metadata_truncated"],
             false
         );
-        let observation_history = db::list_model_observations(&pool, &model_id, 10, 0)
+        let observation_history = db::list_model_observations(&pool, &model_id, 10, None)
             .await
             .unwrap();
         assert_eq!(observation_history.len(), 1);
@@ -16659,7 +16777,7 @@ mod reasoning_discovery_control_plane_tests {
             serde_json::from_str::<Value>(&row.capabilities).unwrap(),
             json!({"structured_output": true})
         );
-        let imported_history = db::list_model_observations(&pool, model_id, 10, 0)
+        let imported_history = db::list_model_observations(&pool, model_id, 10, None)
             .await
             .unwrap();
         assert_eq!(imported_history.len(), 1);
@@ -16988,6 +17106,54 @@ mod credential_enrollment_regression_tests {
             .await
             .unwrap();
         }
+        let scope = json!({
+            "provider_id": provider_id,
+            "account_id": "account-a",
+            "model_id": model_id,
+            "transport": "openai"
+        });
+        for (probe_key, verified_at) in [
+            ("tool_calling", "2026-09-03T00:00:00Z"),
+            ("structured_output", "2026-09-04T00:00:00Z"),
+        ] {
+            persist_probe_evidence_observation(
+                &state.pool,
+                provider_id,
+                &model_id,
+                probe_key.into(),
+                json!({
+                    "status": "supported",
+                    "value": null,
+                    "verified_at": verified_at,
+                    "fresh_until": "2999-01-01T00:00:00Z",
+                    "scope": scope
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let history = list_model_observations(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(model_id.clone()),
+            Query(ModelObservationsQuery {
+                limit: Some(10),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let probe_keys: Vec<_> = history.0["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["kind"] == "capability_probe")
+            .map(|row| row["value"]["capability"].as_str().unwrap())
+            .collect();
+        assert_eq!(probe_keys, ["structured_output", "tool_calling"]);
 
         let first_page = list_model_observations(
             State(state.clone()),
@@ -16998,16 +17164,32 @@ mod credential_enrollment_regression_tests {
             Path(model_id.clone()),
             Query(ModelObservationsQuery {
                 limit: Some(1),
-                offset: Some(0),
+                cursor: None,
             }),
         )
         .await
         .unwrap();
         assert_eq!(first_page.0["observations"].as_array().unwrap().len(), 1);
-        assert_eq!(first_page.0["next_offset"], 1);
+        let cursor = first_page.0["next_cursor"].as_str().unwrap().to_string();
+        assert_eq!(
+            first_page.0["observations"][0]["value"]["capability"],
+            "structured_output"
+        );
         assert!(first_page.0["observations"][0].get("scope").is_some());
         assert!(first_page.0["observations"][0].get("value").is_some());
 
+        persist_model_discovery_update(
+            &state.pool,
+            &row,
+            json!({
+                "latest_observation": {
+                    "observed_at": "2026-09-05T00:00:00Z",
+                    "capability_sources": {}
+                }
+            }),
+        )
+        .await
+        .unwrap();
         let second_page = list_model_observations(
             State(state.clone()),
             AdminAuth {
@@ -17017,13 +17199,20 @@ mod credential_enrollment_regression_tests {
             Path(model_id.clone()),
             Query(ModelObservationsQuery {
                 limit: Some(1),
-                offset: Some(1),
+                cursor: Some(cursor),
             }),
         )
         .await
         .unwrap();
         assert_eq!(second_page.0["observations"].as_array().unwrap().len(), 1);
-        assert!(second_page.0["next_offset"].is_null());
+        assert_eq!(
+            second_page.0["observations"][0]["value"]["capability"],
+            "tool_calling"
+        );
+        assert_ne!(
+            first_page.0["observations"][0]["id"], second_page.0["observations"][0]["id"],
+            "appending a row between pages must not duplicate earlier history"
+        );
 
         db::delete_model(&state.pool, &model_id).await.unwrap();
         let retained = list_model_observations(
@@ -17035,12 +17224,12 @@ mod credential_enrollment_regression_tests {
             Path(model_id),
             Query(ModelObservationsQuery {
                 limit: Some(10),
-                offset: Some(0),
+                cursor: None,
             }),
         )
         .await
         .unwrap();
-        assert_eq!(retained.0["observations"].as_array().unwrap().len(), 2);
+        assert_eq!(retained.0["observations"].as_array().unwrap().len(), 5);
 
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(root);
