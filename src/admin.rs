@@ -12739,19 +12739,32 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
         let Ok(providers) = db::list_providers(&state.pool).await else {
             continue;
         };
-        let existing = providers.into_iter().find(|provider| {
-            normalize_provider_endpoint_identity(&provider.base_url)
-                == normalize_provider_endpoint_identity(&template.base_url)
-                && provider.wire_plugin == wire_plugin
-                && provider.credential_plugin == credential_plugin
-                && provider.model_source_plugin == model_source_plugin
-        });
+        // Portable imports retain provenance even when their plugin capability names go stale.
+        // Rebind those providers by provenance; only legacy rows without provenance use bindings.
+        let existing = providers
+            .iter()
+            .find(|provider| {
+                provider.source_plugin_id.as_deref() == Some(id)
+                    && provider.source_integration_id.as_deref() == Some(&integration.id)
+            })
+            .or_else(|| {
+                providers.iter().find(|provider| {
+                    provider.source_plugin_id.is_none()
+                        && provider.source_integration_id.is_none()
+                        && normalize_provider_endpoint_identity(&provider.base_url)
+                            == normalize_provider_endpoint_identity(&template.base_url)
+                        && provider.wire_plugin == wire_plugin
+                        && provider.credential_plugin == credential_plugin
+                        && provider.model_source_plugin == model_source_plugin
+                })
+            })
+            .cloned();
         if let Some(provider) = existing {
             if let Err(error) = validate_integration_upstream_protocols(
                 &manager,
                 integration.protocols.as_ref(),
-                &provider.wire_format,
-                &provider.wire_plugin,
+                wire.as_str(),
+                &wire_plugin,
             )
             .await
             {
@@ -12760,7 +12773,51 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                     plugin = %id,
                     integration = %integration.id,
                     %error,
-                    "integration upstream protocols do not match the configured provider"
+                    "integration upstream protocols do not match the provider template"
+                );
+                continue;
+            }
+
+            let credential_hosts = template.credential_hosts.join(",");
+            let extra_headers = serde_json::to_value(&template.extra_headers).unwrap_or(json!({}));
+            let rate_limit_rules =
+                serde_json::from_str(&provider.rate_limit_rules).unwrap_or_else(|_| json!({}));
+            let updated_provider = db::NewProvider {
+                name: &integration.name,
+                base_url: &template.base_url,
+                wire_format: wire,
+                auth_scheme: auth,
+                custom_header_name: template.custom_header_name.as_deref(),
+                custom_param_name: template.custom_param_name.as_deref(),
+                extra_headers,
+                timeout_ms: template.timeout_ms as i64,
+                capability_mode: &template.capability_mode,
+                models_path: template.models_path.as_deref(),
+                rate_limit_rules,
+                follow_redirects: template.follow_redirects,
+                credential_hosts: &credential_hosts,
+                allow_insecure_tls: provider.allow_insecure_tls != 0,
+                wire_plugin: &wire_plugin,
+                credential_plugin: &credential_plugin,
+                model_source_plugin: &model_source_plugin,
+                credential_mode: credential_mode.as_str(),
+                source_plugin_id: Some(id),
+                source_integration_id: Some(&integration.id),
+            };
+            if let Err(error) = db::update_provider(
+                &state.pool,
+                &provider.id,
+                &updated_provider,
+                Some(template.pricing_scope.as_str()),
+            )
+            .await
+            {
+                tracing::warn!(
+                    provider = %provider.id,
+                    plugin = %id,
+                    integration = %integration.id,
+                    %error,
+                    "failed to update provider from current integration template"
                 );
                 continue;
             }
@@ -20817,7 +20874,7 @@ mod credential_enrollment_regression_tests {
             .into_iter()
             .find(|provider| provider.id == restored_provider_id)
             .unwrap();
-        assert_eq!(provider.base_url, restored_base_url);
+        assert_eq!(provider.base_url, manifest_base_url);
         assert_eq!(provider.pricing_scope, "direct_api");
 
         drop(state);
@@ -23302,7 +23359,7 @@ mod credential_enrollment_regression_tests {
                 follow_redirects: false,
                 credential_hosts: "",
                 allow_insecure_tls: false,
-                wire_plugin: "plugin:plugin.test/session-echo",
+                wire_plugin: "plugin:plugin.test/old-adapter",
                 credential_plugin: "",
                 model_source_plugin: "",
                 credential_mode: "manual",
@@ -23331,7 +23388,7 @@ mod credential_enrollment_regression_tests {
         assert!(validate_imported_upstream_protocols_structurally(
             &protocols,
             "openai",
-            "plugin:plugin.test/session-echo",
+            "plugin:plugin.test/old-adapter",
         )
         .is_err());
         assert!(validate_imported_upstream_protocols_structurally(
@@ -23446,7 +23503,8 @@ storage = "2MiB"
             .into_iter()
             .find(|provider| provider.name == "native-provider")
             .unwrap();
-        assert_eq!(provider.wire_plugin, "plugin:plugin.test/session-echo");
+        assert_eq!(provider.wire_plugin, "plugin:plugin.test/old-adapter");
+        let restored_provider_id = provider.id.clone();
         assert_eq!(provider.source_plugin_id.as_deref(), Some("plugin.test"));
         assert_eq!(provider.source_integration_id.as_deref(), Some("native"));
         let restored_features = provider.integration_feature_ceiling().unwrap().unwrap();
@@ -23466,13 +23524,13 @@ version = "0.1.0"
 plugin_api = "{}.0.0"
 
 [provides]
-provider_adapters = ["session-echo"]
+provider_adapters = ["new-adapter"]
 
 [[integrations]]
 id = "native"
-name = "Native Provider"
+name = "Native Provider v2"
 credential_mode = "manual"
-provider_adapter = "session-echo"
+provider_adapter = "new-adapter"
 
 [integrations.features]
 schema_version = 1
@@ -23494,6 +23552,7 @@ upstream = ["plugin-native"]
 base_url = "https://native.example/v1"
 wire_format = "plugin"
 auth_scheme = "bearer"
+timeout_ms = 2000
 
 [permissions]
 network_hosts = ["native.example"]
@@ -23536,7 +23595,7 @@ storage = "2MiB"
                 "wire_plugin must reference source plugin 'plugin.test'",
             ),
             (
-                "plugin:plugin.test/stale-adapter",
+                "plugin:plugin.test/old-adapter",
                 "wire_plugin does not match source integration 'native'",
             ),
         ] {
@@ -23562,29 +23621,19 @@ storage = "2MiB"
             .unwrap();
         assert_eq!(
             provider_after_rejected_mismatch.wire_plugin,
-            "plugin:plugin.test/session-echo"
+            "plugin:plugin.test/old-adapter"
         );
 
-        let imported_while_disabled = import_config(
-            State(target.clone()),
-            auth(),
-            Json(ImportBody {
-                config: exported,
-                apply: true,
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(imported_while_disabled["ok"], true);
-        let disabled_provider = db::list_providers(&target.pool)
+        let disabled_provider = db::get_provider(&target.pool, &restored_provider_id)
             .await
             .unwrap()
-            .into_iter()
-            .find(|provider| provider.name == "native-provider")
             .unwrap();
+        assert_eq!(
+            disabled_provider.wire_plugin,
+            "plugin:plugin.test/old-adapter"
+        );
         assert!(
-            !disabled_provider
+            disabled_provider
                 .integration_feature_ceiling()
                 .unwrap()
                 .unwrap()
@@ -23594,7 +23643,7 @@ storage = "2MiB"
             .integration_protocol_ceiling()
             .unwrap()
             .unwrap();
-        assert_eq!(disabled_protocols.input, vec!["anthropic"]);
+        assert_eq!(disabled_protocols.input, vec!["openai-chat"]);
         assert_eq!(disabled_protocols.upstream, vec!["plugin-native"]);
         assert!(target.adapters.for_transport(&transport).is_err());
 
@@ -23603,12 +23652,19 @@ storage = "2MiB"
         register_enabled_plugin_capabilities(&target, "plugin.test").await;
 
         assert!(target.adapters.for_transport(&transport).is_ok());
-        let reconciled = db::list_providers(&target.pool)
-            .await
-            .unwrap()
+        let providers = db::list_providers(&target.pool).await.unwrap();
+        assert_eq!(
+            providers.len(),
+            1,
+            "reconciliation must not duplicate providers"
+        );
+        let reconciled = providers
             .into_iter()
-            .find(|provider| provider.name == "native-provider")
+            .find(|provider| provider.id == restored_provider_id)
             .unwrap();
+        assert_eq!(reconciled.wire_plugin, "plugin:plugin.test/new-adapter");
+        assert_eq!(reconciled.name, "Native Provider v2");
+        assert_eq!(reconciled.timeout_ms, 2_000);
         assert!(
             !reconciled
                 .integration_feature_ceiling()
