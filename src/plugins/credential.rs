@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 
 use crate::credentials::{
     CredentialHealth, CredentialRotationError, CredentialStrategy, ResolvedCredential,
@@ -36,7 +37,7 @@ fn credential_error(fault: super::runtime::PluginFault) -> CredentialRotationErr
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PluginCredentialLease {
     handle: String,
     expires_at: Option<String>,
@@ -122,6 +123,7 @@ pub struct PluginCredentialStrategy {
     pool: Pool,
     crypto: Arc<Crypto>,
     plugin_id: String,
+    leases: DashMap<(String, String), PluginCredentialLease>,
 }
 
 impl PluginCredentialStrategy {
@@ -145,6 +147,7 @@ impl PluginCredentialStrategy {
             pool,
             crypto,
             plugin_id: plugin_id.into(),
+            leases: DashMap::new(),
         }
     }
 
@@ -191,6 +194,37 @@ impl CredentialStrategy for PluginCredentialStrategy {
         "plugin_credential_strategy"
     }
 
+    async fn resolve_cached(
+        &self,
+        account: &AccountRow,
+    ) -> std::result::Result<Option<ResolvedCredential>, CredentialRotationError> {
+        let key = (account.provider_id.clone(), account.id.clone());
+        let Some(lease) = self.leases.get(&key).map(|entry| entry.value().clone()) else {
+            return Ok(None);
+        };
+        let now = chrono::Utc::now();
+        let has_timing_hint = lease.expires_at.is_some() || lease.refresh_after.is_some();
+        let refresh_deadline = crate::credential_refresh::lease_refresh_deadline(
+            lease.expires_at.as_deref(),
+            lease.refresh_after.as_deref(),
+            now,
+        );
+        // Missing timing metadata is unknown, not an immediate refresh deadline.
+        // Keep using the lease until the plugin supplies a refresh hint or auth
+        // failure triggers the existing reactive rotation path.
+        if has_timing_hint && refresh_deadline.is_none_or(|deadline| deadline <= now) {
+            return Ok(None);
+        }
+
+        let secret = self.lease_secret(&lease.handle).await?;
+        Ok(Some(ResolvedCredential {
+            secret,
+            expires_at: lease.expires_at,
+            refresh_after: lease.refresh_after,
+            rotated: false,
+        }))
+    }
+
     async fn resolve(
         &self,
         account: &AccountRow,
@@ -205,6 +239,10 @@ impl CredentialStrategy for PluginCredentialStrategy {
             )
             .await
             .map_err(credential_error)?;
+        self.leases.insert(
+            (account.provider_id.clone(), account.id.clone()),
+            lease.clone(),
+        );
         let secret = self.lease_secret(&lease.handle).await?;
         Ok(ResolvedCredential {
             secret,
@@ -290,6 +328,7 @@ mod tests {
         refresh_after: String,
         change_secret_on_resolve: bool,
         advance_expiry_on_resolve: bool,
+        omit_timing_metadata: bool,
     }
 
     #[async_trait]
@@ -324,8 +363,8 @@ mod tests {
             };
             Ok(PluginCredentialLease {
                 handle,
-                expires_at: Some(expires_at),
-                refresh_after: Some(self.refresh_after.clone()),
+                expires_at: (!self.omit_timing_metadata).then_some(expires_at),
+                refresh_after: (!self.omit_timing_metadata).then(|| self.refresh_after.clone()),
             })
         }
 
@@ -392,6 +431,7 @@ mod tests {
             refresh_after: (now - chrono::Duration::seconds(1)).to_rfc3339(),
             change_secret_on_resolve: false,
             advance_expiry_on_resolve: false,
+            omit_timing_metadata: false,
         });
         let strategy = Arc::new(PluginCredentialStrategy::with_host(
             host.clone(),
@@ -459,6 +499,7 @@ mod tests {
             refresh_after: (now - chrono::Duration::seconds(1)).to_rfc3339(),
             change_secret_on_resolve: true,
             advance_expiry_on_resolve: false,
+            omit_timing_metadata: false,
         });
         let secret_refresh_strategy = Arc::new(PluginCredentialStrategy::with_host(
             secret_refresh_host.clone(),
@@ -533,11 +574,12 @@ mod tests {
             refresh_after: (now - chrono::Duration::seconds(1)).to_rfc3339(),
             change_secret_on_resolve: false,
             advance_expiry_on_resolve: true,
+            omit_timing_metadata: false,
         });
         let timing_refresh_strategy = Arc::new(PluginCredentialStrategy::with_host(
             timing_refresh_host,
             pool.clone(),
-            crypto,
+            crypto.clone(),
             "test.plugin",
         ));
         let timing_refresh_account = AccountRow {
@@ -596,6 +638,68 @@ mod tests {
                 >= now + chrono::Duration::seconds(59)
         );
         assert!(coordinator.claim_due(now).is_empty());
+
+        let cached_now = chrono::Utc::now();
+        let cached_host = Arc::new(ChangingLeaseHost {
+            pool: pool.clone(),
+            crypto: crypto.clone(),
+            resolutions: AtomicUsize::new(0),
+            rotations: AtomicUsize::new(0),
+            expires_at: (cached_now + chrono::Duration::hours(1)).to_rfc3339(),
+            refresh_after: (cached_now + chrono::Duration::minutes(30)).to_rfc3339(),
+            change_secret_on_resolve: true,
+            advance_expiry_on_resolve: false,
+            omit_timing_metadata: false,
+        });
+        let cached_strategy = PluginCredentialStrategy::with_host(
+            cached_host.clone(),
+            pool.clone(),
+            crypto.clone(),
+            "test.plugin",
+        );
+        let mut cached_account = timing_refresh_account.clone();
+        cached_account.id = "acc_plugin_cached_lease".into();
+        cached_account.provider_id = "provider_plugin_cached_lease".into();
+        let resolved = cached_strategy.resolve(&cached_account).await.unwrap();
+        let cached = cached_strategy
+            .resolve_cached(&cached_account)
+            .await
+            .unwrap()
+            .expect("fresh plugin lease should be available without invoking the plugin");
+        assert_eq!(cached.secret, resolved.secret);
+        assert_eq!(cached_host.resolutions.load(Ordering::Relaxed), 1);
+
+        let unbounded_host = Arc::new(ChangingLeaseHost {
+            pool: pool.clone(),
+            crypto: crypto.clone(),
+            resolutions: AtomicUsize::new(0),
+            rotations: AtomicUsize::new(0),
+            expires_at: String::new(),
+            refresh_after: String::new(),
+            change_secret_on_resolve: true,
+            advance_expiry_on_resolve: false,
+            omit_timing_metadata: true,
+        });
+        let unbounded_strategy = PluginCredentialStrategy::with_host(
+            unbounded_host.clone(),
+            pool.clone(),
+            crypto.clone(),
+            "test.plugin",
+        );
+        let mut unbounded_account = cached_account.clone();
+        unbounded_account.id = "acc_plugin_unbounded_lease".into();
+        unbounded_account.provider_id = "provider_plugin_unbounded_lease".into();
+        let resolved = unbounded_strategy
+            .resolve(&unbounded_account)
+            .await
+            .unwrap();
+        let cached = unbounded_strategy
+            .resolve_cached(&unbounded_account)
+            .await
+            .unwrap()
+            .expect("lease without timing metadata should remain available");
+        assert_eq!(cached.secret, resolved.secret);
+        assert_eq!(unbounded_host.resolutions.load(Ordering::Relaxed), 1);
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);

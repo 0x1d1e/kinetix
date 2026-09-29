@@ -336,7 +336,6 @@ impl ProviderWorkCoordinator {
                     return Err(wait);
                 }
                 rate.backed_off_until = None;
-                rate.consecutive_failures = 0;
             }
 
             while rate
@@ -401,11 +400,11 @@ impl ProviderWorkPermit {
     pub async fn finish_success(mut self) {
         self.completed = true;
         let mut rate = self.gate.rate.lock().await;
+        rate.consecutive_failures = 0;
         if rate
             .backed_off_until
-            .is_none_or(|until| until <= Instant::now())
+            .is_some_and(|until| until <= Instant::now())
         {
-            rate.consecutive_failures = 0;
             rate.backed_off_until = None;
         }
     }
@@ -438,6 +437,11 @@ impl Drop for ProviderWorkPermit {
 }
 
 fn provider_backoff_evidence(kind: FailureKind) -> bool {
+    // Normalized RateLimit is explicitly account-scoped and keeps its existing
+    // account cooldown semantics; it is not evidence to throttle sibling accounts.
+    if kind == FailureKind::RateLimit {
+        return false;
+    }
     matches!(
         kind.policy().category,
         FailureCategory::RateLimited
@@ -569,32 +573,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rate_limit_starts_bounded_provider_backoff_but_bad_request_does_not() {
+    async fn account_rate_limit_does_not_back_off_other_account_work() {
         let coordinator = ProviderWorkCoordinator::default();
-        let permit = coordinator
+        let account_a = coordinator
             .acquire("provider-a", ProviderWorkClass::ModelDiscovery)
             .await
             .unwrap();
-        permit
+        account_a
             .finish_failure(Some((FailureKind::RateLimit, Some(60))))
             .await;
-        assert!(coordinator
+
+        let account_b = coordinator
             .acquire("provider-a", ProviderWorkClass::HealthProbe)
             .await
-            .is_err());
-        assert_eq!(coordinator.metrics_snapshot().provider_throttled, 1);
+            .expect("account A's rate limit must not back off account B");
+        account_b.finish_success().await;
+        assert_eq!(coordinator.metrics_snapshot().provider_throttled, 0);
 
-        let other = coordinator
+        let provider_error = coordinator
             .acquire("provider-b", ProviderWorkClass::ModelDiscovery)
             .await
             .unwrap();
-        other
-            .finish_failure(Some((FailureKind::BadRequest, None)))
+        provider_error
+            .finish_failure(Some((FailureKind::ServerError, None)))
             .await;
         assert!(coordinator
             .acquire("provider-b", ProviderWorkClass::HealthProbe)
             .await
-            .is_ok());
+            .is_err());
+        assert_eq!(coordinator.metrics_snapshot().provider_throttled, 1);
     }
 
     #[tokio::test]
@@ -637,13 +644,13 @@ mod tests {
     fn only_provider_level_failure_categories_back_off() {
         for kind in [
             FailureKind::BadRequest,
+            FailureKind::RateLimit,
             FailureKind::QuotaExhausted,
             FailureKind::TargetError,
         ] {
             assert!(!provider_backoff_evidence(kind));
         }
         for kind in [
-            FailureKind::RateLimit,
             FailureKind::ServerError,
             FailureKind::ConnectionError,
             FailureKind::Timeout,
@@ -653,6 +660,44 @@ mod tests {
         assert_eq!(backoff_delay(1, None), Duration::from_secs(5));
         assert_eq!(backoff_delay(2, None), Duration::from_secs(10));
         assert_eq!(backoff_delay(99, Some(u64::MAX)), MAX_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn sequential_failures_increase_backoff_after_expiry() {
+        let coordinator = ProviderWorkCoordinator::default();
+        let first = coordinator
+            .acquire("provider-a", ProviderWorkClass::CredentialRefresh)
+            .await
+            .unwrap();
+        first
+            .finish_failure(Some((FailureKind::ServerError, None)))
+            .await;
+
+        let gate = coordinator.gate("provider-a");
+        {
+            let mut rate = gate.rate.lock().await;
+            assert_eq!(rate.consecutive_failures, 1);
+            rate.backed_off_until = Some(Instant::now() - Duration::from_millis(1));
+        }
+
+        let retry = coordinator
+            .acquire("provider-a", ProviderWorkClass::CredentialRefresh)
+            .await
+            .expect("expired backoff should permit the next attempt");
+        retry
+            .finish_failure(Some((FailureKind::ServerError, None)))
+            .await;
+
+        let rate = gate.rate.lock().await;
+        assert_eq!(rate.consecutive_failures, 2);
+        let remaining = rate
+            .backed_off_until
+            .expect("second failure should install another backoff")
+            .duration_since(Instant::now());
+        assert!(
+            remaining > Duration::from_secs(9),
+            "second sequential failure should back off for about 10s, got {remaining:?}"
+        );
     }
 
     #[test]

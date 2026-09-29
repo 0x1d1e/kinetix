@@ -307,6 +307,15 @@ impl AppState {
             let refresh = self.credential_refresh.clone();
             let provider_id = provider.id.clone();
             let account = account.clone();
+            if let Some(credential) = refresh
+                .resolve_cached(&provider_id, Arc::clone(&strategy), &account)
+                .await?
+            {
+                return Ok(credential);
+            }
+
+            // A cache miss may invoke plugin resolution, which can perform
+            // network refresh work. Cache hits above stay off provider pacing.
             let result = self
                 .provider_work
                 .run(

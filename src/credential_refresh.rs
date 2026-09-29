@@ -86,10 +86,27 @@ impl RefreshCoordinator {
         self.store_schedule(provider_id, account_id, credential, false, Utc::now(), None);
     }
 
+    /// Read a cached credential under the account-scoped gate so it cannot
+    /// race with a scheduled or reactive rotation.
+    pub async fn resolve_cached(
+        &self,
+        provider_id: &str,
+        strategy: Arc<dyn CredentialStrategy>,
+        account: &AccountRow,
+    ) -> std::result::Result<Option<ResolvedCredential>, CredentialRotationError> {
+        let key = CredentialKey::new(provider_id, &account.id);
+        let gate = self.gate(&key);
+        let _guard = gate.lock.lock().await;
+        let current = strategy.resolve_cached(account).await?;
+        if let Some(current) = &current {
+            self.observe(provider_id, &account.id, current);
+        }
+        Ok(current)
+    }
+
     /// Resolve an account credential under the same account-scoped gate used
-    /// by scheduled and reactive refresh. Some existing plugins refresh inside
-    /// resolve(), so treating it as read-only would allow rotating refresh
-    /// tokens to race.
+    /// by cached reads and scheduled/reactive refresh. Some strategies refresh
+    /// inside resolve(), so the cache check and full resolution share the gate.
     pub async fn resolve(
         &self,
         provider_id: &str,
@@ -99,6 +116,11 @@ impl RefreshCoordinator {
         let key = CredentialKey::new(provider_id, &account.id);
         let gate = self.gate(&key);
         let _guard = gate.lock.lock().await;
+
+        if let Some(current) = strategy.resolve_cached(account).await? {
+            self.observe(provider_id, &account.id, &current);
+            return Ok(current);
+        }
 
         match strategy.resolve(account).await {
             Ok(current) => {
@@ -441,6 +463,25 @@ fn parse_time(value: Option<&str>) -> Option<DateTime<Utc>> {
     value.and_then(crate::db::parse_dt)
 }
 
+pub(crate) fn lease_refresh_deadline(
+    expires_at: Option<&str>,
+    refresh_after: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let expires_at = parse_time(expires_at);
+    let requested = parse_time(refresh_after).or_else(|| {
+        expires_at.as_ref().map(|expires| {
+            // Keep half of a short lease available before refreshing. Applying
+            // the fixed lead to a lease shorter than five minutes would make
+            // it due immediately after a successful refresh.
+            let remaining_secs = (expires.to_owned() - now.to_owned()).num_seconds().max(0);
+            let lead_secs = (remaining_secs / 2).min(DEFAULT_REFRESH_LEAD_SECS);
+            expires.to_owned() - ChronoDuration::seconds(lead_secs)
+        })
+    });
+    requested.map(|deadline| deadline.max(now))
+}
+
 fn schedule_from_credential(
     credential: &ResolvedCredential,
     now: DateTime<Utc>,
@@ -453,18 +494,11 @@ fn schedule_from_credential(
         secret_fingerprint: Sha256::digest(credential.secret.as_bytes()).into(),
     };
 
-    let requested = lease_identity.refresh_after.or_else(|| {
-        lease_identity.expires_at.as_ref().map(|expires| {
-            // Keep half of a short lease available before refreshing. Applying
-            // the fixed five-minute lead to a lease shorter than five minutes
-            // clamps its deadline to `now`, causing a successful rotation to
-            // be claimed again on every scheduler tick.
-            let remaining_secs = (expires.to_owned() - now.to_owned()).num_seconds().max(0);
-            let lead_secs = (remaining_secs / 2).min(DEFAULT_REFRESH_LEAD_SECS);
-            expires.to_owned() - ChronoDuration::seconds(lead_secs)
-        })
-    })?;
-    let next_attempt_at = requested.max(now);
+    let next_attempt_at = lease_refresh_deadline(
+        credential.expires_at.as_deref(),
+        credential.refresh_after.as_deref(),
+        now,
+    )?;
 
     Some(LeaseSchedule {
         next_attempt_at,
@@ -556,6 +590,41 @@ mod tests {
             "test_rotating"
         }
 
+        async fn resolve_cached(
+            &self,
+            _account: &AccountRow,
+        ) -> std::result::Result<Option<ResolvedCredential>, CredentialRotationError> {
+            let now = Utc::now();
+            let rotations = self.rotations.load(Ordering::Relaxed);
+            let has_short_lease = self.short_lease_after_rotation && rotations > 0;
+            let expires_at = if has_short_lease {
+                self.short_expires_at.clone()
+            } else if rotations == 0 {
+                self.initial_expires_at.clone()
+            } else {
+                self.rotated_expires_at.clone()
+            };
+            let refresh_after = if has_short_lease {
+                None
+            } else if rotations == 0 {
+                Some(self.initial_refresh_after.clone())
+            } else {
+                Some(self.rotated_refresh_after.clone())
+            };
+            if lease_refresh_deadline(Some(&expires_at), refresh_after.as_deref(), now)
+                .is_some_and(|deadline| deadline > now)
+            {
+                Ok(Some(ResolvedCredential {
+                    secret: self.secret.lock().await.clone(),
+                    expires_at: Some(expires_at),
+                    refresh_after,
+                    rotated: false,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+
         async fn resolve(
             &self,
             _account: &AccountRow,
@@ -604,6 +673,22 @@ mod tests {
     impl CredentialStrategy for FixedShortLeaseStrategy {
         fn name(&self) -> &'static str {
             "test_fixed_short_lease"
+        }
+
+        async fn resolve_cached(
+            &self,
+            _account: &AccountRow,
+        ) -> std::result::Result<Option<ResolvedCredential>, CredentialRotationError> {
+            let now = Utc::now();
+            let is_fresh =
+                lease_refresh_deadline(Some(&self.expires_at), self.refresh_after.as_deref(), now)
+                    .is_some_and(|deadline| deadline > now);
+            Ok(is_fresh.then(|| ResolvedCredential {
+                secret: "fixed-lease-token".into(),
+                expires_at: Some(self.expires_at.clone()),
+                refresh_after: self.refresh_after.clone(),
+                rotated: false,
+            }))
         }
 
         async fn resolve(

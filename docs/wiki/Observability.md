@@ -83,8 +83,11 @@ when it skips multiple targets behind an open provider circuit.
 | `kinetix_allocations_total` / `kinetix_alloc_bytes_total` | Allocations per request (only when built `--features alloc-stats`; `0` otherwise = honestly "not measured"). |
 
 Provider-work counters omit provider, account, and model labels. The coordinator
-budgets credential refresh, discovery, probes, pricing refresh, and cached routing
-fact refresh; probes, discovery, and routing-fact refresh stay off inference paths.
+budgets refresh-capable credential resolution, discovery, probes, pricing refresh,
+and cached routing-fact refresh. Cached credential reads bypass this coordinator
+on inference paths; probes, discovery, and routing-fact refresh stay off inference
+paths. Normalized account-level rate limits retain account cooldown behavior and
+do not trigger provider-wide backoff.
 
 Admission metrics omit key and Route identities to keep label cardinality bounded. Incomplete usage keeps the conservative token reservation; the oldest-reservation age is exposed without imposing a fixed stale threshold.
 
