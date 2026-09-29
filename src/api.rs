@@ -6,11 +6,13 @@ use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::Datelike;
 use serde_json::Value;
 
 use crate::app::AppState;
 use crate::auth::{authenticate_virtual_key, extract_virtual_key};
 use crate::client_disconnect::ClientDisconnect;
+use crate::db;
 use crate::frontends::{self, FrontendFormat};
 use crate::limits;
 use crate::pipeline;
@@ -482,6 +484,118 @@ pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> R
     Json(body).into_response()
 }
 
+/// `GET /v1/usage` returns bounded, self-service usage for the authenticated key.
+pub async fn client_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let request_id = new_request_id();
+    let format = if headers.contains_key("x-api-key")
+        || headers
+            .get("anthropic-version")
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+    {
+        FrontendFormat::Anthropic
+    } else {
+        FrontendFormat::OpenAi
+    };
+
+    if let Err(retry) = state.ip_limiter.check(limits::client_ip(&headers)) {
+        return error_response(
+            format,
+            &request_id,
+            ProxyError::rate_limited("too many requests from this client", Some(retry)),
+        );
+    }
+    let presented = match extract_virtual_key(&headers) {
+        Some(key) => key,
+        None => {
+            return error_response(
+                format,
+                &request_id,
+                ProxyError::unauthorized("missing API key"),
+            )
+        }
+    };
+    let key = match authenticate_virtual_key(&state, &presented).await {
+        Ok(key) => key,
+        Err(error) => return error_response(format, &request_id, error),
+    };
+    if let Err(error) = limits::validate_status(&key) {
+        return error_response(format, &request_id, error);
+    }
+    if let Err(error) = limits::enforce_ip(&key, limits::client_ip(&headers)) {
+        return error_response(format, &request_id, error);
+    }
+
+    let now = chrono::Utc::now();
+    let daily_start = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_utc();
+    let monthly_start = now
+        .date_naive()
+        .with_day(1)
+        .expect("the first day of a month is valid")
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_utc();
+    let daily_reset = daily_start + chrono::Duration::days(1);
+    let next_month_date = if now.month() == 12 {
+        chrono::NaiveDate::from_ymd_opt(now.year() + 1, 1, 1)
+    } else {
+        chrono::NaiveDate::from_ymd_opt(now.year(), now.month() + 1, 1)
+    }
+    .expect("the next month is a valid date");
+    let monthly_reset = next_month_date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_utc();
+    let now_iso = now.to_rfc3339();
+    let daily_from = daily_start.to_rfc3339();
+    let monthly_from = monthly_start.to_rfc3339();
+    let (daily, monthly) = match tokio::try_join!(
+        db::client_usage_summary(&state.pool, &key.id, &daily_from, &now_iso),
+        db::client_usage_summary(&state.pool, &key.id, &monthly_from, &now_iso),
+    ) {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            return error_response(format, &request_id, ProxyError::internal(error.to_string()))
+        }
+    };
+
+    let remaining = |limit: Option<f64>, summary: &db::ClientUsageSummary| {
+        let limit = limit.filter(|value| *value > 0.0)?;
+        if summary.unknown_cost_requests > 0 {
+            return None;
+        }
+        Some((limit - summary.known_cost_usd?).max(0.0))
+    };
+    Json(serde_json::json!({
+        "periods": {
+            "daily": { "from": daily_from, "to": now_iso, "timezone": "UTC" },
+            "monthly": { "from": monthly_from, "to": now_iso, "timezone": "UTC" },
+        },
+        "usage": { "daily": daily, "monthly": monthly },
+        "limits": {
+            "rpm": key.rpm_limit.filter(|value| *value > 0),
+            "tpm": key.tpm_limit.filter(|value| *value > 0),
+            "concurrency": key.max_concurrent_requests.filter(|value| *value > 0),
+            "daily_budget_usd": key.daily_budget.filter(|value| *value > 0.0),
+            "monthly_budget_usd": key.monthly_budget.filter(|value| *value > 0.0),
+        },
+        "remaining": {
+            "daily_budget_usd": remaining(key.daily_budget, &daily),
+            "monthly_budget_usd": remaining(key.monthly_budget, &monthly),
+        },
+        "resets": {
+            "daily": daily_reset.to_rfc3339(),
+            "monthly": monthly_reset.to_rfc3339(),
+        },
+        "admission": { "in_flight": state.admission.key_inflight(&key.id) },
+    }))
+    .into_response()
+}
+
 pub async fn healthz(State(state): State<AppState>) -> Response {
     // Lightweight process + database check (Monitoring section).
     let db_ok = sqlx::query("SELECT 1").fetch_one(&state.pool).await.is_ok();
@@ -575,5 +689,328 @@ mod protocol_tests {
             ]
         );
         assert!(extract_protocol_headers(FrontendFormat::OpenAi, &headers).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod client_usage_tests {
+    use super::*;
+    use crate::db::{self, UsageLogRow, VirtualKeyRow};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    async fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-client-usage-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = crate::paths::Paths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+        };
+        paths.ensure_dirs().unwrap();
+        let database_url = paths.database_url();
+        let pool = db::connect(&database_url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let config = Arc::new(crate::config::Config {
+            bind: "127.0.0.1:0".into(),
+            public_base_url: "http://127.0.0.1".into(),
+            database_url,
+            master_key: [42_u8; 32],
+            admin_token: "test-admin".into(),
+            cf_access_aud: None,
+            cf_access_team_domain: None,
+            log_json: false,
+            bootstrap_file: None,
+            allow_private_upstreams: true,
+            allow_insecure_tls: true,
+            data_dir: paths.data_dir.clone(),
+            shutdown_grace_secs: 1,
+            max_inflight_inferences: crate::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
+            alert_webhook_url: None,
+            alert_fallback_rate: 1.0,
+            alert_error_rate: 1.0,
+            alert_min_requests: 1,
+            alert_interval_secs: 60,
+            alert_p95_latency_ms: 1_000,
+            ip_rate_limit_per_min: 0,
+            session_ttl_minutes: 60,
+            export_retention_days: 1,
+            paths,
+            generated_admin_password: None,
+        });
+        let registry = Arc::new(crate::registry::Registry::new());
+        registry.reload(&pool).await.unwrap();
+        let state = AppState::new(
+            config,
+            pool.clone(),
+            registry,
+            Arc::new(crate::crypto::Crypto::new(&[42_u8; 32])),
+            reqwest::Client::new(),
+            crate::logqueue::UsageLogQueue::new(pool, 16),
+            0,
+        );
+        (state, root)
+    }
+
+    fn test_key(id: &str, secret: &str, status: &str) -> VirtualKeyRow {
+        VirtualKeyRow {
+            id: id.into(),
+            key_hash: crate::crypto::hash_virtual_key(secret),
+            name: format!("{id} name"),
+            owner: String::new(),
+            tag: String::new(),
+            allowed_models: "[\"*\"]".into(),
+            allowed_providers: "[]".into(),
+            rpm_limit: Some(20),
+            tpm_limit: Some(1000),
+            max_concurrent_requests: Some(2),
+            daily_budget: Some(5.0),
+            monthly_budget: Some(50.0),
+            expires_at: None,
+            status: status.into(),
+            allowed_ips: "[]".into(),
+            body_logging: 0,
+            created_at: db::now_iso(),
+            revoked_at: None,
+        }
+    }
+
+    fn usage_row(
+        key_id: &str,
+        input: Option<i64>,
+        output: Option<i64>,
+        cost: Option<f64>,
+    ) -> UsageLogRow {
+        UsageLogRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            request_id: format!("req-{}", uuid::Uuid::new_v4()),
+            ts: chrono::Utc::now().to_rfc3339(),
+            key_id: Some(key_id.into()),
+            key_name: Some("private key name".into()),
+            client_format: "openai".into(),
+            requested_model: "private-model".into(),
+            effective_model: Some("private-model".into()),
+            route_id: Some("private-route-id".into()),
+            route_name: Some("private-route-name".into()),
+            fallback_hops: 0,
+            fallback_path: "[]".into(),
+            status: if cost.is_some() {
+                "success"
+            } else {
+                "upstream_error"
+            }
+            .into(),
+            status_code: if cost.is_some() { 200 } else { 502 },
+            latency_ms: Some(10),
+            ttft_ms: None,
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: None,
+            cache_write_tokens: None,
+            thinking_tokens: None,
+            cost_usd: cost,
+            cost_known: i64::from(cost.is_some()),
+            price_version_id: None,
+            cache_status: "bypass".into(),
+            serving_account_id: Some("private-account-id".into()),
+            serving_account: Some("private-account-label".into()),
+            serving_provider: Some("private-provider-name".into()),
+            upstream_request_id: Some("private-upstream-request-id".into()),
+            flagged: 0,
+            error_message: None,
+            usage_confidence: if input.is_some() && output.is_some() {
+                "provider_reported"
+            } else {
+                "unknown"
+            }
+            .into(),
+            commit_state: "committed".into(),
+            retry_count: 0,
+            route_trace_id: None,
+            opaque_route_id: Some("private-opaque-route-id".into()),
+        }
+    }
+
+    async fn request_usage(app: &axum::Router, path: &str, secret: Option<&str>) -> Response {
+        let mut request = axum::http::Request::builder().method("GET").uri(path);
+        if let Some(secret) = secret {
+            request = request.header("authorization", format!("Bearer {secret}"));
+        }
+        app.clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn usage_is_key_scoped_and_does_not_expose_routing_topology() {
+        let (state, root) = test_state("scope").await;
+        let key = test_key("own-key-id", "own-client-key", "active");
+        let other = test_key("other-key-id", "other-client-key", "active");
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        db::insert_virtual_key(&state.pool, &other).await.unwrap();
+        db::insert_usage_log(
+            &state.pool,
+            &usage_row(&key.id, Some(3), Some(4), Some(0.5)),
+        )
+        .await
+        .unwrap();
+        db::insert_usage_log(&state.pool, &usage_row(&key.id, None, Some(2), None))
+            .await
+            .unwrap();
+        db::insert_usage_log(
+            &state.pool,
+            &usage_row(&other.id, Some(100), Some(200), Some(9.0)),
+        )
+        .await
+        .unwrap();
+        let _in_flight = state
+            .admission
+            .reserve_concurrency(Some((&key.id, key.max_concurrent_requests)), None)
+            .unwrap();
+        let app = crate::router::build(state.clone());
+
+        let response = request_usage(
+            &app,
+            "/v1/usage?key_id=other-key-id",
+            Some("own-client-key"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["limits"]["rpm"], 20);
+        assert_eq!(body["limits"]["tpm"], 1000);
+        assert_eq!(body["limits"]["concurrency"], 2);
+        assert_eq!(body["limits"]["daily_budget_usd"], 5.0);
+        assert_eq!(body["limits"]["monthly_budget_usd"], 50.0);
+        assert_eq!(body["admission"]["in_flight"], 1);
+        for period in ["daily", "monthly"] {
+            assert_eq!(body["usage"][period]["requests"], 2);
+            assert!(body["usage"][period]["input_tokens"].is_null());
+            assert_eq!(body["usage"][period]["output_tokens"], 6);
+            assert_eq!(body["usage"][period]["known_cost_usd"], 0.5);
+            assert_eq!(body["usage"][period]["unknown_cost_requests"], 1);
+            assert_eq!(body["usage"][period]["unknown_usage_requests"], 1);
+        }
+        assert!(body["remaining"]["daily_budget_usd"].is_null());
+        assert!(body["remaining"]["monthly_budget_usd"].is_null());
+        assert!(body["periods"]["daily"]["from"].is_string());
+        assert!(body["periods"]["monthly"]["from"].is_string());
+        assert!(body["resets"]["daily"].is_string());
+        assert!(body["resets"]["monthly"].is_string());
+
+        let serialized = body.to_string();
+        for private_value in [
+            "other-key-id",
+            "private key name",
+            "private-model",
+            "private-route-id",
+            "private-route-name",
+            "private-account-id",
+            "private-account-label",
+            "private-provider-name",
+            "private-upstream-request-id",
+            "private-opaque-route-id",
+        ] {
+            assert!(
+                !serialized.contains(private_value),
+                "leaked {private_value}"
+            );
+        }
+        drop(_in_flight);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn usage_shows_full_remaining_budget_when_no_usage_exists() {
+        let (state, root) = test_state("empty").await;
+        let key = test_key("empty-key", "empty-client-key", "active");
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        let app = crate::router::build(state.clone());
+        let response = request_usage(&app, "/v1/usage", Some("empty-client-key")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        for period in ["daily", "monthly"] {
+            assert_eq!(body["usage"][period]["requests"], 0);
+            assert_eq!(body["usage"][period]["input_tokens"], 0);
+            assert_eq!(body["usage"][period]["output_tokens"], 0);
+            assert_eq!(body["usage"][period]["known_cost_usd"], 0.0);
+        }
+        assert_eq!(body["remaining"]["daily_budget_usd"], 5.0);
+        assert_eq!(body["remaining"]["monthly_budget_usd"], 50.0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn known_cost_reduces_daily_and_monthly_remaining_budgets() {
+        let (state, root) = test_state("known-cost").await;
+        let key = test_key("priced-key", "priced-client-key", "active");
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        db::insert_usage_log(
+            &state.pool,
+            &usage_row(&key.id, Some(3), Some(4), Some(1.25)),
+        )
+        .await
+        .unwrap();
+        let app = crate::router::build(state.clone());
+
+        let response = request_usage(&app, "/v1/usage", Some("priced-client-key")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["remaining"]["daily_budget_usd"], 3.75);
+        assert_eq!(body["remaining"]["monthly_budget_usd"], 48.75);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn usage_requires_a_valid_active_unexpired_virtual_key() {
+        let (state, root) = test_state("auth").await;
+        let revoked = test_key("revoked-key", "revoked-client-key", "revoked");
+        let disabled = test_key("disabled-key", "disabled-client-key", "disabled");
+        let mut expired = test_key("expired-key", "expired-client-key", "active");
+        expired.expires_at = Some((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+        for key in [&revoked, &disabled, &expired] {
+            db::insert_virtual_key(&state.pool, key).await.unwrap();
+        }
+        let app = crate::router::build(state.clone());
+
+        assert_eq!(
+            request_usage(&app, "/v1/usage", None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request_usage(&app, "/v1/usage", Some("unknown-client-key"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request_usage(&app, "/v1/usage", Some("revoked-client-key"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request_usage(&app, "/v1/usage", Some("expired-client-key"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request_usage(&app, "/v1/usage", Some("disabled-client-key"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

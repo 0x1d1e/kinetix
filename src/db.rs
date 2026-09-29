@@ -4123,6 +4123,58 @@ pub async fn key_usage_since(pool: &Pool, key_id: &str, since_iso: &str) -> Resu
     Ok((row.get::<i64, _>("n"), row.get::<i64, _>("t")))
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientUsageSummary {
+    pub requests: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub known_cost_usd: Option<f64>,
+    pub unknown_cost_requests: i64,
+    pub unknown_usage_requests: i64,
+}
+
+/// Bounded usage summary for one key over `[from, to)`. Totals remain unknown
+/// when any request in the period lacks the corresponding token count or cost.
+pub async fn client_usage_summary(
+    pool: &Pool,
+    key_id: &str,
+    from_iso: &str,
+    to_iso: &str,
+) -> Result<ClientUsageSummary> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS requests,
+            CASE WHEN COUNT(*) = 0 THEN 0
+                 WHEN SUM(CASE WHEN input_tokens IS NULL THEN 1 ELSE 0 END) = 0
+                 THEN SUM(input_tokens) ELSE NULL END AS input_tokens,
+            CASE WHEN COUNT(*) = 0 THEN 0
+                 WHEN SUM(CASE WHEN output_tokens IS NULL THEN 1 ELSE 0 END) = 0
+                 THEN SUM(output_tokens) ELSE NULL END AS output_tokens,
+            CASE WHEN COUNT(*) = 0 THEN 0.0
+                 WHEN SUM(CASE WHEN cost_known != 0 AND cost_usd IS NOT NULL THEN 1 ELSE 0 END) = 0
+                 THEN NULL
+                 ELSE SUM(CASE WHEN cost_known != 0 AND cost_usd IS NOT NULL THEN cost_usd ELSE 0.0 END)
+            END AS known_cost_usd,
+            COALESCE(SUM(CASE WHEN cost_known = 0 OR cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS unknown_cost_requests,
+            COALESCE(SUM(CASE WHEN usage_confidence = 'unknown' THEN 1 ELSE 0 END), 0) AS unknown_usage_requests
+         FROM usage_logs
+         WHERE key_id = ? AND ts >= ? AND ts < ?",
+    )
+    .bind(key_id)
+    .bind(from_iso)
+    .bind(to_iso)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(ClientUsageSummary {
+        requests: row.get("requests"),
+        input_tokens: row.get("input_tokens"),
+        output_tokens: row.get("output_tokens"),
+        known_cost_usd: row.get("known_cost_usd"),
+        unknown_cost_requests: row.get("unknown_cost_requests"),
+        unknown_usage_requests: row.get("unknown_usage_requests"),
+    })
+}
+
 // ===========================================================================
 // Lifetime totals (for the dashboard)
 // ===========================================================================

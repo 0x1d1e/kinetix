@@ -2319,6 +2319,14 @@ pub(crate) async fn run_with_disconnect(
                                     attempts_done,
                                 );
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
+                                enqueue_precommit_failure(
+                                    state,
+                                    &req,
+                                    &meta,
+                                    started,
+                                    attempts_done,
+                                    &refresh_error,
+                                );
                                 return Err(refresh_error);
                             }
                             last_error = Some(refresh_error);
@@ -2372,6 +2380,14 @@ pub(crate) async fn run_with_disconnect(
                         attempts_done,
                     );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
+                    enqueue_precommit_failure(
+                        state,
+                        &req,
+                        &meta,
+                        started,
+                        attempts_done,
+                        &client_error,
+                    );
                     return Err(client_error);
                 }
                 if failure.kind == FailureKind::TargetError {
@@ -2525,6 +2541,9 @@ pub(crate) async fn run_with_disconnect(
         return Err(failure.client_error);
     }
     if let Some(error) = last_error {
+        if attempts_done > 0 {
+            enqueue_precommit_failure(state, &req, &meta, started, attempts_done, &error);
+        }
         return Err(error);
     }
 
@@ -2545,6 +2564,55 @@ pub(crate) async fn run_with_disconnect(
         format!("{name}: {msg}"),
         retry_after,
     ))
+}
+
+fn enqueue_precommit_failure(
+    state: &AppState,
+    req: &InternalRequest,
+    meta: &RequestMeta,
+    started: Instant,
+    attempts_done: usize,
+    error: &ProxyError,
+) {
+    let retries = attempts_done.saturating_sub(1) as i64;
+    state.log_queue.enqueue(db::UsageLogRow {
+        id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
+        request_id: meta.request_id.clone(),
+        ts: db::now_iso(),
+        key_id: meta.key_id.clone(),
+        key_name: meta.key_name.clone(),
+        client_format: meta.client_format.to_string(),
+        requested_model: req.requested_model.clone(),
+        effective_model: None,
+        route_id: None,
+        route_name: None,
+        fallback_hops: retries,
+        fallback_path: "[]".into(),
+        status: "upstream_error".into(),
+        status_code: i64::from(error.http_status()),
+        latency_ms: Some(started.elapsed().as_millis() as i64),
+        ttft_ms: None,
+        input_tokens: None,
+        output_tokens: None,
+        cached_tokens: None,
+        cache_write_tokens: None,
+        thinking_tokens: None,
+        cost_usd: None,
+        cost_known: 0,
+        price_version_id: None,
+        cache_status: "bypass".into(),
+        serving_account_id: None,
+        serving_account: None,
+        serving_provider: None,
+        upstream_request_id: None,
+        flagged: 0,
+        error_message: None,
+        usage_confidence: "unknown".into(),
+        commit_state: "pre_commit".into(),
+        retry_count: retries,
+        route_trace_id: None,
+        opaque_route_id: None,
+    });
 }
 
 fn target_key(route: &db::RouteRow, t: &ResolvedTarget) -> String {

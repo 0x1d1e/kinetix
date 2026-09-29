@@ -42,6 +42,17 @@ check() { # check <label> <actual> <expected-substring>
   fi
 }
 
+check_absent() { # check_absent <label> <actual> <forbidden-substring>
+  if [[ "$2" != *"$3"* ]]; then
+    echo "  ok   $1"
+  else
+    echo "  FAIL $1"
+    echo "       must not contain: $3"
+    echo "       got: $2"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
 echo "==> building release binary"
 cargo build --release --quiet || { echo "build failed"; exit 1; }
 
@@ -82,6 +93,33 @@ check "models lists syn-openai" "$(curl -s "$BASE/v1/models" -H "authorization: 
 STREAM="$(curl -s -N --max-time 20 -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"model":"syn-openai","stream":true,"messages":[{"role":"user","content":"hi"}]}')"
 check "passthrough streams frames" "$STREAM" 'data:'
 check "passthrough terminates" "$STREAM" '[DONE]'
+
+# Client usage is key-scoped and keeps unknown cost explicit. Usage logging is
+# asynchronous, so wait briefly for the completed stream to reach SQLite.
+for _ in $(seq 1 50); do
+  CLIENT_USAGE="$(curl -s "$BASE/v1/usage" -H "authorization: Bearer $KEY")"
+  [[ "$CLIENT_USAGE" == *'"requests":1'* ]] && break
+  sleep 0.1
+done
+check "client usage includes streamed request" "$CLIENT_USAGE" '"requests":1'
+check "client usage preserves unknown cost" "$CLIENT_USAGE" '"known_cost_usd":null'
+check_absent "client usage hides serving topology" "$CLIENT_USAGE" 'serving_provider'
+check_absent "client usage hides account identity" "$CLIENT_USAGE" 'serving_account'
+
+# A failed upstream attempt is still accounted to the calling key.
+FAIL_CODE="$(curl -s --max-time 20 -o "$WORK/failure-response" -w '%{http_code}' \
+  -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $KEY" \
+  -H 'content-type: application/json' \
+  -d '{"model":"syn-fail","stream":false,"messages":[{"role":"user","content":"fail"}]}')"
+check "failed upstream request returns gateway error" "$FAIL_CODE" '502'
+for _ in $(seq 1 50); do
+  CLIENT_USAGE="$(curl -s "$BASE/v1/usage" -H "authorization: Bearer $KEY")"
+  [[ "$CLIENT_USAGE" == *'"requests":2'* ]] && break
+  sleep 0.1
+done
+check "client usage includes failed request" "$CLIENT_USAGE" '"requests":2'
+check "failed request usage stays unknown" "$CLIENT_USAGE" '"unknown_usage_requests":1'
+check_absent "failed request usage hides provider topology" "$CLIENT_USAGE" 'serving_provider'
 
 # translation (OpenAI inbound -> Gemini outbound)
 TRANSL="$(curl -s -N --max-time 20 -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $KEY" -H 'content-type: application/json' -d '{"model":"syn-gemini-3","stream":true,"messages":[{"role":"user","content":"hi"}]}')"

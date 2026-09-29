@@ -318,6 +318,16 @@ impl AdmissionController {
             < limit as u64
     }
 
+    /// Number of currently admitted inference requests for one virtual key.
+    pub fn key_inflight(&self, key_id: &str) -> u64 {
+        self.concurrency
+            .lock()
+            .keys
+            .get(key_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     pub fn reserve_concurrency(
         &self,
         key: Option<(&str, Option<i64>)>,

@@ -73,6 +73,54 @@ rows, with legacy request rows included when no attempt data exists.
 - **Dashboard → Request Inspector** — per-request rows with a live view.
 - **Admin API** — `GET /admin/api/usage` (alias `/requests`) returns rows +
   summary.
+- **Client API** - `GET /v1/usage` uses the caller's virtual key and returns only
+  that key's usage. Daily and monthly windows use UTC `[from,to)` bounds from
+  each period's start to request time; `resets` gives the next UTC boundaries.
+  `admission` exposes the current in-flight count, not reservation details.
+
+```json
+{
+  "periods": {
+    "daily": { "from": "...", "to": "...", "timezone": "UTC" },
+    "monthly": { "from": "...", "to": "...", "timezone": "UTC" }
+  },
+  "usage": {
+    "daily": {
+      "requests": 0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "known_cost_usd": 0,
+      "unknown_cost_requests": 0,
+      "unknown_usage_requests": 0
+    },
+    "monthly": {
+      "requests": 0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "known_cost_usd": 0,
+      "unknown_cost_requests": 0,
+      "unknown_usage_requests": 0
+    }
+  },
+  "limits": {
+    "rpm": null,
+    "tpm": null,
+    "concurrency": null,
+    "daily_budget_usd": null,
+    "monthly_budget_usd": null
+  },
+  "remaining": { "daily_budget_usd": null, "monthly_budget_usd": null },
+  "resets": { "daily": "...", "monthly": "..." },
+  "admission": { "in_flight": 0 }
+}
+```
+
+`usage` includes failed requests with usage rows. Token totals are `null` if any
+request in the window lacks that token count. `known_cost_usd` is the subtotal
+for priced requests; `unknown_cost_requests` counts unpriced requests, and
+remaining budgets are `null` when any request is unpriced. Unset limits are
+`null`. The endpoint never returns model, Route, provider, account, or other key
+identities.
 
 ## Exports (JSONL + CSV)
 

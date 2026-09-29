@@ -158,10 +158,17 @@ POST /v1/chat/completions
 POST /v1/responses
 POST /v1/messages
 GET  /v1/models
+GET  /v1/usage
 GET  /healthz
 ```
 
-Inference endpoints support streaming and non-streaming operation.
+Inference endpoints support streaming and non-streaming operation. `GET /v1/usage`
+uses the caller's virtual key and reports its daily/monthly usage, configured
+limits and budgets, and reset times. Incomplete token totals remain unknown;
+unknown-cost requests are counted separately and make remaining budgets unknown.
+The response does not expose provider, account, or route identities. See
+[Usage, Cost and Accounting](docs/wiki/Usage-Cost-and-Accounting.md) for its
+response schema and unknown-value semantics.
 
 Protocol compatibility and known limitations are documented in [docs/compatibility.md](docs/compatibility.md).
 
