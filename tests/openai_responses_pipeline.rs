@@ -33,7 +33,7 @@ const TPM_DISCONNECT_KEY: &str = "sk-kinetix-disconnect-tpm-test";
 const BUDGET_DISCONNECT_KEY: &str = "sk-kinetix-disconnect-budget-test";
 const UPSTREAM_MODEL: &str = "upstream-responses-model";
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct CapturedRequest {
     method: Method,
     path: String,
@@ -211,6 +211,26 @@ async fn upstream(
                 )))
                 .unwrap()
         }
+        "unknown_precommit_fallback" if upstream_model == "upstream-anthropic-model" => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from("data: {\"type\":\"message_start\""))
+                .unwrap()
+        }
+        "unknown_precommit_fallback" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from(concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fallback answer\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n"
+            )))
+            .unwrap(),
+        "terminal_http_503" => Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"error":{"message":"temporarily unavailable"}}"#))
+            .unwrap(),
         "known_partial_then_cancel"
             if upstream_model == "upstream-anthropic-model" && attempt_number == 1 => {
             Response::builder()
@@ -1172,7 +1192,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{timeout_body}");
 
     let requests = mock.requests.lock().await;
-    assert_eq!(requests.len(), 14);
+    assert_eq!(requests.len(), 14, "captured requests: {requests:?}");
     for (request, test_case) in requests
         .iter()
         .take(2)
@@ -1242,6 +1262,57 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
     assert_eq!(requests[13].body["model"], UPSTREAM_MODEL);
     assert_eq!(requests[13].body["input"], "case:timeout");
     drop(requests);
+
+    let (request_id, status, terminal_503) = call_responses_with_id(
+        &state,
+        "responses-partial-usage-terminal",
+        "terminal_http_503",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{terminal_503}");
+    let rows = wait_for_usage_rows(&state, &request_id, 1).await;
+    assert_eq!(rows.len(), 1, "terminal HTTP error needs one request row");
+    assert_eq!(rows[0].0, "stream_error");
+    let attempts = usage_attempt_rows_for_request(&state, &request_id).await;
+    assert_eq!(
+        attempts.len(),
+        1,
+        "terminal HTTP error needs one attempt row"
+    );
+    assert_eq!(attempts[0].0, 1);
+    assert_eq!(attempts[0].1, "stream_error");
+    assert_eq!(attempts[0].6, "pre_commit");
+
+    let before_unknown_attempt = state.admission.metrics_snapshot();
+    let (request_id, status, unknown_fallback) = call_responses_with_id_stream(
+        &state,
+        "responses-hidden-reasoning-fallback-route",
+        "unknown_precommit_fallback",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{unknown_fallback}");
+    assert!(
+        unknown_fallback.contains("fallback answer"),
+        "{unknown_fallback}"
+    );
+    let rows = wait_for_usage_rows(&state, &request_id, 1).await;
+    assert_eq!(rows.len(), 1);
+    let attempts = usage_attempt_rows_for_request(&state, &request_id).await;
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].0, 1);
+    assert_eq!(attempts[0].1, "stream_error");
+    assert_eq!(
+        (attempts[0].2, attempts[0].3, attempts[0].4),
+        (None, None, None)
+    );
+    assert_eq!(attempts[1].1, "success");
+    let after_unknown_attempt = state.admission.metrics_snapshot();
+    assert_eq!(
+        after_unknown_attempt.reconciled_incomplete_total,
+        before_unknown_attempt.reconciled_incomplete_total + 1,
+        "unknown usage from a dispatched precommit attempt makes aggregate reconciliation incomplete"
+    );
 
     for (test_case, route, expected_status, expected_rows, expected_tokens, fallback) in [
         (
@@ -1873,6 +1944,8 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
                 .collect::<Vec<_>>()
         )
     });
+    abandoned.abort();
+    let _ = abandoned.await;
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let known_partial: i64 = sqlx::query_scalar(
@@ -1889,9 +1962,37 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
         }
     })
     .await
-    .expect("first fallback attempt's reported usage was not persisted");
-    abandoned.abort();
-    let _ = abandoned.await;
+    .expect("cancelled request accounting bundle was not persisted");
+    let cancelled_request_id: String = sqlx::query_scalar(
+        "SELECT request_id FROM usage_attempts WHERE route_name = ? AND input_tokens = 13 AND output_tokens = 7 ORDER BY ts DESC LIMIT 1",
+    )
+    .bind("responses-hidden-reasoning-fallback-route")
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    let cancelled_request_rows = usage_rows_for_request(&state, &cancelled_request_id).await;
+    assert_eq!(cancelled_request_rows.len(), 1);
+    assert_eq!(cancelled_request_rows[0].0, "client_disconnect");
+    assert_eq!(cancelled_request_rows[0].1, 499);
+    assert_eq!(
+        (cancelled_request_rows[0].2, cancelled_request_rows[0].3),
+        (None, None),
+        "unknown usage from the cancelled active attempt prevents an exact request total"
+    );
+    let cancelled_attempts = usage_attempt_rows_for_request(&state, &cancelled_request_id).await;
+    assert_eq!(cancelled_attempts.len(), 2);
+    assert_eq!(cancelled_attempts[0].0, 1);
+    assert_eq!(cancelled_attempts[0].1, "stream_error");
+    assert_eq!(
+        (cancelled_attempts[0].2, cancelled_attempts[0].3),
+        (Some(13), Some(7))
+    );
+    assert_eq!(cancelled_attempts[1].0, 2);
+    assert_eq!(cancelled_attempts[1].1, "client_disconnect");
+    assert_eq!(
+        (cancelled_attempts[1].2, cancelled_attempts[1].3),
+        (None, None)
+    );
     tokio::time::timeout(Duration::from_secs(1), async {
         while state.admission.metrics_snapshot().inflight_inferences != 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;

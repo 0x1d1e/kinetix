@@ -3783,6 +3783,11 @@ pub struct UsageLogRow {
 }
 
 pub async fn insert_usage_log(pool: &Pool, u: &UsageLogRow) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    insert_usage_log_on(&mut conn, u).await
+}
+
+async fn insert_usage_log_on(conn: &mut sqlx::SqliteConnection, u: &UsageLogRow) -> Result<()> {
     sqlx::query(
         "INSERT INTO usage_logs
         (id, request_id, ts, key_id, key_name, client_format, requested_model, effective_model, route_id,
@@ -3828,12 +3833,12 @@ pub async fn insert_usage_log(pool: &Pool, u: &UsageLogRow) -> Result<()> {
     .bind(u.retry_count)
     .bind(&u.route_trace_id)
     .bind(&u.opaque_route_id)
-    .execute(pool)
+    .execute(conn)
     .await?;
     Ok(())
 }
 
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, FromRow, Serialize, Deserialize)]
 pub struct UsageAttemptRow {
     pub id: String,
     pub request_id: String,
@@ -3865,6 +3870,14 @@ pub struct UsageAttemptRow {
 }
 
 pub async fn insert_usage_attempt(pool: &Pool, attempt: &UsageAttemptRow) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    insert_usage_attempt_on(&mut conn, attempt).await
+}
+
+async fn insert_usage_attempt_on(
+    conn: &mut sqlx::SqliteConnection,
+    attempt: &UsageAttemptRow,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO usage_attempts
          (id, request_id, attempt_number, ts, key_id, key_name, effective_model, route_id, route_name,
@@ -3900,8 +3913,24 @@ pub async fn insert_usage_attempt(pool: &Pool, attempt: &UsageAttemptRow) -> Res
     .bind(&attempt.commit_state)
     .bind(&attempt.error_message)
     .bind(&attempt.opaque_route_id)
-    .execute(pool)
+    .execute(conn)
     .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageAccountingBundle {
+    pub request: UsageLogRow,
+    pub attempts: Vec<UsageAttemptRow>,
+}
+
+pub async fn insert_usage_bundle(pool: &Pool, bundle: &UsageAccountingBundle) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for attempt in &bundle.attempts {
+        insert_usage_attempt_on(&mut *tx, attempt).await?;
+    }
+    insert_usage_log_on(&mut *tx, &bundle.request).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -5674,6 +5703,75 @@ mod usage_request_log_tests {
             route_trace_id: None,
             opaque_route_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn usage_bundle_rolls_back_attempts_if_any_write_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-usage-bundle-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO virtual_keys (id, key_hash, name, owner, created_at, monthly_budget)
+             VALUES ('usage-view-key', 'usage-bundle-hash', 'Usage bundle key', 'test', '2026-01-01T00:00:00Z', 1.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let attempt = UsageAttemptRow {
+            id: "bundle-attempt-1".into(),
+            request_id: "request-with-fallback".into(),
+            attempt_number: 1,
+            ts: "2026-01-02T10:00:00Z".into(),
+            status: "stream_error".into(),
+            status_code: 502,
+            usage_confidence: "unknown".into(),
+            commit_state: "pre_commit".into(),
+            ..UsageAttemptRow::default()
+        };
+        let duplicate_attempt = UsageAttemptRow {
+            id: "bundle-attempt-2".into(),
+            ..attempt.clone()
+        };
+        let bundle = UsageAccountingBundle {
+            request: request_row(
+                "bundle-request",
+                "2026-01-02T10:00:00Z",
+                "stream_error",
+                502,
+                0,
+                0,
+                0.0,
+                0,
+                "bundle-account",
+            ),
+            attempts: vec![attempt, duplicate_attempt],
+        };
+
+        assert!(insert_usage_bundle(&pool, &bundle).await.is_err());
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_attempts WHERE request_id = 'request-with-fallback'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let requests: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_logs WHERE request_id = 'request-with-fallback'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 0, "failed bundles must not leave orphan attempts");
+        assert_eq!(requests, 0, "failed bundles must not leave orphan requests");
+
+        pool.close().await;
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

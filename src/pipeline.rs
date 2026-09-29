@@ -86,6 +86,14 @@ fn cache_status_from_usage(usage: &TokenUsage) -> &'static str {
 struct PartialAttemptUsage {
     usage: TokenUsage,
     cost: Option<f64>,
+    row: db::UsageAttemptRow,
+}
+
+struct ActivePrecommitAttempt {
+    target: ResolvedTarget,
+    attempt_number: usize,
+    opaque_route_id: String,
+    upstream_request_id: Option<String>,
 }
 
 /// Request-scoped metadata carried into the usage log and Route Trace.
@@ -111,6 +119,9 @@ pub struct RequestMeta {
     /// Usage and costs from failed precommit provider attempts. Persisted as
     /// per-attempt rows and included in admission reconciliation.
     partial_attempts: Vec<PartialAttemptUsage>,
+    active_precommit_attempt: Option<ActivePrecommitAttempt>,
+    log_queue: Option<crate::logqueue::UsageLogQueue>,
+    accounting_enqueued: AtomicBool,
     /// Bounded global, key, and Route in-flight admission; streaming transfers it to the response body.
     pub concurrency: Option<crate::admission::ConcurrencyReservation>,
     /// Set immediately before the inference request is handed to the HTTP client.
@@ -150,6 +161,9 @@ impl RequestMeta {
             admission: None,
             concurrency: None,
             partial_attempts: Vec::new(),
+            active_precommit_attempt: None,
+            log_queue: None,
+            accounting_enqueued: AtomicBool::new(false),
             upstream_dispatched: AtomicBool::new(false),
             client_disconnect: None,
             disconnected: Arc::new(AtomicBool::new(false)),
@@ -166,12 +180,108 @@ impl Drop for RequestMeta {
                 .as_ref()
                 .is_some_and(crate::client_disconnect::ClientDisconnect::is_cancelled);
         if disconnected_after_dispatch {
+            self.record_cancelled_accounting();
             if let Some(admission) = self.admission.take() {
                 // The active dispatch may have incurred unreported usage. Earlier
                 // attempts cannot make this request's total exact.
                 admission.reconcile_incomplete();
             }
         }
+    }
+}
+
+impl RequestMeta {
+    fn record_cancelled_accounting(&mut self) {
+        if self.accounting_enqueued.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(active) = self.active_precommit_attempt.take() {
+            let termination = StreamTermination::new(
+                StreamOutcome::ClientCancelled,
+                CommitState::PreCommit,
+                None,
+                None,
+            );
+            let mut row = usage_attempt_row(
+                self,
+                &active.target,
+                None,
+                active.upstream_request_id.as_deref(),
+                active.attempt_number,
+                &TokenUsage::default(),
+                None,
+                None,
+                termination,
+                Some("client disconnected before response commit"),
+                &active.opaque_route_id,
+            );
+            row.key_id = self.key_id.clone();
+            row.key_name = self.key_name.clone();
+            self.partial_attempts.push(PartialAttemptUsage {
+                usage: TokenUsage::default(),
+                cost: None,
+                row,
+            });
+        }
+        let Some(log_queue) = self.log_queue.clone() else {
+            return;
+        };
+        let Some(last_attempt) = self.partial_attempts.last() else {
+            return;
+        };
+        let (usage, cost) = aggregate_request_accounting(self, None, None);
+        let request_row = UsageLogRow {
+            id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
+            request_id: self.request_id.clone(),
+            ts: db::now_iso(),
+            key_id: self.key_id.clone(),
+            key_name: self.key_name.clone(),
+            client_format: self.client_format.to_string(),
+            requested_model: self.requested_model.clone(),
+            effective_model: last_attempt.row.effective_model.clone(),
+            route_id: self.route_id.clone(),
+            route_name: self.route_name.clone(),
+            fallback_hops: self.partial_attempts.len().saturating_sub(1) as i64,
+            fallback_path: serde_json::to_string(&self.fallback_path)
+                .unwrap_or_else(|_| "[]".into()),
+            status: "client_disconnect".into(),
+            status_code: 499,
+            latency_ms: None,
+            ttft_ms: None,
+            input_tokens: usage.input.map(|value| value as i64),
+            output_tokens: usage.output.map(|value| value as i64),
+            cached_tokens: usage.cached.map(|value| value as i64),
+            cache_write_tokens: usage.cache_write.map(|value| value as i64),
+            thinking_tokens: usage.thinking.map(|value| value as i64),
+            cost_usd: cost,
+            cost_known: cost.is_some() as i64,
+            price_version_id: None,
+            cache_status: self.cache_status.to_string(),
+            serving_account_id: last_attempt.row.serving_account_id.clone(),
+            serving_account: last_attempt.row.serving_account.clone(),
+            serving_provider: last_attempt.row.serving_provider.clone(),
+            upstream_request_id: last_attempt.row.upstream_request_id.clone(),
+            flagged: 0,
+            error_message: Some("client disconnected before response commit".into()),
+            usage_confidence: if usage_has_reported_tokens(&usage) {
+                "provider_reported".into()
+            } else {
+                "unknown".into()
+            },
+            commit_state: CommitState::PreCommit.as_usage_str().to_string(),
+            retry_count: self.partial_attempts.len().saturating_sub(1) as i64,
+            route_trace_id: last_attempt.row.opaque_route_id.clone(),
+            opaque_route_id: last_attempt.row.opaque_route_id.clone(),
+        };
+        log_queue.enqueue_bundle(db::UsageAccountingBundle {
+            request: request_row,
+            attempts: self
+                .partial_attempts
+                .iter()
+                .map(|attempt| attempt.row.clone())
+                .collect(),
+        });
+        self.accounting_enqueued.store(true, Ordering::Release);
     }
 }
 
@@ -581,6 +691,7 @@ pub(crate) async fn run_with_disconnect(
     );
     meta.session = session.clone();
     meta.client_disconnect = client_disconnect;
+    meta.log_queue = Some(state.log_queue.clone());
     meta.admission = admission;
     meta.concurrency = Some(concurrency);
     if let Some(k) = &key {
@@ -1620,7 +1731,6 @@ pub(crate) async fn run_with_disconnect(
         }
 
         let attempt_started = Instant::now();
-        last_precommit_failure = None;
         attempts_done += 1;
         previous_origin = Some(continuation_origin(target));
         state.live.set_fallback_hops(
@@ -1644,6 +1754,12 @@ pub(crate) async fn run_with_disconnect(
             ),
         );
 
+        meta.active_precommit_attempt = Some(ActivePrecommitAttempt {
+            target: target.clone(),
+            attempt_number: meta.partial_attempts.len() + 1,
+            opaque_route_id: trace.opaque_route_id.clone(),
+            upstream_request_id: None,
+        });
         let send_result = match tokio::time::timeout(
             send_budget,
             send_upstream(
@@ -1674,6 +1790,9 @@ pub(crate) async fn run_with_disconnect(
                 );
                 if resp.status().is_success() {
                     let upstream_request_id = extract_upstream_request_id(&resp);
+                    if let Some(active) = meta.active_precommit_attempt.as_mut() {
+                        active.upstream_request_id = upstream_request_id.clone();
+                    }
                     let responses = if format == FrontendFormat::OpenAiResponses {
                         match frontends::responses::response_fields_from_request(&target_req) {
                             Ok(fields) => fields,
@@ -1770,9 +1889,9 @@ pub(crate) async fn run_with_disconnect(
                                 Some(failure.kind),
                                 failure.status,
                             );
-                            if let Some(attempt_usage) = record_precommit_attempt_usage(
+                            record_precommit_attempt_usage(
                                 state,
-                                &meta,
+                                &mut meta,
                                 target,
                                 key.as_ref(),
                                 &trace,
@@ -1780,12 +1899,8 @@ pub(crate) async fn run_with_disconnect(
                                 precommit_usage,
                                 &failure,
                                 termination,
-                                attempts_done,
                             )
-                            .await
-                            {
-                                meta.partial_attempts.push(attempt_usage);
-                            }
+                            .await;
                             if let Some(permit) = traffic_permit.as_ref() {
                                 permit.finish(traffic_outcome_for_failure(failure.kind));
                             }
@@ -1948,6 +2063,10 @@ pub(crate) async fn run_with_disconnect(
 
                 // Classify and maybe fail over. Reading an error body is still
                 // part of the pre-commit phase and cannot outlive its budget.
+                let upstream_request_id = extract_upstream_request_id(&resp);
+                if let Some(active) = meta.active_precommit_attempt.as_mut() {
+                    active.upstream_request_id = upstream_request_id.clone();
+                }
                 let status = resp.status().as_u16();
                 let headers = resp.headers().clone();
                 let error_body_remaining = phase_deadline.saturating_duration_since(Instant::now());
@@ -1984,6 +2103,31 @@ pub(crate) async fn run_with_disconnect(
                     }
                 };
                 let failure = apply_header_reset_to_rate_limit(failure, quota_observation);
+                let termination = StreamTermination::new(
+                    stream_outcome_for_failure(failure.kind),
+                    CommitState::PreCommit,
+                    Some(failure.kind),
+                    failure.status,
+                );
+                record_precommit_attempt_usage(
+                    state,
+                    &mut meta,
+                    target,
+                    key.as_ref(),
+                    &trace,
+                    upstream_request_id.as_deref(),
+                    TokenUsage::default(),
+                    &failure,
+                    termination,
+                )
+                .await;
+                last_precommit_failure = Some((
+                    (*target).clone(),
+                    upstream_request_id.clone(),
+                    failure.clone(),
+                    termination,
+                    attempts_done,
+                ));
                 if let Some(permit) = traffic_permit.as_ref() {
                     permit.finish(traffic_outcome_for_failure(failure.kind));
                 }
@@ -2118,15 +2262,7 @@ pub(crate) async fn run_with_disconnect(
                             );
                             let can_fallback = allow_fallback
                                 && route_allows_fallback(route.as_ref(), FailureKind::AuthError);
-                            trace.stream_termination(
-                                StreamTermination::new(
-                                    stream_outcome_for_failure(failure.kind),
-                                    CommitState::PreCommit,
-                                    Some(failure.kind),
-                                    failure.status,
-                                ),
-                                Some(can_fallback),
-                            );
+                            trace.stream_termination(termination, Some(can_fallback));
                             record_target_telemetry(
                                 state,
                                 target,
@@ -2148,6 +2284,19 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                 );
                                 reconcile_partial_attempts(&mut meta);
+                                record_precommit_request_log(
+                                    state,
+                                    &meta,
+                                    &req,
+                                    target,
+                                    key.as_ref(),
+                                    &trace,
+                                    upstream_request_id.as_deref(),
+                                    &failure,
+                                    termination,
+                                    started,
+                                    attempts_done,
+                                );
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
                                 return Err(refresh_error);
                             }
@@ -2169,15 +2318,7 @@ pub(crate) async fn run_with_disconnect(
                 );
                 let can_fallback =
                     allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
-                trace.stream_termination(
-                    StreamTermination::new(
-                        stream_outcome_for_failure(failure.kind),
-                        CommitState::PreCommit,
-                        Some(failure.kind),
-                        failure.status,
-                    ),
-                    Some(can_fallback),
-                );
+                trace.stream_termination(termination, Some(can_fallback));
                 record_target_telemetry(
                     state,
                     target,
@@ -2204,6 +2345,19 @@ pub(crate) async fn run_with_disconnect(
                         None,
                     );
                     reconcile_partial_attempts(&mut meta);
+                    record_precommit_request_log(
+                        state,
+                        &meta,
+                        &req,
+                        target,
+                        key.as_ref(),
+                        &trace,
+                        upstream_request_id.as_deref(),
+                        &failure,
+                        termination,
+                        started,
+                        attempts_done,
+                    );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
                     return Err(client_error);
                 }
@@ -2214,6 +2368,31 @@ pub(crate) async fn run_with_disconnect(
                 continue;
             }
             Err(failure) => {
+                let termination = StreamTermination::new(
+                    stream_outcome_for_failure(failure.kind),
+                    CommitState::PreCommit,
+                    Some(failure.kind),
+                    failure.status,
+                );
+                record_precommit_attempt_usage(
+                    state,
+                    &mut meta,
+                    target,
+                    key.as_ref(),
+                    &trace,
+                    None,
+                    TokenUsage::default(),
+                    &failure,
+                    termination,
+                )
+                .await;
+                last_precommit_failure = Some((
+                    (*target).clone(),
+                    None,
+                    failure.clone(),
+                    termination,
+                    attempts_done,
+                ));
                 if let Some(permit) = traffic_permit.as_ref() {
                     permit.finish(traffic_outcome_for_failure(failure.kind));
                 }
@@ -2236,15 +2415,7 @@ pub(crate) async fn run_with_disconnect(
                 handle_key_failure(state, target, &failure, &mut meta, &mut trace).await;
                 let can_fallback =
                     allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
-                trace.stream_termination(
-                    StreamTermination::new(
-                        stream_outcome_for_failure(failure.kind),
-                        CommitState::PreCommit,
-                        Some(failure.kind),
-                        failure.status,
-                    ),
-                    Some(can_fallback),
-                );
+                trace.stream_termination(termination, Some(can_fallback));
                 record_target_telemetry(
                     state,
                     target,
@@ -2271,6 +2442,19 @@ pub(crate) async fn run_with_disconnect(
                         None,
                     );
                     reconcile_partial_attempts(&mut meta);
+                    record_precommit_request_log(
+                        state,
+                        &meta,
+                        &req,
+                        target,
+                        key.as_ref(),
+                        &trace,
+                        None,
+                        &failure,
+                        termination,
+                        started,
+                        attempts_done,
+                    );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
                     return Err(failure_to_error(&failure, target));
                 }
@@ -6413,7 +6597,7 @@ fn reconcile_partial_attempts(meta: &mut RequestMeta) {
 #[allow(clippy::too_many_arguments)]
 async fn record_precommit_attempt_usage(
     state: &AppState,
-    meta: &RequestMeta,
+    meta: &mut RequestMeta,
     target: &ResolvedTarget,
     key: Option<&db::VirtualKeyRow>,
     trace: &RouteTrace,
@@ -6421,9 +6605,7 @@ async fn record_precommit_attempt_usage(
     usage: TokenUsage,
     failure: &UpstreamFailure,
     termination: StreamTermination,
-    attempts_done: usize,
-) -> Option<PartialAttemptUsage> {
-    let has_reported_usage = usage_has_reported_tokens(&usage);
+) {
     let computed_cost = (usage.input.is_some() && usage.output.is_some())
         .then(|| cost::compute_cost(&target.model.prices(), &usage))
         .flatten();
@@ -6453,20 +6635,23 @@ async fn record_precommit_attempt_usage(
     } else {
         (None, None)
     };
-    state.log_queue.enqueue_attempt(usage_attempt_row(
+    let attempt_number = meta.partial_attempts.len() + 1;
+    let row = usage_attempt_row(
         meta,
         target,
         key,
         upstream_request_id,
-        attempts_done,
+        attempt_number,
         &usage,
         cost,
         price_version_id.as_deref(),
         termination,
         Some(&failure.message),
         &trace.opaque_route_id,
-    ));
-    has_reported_usage.then_some(PartialAttemptUsage { usage, cost })
+    );
+    meta.partial_attempts
+        .push(PartialAttemptUsage { usage, cost, row });
+    meta.active_precommit_attempt = None;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6576,7 +6761,15 @@ fn record_precommit_request_log(
         route_trace_id: Some(trace.opaque_route_id.clone()),
         opaque_route_id: Some(trace.opaque_route_id.clone()),
     };
-    state.log_queue.enqueue(row);
+    state.log_queue.enqueue_bundle(db::UsageAccountingBundle {
+        request: row,
+        attempts: meta
+            .partial_attempts
+            .iter()
+            .map(|attempt| attempt.row.clone())
+            .collect(),
+    });
+    meta.accounting_enqueued.store(true, Ordering::Release);
 }
 
 /// Compute cost and enqueue the usage row (never blocks the request path),
@@ -6725,8 +6918,8 @@ async fn finalize_log(
     } else {
         (None, None)
     };
-    let attempt_number = meta.retry_count.saturating_add(1).max(1) as usize;
-    state.log_queue.enqueue_attempt(usage_attempt_row(
+    let attempt_number = meta.partial_attempts.len() + 1;
+    let attempt_row = usage_attempt_row(
         meta,
         &attempt.target,
         key.as_ref(),
@@ -6738,7 +6931,7 @@ async fn finalize_log(
         termination,
         error_message.as_deref(),
         &trace.opaque_route_id,
-    ));
+    );
     let (request_usage, request_cost) = aggregate_request_accounting(meta, Some(&usage), cost);
 
     // Reconcile against every provider attempt, not only the final fallback
@@ -6841,7 +7034,17 @@ async fn finalize_log(
         route_trace_id: Some(trace.opaque_route_id.clone()),
         opaque_route_id: Some(trace.opaque_route_id.clone()),
     };
-    state.log_queue.enqueue(row);
+    let mut attempt_rows = meta
+        .partial_attempts
+        .iter()
+        .map(|attempt| attempt.row.clone())
+        .collect::<Vec<_>>();
+    attempt_rows.push(attempt_row);
+    state.log_queue.enqueue_bundle(db::UsageAccountingBundle {
+        request: row,
+        attempts: attempt_rows,
+    });
+    meta.accounting_enqueued.store(true, Ordering::Release);
 
     // Read-only usage hook (§6.6): fire-and-forget on the bounded async queue,
     // after accounting is recorded, so it can never block or fail the request.
@@ -7556,6 +7759,7 @@ mod route_policy_tests {
                 ..TokenUsage::default()
             },
             cost: Some(0.000067),
+            row: db::UsageAttemptRow::default(),
         });
         let final_usage = TokenUsage {
             input: Some(1),

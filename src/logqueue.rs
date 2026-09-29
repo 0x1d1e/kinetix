@@ -1,24 +1,19 @@
 //! Asynchronous, bounded usage-log queue (FR-6.4, NFR-1.7).
 //!
-//! Logging must never block or fail a client request. Writes go through a
-//! bounded channel; if the queue is full we drop the row and count it rather
-//! than blocking the request path.
+//! Logging must never block or fail a client request. Each bounded queue item
+//! contains one request row and all its attempt rows; saturation drops the
+//! bundle rather than persisting partial accounting.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::db::{self, Pool, UsageAttemptRow, UsageLogRow};
-
-enum UsageWrite {
-    Request(UsageLogRow),
-    Attempt(UsageAttemptRow),
-}
+use crate::db::{self, Pool, UsageAccountingBundle};
 
 #[derive(Clone)]
 pub struct UsageLogQueue {
-    tx: mpsc::Sender<UsageWrite>,
+    tx: mpsc::Sender<UsageAccountingBundle>,
     dropped: Arc<AtomicU64>,
     depth: Arc<AtomicU64>,
     capacity: usize,
@@ -26,14 +21,14 @@ pub struct UsageLogQueue {
 
 impl UsageLogQueue {
     pub fn new(pool: Pool, capacity: usize) -> Self {
-        let (tx, mut rx) = mpsc::channel::<UsageWrite>(capacity);
+        let (tx, mut rx) = mpsc::channel::<UsageAccountingBundle>(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
         let depth = Arc::new(AtomicU64::new(0));
 
         let dropped_task = dropped.clone();
         let depth_task = depth.clone();
         tokio::spawn(async move {
-            let mut batch: Vec<UsageWrite> = Vec::with_capacity(64);
+            let mut batch: Vec<UsageAccountingBundle> = Vec::with_capacity(64);
             loop {
                 // Drain whatever is available, then flush.
                 let first = rx.recv().await;
@@ -45,14 +40,10 @@ impl UsageLogQueue {
                         Err(_) => break,
                     }
                 }
-                for write in batch.drain(..) {
+                for bundle in batch.drain(..) {
                     depth_task.fetch_sub(1, Ordering::Relaxed);
-                    let result = match write {
-                        UsageWrite::Request(row) => db::insert_usage_log(&pool, &row).await,
-                        UsageWrite::Attempt(row) => db::insert_usage_attempt(&pool, &row).await,
-                    };
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "failed to write usage accounting row");
+                    if let Err(error) = db::insert_usage_bundle(&pool, &bundle).await {
+                        tracing::warn!(%error, "failed to write usage accounting bundle");
                         dropped_task.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -72,17 +63,10 @@ impl UsageLogQueue {
         self.capacity
     }
 
-    /// Enqueue a usage row. Never blocks; drops (and counts) when full.
-    pub fn enqueue(&self, row: UsageLogRow) {
-        self.enqueue_write(UsageWrite::Request(row));
-    }
-
-    pub fn enqueue_attempt(&self, row: UsageAttemptRow) {
-        self.enqueue_write(UsageWrite::Attempt(row));
-    }
-
-    fn enqueue_write(&self, write: UsageWrite) {
-        match self.tx.try_send(write) {
+    /// Enqueue a complete request accounting bundle. Never blocks; drops the
+    /// request and all its attempts together when full.
+    pub fn enqueue_bundle(&self, bundle: UsageAccountingBundle) {
+        match self.tx.try_send(bundle) {
             Ok(()) => {
                 self.depth.fetch_add(1, Ordering::Relaxed);
             }
