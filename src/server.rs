@@ -723,145 +723,164 @@ async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>
         Ok(p) => p,
         Err(_) => return,
     };
-    for provider in providers {
-        let Some(pref) = provider.credential_plugin_ref() else {
+    let task_errors = crate::provider_work::run_bounded_provider_jobs(providers, {
+        let state = state.clone();
+        let manager = manager.clone();
+        move |provider| {
+            let state = state.clone();
+            let manager = manager.clone();
+            async move {
+                run_plugin_health_probes_for_provider(&state, &manager, provider).await;
+            }
+        }
+    })
+    .await;
+    for error in task_errors {
+        tracing::warn!(%error, "plugin health probe provider task failed");
+    }
+}
+
+async fn run_plugin_health_probes_for_provider(
+    state: &AppState,
+    manager: &Arc<PluginManager>,
+    provider: db::ProviderRow,
+) {
+    let Some(pref) = provider.credential_plugin_ref() else {
+        return;
+    };
+    // The plugin must be enabled and actually provide a health probe.
+    if manager
+        .resolve_binding(
+            &format!("plugin:{}/{}", pref.plugin_id, pref.capability),
+            crate::plugins::Capability::HealthProbe,
+        )
+        .await
+        .is_none()
+    {
+        return;
+    }
+    let accounts = match db::accounts_for_provider(&state.pool, &provider.id).await {
+        Ok(accounts) => accounts,
+        Err(_) => return,
+    };
+    for account in accounts {
+        if account.status == "disabled" {
             continue;
-        };
-        // The plugin must be enabled and actually provide a health probe.
-        if manager
-            .resolve_binding(
-                &format!("plugin:{}/{}", pref.plugin_id, pref.capability),
-                crate::plugins::Capability::HealthProbe,
+        }
+        let probe_plugin = pref.plugin_id.clone();
+        let probe_provider = provider.id.clone();
+        let probe_account = account.id.clone();
+        let probe_manager = manager.clone();
+        let probe = match state
+            .provider_work
+            .run(
+                provider.id.clone(),
+                crate::provider_work::ProviderWorkClass::HealthProbe,
+                Some(format!("account:{}", account.id)),
+                move || async move {
+                    probe_manager
+                        .health_probe_with_snapshots(
+                            &probe_plugin,
+                            &probe_provider,
+                            &probe_account,
+                        )
+                        .await
+                },
+                |error| {
+                    crate::provider_work::plugin_backoff_evidence_for_scope(
+                        error,
+                        crate::provider_work::RateLimitScope::Account,
+                    )
+                },
             )
             .await
-            .is_none()
         {
+            Ok(observation) => observation,
+            Err(error) => {
+                match error.as_ref() {
+                    crate::provider_work::ProviderWorkError::BackedOff(wait) => {
+                        tracing::debug!(plugin = %pref.plugin_id, account = %account.id, retry_after_secs = wait.as_secs(), "plugin health probe backed off");
+                    }
+                    crate::provider_work::ProviderWorkError::Operation(error) => {
+                        tracing::debug!(plugin = %pref.plugin_id, account = %account.id, error = %error.message(), "plugin health probe failed");
+                    }
+                    crate::provider_work::ProviderWorkError::Aborted => {
+                        tracing::debug!(plugin = %pref.plugin_id, account = %account.id, "plugin health probe task aborted");
+                    }
+                }
+                continue;
+            }
+        };
+        let obs = &probe.observation;
+        let quota_observation = match probe.quota_snapshots.as_ref() {
+            Some(snapshots) => state.quota.observe_plugin_snapshots(
+                &provider.id,
+                &account.id,
+                snapshots
+                    .iter()
+                    .map(|snapshot| crate::quota::PluginQuotaSnapshot {
+                        scope: match &snapshot.scope {
+                            crate::plugins::runtime::health_v2_wit::types::QuotaScopeV1::Account => {
+                                crate::quota::PluginQuotaScope::Account
+                            }
+                            crate::plugins::runtime::health_v2_wit::types::QuotaScopeV1::Model(model) => {
+                                crate::quota::PluginQuotaScope::Model(model.clone())
+                            }
+                            crate::plugins::runtime::health_v2_wit::types::QuotaScopeV1::Unknown => {
+                                crate::quota::PluginQuotaScope::Unknown
+                            }
+                        },
+                        group: snapshot.group.clone(),
+                        bucket_id: snapshot.bucket_id.clone(),
+                        remaining_fraction: snapshot.remaining_fraction,
+                        remaining: snapshot.remaining,
+                        limit: snapshot.limit,
+                        unit: snapshot.unit.clone(),
+                        window: snapshot.window.clone(),
+                        reset_at: snapshot.reset_at.clone(),
+                    })
+                    .collect(),
+            ),
+            None => state.quota.observe_plugin(
+                &provider.id,
+                &account.id,
+                obs.quota_state.as_deref(),
+                obs.reset_at.as_deref(),
+            ),
+        };
+        if let Some(observation) = quota_observation.filter(|observation| observation.exhausted) {
+            let now = chrono::Utc::now();
+            let reset_at = plugin_quota_reset_at(observation.reset_at, obs.retry_after, now)
+                .unwrap_or_else(|| now + chrono::Duration::seconds(3600))
+                .to_rfc3339();
+            if matches!(
+                db::set_account_status_if_version(
+                    &state.pool,
+                    &account.id,
+                    account.account_state_version,
+                    "exhausted",
+                    "account_quota_exhausted",
+                    None,
+                    Some(&reset_at),
+                    Some("plugin health probe: quota exhausted"),
+                )
+                .await,
+                Ok(true)
+            ) {
+                let _ = state.registry.reload(&state.pool).await;
+            }
             continue;
         }
-        let accounts = match db::accounts_for_provider(&state.pool, &provider.id).await {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-        for account in accounts {
-            if account.status == "disabled" {
-                continue;
-            }
-            let probe_plugin = pref.plugin_id.clone();
-            let probe_provider = provider.id.clone();
-            let probe_account = account.id.clone();
-            let probe_manager = manager.clone();
-            let probe = match state
-                .provider_work
-                .run(
-                    provider.id.clone(),
-                    crate::provider_work::ProviderWorkClass::HealthProbe,
-                    Some(format!("account:{}", account.id)),
-                    move || async move {
-                        probe_manager
-                            .health_probe_with_snapshots(
-                                &probe_plugin,
-                                &probe_provider,
-                                &probe_account,
-                            )
-                            .await
-                    },
-                    |error| {
-                        crate::provider_work::plugin_backoff_evidence_for_scope(
-                            error,
-                            crate::provider_work::RateLimitScope::Account,
-                        )
-                    },
-                )
-                .await
-            {
-                Ok(observation) => observation,
-                Err(error) => {
-                    match error.as_ref() {
-                        crate::provider_work::ProviderWorkError::BackedOff(wait) => {
-                            tracing::debug!(plugin = %pref.plugin_id, account = %account.id, retry_after_secs = wait.as_secs(), "plugin health probe backed off");
-                        }
-                        crate::provider_work::ProviderWorkError::Operation(error) => {
-                            tracing::debug!(plugin = %pref.plugin_id, account = %account.id, error = %error.message(), "plugin health probe failed");
-                        }
-                        crate::provider_work::ProviderWorkError::Aborted => {
-                            tracing::debug!(plugin = %pref.plugin_id, account = %account.id, "plugin health probe task aborted");
-                        }
-                    }
-                    continue;
-                }
-            };
-            let obs = &probe.observation;
-            let quota_observation = match probe.quota_snapshots.as_ref() {
-                Some(snapshots) => state.quota.observe_plugin_snapshots(
-                    &provider.id,
-                    &account.id,
-                    snapshots
-                        .iter()
-                        .map(|snapshot| crate::quota::PluginQuotaSnapshot {
-                            scope: match &snapshot.scope {
-                                crate::plugins::runtime::health_v2_wit::types::QuotaScopeV1::Account => {
-                                    crate::quota::PluginQuotaScope::Account
-                                }
-                                crate::plugins::runtime::health_v2_wit::types::QuotaScopeV1::Model(model) => {
-                                    crate::quota::PluginQuotaScope::Model(model.clone())
-                                }
-                                crate::plugins::runtime::health_v2_wit::types::QuotaScopeV1::Unknown => {
-                                    crate::quota::PluginQuotaScope::Unknown
-                                }
-                            },
-                            group: snapshot.group.clone(),
-                            bucket_id: snapshot.bucket_id.clone(),
-                            remaining_fraction: snapshot.remaining_fraction,
-                            remaining: snapshot.remaining,
-                            limit: snapshot.limit,
-                            unit: snapshot.unit.clone(),
-                            window: snapshot.window.clone(),
-                            reset_at: snapshot.reset_at.clone(),
-                        })
-                        .collect(),
-                ),
-                None => state.quota.observe_plugin(
-                    &provider.id,
-                    &account.id,
-                    obs.quota_state.as_deref(),
-                    obs.reset_at.as_deref(),
-                ),
-            };
-            if let Some(observation) = quota_observation.filter(|observation| observation.exhausted)
-            {
-                let now = chrono::Utc::now();
-                let reset_at = plugin_quota_reset_at(observation.reset_at, obs.retry_after, now)
-                    .unwrap_or_else(|| now + chrono::Duration::seconds(3600))
-                    .to_rfc3339();
-                if matches!(
-                    db::set_account_status_if_version(
-                        &state.pool,
-                        &account.id,
-                        account.account_state_version,
-                        "exhausted",
-                        "account_quota_exhausted",
-                        None,
-                        Some(&reset_at),
-                        Some("plugin health probe: quota exhausted"),
-                    )
-                    .await,
-                    Ok(true)
-                ) {
-                    let _ = state.registry.reload(&state.pool).await;
-                }
-                continue;
-            }
-            apply_plugin_health_status(
-                &state.pool,
-                &account.id,
-                account.account_state_version,
-                &account.status,
-                &obs.state,
-                obs.reset_at.as_deref(),
-                obs.retry_after,
-            )
-            .await;
-        }
+        apply_plugin_health_status(
+            &state.pool,
+            &account.id,
+            account.account_state_version,
+            &account.status,
+            &obs.state,
+            obs.reset_at.as_deref(),
+            obs.retry_after,
+        )
+        .await;
     }
 }
 

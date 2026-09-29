@@ -26,6 +26,42 @@ const RATE_WINDOW: Duration = Duration::from_secs(10);
 const MIN_PROVIDER_SPACING: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const MAX_SINGLEFLIGHTS: usize = 1024;
+pub(crate) const MAX_CONCURRENT_SCHEDULED_PROVIDERS: usize = 4;
+
+/// Run scheduled work for independent providers concurrently while keeping the
+/// scheduler's process-wide task count bounded. Provider-local rate and
+/// concurrency limits remain the coordinator's responsibility.
+pub(crate) async fn run_bounded_provider_jobs<I, T, F, Fut>(
+    jobs: I,
+    work: F,
+) -> Vec<tokio::task::JoinError>
+where
+    I: IntoIterator<Item = T>,
+    T: Send + 'static,
+    F: Fn(T) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let mut pending = jobs.into_iter();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut errors = Vec::new();
+
+    loop {
+        while tasks.len() < MAX_CONCURRENT_SCHEDULED_PROVIDERS {
+            let Some(job) = pending.next() else {
+                break;
+            };
+            let work = work.clone();
+            tasks.spawn(async move { work(job).await });
+        }
+        match tasks.join_next().await {
+            Some(Ok(())) => {}
+            Some(Err(error)) => errors.push(error),
+            None => break,
+        }
+    }
+
+    errors
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderWorkClass {
@@ -599,6 +635,43 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_provider_jobs_start_siblings_while_one_provider_is_stalled() {
+        use tokio::sync::{Notify, Semaphore};
+
+        let provider_a_started = Arc::new(Notify::new());
+        let provider_b_started = Arc::new(Notify::new());
+        let release_provider_a = Arc::new(Semaphore::new(0));
+        let a_started = provider_a_started.clone();
+        let b_started = provider_b_started.clone();
+        let release_a = release_provider_a.clone();
+        let task = tokio::spawn(run_bounded_provider_jobs(
+            vec!["provider-a", "provider-b"],
+            move |provider| {
+                let a_started = a_started.clone();
+                let b_started = b_started.clone();
+                let release_a = release_a.clone();
+                async move {
+                    if provider == "provider-a" {
+                        a_started.notify_one();
+                        release_a.acquire().await.unwrap().forget();
+                    } else {
+                        b_started.notify_one();
+                    }
+                }
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), provider_a_started.notified())
+            .await
+            .expect("provider A job did not start");
+        tokio::time::timeout(Duration::from_secs(1), provider_b_started.notified())
+            .await
+            .expect("stalled provider A blocked provider B");
+        release_provider_a.add_permits(1);
+        assert!(task.await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn provider_concurrency_is_bounded_and_providers_are_independent() {

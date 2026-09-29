@@ -744,47 +744,64 @@ pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
         }
     };
 
-    for provider in providers {
-        let reconcile_key = lifecycle_setting_key("reconciliation", "last_attempt", &provider.id);
-        let pricing_key = lifecycle_setting_key("pricing_sync", "last_attempt", &provider.id);
-        let reconcile_due = scheduled_due(
-            &state.pool,
-            &reconcile_key,
-            settings.reconciliation_interval_secs,
-            settings.jitter_secs,
-        )
-        .await;
-        let pricing_due = scheduled_due(
-            &state.pool,
-            &pricing_key,
-            settings.pricing_sync_interval_secs,
-            settings.jitter_secs,
-        )
-        .await;
-
-        if reconcile_due {
-            if let Err(error) =
-                run_model_lifecycle_lane(state, &provider.id, ModelLifecycleLane::Reconciliation)
-                    .await
-            {
-                tracing::warn!(
-                    provider = %provider.id,
-                    error = ?error,
-                    "scheduled model reconciliation failed; existing state left intact"
-                );
+    let task_errors = crate::provider_work::run_bounded_provider_jobs(providers, {
+        let state = state.clone();
+        move |provider| {
+            let state = state.clone();
+            async move {
+                run_scheduled_model_lifecycle_for_provider(&state, provider, settings).await;
             }
         }
+    })
+    .await;
+    for error in task_errors {
+        tracing::warn!(%error, "scheduled model lifecycle provider task failed");
+    }
+}
 
-        if pricing_due {
-            if let Err(error) =
-                run_model_lifecycle_lane(state, &provider.id, ModelLifecycleLane::PricingSync).await
-            {
-                tracing::warn!(
-                    provider = %provider.id,
-                    error = ?error,
-                    "scheduled pricing sync failed; preserving last-known metadata and prices"
-                );
-            }
+async fn run_scheduled_model_lifecycle_for_provider(
+    state: &AppState,
+    provider: db::ProviderRow,
+    settings: ModelLifecycleSettings,
+) {
+    let reconcile_key = lifecycle_setting_key("reconciliation", "last_attempt", &provider.id);
+    let pricing_key = lifecycle_setting_key("pricing_sync", "last_attempt", &provider.id);
+    let reconcile_due = scheduled_due(
+        &state.pool,
+        &reconcile_key,
+        settings.reconciliation_interval_secs,
+        settings.jitter_secs,
+    )
+    .await;
+    let pricing_due = scheduled_due(
+        &state.pool,
+        &pricing_key,
+        settings.pricing_sync_interval_secs,
+        settings.jitter_secs,
+    )
+    .await;
+
+    if reconcile_due {
+        if let Err(error) =
+            run_model_lifecycle_lane(state, &provider.id, ModelLifecycleLane::Reconciliation).await
+        {
+            tracing::warn!(
+                provider = %provider.id,
+                error = ?error,
+                "scheduled model reconciliation failed; existing state left intact"
+            );
+        }
+    }
+
+    if pricing_due {
+        if let Err(error) =
+            run_model_lifecycle_lane(state, &provider.id, ModelLifecycleLane::PricingSync).await
+        {
+            tracing::warn!(
+                provider = %provider.id,
+                error = ?error,
+                "scheduled pricing sync failed; preserving last-known metadata and prices"
+            );
         }
     }
 }
@@ -7564,6 +7581,138 @@ async fn read_capability_probe_response(mut response: reqwest::Response) -> Resu
     String::from_utf8(bytes).map_err(|_| "upstream probe response was not valid UTF-8".to_string())
 }
 
+struct CapabilityProbeExchange {
+    status_code: u16,
+    text: String,
+    body_read_error: Option<String>,
+    request_error: Option<String>,
+}
+
+fn capability_probe_singleflight_key(
+    provider_id: &str,
+    account_id: &str,
+    model_id: &str,
+    transport: &str,
+    capability: &str,
+    value: Option<&Value>,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let value = serde_json::to_vec(&value).expect("JSON values always serialize");
+    let value_hash = hex::encode(Sha256::digest(value));
+    format!(
+        "provider:{provider_id}:account:{account_id}:model:{model_id}:transport:{transport}:capability:{capability}:value:{value_hash}"
+    )
+}
+
+async fn execute_capability_probe_request(
+    state: AppState,
+    provider: db::ProviderRow,
+    execution_model: db::ModelRow,
+    account_id: String,
+    credential: String,
+    adapter: std::sync::Arc<dyn crate::adapters::Adapter>,
+    url: url::Url,
+    outbound: Value,
+) -> Result<CapabilityProbeExchange, ApiError> {
+    let permit = state
+        .provider_work
+        .acquire(
+            &provider.id,
+            crate::provider_work::ProviderWorkClass::CapabilityProbe,
+        )
+        .await
+        .map_err(|wait| {
+            ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "provider work is temporarily backed off; retry in {}s",
+                    wait.as_secs().max(1)
+                ),
+                None,
+            )
+        })?;
+    let ctx = UpstreamContext {
+        provider: &provider,
+        model: &execution_model,
+        account_id: Some(&account_id),
+        session_context: None,
+        credential,
+    };
+    let response = crate::outbound::send_provider_request(
+        &state.outbound_clients,
+        state.config.allow_private_upstreams,
+        state.config.allow_insecure_tls,
+        &adapter,
+        &ctx,
+        crate::outbound::ProviderRequest {
+            method: reqwest::Method::POST,
+            url,
+            json_body: Some(outbound),
+            accept_event_stream: false,
+            request_id: None,
+            headers: Vec::new(),
+            total_timeout: Some(std::time::Duration::from_secs(10)),
+        },
+    )
+    .await;
+
+    match response {
+        Err(error) => {
+            let evidence = crate::provider_work::outbound_error_backoff_evidence(
+                &error,
+                crate::provider_work::RateLimitScope::Account,
+            );
+            permit.finish_failure(evidence).await;
+            Ok(CapabilityProbeExchange {
+                status_code: 0,
+                text: String::new(),
+                body_read_error: None,
+                request_error: Some(error.message),
+            })
+        }
+        Ok(response) => {
+            let status_code = response.status().as_u16();
+            let response_headers = response.headers().clone();
+            let (text, body_read_error) = match read_capability_probe_response(response).await {
+                Ok(text) => (text, None),
+                Err(error) => (String::new(), Some(error)),
+            };
+            // Classification belongs to this provider-scoped operation so the
+            // shared probe installs the same backoff evidence for every waiter.
+            let failure_evidence =
+                if body_read_error.is_none() && !(200..300).contains(&status_code) {
+                    let native = adapter.classify_error(status_code, &text, &response_headers);
+                    let failure = crate::pipeline::apply_provider_failure_rules(
+                        &provider,
+                        status_code,
+                        &text,
+                        native,
+                    );
+                    crate::provider_work::upstream_backoff_evidence(
+                        &failure,
+                        crate::provider_work::RateLimitScope::Account,
+                    )
+                } else {
+                    None
+                };
+            if body_read_error.is_some() {
+                permit.finish_failure(None).await;
+            } else if !(200..300).contains(&status_code) {
+                permit.finish_failure(failure_evidence).await;
+            } else {
+                permit.finish_success().await;
+            }
+            Ok(CapabilityProbeExchange {
+                status_code,
+                text,
+                body_read_error,
+                request_error: None,
+            })
+        }
+    }
+}
+
 /// Run one explicit, bounded upstream capability probe against the selected
 /// provider/account/model/transport execution profile. No automatic path calls
 /// this handler.
@@ -7814,7 +7963,7 @@ pub async fn probe_model_capability(
         model: &execution_model,
         account_id: Some(account.id.as_str()),
         session_context: None,
-        credential,
+        credential: credential.clone(),
     };
     let url = adapter
         .build_url(&ctx)
@@ -7849,41 +7998,66 @@ pub async fn probe_model_capability(
     let parsed_url = url::Url::parse(&url)
         .map_err(|error| ApiError::bad(format!("invalid probe URL: {error}")))?;
 
-    let permit = state
-        .provider_work
-        .acquire(
-            &provider.id,
-            crate::provider_work::ProviderWorkClass::CapabilityProbe,
-        )
-        .await
-        .map_err(|wait| {
-            ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "provider work is temporarily backed off; retry in {}s",
-                    wait.as_secs().max(1)
-                ),
-                None,
-            )
-        })?;
     let started = std::time::Instant::now();
-    let response = crate::outbound::send_provider_request(
-        &state.outbound_clients,
-        state.config.allow_private_upstreams,
-        state.config.allow_insecure_tls,
-        &adapter,
-        &ctx,
-        crate::outbound::ProviderRequest {
-            method: reqwest::Method::POST,
-            url: parsed_url,
-            json_body: Some(outbound),
-            accept_event_stream: false,
-            request_id: None,
-            headers: Vec::new(),
-            total_timeout: Some(std::time::Duration::from_secs(10)),
+    let singleflight_key = capability_probe_singleflight_key(
+        &provider.id,
+        &account.id,
+        &model.id,
+        profile.transport.as_str(),
+        &body.capability,
+        probe_value.as_ref(),
+    );
+    let work_state = state.clone();
+    let work_provider = provider.clone();
+    let work_model = execution_model.clone();
+    let work_account_id = account.id.clone();
+    let work_adapter = adapter.clone();
+    let work_credential = credential;
+    let work_url = parsed_url;
+    let work_outbound = outbound;
+    let exchange = state
+        .provider_work
+        .coalesce(
+            provider.id.clone(),
+            crate::provider_work::ProviderWorkClass::CapabilityProbe,
+            singleflight_key,
+            move || async move {
+                execute_capability_probe_request(
+                    work_state,
+                    work_provider,
+                    work_model,
+                    work_account_id,
+                    work_credential,
+                    work_adapter,
+                    work_url,
+                    work_outbound,
+                )
+                .await
+            },
+        )
+        .await;
+    let exchange = match exchange {
+        Ok(exchange) => exchange,
+        Err(error) => match error.as_ref() {
+            crate::provider_work::ProviderWorkError::Operation(error) => {
+                return Err(ApiError(error.0, error.1.clone(), error.2));
+            }
+            crate::provider_work::ProviderWorkError::BackedOff(wait) => {
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "provider work is temporarily backed off; retry in {}s",
+                        wait.as_secs().max(1)
+                    ),
+                    None,
+                ));
+            }
+            crate::provider_work::ProviderWorkError::Aborted => {
+                return Err(ApiError::internal("capability probe work was aborted"));
+            }
         },
-    )
-    .await;
+    };
+    let exchange = exchange.as_ref();
 
     let verified_at = chrono::Utc::now();
     let freshness_secs = db::get_setting(&state.pool, "model_probe_freshness_secs")
@@ -7894,28 +8068,28 @@ pub async fn probe_model_capability(
         .filter(|value| *value > 0)
         .unwrap_or(30 * 24 * 3600);
     let fresh_until = verified_at + chrono::Duration::seconds(freshness_secs);
-    let mut failure_evidence = None;
-    let (status, status_code, detail) = match response {
-        Ok(response) => {
-            let status_code = response.status().as_u16();
-            let response_headers = response.headers().clone();
-            let (text, body_read_error) = match read_capability_probe_response(response).await {
-                Ok(text) => (text, None),
-                Err(error) => (String::new(), Some(error)),
-            };
-            if let Some(error) = body_read_error {
-                (
-                    "inconclusive",
-                    status_code,
-                    Some(truncate(&crypto::redact(&error), 400)),
-                )
-            } else if (200..300).contains(&status_code) {
-                if body.capability == "reasoning_disable" {
-                    let verified = serde_json::from_str::<Value>(&text)
-                        .ok()
-                        .and_then(|payload| adapter.parse_full_response(&payload).ok())
-                        .and_then(|events| reasoning_disable_probe_contract(&events));
-                    match verified {
+    let (status, status_code, detail) = if let Some(error) = exchange.request_error.as_ref() {
+        (
+            "inconclusive",
+            0,
+            Some(truncate(&crypto::redact(error), 400)),
+        )
+    } else {
+        let status_code = exchange.status_code;
+        let text = exchange.text.as_str();
+        if let Some(error) = exchange.body_read_error.as_ref() {
+            (
+                "inconclusive",
+                status_code,
+                Some(truncate(&crypto::redact(&error), 400)),
+            )
+        } else if (200..300).contains(&status_code) {
+            if body.capability == "reasoning_disable" {
+                let verified = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|payload| adapter.parse_full_response(&payload).ok())
+                    .and_then(|events| reasoning_disable_probe_contract(&events));
+                match verified {
                         Some(true) => ("supported", status_code, None),
                         Some(false) => (
                             "unsupported",
@@ -7934,93 +8108,64 @@ pub async fn probe_model_capability(
                             ),
                         ),
                     }
-                } else {
-                    let contract_verified = match body.capability.as_str() {
-                        "tool_calling" => serde_json::from_str::<Value>(&text)
-                            .ok()
-                            .and_then(|payload| adapter.parse_full_response(&payload).ok())
-                            .is_some_and(|events| {
-                                events.iter().any(|event| {
-                                    matches!(
-                                        event,
-                                        crate::types::StreamEvent::ToolCallStart { name, .. }
-                                            if name == "kinetix_probe_noop"
-                                    )
-                                })
-                            }),
-                        "structured_output" => serde_json::from_str::<Value>(&text)
-                            .ok()
-                            .and_then(|payload| adapter.parse_full_response(&payload).ok())
-                            .map(|events| {
-                                events
-                                    .into_iter()
-                                    .filter_map(|event| match event {
-                                        crate::types::StreamEvent::TextDelta(text) => Some(text),
-                                        _ => None,
-                                    })
-                                    .collect::<String>()
-                            })
-                            .and_then(|text| serde_json::from_str::<Value>(text.trim()).ok())
-                            .is_some_and(|value| structured_output_probe_contract(&value)),
-                        _ => true,
-                    };
-                    if contract_verified {
-                        ("supported", status_code, None)
-                    } else {
-                        (
-                            "inconclusive",
-                            status_code,
-                            Some(format!(
-                                "upstream returned success but did not satisfy the {} probe contract",
-                                body.capability
-                            )),
-                        )
-                    }
-                }
             } else {
-                let native = adapter.classify_error(status_code, &text, &response_headers);
-                let failure = crate::pipeline::apply_provider_failure_rules(
-                    &provider,
-                    status_code,
-                    &text,
-                    native,
-                );
-                failure_evidence = crate::provider_work::upstream_backoff_evidence(
-                    &failure,
-                    crate::provider_work::RateLimitScope::Provider,
-                );
-                let redacted = crypto::redact(&text);
-                let status = if deterministic_probe_rejection(
-                    &body.capability,
-                    probe_value.as_ref(),
-                    status_code,
-                    &redacted,
-                ) {
-                    "unsupported"
-                } else {
-                    "inconclusive"
+                let contract_verified = match body.capability.as_str() {
+                    "tool_calling" => serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|payload| adapter.parse_full_response(&payload).ok())
+                        .is_some_and(|events| {
+                            events.iter().any(|event| {
+                                matches!(
+                                    event,
+                                    crate::types::StreamEvent::ToolCallStart { name, .. }
+                                        if name == "kinetix_probe_noop"
+                                )
+                            })
+                        }),
+                    "structured_output" => serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|payload| adapter.parse_full_response(&payload).ok())
+                        .map(|events| {
+                            events
+                                .into_iter()
+                                .filter_map(|event| match event {
+                                    crate::types::StreamEvent::TextDelta(text) => Some(text),
+                                    _ => None,
+                                })
+                                .collect::<String>()
+                        })
+                        .and_then(|text| serde_json::from_str::<Value>(text.trim()).ok())
+                        .is_some_and(|value| structured_output_probe_contract(&value)),
+                    _ => true,
                 };
-                (status, status_code, Some(truncate(&redacted, 400)))
+                if contract_verified {
+                    ("supported", status_code, None)
+                } else {
+                    (
+                        "inconclusive",
+                        status_code,
+                        Some(format!(
+                            "upstream returned success but did not satisfy the {} probe contract",
+                            body.capability
+                        )),
+                    )
+                }
             }
-        }
-        Err(error) => {
-            failure_evidence = crate::provider_work::outbound_error_backoff_evidence(
-                &error,
-                crate::provider_work::RateLimitScope::Provider,
-            );
-            (
-                "inconclusive",
-                0,
-                Some(truncate(&crypto::redact(&error.message), 400)),
-            )
+        } else {
+            let redacted = crypto::redact(text);
+            let status = if deterministic_probe_rejection(
+                &body.capability,
+                probe_value.as_ref(),
+                status_code,
+                &redacted,
+            ) {
+                "unsupported"
+            } else {
+                "inconclusive"
+            };
+            (status, status_code, Some(truncate(&redacted, 400)))
         }
     };
-
-    if let Some(failure) = failure_evidence {
-        permit.finish_failure(Some(failure)).await;
-    } else {
-        permit.finish_success().await;
-    }
 
     let evidence_value = json!({
         "status": status,
@@ -18129,6 +18274,300 @@ mod credential_enrollment_regression_tests {
         server.abort();
         drop(state);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn insert_capability_probe_target(
+        state: &AppState,
+        base_url: &str,
+        name: &str,
+    ) -> (String, String, String) {
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name,
+                base_url,
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 2_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "127.0.0.1",
+                allow_insecure_tls: true,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let encrypted = state.crypto.encrypt("probe-key").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "probe-account",
+            &encrypted,
+            "probe-key",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "probe-model",
+                display_name: "Probe Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: Some(64),
+                capabilities: json!({}),
+                prices: json!({ "input_per_1m": 1.0, "output_per_1m": 1.0 }),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        (provider_id, account_id, model_id)
+    }
+
+    #[tokio::test]
+    async fn identical_capability_probes_share_one_upstream_request() {
+        let (state, root) = test_state("capability-probe-singleflight").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post({
+                let requests = requests.clone();
+                let arrived = arrived.clone();
+                let release = release.clone();
+                move || {
+                    let requests = requests.clone();
+                    let arrived = arrived.clone();
+                    let release = release.clone();
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        arrived.notify_one();
+                        release.acquire_owned().await.unwrap().forget();
+                        (StatusCode::OK, r#"{"choices":[]}"#)
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{address}/v1");
+        let (provider_id, account_id, model_id) =
+            insert_capability_probe_target(&state, &base_url, "singleflight-provider").await;
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let probes = (0..2)
+            .map(|_| {
+                let state = state.clone();
+                let start = start.clone();
+                let provider_id = provider_id.clone();
+                let account_id = account_id.clone();
+                let model_id = model_id.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    probe_model_capability(
+                        State(state),
+                        auth(),
+                        Path(model_id),
+                        Json(CapabilityProbeBody {
+                            account_id: Some(account_id),
+                            capability: "transport".into(),
+                            value: None,
+                            max_cost_usd: Some(1.0),
+                            transport: None,
+                        }),
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("provider {provider_id} probe failed: {error:?}")
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait().await;
+        let coalescing_observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.provider_work.metrics_snapshot().coalesced > 0
+                    || requests.load(std::sync::atomic::Ordering::Relaxed) > 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        release.add_permits(2);
+        for probe in probes {
+            let _ = probe.await.unwrap();
+        }
+        assert!(
+            coalescing_observed,
+            "neither coalescing nor duplicate execution was observed"
+        );
+        assert_eq!(state.provider_work.metrics_snapshot().coalesced, 1);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        server.abort();
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn capability_probe_body_read_failure_is_unclassified_and_preserves_backoff_count() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (state, root) = test_state("capability-probe-body-read-failure").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let base_url = format!("http://{address}/v1");
+        let (provider_id, account_id, model_id) =
+            insert_capability_probe_target(&state, &base_url, "read-failure-provider").await;
+        state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::CapabilityProbe,
+            )
+            .await
+            .unwrap()
+            .finish_failure(Some(
+                crate::provider_work::ProviderBackoffEvidence::Transient {
+                    retry_after_secs: Some(1),
+                },
+            ))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let failed_before = state.provider_work.metrics_snapshot().failed;
+
+        let response = probe_model_capability(
+            State(state.clone()),
+            auth(),
+            Path(model_id),
+            Json(CapabilityProbeBody {
+                account_id: Some(account_id),
+                capability: "transport".into(),
+                value: None,
+                max_cost_usd: Some(1.0),
+                transport: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["evidence"]["status"], "inconclusive");
+        assert_eq!(
+            state.provider_work.metrics_snapshot().failed,
+            failed_before + 1
+        );
+        server.await.unwrap();
+
+        let permit = state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::CapabilityProbe,
+            )
+            .await
+            .expect("unclassified body read failure must not install provider backoff");
+        drop(permit);
+        state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::CapabilityProbe,
+            )
+            .await
+            .unwrap()
+            .finish_failure(Some(
+                crate::provider_work::ProviderBackoffEvidence::Transient {
+                    retry_after_secs: None,
+                },
+            ))
+            .await;
+        let wait = match state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::CapabilityProbe,
+            )
+            .await
+        {
+            Err(wait) => wait,
+            Ok(permit) => {
+                drop(permit);
+                panic!("the second transient failure should extend provider backoff");
+            }
+        };
+        assert!(wait >= std::time::Duration::from_secs(8), "got {wait:?}");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capability_probe_singleflight_key_is_stable_and_value_specific() {
+        let key = capability_probe_singleflight_key(
+            "provider-a",
+            "account-a",
+            "model-a",
+            "openai",
+            "reasoning",
+            Some(&json!("low")),
+        );
+        assert_eq!(
+            key,
+            capability_probe_singleflight_key(
+                "provider-a",
+                "account-a",
+                "model-a",
+                "openai",
+                "reasoning",
+                Some(&json!("low")),
+            )
+        );
+        assert_ne!(
+            key,
+            capability_probe_singleflight_key(
+                "provider-a",
+                "account-a",
+                "model-a",
+                "openai",
+                "reasoning",
+                Some(&json!("high")),
+            )
+        );
     }
 
     #[tokio::test]
