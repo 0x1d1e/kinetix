@@ -5265,7 +5265,7 @@ async fn discover_models_native(
             Err(error) => {
                 let evidence = crate::provider_work::outbound_error_backoff_evidence(
                     &error,
-                    crate::provider_work::RateLimitScope::Provider,
+                    crate::provider_work::RateLimitScope::Account,
                 );
                 permit.finish_failure(evidence).await;
                 return Err(ApiError::bad(format!(
@@ -5289,7 +5289,7 @@ async fn discover_models_native(
             );
             let evidence = crate::provider_work::upstream_backoff_evidence(
                 &failure,
-                crate::provider_work::RateLimitScope::Provider,
+                crate::provider_work::RateLimitScope::Account,
             );
             permit.finish_failure(evidence).await;
             return Err(ApiError::bad(format!(
@@ -5500,7 +5500,7 @@ pub async fn test_provider(
                 permit
                     .finish_failure(crate::provider_work::upstream_backoff_evidence(
                         &failure,
-                        crate::provider_work::RateLimitScope::Provider,
+                        crate::provider_work::RateLimitScope::Account,
                     ))
                     .await;
                 return Ok(Json(json!({
@@ -5526,7 +5526,7 @@ pub async fn test_provider(
         Err(e) => {
             let evidence = crate::provider_work::outbound_error_backoff_evidence(
                 &e,
-                crate::provider_work::RateLimitScope::Provider,
+                crate::provider_work::RateLimitScope::Account,
             );
             permit.finish_failure(evidence).await;
             Ok(Json(json!({
@@ -18163,6 +18163,92 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn native_discovery_account_rate_limit_does_not_back_off_sibling_work() {
+        let (state, root) = test_state("native-discovery-account-rate-limit").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    r#"{"error":{"message":"account rate limited"}}"#,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base_url = format!("http://{address}");
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "native-discovery-rate-limit-provider",
+                base_url: &base_url,
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 2_000,
+                capability_mode: "permissive",
+                models_path: Some("/models"),
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "127.0.0.1",
+                allow_insecure_tls: true,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        for (label, priority) in [("account-a", 1), ("account-b", 2)] {
+            let encrypted = state.crypto.encrypt(&format!("{label}-key")).unwrap();
+            db::insert_account(
+                &state.pool,
+                &provider_id,
+                label,
+                &encrypted,
+                "test-key",
+                priority,
+                1,
+                None,
+                "none",
+            )
+            .await
+            .unwrap();
+        }
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = discover_models_native(&state, &provider)
+            .await
+            .expect_err("account A should be rate limited");
+        assert!(error.1.contains("account 'account-a'"), "{error:?}");
+
+        let sibling = state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::ModelDiscovery,
+            )
+            .await
+            .expect("account A's 429 must not block account B's provider work");
+        sibling.finish_success().await;
+
+        server.abort();
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn provider_test_honors_retry_after_response_header() {
         let (state, root) = test_state("provider-test-retry-after").await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -18342,6 +18428,55 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
         (provider_id, account_id, model_id)
+    }
+
+    #[tokio::test]
+    async fn provider_test_account_rate_limit_does_not_back_off_sibling_work() {
+        let (state, root) = test_state("provider-test-account-rate-limit").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    r#"{"error":{"message":"account rate limited"}}"#,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{address}/v1");
+        let (provider_id, account_id, _model_id) =
+            insert_capability_probe_target(&state, &base_url, "provider-test-rate-limit").await;
+
+        let response = test_provider(
+            State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+            Json(TestBody {
+                model: Some("probe-model".into()),
+                account_id: Some(account_id),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["status"], 429);
+
+        let sibling = state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::HealthProbe,
+            )
+            .await
+            .expect("an account's 429 must not block sibling provider work");
+        sibling.finish_success().await;
+
+        server.abort();
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
