@@ -144,9 +144,9 @@ can never grow unbounded.
 latency, TTFT). Surfaced in the dashboard's Request Inspector and reflected in the
 `kinetix_active_streams` metric.
 
-> Client disconnects after commit are detected immediately; a disconnect during
-> the pre-commit connect window is bounded only by the provider timeout (there is
-> no response body to observe yet).
+> Client connection closure cancels pre-commit upstream work. After commit,
+> dropping the response stream cancels active stream work and releases its
+> concurrency capacity.
 
 ## Alerts
 

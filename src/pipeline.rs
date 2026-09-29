@@ -451,13 +451,11 @@ fn mark_provider_probe_validated(
 /// request, so a concurrent configuration change never alters an in-flight
 /// request (NFR-2.10).
 ///
-/// Cancellation note (FR-2.9): the client-disconnect watchdog is the response
-/// body's drop-guard, which only exists once a response is produced. During the
-/// pre-commit selection/connect window there is no body to observe, so a client
-/// that goes away then is noticed only when the upstream responds or the
-/// first-event phase budget elapses. The whole pre-commit window is also capped
-/// by `MAX_PRE_COMMIT_DEADLINE`. Post-commit cancellation is immediate; active
-/// streams have no total wall-clock timeout and only enforce per-gap idle time.
+/// Cancellation note (FR-2.9): the public API handler cancels this future when
+/// its client connection closes, including during pre-commit upstream work. Once
+/// a response is produced, the response body's drop-guard handles post-commit
+/// cancellation. Active streams have no total wall-clock timeout and only
+/// enforce per-gap idle time.
 pub async fn run(
     state: &AppState,
     format: FrontendFormat,

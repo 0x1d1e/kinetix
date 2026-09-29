@@ -2,7 +2,7 @@
 //! Messages, model listing, and health.
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::app::AppState;
 use crate::auth::{authenticate_virtual_key, extract_virtual_key};
+use crate::client_disconnect::ClientDisconnect;
 use crate::frontends::{self, FrontendFormat};
 use crate::limits;
 use crate::pipeline;
@@ -65,6 +66,69 @@ fn extract_protocol_headers(format: FrontendFormat, headers: &HeaderMap) -> Vec<
         .collect()
 }
 
+struct PreCommitRequestGuard {
+    state: AppState,
+    request_id: String,
+    started: std::time::Instant,
+    disconnect: Option<ClientDisconnect>,
+    finished: bool,
+}
+
+impl PreCommitRequestGuard {
+    fn new(
+        state: AppState,
+        request_id: String,
+        started: std::time::Instant,
+        disconnect: Option<ClientDisconnect>,
+    ) -> Self {
+        Self {
+            state,
+            request_id,
+            started,
+            disconnect,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+
+    fn record_cancellation(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.state
+            .cancellations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let signal_latency_ms = self
+            .disconnect
+            .as_ref()
+            .map(ClientDisconnect::cancellation_latency_ms)
+            .unwrap_or(0);
+        self.state
+            .cancellation_latency_ms_total
+            .fetch_add(signal_latency_ms, std::sync::atomic::Ordering::Relaxed);
+        let latency_ms = self.started.elapsed().as_millis() as u64;
+        self.state
+            .live
+            .finish(&self.request_id, "cancelled", latency_ms, None, None);
+        self.state.flight.record(
+            &self.request_id,
+            latency_ms,
+            "cancellation_issued",
+            "client disconnected before response commit",
+        );
+    }
+}
+
+impl Drop for PreCommitRequestGuard {
+    fn drop(&mut self) {
+        self.record_cancellation();
+    }
+}
+
 /// Shared entry for both inbound frontends.
 async fn handle(
     state: AppState,
@@ -72,6 +136,7 @@ async fn handle(
     headers: HeaderMap,
     body: Value,
     raw_body: String,
+    client_disconnect: Option<ClientDisconnect>,
 ) -> Response {
     let request_id = new_request_id();
 
@@ -118,7 +183,17 @@ async fn handle(
     // 4. Run the pipeline.
     let session = extract_session(&headers);
     let protocol_headers = extract_protocol_headers(format, &headers);
-    match pipeline::run(
+    let request_started = std::time::Instant::now();
+    if let Some(disconnect) = client_disconnect.as_ref() {
+        disconnect.start_monitor();
+    }
+    let mut request_guard = PreCommitRequestGuard::new(
+        state.clone(),
+        request_id.clone(),
+        request_started,
+        client_disconnect.clone(),
+    );
+    let pipeline_run = pipeline::run(
         &state,
         format,
         Some(key),
@@ -127,9 +202,21 @@ async fn handle(
         true,
         session,
         protocol_headers,
-    )
-    .await
-    {
+    );
+    let pipeline_result = if let Some(disconnect) = client_disconnect {
+        tokio::select! {
+            biased;
+            _ = disconnect.cancelled() => {
+                request_guard.record_cancellation();
+                Err(ProxyError::internal("client disconnected"))
+            }
+            result = pipeline_run => result,
+        }
+    } else {
+        pipeline_run.await
+    };
+    request_guard.finish();
+    match pipeline_result {
         Ok(resp) => resp,
         Err(e) => error_response(format, &request_id, e),
     }
@@ -137,6 +224,7 @@ async fn handle(
 
 pub async fn chat_completions(
     State(state): State<AppState>,
+    client_disconnect: Option<Extension<ClientDisconnect>>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
@@ -150,11 +238,20 @@ pub async fn chat_completions(
             )
         }
     };
-    handle(state, FrontendFormat::OpenAi, headers, json, body).await
+    handle(
+        state,
+        FrontendFormat::OpenAi,
+        headers,
+        json,
+        body,
+        client_disconnect.map(|Extension(disconnect)| disconnect),
+    )
+    .await
 }
 
 pub async fn responses(
     State(state): State<AppState>,
+    client_disconnect: Option<Extension<ClientDisconnect>>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
@@ -168,10 +265,23 @@ pub async fn responses(
             )
         }
     };
-    handle(state, FrontendFormat::OpenAiResponses, headers, json, body).await
+    handle(
+        state,
+        FrontendFormat::OpenAiResponses,
+        headers,
+        json,
+        body,
+        client_disconnect.map(|Extension(disconnect)| disconnect),
+    )
+    .await
 }
 
-pub async fn messages(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
+pub async fn messages(
+    State(state): State<AppState>,
+    client_disconnect: Option<Extension<ClientDisconnect>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     let json: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -182,7 +292,15 @@ pub async fn messages(State(state): State<AppState>, headers: HeaderMap, body: S
             )
         }
     };
-    handle(state, FrontendFormat::Anthropic, headers, json, body).await
+    handle(
+        state,
+        FrontendFormat::Anthropic,
+        headers,
+        json,
+        body,
+        client_disconnect.map(|Extension(disconnect)| disconnect),
+    )
+    .await
 }
 
 pub async fn count_message_tokens(

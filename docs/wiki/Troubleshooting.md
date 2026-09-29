@@ -76,11 +76,11 @@ It shouldn't — sessions are in-memory and a restart invalidates them. If you s
 this, ensure you're on a build that uses the in-memory session store (older
 builds used a deterministic token). Clear cookies and log in again.
 
-## Client disconnect isn't detected immediately
+## Client disconnect cancellation
 
-Post-commit disconnects are detected at once. A disconnect during the **pre-commit
-connect window** is bounded only by the provider timeout, because there is no
-response body to observe yet. This is expected.
+Kinetix cancels pre-commit upstream work when it observes the client connection
+close. After response commit, dropping the response stream cancels active stream
+work and releases its concurrency capacity.
 
 ## Test/throwaway instances write to my real config
 

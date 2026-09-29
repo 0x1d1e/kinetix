@@ -1,6 +1,8 @@
 //! HTTP router: public API, admin API, embedded dashboard.
 
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request};
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -10,6 +12,18 @@ use crate::admin;
 use crate::api;
 use crate::app::AppState;
 use crate::assets;
+use crate::server::ClientConnectionInfo;
+
+async fn attach_client_disconnect(mut request: Request, next: Next) -> Response {
+    let disconnect = request
+        .extensions()
+        .get::<ConnectInfo<ClientConnectionInfo>>()
+        .map(|info| info.0.disconnect.clone());
+    if let Some(disconnect) = disconnect {
+        request.extensions_mut().insert(disconnect);
+    }
+    next.run(request).await
+}
 
 pub fn build(state: AppState) -> Router {
     let cors = CorsLayer::new()
@@ -39,7 +53,8 @@ pub fn build(state: AppState) -> Router {
         .route("/v1/responses", post(api::responses))
         .route("/v1/messages", post(api::messages))
         .route("/v1/messages/count_tokens", post(api::count_message_tokens))
-        .route("/v1/models", get(api::list_models));
+        .route("/v1/models", get(api::list_models))
+        .layer(axum::middleware::from_fn(attach_client_disconnect));
 
     let admin_api = Router::new()
         .route("/login", post(admin::login))

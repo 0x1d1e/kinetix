@@ -86,6 +86,19 @@ async fn upstream(
                 "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n"
             )))
             .unwrap(),
+        "delayed_first_event" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(async_stream::stream! {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                yield Ok::<_, std::io::Error>(bytes::Bytes::from(
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n"
+                ));
+                yield Ok(bytes::Bytes::from(
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+                ));
+            }))
+            .unwrap(),
         "stream_refusal" => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
@@ -196,7 +209,7 @@ async fn call_raw_responses(state: &AppState, raw_body: String) -> Response {
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {CLIENT_KEY}")).unwrap(),
     );
-    api::responses(State(state.clone()), headers, raw_body).await
+    api::responses(State(state.clone()), None, headers, raw_body).await
 }
 
 async fn call_chat(state: &AppState) -> (StatusCode, String) {
@@ -211,7 +224,7 @@ async fn call_chat(state: &AppState) -> (StatusCode, String) {
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {CLIENT_KEY}")).unwrap(),
     );
-    let response = api::chat_completions(State(state.clone()), headers, raw_body).await;
+    let response = api::chat_completions(State(state.clone()), None, headers, raw_body).await;
     let status = response.status();
     let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     (status, String::from_utf8(body.to_vec()).unwrap())
@@ -465,7 +478,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
             allow_insecure_tls: true,
             data_dir: paths.data_dir.clone(),
             shutdown_grace_secs: 1,
-            max_inflight_inferences: kinetix::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
+            max_inflight_inferences: 1,
             alert_webhook_url: None,
             alert_fallback_rate: 1.0,
             alert_error_rate: 1.0,
@@ -821,6 +834,79 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
     assert_eq!(third.status(), StatusCode::OK);
     let _ = to_bytes(third.into_body(), 1024 * 1024).await.unwrap();
 
+    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_addr = gateway_listener.local_addr().unwrap();
+    let gateway = kinetix::router::build(state.clone());
+    let gateway_server = tokio::spawn(async move {
+        axum::serve(
+            kinetix::server::DisconnectAwareListener::new(gateway_listener),
+            gateway.into_make_service_with_connect_info::<kinetix::server::ClientConnectionInfo>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+    let abandoned_client = client.clone();
+    let abandoned = tokio::spawn(async move {
+        abandoned_client
+            .post(format!("http://{gateway_addr}/v1/responses"))
+            .header("authorization", format!("Bearer {CLIENT_KEY}"))
+            .json(&json!({
+                "model": "responses-route",
+                "input": "case:delayed_first_event",
+                "stream": true
+            }))
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if mock
+                .requests
+                .lock()
+                .await
+                .iter()
+                .any(|request| request.body["input"] == "case:delayed_first_event")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("delayed upstream request did not start");
+    assert_eq!(state.admission.metrics_snapshot().inflight_inferences, 1);
+
+    abandoned.abort();
+    let _ = abandoned.await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while state.admission.metrics_snapshot().inflight_inferences != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("client disconnect did not release admission promptly");
+
+    let admitted = client
+        .post(format!("http://{gateway_addr}/v1/responses"))
+        .header("authorization", format!("Bearer {CLIENT_KEY}"))
+        .json(&json!({
+            "model": "responses-route",
+            "input": "case:lease_lifecycle",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admitted.status().as_u16(), 200);
+    let _ = admitted.bytes().await.unwrap();
+    assert_eq!(state.admission.metrics_snapshot().inflight_inferences, 0);
+
+    gateway_server.abort();
     server.abort();
     let _ = std::fs::remove_dir_all(&root);
 }
