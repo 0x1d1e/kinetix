@@ -1033,7 +1033,10 @@ impl ResponsesEncoder {
                     }),
                 ));
             }
-            StreamEvent::ThinkingDelta { .. } => {
+            StreamEvent::ThinkingBlockStart { .. }
+            | StreamEvent::ThinkingDelta { .. }
+            | StreamEvent::ThinkingBlockStop { .. }
+            | StreamEvent::RedactedThinking { .. } => {
                 // Raw provider reasoning is not a Responses reasoning-summary
                 // item. reasoning.effort is supported as an input control, but
                 // reasoning output items/summaries are outside this subset.

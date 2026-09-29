@@ -252,12 +252,12 @@ def expect_mixed(profile, model, payload):
         need("function_call" in body and "get_weather" in body, "Responses stream lost function call")
 
 
-def expect_rejected(path, base_payload, variants):
+def expect_rejected(path, base_payload, variants, expected_status=422):
     for label, patch in variants:
         payload = json.loads(json.dumps(base_payload))
         payload.update(patch)
         status, _, body = request(path, payload)
-        need(status == 422, f"{label}: expected 422, got {status}: {body}")
+        need(status == expected_status, f"{label}: expected {expected_status}, got {status}: {body}")
 
 
 def run_http_case(case_id):
@@ -751,7 +751,7 @@ def run_http_case(case_id):
             ("refusal", {"messages": [{"role": "assistant", "content": "x", "refusal": "no"}]}),
             ("reasoning_details", {"messages": [{"role": "assistant", "content": "x", "reasoning_details": [{"type": "summary", "text": "hidden"}]}]}),
         ]
-        expect_rejected("/v1/chat/completions", base, variants)
+        expect_rejected("/v1/chat/completions", base, variants, expected_status=400)
         return
 
     if case_id == "messages.translate.multimodal_tool_result.reject":
@@ -776,7 +776,7 @@ def run_http_case(case_id):
                 "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             }),
         ]
-        expect_rejected("/v1/messages", base, variants)
+        expect_rejected("/v1/messages", base, variants, expected_status=400)
         return
 
     if case_id == "chat.native.openai.provider_extensions":
@@ -830,7 +830,7 @@ def run_http_case(case_id):
             status, _, body = request("/v1/chat/completions", native)
             need(status == 200, f"{label}: same-format passthrough failed: {status}: {body}")
         translated = {"model": "syn-gemini-3", "messages": [{"role": "user", "content": "translated"}]}
-        expect_rejected("/v1/chat/completions", translated, variants)
+        expect_rejected("/v1/chat/completions", translated, variants, expected_status=400)
         return
 
     if case_id == "responses.unsupported_fields.reject":

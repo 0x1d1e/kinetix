@@ -343,8 +343,8 @@ export default function App() {
   const handleDeleteProvider = (providerId: string) =>
     withRefresh(() => Kinetix.deleteProvider(providerId));
 
-  const modelCapabilitiesPayload = (model: ModelConfig): Record<string, boolean> => {
-    const out: Record<string, boolean> = {};
+  const modelCapabilitiesPayload = (model: ModelConfig): Record<string, unknown> => {
+    const out: Record<string, unknown> = {};
     const fields: [string, boolean | undefined][] = [
       ['text', model.capabilities.text],
       ['vision', model.capabilities.vision],
@@ -356,6 +356,8 @@ export default function App() {
     for (const [key, value] of fields) {
       if (typeof value === 'boolean') out[key] = value;
     }
+    const families = model.capabilities.continuationFamilies ?? [];
+    if (families.length > 0) out.continuation_families = families;
     return out;
   };
 
@@ -429,7 +431,7 @@ export default function App() {
       }),
     );
 
-  const handleUpdateAccount = (acc: Account) =>
+  const handleUpdateAccount = (acc: Account, status?: Account['status']) =>
     withRefresh(() =>
       Kinetix.updateAccount(acc.id, {
         provider_id: acc.providerId,
@@ -438,7 +440,7 @@ export default function App() {
         weight: acc.weight,
         soft_quota_usd: acc.softQuotaSpendLimit ?? null,
         quota_type: acc.quotaType,
-        status: acc.status,
+        ...(status ? { status } : {}),
       }),
     );
 

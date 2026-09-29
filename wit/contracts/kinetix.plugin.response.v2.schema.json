@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kinetix:plugin.response:v2",
+  "title": "Kinetix plugin response v2",
+  "type": "object",
+  "required": ["schema", "schema_version", "events"],
+  "properties": {
+    "schema": { "const": "kinetix.plugin.response" },
+    "schema_version": { "const": 2 },
+    "events": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/event" }
+    }
+  },
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "events": {
+            "contains": {
+              "type": "object",
+              "required": ["type"],
+              "properties": { "type": { "const": "error" } }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "events": { "maxItems": 1 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "event": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "start" },
+            "upstream_request_id": { "type": ["string", "null"] }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type", "text"],
+          "properties": {
+            "type": { "const": "text_delta" },
+            "text": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type", "text"],
+          "properties": {
+            "type": { "const": "thinking_delta" },
+            "block_index": { "type": ["integer", "null"], "minimum": 0, "maximum": 4294967295 },
+            "text": { "type": "string" },
+            "signature": { "type": ["string", "null"] }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type", "index", "thinking"],
+          "properties": {
+            "type": { "const": "thinking_block_start" },
+            "index": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "thinking": { "type": "string" },
+            "signature": { "type": ["string", "null"] }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type", "index"],
+          "properties": {
+            "type": { "const": "thinking_block_stop" },
+            "index": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type", "index", "data"],
+          "properties": {
+            "type": { "const": "redacted_thinking" },
+            "index": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "data": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type", "index", "name"],
+          "properties": {
+            "type": { "const": "tool_call_start" },
+            "index": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "id": { "type": ["string", "null"] },
+            "name": { "type": "string" },
+            "signature": { "type": ["string", "null"] }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type", "index", "args"],
+          "properties": {
+            "type": { "const": "tool_call_args_delta" },
+            "index": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "args": { "type": "string" }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "usage" },
+            "input": { "type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615 },
+            "output": { "type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615 },
+            "cached": { "type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615 },
+            "cache_write": { "type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615 },
+            "thinking": { "type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615 }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type", "reason"],
+          "properties": {
+            "type": { "const": "finish" },
+            "reason": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type", "code", "message"],
+          "properties": {
+            "type": { "const": "warning" },
+            "code": { "type": "string", "minLength": 1 },
+            "message": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "required": ["type", "kind", "message"],
+          "properties": {
+            "type": { "const": "error" },
+            "kind": {
+              "enum": [
+                "rate_limit",
+                "quota_exhausted",
+                "auth_error",
+                "target_error",
+                "server_error",
+                "connection_error",
+                "timeout",
+                "bad_request"
+              ]
+            },
+            "message": { "type": "string", "minLength": 1 },
+            "status": { "type": ["integer", "null"], "minimum": 0, "maximum": 65535 },
+            "retry_after_secs": { "type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615 },
+            "quota_reset_at": { "type": ["string", "null"], "format": "date-time" }
+          },
+          "additionalProperties": true
+        }
+      ]
+    }
+  }
+}

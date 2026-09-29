@@ -309,6 +309,7 @@ fn responses_stream_does_not_expose_raw_provider_reasoning() {
         upstream_request_id: Some("up-1".into()),
     }));
     out.extend(enc.encode(StreamEvent::ThinkingDelta {
+        block_index: None,
         text: "private provider reasoning".into(),
         signature: Some("opaque".into()),
     }));

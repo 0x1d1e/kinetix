@@ -6,6 +6,7 @@
 //! the commit point (the first client response bytes). A failure after commit
 //! terminates the stream with a format-correct error and is never spliced.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -615,7 +616,7 @@ pub(crate) async fn run_with_disconnect(
         });
     }
 
-    let (mut targets, route) = match resolved {
+    let (mut targets, route, route_target_origins) = match resolved {
         Resolved::Single {
             provider_id,
             model_id,
@@ -644,7 +645,7 @@ pub(crate) async fn run_with_disconnect(
                     param_overrides: Value::Null,
                 })
                 .collect();
-            (targets, None)
+            (targets, None, Vec::new())
         }
         Resolved::Route { route, targets } => {
             meta.route_id = Some(route.id.clone());
@@ -661,6 +662,12 @@ pub(crate) async fn run_with_disconnect(
             } else {
                 order_route_targets(state, &route, targets).await.targets
             };
+            // Retain route-wide producer provenance before request-specific
+            // predicates and other eligibility filters remove candidates.
+            let route_target_origins = ordered
+                .iter()
+                .map(|target| (target_key(&route, target), continuation_origin(target)))
+                .collect::<Vec<_>>();
             // Read-only target hook (§6.6): observe each candidate target before
             // eligibility filtering. Fire-and-forget; never blocks routing.
             if let Some(manager) = state.plugin_manager().cloned() {
@@ -732,7 +739,7 @@ pub(crate) async fn run_with_disconnect(
                     kept.push(t);
                 }
             }
-            (kept, Some(route))
+            (kept, Some(route), route_target_origins)
         }
     };
 
@@ -836,13 +843,26 @@ pub(crate) async fn run_with_disconnect(
     let session_origin_key = session
         .as_deref()
         .and_then(|session| state.sticky_lookup(session, STICKY_TTL));
-    let session_origin_provider = route.as_ref().and_then(|route| {
-        session_origin_key.as_ref().and_then(|key| {
-            targets
-                .iter()
-                .find(|target| target_key(route, target) == *key)
-                .map(|target| target.provider.id.clone())
-        })
+    let session_origin = session_origin_key
+        .as_ref()
+        .and_then(|key| resolve_session_origin(key, &route_target_origins));
+    let possible_history_origins = if route.is_some() {
+        route_target_origins
+            .iter()
+            .map(|(_, origin)| origin.clone())
+            .collect::<Vec<_>>()
+    } else {
+        targets.iter().map(continuation_origin).collect::<Vec<_>>()
+    };
+    let initial_origin = targets.first().map(continuation_origin);
+    let session_origin_unknown = session_origin_key.is_some() && session_origin.is_none();
+    // Anthropic continuation state was produced by successful conversation
+    // history, not by any fallback candidate dispatched during this request.
+    // Without a session, a multi-target Route has no known producer; only
+    // preserve reasoning when every possible producer is explicitly compatible.
+    let history_origin = session_origin.as_ref().or_else(|| {
+        (!session_origin_unknown && possible_history_origins.len() == 1)
+            .then(|| &possible_history_origins[0])
     });
 
     // Sticky routing and prompt-cache affinity share the same bounded session
@@ -872,7 +892,7 @@ pub(crate) async fn run_with_disconnect(
     let mut last_error: Option<ProxyError> = None;
     let mut all_accounts: Vec<db::AccountRow> = Vec::new();
     let mut attempts_done = 0usize;
-    let mut previous_provider_id: Option<String> = None;
+    let mut previous_origin: Option<ContinuationOrigin> = None;
     let mut skip_logical_target: Option<String> = None;
     let deadline = started + MAX_PRE_COMMIT_DEADLINE;
 
@@ -930,12 +950,18 @@ pub(crate) async fn run_with_disconnect(
 
         // Soft quota check (FR-12.8).
         if let Ok(true) = pool::soft_quota_reached(&state.pool, &target.account).await {
-            let _ = pool::mark_exhausted(
+            let reset_at = (chrono::Utc::now()
+                + chrono::Duration::seconds(default_quota_window(&target.account)))
+            .to_rfc3339();
+            let _ = db::set_account_status_if_version(
                 &state.pool,
                 &target.account.id,
+                target.account.account_state_version,
+                "exhausted",
+                "account_quota_exhausted",
                 None,
-                default_quota_window(&target.account),
-                "soft quota reached",
+                Some(&reset_at),
+                Some("soft quota reached"),
             )
             .await;
             meta.fallback_path
@@ -1087,21 +1113,40 @@ pub(crate) async fn run_with_disconnect(
         // Portability applies on cross-format translation, on fallback across
         // providers, and on the first attempt when session provenance shows the
         // previous turn came from a different provider.
-        let cross_provider = previous_provider_id
-            .as_deref()
+        let attempt_origin = previous_origin
+            .as_ref()
             .or(if attempts_done == 0 {
-                session_origin_provider.as_deref()
+                session_origin.as_ref()
             } else {
                 None
             })
-            .map(|id| id != target.provider.id)
-            .unwrap_or(false);
+            .or(initial_origin.as_ref());
+        let cross_provider =
+            attempt_origin.is_some_and(|origin| origin.provider_id != target.provider.id);
         let cross_format = !passthrough::is_transport_passthrough(format, &profile.transport);
 
-        // Inline opaque state is evaluated *before* hydration so a signature we
-        // are about to restore for a compatible target is never mistaken for
-        // non-portable client state and stripped.
-        let inline_opaque = request_has_opaque_state(&target_req);
+        // Anthropic continuation is safe for the same provider/model, or when
+        // both models explicitly share an operator-declared continuation family.
+        // Wire-format and upstream model-name equality alone are insufficient.
+        let history_is_compatible = !session_origin_unknown
+            && history_origin.map_or_else(
+                || {
+                    possible_history_origins
+                        .iter()
+                        .all(|origin| anthropic_continuation_is_compatible(Some(origin), target))
+                },
+                |origin| anthropic_continuation_is_compatible(Some(origin), target),
+            );
+        let preserves_anthropic_thinking = format == FrontendFormat::Anthropic
+            && adapter.wire_format() == "anthropic"
+            && history_is_compatible;
+        // Evaluate inline opaque state before hydration so a signature about to
+        // be restored for a compatible target is not mistaken for client state.
+        let inline_opaque = request_has_nonportable_inline_state(
+            &target_req,
+            preserves_anthropic_thinking,
+            cross_provider || cross_format,
+        );
 
         // Resolve host-owned stored continuation state for this candidate
         // target. Compatible signatures are restored only after portability is
@@ -1124,22 +1169,33 @@ pub(crate) async fn run_with_disconnect(
         // an OpenAI target with no session provenance). Without this, the
         // Route's reject/strip_with_warning policy would be bypassed and the
         // state silently dropped.
-        if cross_provider || cross_format || opaque_report.nonportable() {
+        if cross_provider || cross_format || inline_opaque || opaque_report.nonportable() {
             // A target that cannot carry the real stored state may still have a
             // documented placeholder for it (e.g. Gemini's cross-model
             // sentinel). The adapter owns that wire detail; the pipeline only
             // decides whether the Route policy allows proceeding.
             let placeholder = adapter.opaque_state_placeholder(&target.model);
             if let Some(route) = &route {
-                apply_portability(
+                if let Err(error) = apply_portability(
                     &mut target_req,
                     route,
                     target,
                     inline_opaque,
                     &opaque_report,
                     placeholder,
+                    preserves_anthropic_thinking,
                     &mut trace,
-                )?;
+                ) {
+                    return Err(finish_policy_rejection(
+                        state,
+                        &meta,
+                        &mut trace,
+                        Some(target.account.label.clone()),
+                        error.message,
+                        started,
+                    )
+                    .await);
+                }
             } else if let Some(placeholder) =
                 placeholder.filter(|_| opaque_report.nonportable() && !inline_opaque)
             {
@@ -1148,17 +1204,29 @@ pub(crate) async fn run_with_disconnect(
                 // substitute for the stored state it cannot carry (e.g. Gemini's
                 // cross-model function-call placeholder). Translate with it
                 // rather than failing the request; never strip silently.
-                let placed =
-                    strip_nonportable_state(&mut target_req, &opaque_report, Some(placeholder));
+                let placed = strip_nonportable_state(
+                    &mut target_req,
+                    &opaque_report,
+                    Some(placeholder),
+                    preserves_anthropic_thinking,
+                );
                 let warning = portability_warning(target, placed);
                 trace.warn(warning.clone());
                 tracing::warn!("{}", warning);
             } else if inline_opaque || opaque_report.nonportable() {
                 // A direct target with no Route policy must not silently drop
                 // known non-portable continuation state (§24).
-                return Err(ProxyError::unsupported(
-                    "non-portable provider continuation state cannot be sent to a direct cross-format target",
-                ));
+                return Err(
+                    finish_policy_rejection(
+                        state,
+                        &meta,
+                        &mut trace,
+                        Some(target.account.label.clone()),
+                        "non-portable provider continuation state cannot be sent to a direct cross-format target",
+                        started,
+                    )
+                    .await,
+                );
             }
         }
 
@@ -1211,13 +1279,16 @@ pub(crate) async fn run_with_disconnect(
         };
 
         // Parameter policy reject (FR-10.6): a request-level failure, never retried.
-        if let Err(e) = check_param_policy(target, &profile, &target_req) {
-            trace.finish("rejected");
-            state
-                .live
-                .finish(&meta.request_id, "rejected", 0, None, None);
-            let _ = db::insert_route_trace(&state.pool, &trace).await;
-            return Err(e);
+        if let Err(error) = check_param_policy(target, &profile, &target_req) {
+            return Err(finish_policy_rejection(
+                state,
+                &meta,
+                &mut trace,
+                Some(target.account.label.clone()),
+                error.message,
+                started,
+            )
+            .await);
         }
 
         // Same-format passthrough (FR-2.7).
@@ -1228,25 +1299,28 @@ pub(crate) async fn run_with_disconnect(
         // translating path (FR-2.8). A request-level failure; never retried.
         if !use_passthrough {
             if let Some(msg) = crate::frontends::translation_unsupported(&target_req.extra) {
-                trace.finish("rejected");
-                state
-                    .live
-                    .finish(&meta.request_id, "rejected", 0, None, None);
-                let _ = db::insert_route_trace(&state.pool, &trace).await;
-                return Err(ProxyError::new(
-                    crate::types::ErrorKind::Unsupported,
+                return Err(finish_policy_rejection(
+                    state,
+                    &meta,
+                    &mut trace,
+                    Some(target.account.label.clone()),
                     format!("request uses a feature that cannot be translated: {msg}"),
-                ));
+                    started,
+                )
+                .await);
             }
             if let Err(error) =
                 check_resolved_thinking_translation(adapter.as_ref(), target, &profile, &target_req)
             {
-                trace.finish("rejected");
-                state
-                    .live
-                    .finish(&meta.request_id, "rejected", 0, None, None);
-                let _ = db::insert_route_trace(&state.pool, &trace).await;
-                return Err(error);
+                return Err(finish_policy_rejection(
+                    state,
+                    &meta,
+                    &mut trace,
+                    Some(target.account.label.clone()),
+                    error.message,
+                    started,
+                )
+                .await);
             }
         }
 
@@ -1330,9 +1404,47 @@ pub(crate) async fn run_with_disconnect(
             }
         };
 
+        if probing {
+            match db::claim_half_open_probe_at(
+                &state.pool,
+                &target.account.id,
+                target.account.account_state_version,
+                chrono::Utc::now(),
+                pool::HALF_OPEN_PROBE_MIN_GAP_SECS,
+            )
+            .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    provider_attempt.finish_neutral();
+                    let detail =
+                        "half-open recovery probe already claimed or account state changed";
+                    trace.step("skip", Some(target.account.label.clone()), detail);
+                    meta.fallback_path
+                        .push(format!("{}:probe_claimed", target.account.label));
+                    state.record_skip();
+                    last_error = Some(ProxyError::all_unavailable(detail, None));
+                    continue;
+                }
+                Err(error) => {
+                    provider_attempt.finish_neutral();
+                    tracing::warn!(
+                        account_id = %target.account.id,
+                        error = %error,
+                        "failed to claim half-open account probe"
+                    );
+                    let detail = "half-open recovery probe could not be claimed";
+                    trace.step("skip", Some(target.account.label.clone()), detail);
+                    state.record_skip();
+                    last_error = Some(ProxyError::all_unavailable(detail, None));
+                    continue;
+                }
+            }
+        }
+
         let attempt_started = Instant::now();
         attempts_done += 1;
-        previous_provider_id = Some(target.provider.id.clone());
+        previous_origin = Some(continuation_origin(target));
         state.live.set_fallback_hops(
             &meta.request_id,
             (attempts_done - 1) as u32,
@@ -1353,11 +1465,6 @@ pub(crate) async fn run_with_disconnect(
                 }
             ),
         );
-
-        if probing {
-            // Record that we are actively probing this account (FR-4.7).
-            let _ = db::touch_probe_at(&state.pool, &target.account.id).await;
-        }
 
         let send_result = match tokio::time::timeout(
             send_budget,
@@ -1505,8 +1612,16 @@ pub(crate) async fn run_with_disconnect(
                         "upstream_validated",
                         if prepared.is_sse { "sse" } else { "json" },
                     );
-                    // Only validated responses clear the circuit-breaker counter.
-                    let _ = pool::clear_circuit(&state.pool, &target.account.id).await;
+                    // A validated response may recover only the account state
+                    // version it observed; half-open probes explicitly authorize
+                    // clearing an open circuit.
+                    recover_successful_account(
+                        state,
+                        &target.account.id,
+                        target.account.account_state_version,
+                        probing,
+                    )
+                    .await;
                     let provider_circuit_transition =
                         mark_provider_probe_validated(&provider_attempt);
                     let attempt = Attempt {
@@ -1648,20 +1763,45 @@ pub(crate) async fn run_with_disconnect(
                                 .unwrap_or(if error.retryable { 5 } else { 30 })
                                 .min(3600);
                             let message = format!("credential refresh failed: {}", error.message);
-                            let _ = pool::mark_rate_limited(
+                            let cooldown_until = (chrono::Utc::now()
+                                + chrono::Duration::seconds(cooldown as i64))
+                            .to_rfc3339();
+                            let cooldown_applied = match db::set_account_status_if_version(
                                 &state.pool,
                                 &target.account.id,
-                                cooldown,
-                                &message,
+                                target.account.account_state_version,
+                                "cooldown",
+                                "rate_limited",
+                                Some(&cooldown_until),
+                                None,
+                                Some(&crate::crypto::redact(&message)),
                             )
-                            .await;
-                            // Keep the request planner's in-memory snapshot in
-                            // sync with the cooldown written above.
-                            let _ = state.registry.reload(&state.pool).await;
-                            let detail = format!(
-                                "{}:credential_refresh(cooldown {}s)",
-                                target.account.label, cooldown
-                            );
+                            .await
+                            {
+                                Ok(applied) => applied,
+                                Err(persist_error) => {
+                                    tracing::error!(
+                                        account = %target.account.id,
+                                        error = %persist_error,
+                                        "failed to persist credential refresh cooldown"
+                                    );
+                                    false
+                                }
+                            };
+                            if cooldown_applied {
+                                let _ = state.registry.reload(&state.pool).await;
+                            }
+                            let detail = if cooldown_applied {
+                                format!(
+                                    "{}:credential_refresh(cooldown {}s)",
+                                    target.account.label, cooldown
+                                )
+                            } else {
+                                format!(
+                                    "{}:credential_refresh(stale lifecycle update ignored)",
+                                    target.account.label
+                                )
+                            };
                             meta.fallback_path.push(detail.clone());
                             trace.step("attempt", Some(target.account.label.clone()), detail);
                             tracing::warn!(
@@ -1860,6 +2000,36 @@ fn target_key(route: &db::RouteRow, t: &ResolvedTarget) -> String {
     format!("{}|{}|{}", route.id, t.account.id, t.model.id)
 }
 
+fn target_route_model_identity(key: &str) -> Option<(&str, &str)> {
+    let (route_id, remainder) = key.split_once('|')?;
+    let (_, model_id) = remainder.split_once('|')?;
+    Some((route_id, model_id))
+}
+
+fn resolve_session_origin(
+    sticky_key: &str,
+    route_target_origins: &[(String, ContinuationOrigin)],
+) -> Option<ContinuationOrigin> {
+    if let Some((_, origin)) = route_target_origins
+        .iter()
+        .find(|(candidate_key, _)| candidate_key == sticky_key)
+    {
+        return Some(origin.clone());
+    }
+
+    // Account identity is used for affinity, but an account rotation does not
+    // change who produced continuation state when the Route/model still resolves
+    // unambiguously to the same provider, upstream model, and family metadata.
+    let identity = target_route_model_identity(sticky_key)?;
+    let mut candidates = route_target_origins
+        .iter()
+        .filter(|(candidate_key, _)| target_route_model_identity(candidate_key) == Some(identity));
+    let (_, origin) = candidates.next()?;
+    candidates
+        .all(|(_, candidate)| candidate == origin)
+        .then(|| origin.clone())
+}
+
 fn traffic_key(t: &ResolvedTarget) -> crate::upstream_traffic::TargetKey {
     crate::upstream_traffic::TargetKey::new(
         t.provider.id.clone(),
@@ -1978,6 +2148,7 @@ fn median_observed_ttft(
     }
 }
 
+#[cfg(test)]
 fn build_adaptive_scores(
     targets: &[ResolvedTarget],
     snapshots: &std::collections::HashMap<
@@ -2067,11 +2238,16 @@ fn traffic_outcome_for_failure(kind: FailureKind) -> crate::upstream_traffic::Tr
     match kind {
         FailureKind::RateLimit => TrafficOutcome::Overload,
         FailureKind::Timeout => TrafficOutcome::Timeout,
-        FailureKind::ServerError | FailureKind::ConnectionError => TrafficOutcome::Error,
+        FailureKind::ServerError
+        | FailureKind::ConnectionError
+        | FailureKind::MalformedUpstream => TrafficOutcome::Error,
+        FailureKind::PluginFailure => TrafficOutcome::Neutral,
+        FailureKind::ClientCancelled => TrafficOutcome::Cancelled,
         FailureKind::QuotaExhausted
         | FailureKind::AuthError
         | FailureKind::TargetError
-        | FailureKind::BadRequest => TrafficOutcome::Neutral,
+        | FailureKind::BadRequest
+        | FailureKind::PolicyRejected => TrafficOutcome::Neutral,
     }
 }
 
@@ -2080,12 +2256,14 @@ fn telemetry_outcome_for_failure(kind: FailureKind) -> crate::target_telemetry::
     match kind {
         FailureKind::RateLimit => TelemetryOutcome::RateLimit,
         FailureKind::QuotaExhausted => TelemetryOutcome::QuotaExhausted,
-        FailureKind::ServerError => TelemetryOutcome::ServerError,
+        FailureKind::ServerError | FailureKind::MalformedUpstream => TelemetryOutcome::ServerError,
+        FailureKind::PluginFailure => TelemetryOutcome::TargetError,
         FailureKind::ConnectionError => TelemetryOutcome::ConnectionError,
         FailureKind::Timeout => TelemetryOutcome::Timeout,
         FailureKind::AuthError => TelemetryOutcome::AuthError,
-        FailureKind::TargetError => TelemetryOutcome::TargetError,
+        FailureKind::TargetError | FailureKind::PolicyRejected => TelemetryOutcome::TargetError,
         FailureKind::BadRequest => TelemetryOutcome::BadRequest,
+        FailureKind::ClientCancelled => TelemetryOutcome::Cancelled,
     }
 }
 
@@ -2144,12 +2322,17 @@ fn route_allows_fallback(route: Option<&db::RouteRow>, kind: FailureKind) -> boo
     match kind {
         FailureKind::RateLimit => enabled("on429"),
         FailureKind::QuotaExhausted => enabled("onQuota"),
-        FailureKind::ServerError | FailureKind::ConnectionError => enabled("on5xx"),
+        FailureKind::ServerError
+        | FailureKind::ConnectionError
+        | FailureKind::MalformedUpstream
+        | FailureKind::PluginFailure => enabled("on5xx"),
         FailureKind::Timeout => enabled("onTimeout"),
         // Credential-global failures should try another account. Target-local
         // failures should try another logical route target.
         FailureKind::AuthError | FailureKind::TargetError => true,
-        FailureKind::BadRequest => false,
+        FailureKind::BadRequest | FailureKind::PolicyRejected | FailureKind::ClientCancelled => {
+            false
+        }
     }
 }
 
@@ -2494,7 +2677,7 @@ async fn prepare_success_response(
             .unwrap_or(false)
         {
             return Err(UpstreamFailure {
-                kind: FailureKind::ServerError,
+                kind: FailureKind::MalformedUpstream,
                 status: Some(502),
                 retry_after_secs: None,
                 message: "upstream JSON response exceeds size limit".into(),
@@ -2514,7 +2697,7 @@ async fn prepare_success_response(
         })?;
         if body.len() > MAX_FULL_RESPONSE_BYTES {
             return Err(UpstreamFailure {
-                kind: FailureKind::ServerError,
+                kind: FailureKind::MalformedUpstream,
                 status: Some(502),
                 retry_after_secs: None,
                 message: "upstream JSON response exceeds size limit".into(),
@@ -2526,7 +2709,7 @@ async fn prepare_success_response(
             return Err(failure);
         }
         let value: Value = serde_json::from_slice(&body).map_err(|error| UpstreamFailure {
-            kind: FailureKind::ServerError,
+            kind: FailureKind::MalformedUpstream,
             status: Some(502),
             retry_after_secs: None,
             message: format!("invalid upstream JSON response: {error}"),
@@ -2535,7 +2718,7 @@ async fn prepare_success_response(
         let events = adapter.parse_full_response(&value)?;
         if !events.iter().any(is_semantic_event) {
             return Err(UpstreamFailure {
-                kind: FailureKind::ServerError,
+                kind: FailureKind::MalformedUpstream,
                 status: Some(502),
                 retry_after_secs: None,
                 message: "upstream JSON response contained no model result".into(),
@@ -2565,7 +2748,7 @@ async fn prepare_success_response(
             Ok(Some(bytes)) => {
                 prefetched.push(bytes.clone());
                 let frames = framer.push(&bytes).map_err(|error| UpstreamFailure {
-                    kind: FailureKind::ServerError,
+                    kind: FailureKind::MalformedUpstream,
                     status: Some(502),
                     retry_after_secs: None,
                     message: error.to_string(),
@@ -2580,7 +2763,7 @@ async fn prepare_success_response(
                     }
                     if payload.trim() == "[DONE]" {
                         return Err(UpstreamFailure {
-                            kind: FailureKind::ServerError,
+                            kind: FailureKind::MalformedUpstream,
                             status: Some(502),
                             retry_after_secs: None,
                             message: "upstream SSE ended before any model event".into(),
@@ -2611,7 +2794,7 @@ async fn prepare_success_response(
                     "upstream SSE ended before any model event"
                 };
                 return Err(UpstreamFailure {
-                    kind: FailureKind::ServerError,
+                    kind: FailureKind::MalformedUpstream,
                     status: Some(502),
                     retry_after_secs: None,
                     message: message.into(),
@@ -2664,44 +2847,101 @@ async fn handle_key_failure(
 ) {
     let account_id = &target.account.id;
     let label = target.account.label.clone();
+    let (status, reason_code, cooldown_until, quota_reset_at) = match failure.kind {
+        FailureKind::RateLimit => {
+            let cooldown = failure.retry_after_secs.unwrap_or(30).min(3600);
+            let until =
+                (chrono::Utc::now() + chrono::Duration::seconds(cooldown as i64)).to_rfc3339();
+            (Some("cooldown"), "rate_limited", Some(until), None)
+        }
+        FailureKind::QuotaExhausted => {
+            let reset = failure.quota_reset_at.clone().unwrap_or_else(|| {
+                chrono::Utc::now()
+                    + chrono::Duration::seconds(default_quota_window(&target.account))
+            });
+            (
+                Some("exhausted"),
+                "account_quota_exhausted",
+                None,
+                Some(reset.to_rfc3339()),
+            )
+        }
+        FailureKind::AuthError => (Some("disabled"), failure.kind.reason_code(), None, None),
+        _ => (None, failure.kind.reason_code(), None, None),
+    };
+    let mut persistence_failed = false;
+    let failure_count = if let Some(status) = status {
+        match db::apply_account_failure(
+            &state.pool,
+            account_id,
+            target.account.account_state_version,
+            status,
+            reason_code,
+            cooldown_until.as_deref(),
+            quota_reset_at.as_deref(),
+            &failure.message,
+            CIRCUIT_THRESHOLD,
+            CIRCUIT_OPEN_SECS,
+        )
+        .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                persistence_failed = true;
+                tracing::error!(
+                    account = %account_id,
+                    error = %error,
+                    "failed to persist account-scoped upstream failure"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let transition_applied = failure_count.is_some();
+    let n = failure_count.unwrap_or(0);
     let detail = match failure.kind {
         FailureKind::RateLimit => {
             let cooldown = failure.retry_after_secs.unwrap_or(30).min(3600);
-            let _ =
-                pool::mark_rate_limited(&state.pool, account_id, cooldown, &failure.message).await;
-            let d = format!("{label}:429(cooldown {cooldown}s)");
+            let d = if transition_applied {
+                format!("{label}:429(cooldown {cooldown}s)")
+            } else if persistence_failed {
+                format!("{label}:429(lifecycle update failed)")
+            } else {
+                format!("{label}:429(stale failure ignored)")
+            };
             meta.fallback_path.push(d.clone());
             d
         }
         FailureKind::QuotaExhausted => {
-            let _ = pool::mark_exhausted(
-                &state.pool,
-                account_id,
-                failure.quota_reset_at,
-                default_quota_window(&target.account),
-                &failure.message,
-            )
-            .await;
-            let d = format!("{label}:quota_exhausted");
+            let d = if transition_applied {
+                format!("{label}:quota_exhausted")
+            } else if persistence_failed {
+                format!("{label}:quota_exhausted(lifecycle update failed)")
+            } else {
+                format!("{label}:quota_exhausted(stale failure ignored)")
+            };
             meta.fallback_path.push(d.clone());
             d
         }
         FailureKind::AuthError => {
-            let _ = db::set_account_status(
-                &state.pool,
-                account_id,
-                "disabled",
-                None,
-                None,
-                Some(&failure.message),
-            )
-            .await;
-            let d = format!("{label}:auth_error(disabled)");
+            let d = if transition_applied {
+                format!("{label}:auth_error(disabled)")
+            } else if persistence_failed {
+                format!("{label}:auth_error(lifecycle update failed)")
+            } else {
+                format!("{label}:auth_error(stale failure ignored)")
+            };
             meta.fallback_path.push(d.clone());
             d
         }
-        FailureKind::ServerError | FailureKind::ConnectionError | FailureKind::Timeout => {
-            let d = format!("{label}:transient(request-local)");
+        FailureKind::ServerError
+        | FailureKind::ConnectionError
+        | FailureKind::Timeout
+        | FailureKind::MalformedUpstream
+        | FailureKind::PluginFailure => {
+            let d = format!("{label}:{}", failure.kind.reason_code());
             meta.fallback_path.push(d.clone());
             d
         }
@@ -2710,33 +2950,22 @@ async fn handle_key_failure(
             meta.fallback_path.push(d.clone());
             d
         }
-        FailureKind::BadRequest => format!("{label}:bad_request"),
+        FailureKind::BadRequest | FailureKind::PolicyRejected => {
+            format!("{label}:{}", failure.kind.reason_code())
+        }
+        FailureKind::ClientCancelled => "client_cancelled".into(),
     };
 
-    let n = if failure.kind.is_account_scoped() {
-        // Circuit breaker (FR-4.7) only tracks failures with direct evidence
-        // that the selected account/credential itself is unavailable.
-        pool::record_failure(
-            &state.pool,
-            account_id,
-            CIRCUIT_THRESHOLD,
-            CIRCUIT_OPEN_SECS,
-        )
-        .await
-        .unwrap_or(0)
-    } else {
-        0
-    };
-    trace.step("attempt", Some(label), detail);
-    if n >= CIRCUIT_THRESHOLD {
+    trace.failure(Some(label), detail, failure.kind, failure.status);
+    if transition_applied && n >= CIRCUIT_THRESHOLD {
         trace.step(
             "skip",
             None,
             format!("circuit opened for account after {n} consecutive failures"),
         );
     }
-    if failure.kind.is_account_scoped() {
-        // Refresh the registry snapshot so later requests see the new status.
+    if transition_applied {
+        // Refresh only after this request successfully mutated account state.
         let _ = state.registry.reload(&state.pool).await;
     }
 }
@@ -2821,12 +3050,83 @@ fn apply_header_reset_to_rate_limit(
     failure
 }
 
+async fn recover_successful_account(
+    state: &AppState,
+    account_id: &str,
+    observed_state_version: i64,
+    is_half_open_probe: bool,
+) {
+    match pool::recover_after_success(
+        &state.pool,
+        account_id,
+        observed_state_version,
+        is_half_open_probe,
+    )
+    .await
+    {
+        Ok(true) => {
+            if let Err(error) = state.registry.reload(&state.pool).await {
+                tracing::warn!(
+                    account = %account_id,
+                    %error,
+                    "account circuit recovered but registry reload failed"
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            account = %account_id,
+            %error,
+            "failed to recover account circuit after successful response"
+        ),
+    }
+}
+
+fn policy_rejection(
+    trace: &mut RouteTrace,
+    target: Option<String>,
+    message: impl Into<String>,
+) -> ProxyError {
+    let message = message.into();
+    trace.failure(target, message.clone(), FailureKind::PolicyRejected, None);
+    let mut error = ProxyError::bad_request(message);
+    error.http_status_override = FailureKind::PolicyRejected.client_status(None);
+    error
+}
+
+async fn finish_policy_rejection(
+    state: &AppState,
+    meta: &RequestMeta,
+    trace: &mut RouteTrace,
+    target: Option<String>,
+    message: impl Into<String>,
+    started: Instant,
+) -> ProxyError {
+    let error = policy_rejection(trace, target, message);
+    trace.finish("rejected");
+    state.live.finish(
+        &meta.request_id,
+        "rejected",
+        started.elapsed().as_millis() as u64,
+        None,
+        None,
+    );
+    let _ = db::insert_route_trace(&state.pool, trace).await;
+    error
+}
+
 fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> ProxyError {
     match failure.kind {
-        FailureKind::RateLimit | FailureKind::QuotaExhausted => {
-            ProxyError::rate_limited(failure.message.clone(), failure.retry_after_secs)
-        }
+        FailureKind::RateLimit | FailureKind::QuotaExhausted => ProxyError::rate_limited(
+            failure.message.clone(),
+            failure.kind.retry_after_secs(failure),
+        ),
         FailureKind::BadRequest => ProxyError::bad_request(failure.message.clone()),
+        FailureKind::PolicyRejected => {
+            let mut error = ProxyError::bad_request(failure.message.clone());
+            error.http_status_override = failure.kind.client_status(failure.status);
+            error
+        }
         FailureKind::AuthError => ProxyError::upstream(format!(
             "upstream authentication failed for provider '{}'",
             target.provider.name
@@ -2838,10 +3138,19 @@ fn failure_to_error(failure: &UpstreamFailure, target: &ResolvedTarget) -> Proxy
             Some(404) => ProxyError::not_found(failure.message.clone()),
             _ => ProxyError::upstream(failure.message.clone()),
         },
-        FailureKind::Timeout => ProxyError::upstream("upstream request timed out".to_string()),
-        FailureKind::ConnectionError | FailureKind::ServerError => {
-            ProxyError::upstream(failure.message.clone())
+        FailureKind::Timeout => {
+            let mut error = ProxyError::upstream("upstream request timed out".to_string());
+            error.http_status_override = failure.kind.client_status(failure.status);
+            error
         }
+        FailureKind::ConnectionError
+        | FailureKind::ServerError
+        | FailureKind::MalformedUpstream
+        | FailureKind::PluginFailure => ProxyError::upstream(failure.message.clone()),
+        FailureKind::ClientCancelled => ProxyError::new(
+            crate::types::ErrorKind::ClientCancelled,
+            "client cancelled request",
+        ),
     }
 }
 
@@ -2876,12 +3185,16 @@ fn record_provider_circuit_reject(
 }
 
 fn account_skip_detail(target: &ResolvedTarget, status: pool::AccountStatus) -> String {
+    let lifecycle = pool::lifecycle_at(&target.account, chrono::Utc::now());
     let mut detail = format!(
-        "model={} skipped({}); effective_status={}",
+        "model={} skipped({}); reason_code={}",
         target.model.display_name,
-        status.as_str(),
-        status.as_str()
+        status.as_admin_str(),
+        lifecycle.reason_code
     );
+    if let Some(retry_at) = lifecycle.retry_at {
+        detail.push_str(&format!("; retry_at={retry_at}"));
+    }
     match status {
         pool::AccountStatus::Cooldown => {
             if let Some(until) = target.account.cooldown_until.as_deref() {
@@ -3256,22 +3569,76 @@ async fn order_route_targets(
 /// * `strip_with_warning` — remove the non-portable state, record it in the
 ///   Route Trace, and emit a client-visible warning. Silent stripping is
 ///   forbidden.
-fn request_has_opaque_state(req: &InternalRequest) -> bool {
+#[derive(Clone, PartialEq, Eq)]
+struct ContinuationOrigin {
+    provider_id: String,
+    upstream_model_id: String,
+    families: HashSet<String>,
+}
+
+fn continuation_origin(target: &ResolvedTarget) -> ContinuationOrigin {
+    let capabilities =
+        serde_json::from_str::<Value>(&target.model.capabilities).unwrap_or(Value::Null);
+    let families = capabilities
+        .get("continuation_families")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|family| !family.is_empty())
+        .map(str::to_owned)
+        .collect();
+    ContinuationOrigin {
+        provider_id: target.provider.id.clone(),
+        upstream_model_id: target.model.upstream_id.clone(),
+        families,
+    }
+}
+
+fn anthropic_continuation_is_compatible(
+    source: Option<&ContinuationOrigin>,
+    target: &ResolvedTarget,
+) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    if source.provider_id == target.provider.id
+        && source.upstream_model_id == target.model.upstream_id
+    {
+        return true;
+    }
+
+    let target_families = continuation_origin(target).families;
+    source
+        .families
+        .iter()
+        .any(|family| target_families.contains(family))
+}
+
+fn request_has_nonportable_inline_state(
+    req: &InternalRequest,
+    preserves_anthropic_thinking: bool,
+    include_generic_opaque: bool,
+) -> bool {
     req.messages.iter().any(|message| {
-        message.parts.iter().any(|part| {
-            matches!(part, crate::types::Part::Thinking { .. })
-                || matches!(
-                    part,
-                    crate::types::Part::ToolCall {
-                        signature: Some(_),
-                        ..
-                    }
-                )
+        message.parts.iter().any(|part| match part {
+            crate::types::Part::Thinking { signature, .. } => {
+                !preserves_anthropic_thinking
+                    || !signature
+                        .as_deref()
+                        .is_some_and(|signature| !signature.is_empty())
+            }
+            crate::types::Part::RedactedThinking { .. } => !preserves_anthropic_thinking,
+            crate::types::Part::ToolCall {
+                signature: Some(_), ..
+            } => include_generic_opaque,
+            _ => false,
         })
     })
 }
 
-fn strip_opaque_raw_body(req: &mut InternalRequest) {
+fn strip_opaque_raw_body(req: &mut InternalRequest, preserves_anthropic_thinking: bool) {
     let Some(raw) = req.raw_body.as_deref() else {
         return;
     };
@@ -3293,11 +3660,28 @@ fn strip_opaque_raw_body(req: &mut InternalRequest) {
         let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
-        parts.retain(|part| part.get("type").and_then(Value::as_str) != Some("thinking"));
+        parts.retain(|part| match part.get("type").and_then(Value::as_str) {
+            Some("thinking") => {
+                preserves_anthropic_thinking
+                    && part
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .is_some_and(|signature| !signature.is_empty())
+            }
+            Some("redacted_thinking") => {
+                preserves_anthropic_thinking && part.get("data").and_then(Value::as_str).is_some()
+            }
+            _ => true,
+        });
         for part in parts {
-            if let Some(object) = part.as_object_mut() {
-                object.remove("signature");
-                object.remove("thoughtSignature");
+            let block_type = part.get("type").and_then(Value::as_str);
+            if !preserves_anthropic_thinking
+                || !matches!(block_type, Some("thinking" | "redacted_thinking"))
+            {
+                if let Some(object) = part.as_object_mut() {
+                    object.remove("signature");
+                    object.remove("thoughtSignature");
+                }
             }
         }
     }
@@ -3450,10 +3834,9 @@ fn hydrate_opaque_state(req: &mut InternalRequest, report: &OpaqueHydrationRepor
 ///   Route Trace, and emit a client-visible warning. Silent stripping is
 ///   forbidden.
 ///
-/// `inline_opaque` reflects opaque state already present in the decoded request
-/// (thinking parts, tool-call signatures) and `report` reflects host-owned
-/// stored continuation state resolved for this target. Either source can make
-/// the conversation non-portable for the candidate target.
+/// `inline_opaque` reflects state that this target cannot carry; `report` reflects
+/// host-owned stored continuation state resolved for this target. Either source
+/// can make the conversation non-portable for the candidate target.
 ///
 /// `placeholder` is the target adapter's documented stand-in for a historical
 /// call whose real signature cannot be carried (e.g. a different model in the
@@ -3468,6 +3851,7 @@ fn apply_portability(
     inline_opaque: bool,
     report: &OpaqueHydrationReport,
     placeholder: Option<&'static str>,
+    preserves_anthropic_thinking: bool,
     trace: &mut RouteTrace,
 ) -> Result<(), ProxyError> {
     if !inline_opaque && !report.nonportable() {
@@ -3482,7 +3866,7 @@ fn apply_portability(
     }
 
     // portability=strip_with_warning
-    let placed = strip_nonportable_state(req, report, placeholder);
+    let placed = strip_nonportable_state(req, report, placeholder, preserves_anthropic_thinking);
     let warning = portability_warning(target, placed);
     trace.warn(warning.clone());
     tracing::warn!(route = %route.name, "{}", warning);
@@ -3492,6 +3876,7 @@ fn apply_portability(
 /// Remove non-portable continuation state (thinking parts and tool-call
 /// signatures) from the request and, where the target adapter documents a
 /// substitute, paint its placeholder onto the historical calls it cannot carry.
+/// Explicitly compatible Anthropic thinking blocks remain unchanged.
 /// Returns the number of placeholders applied. Shared by Route-based
 /// `strip_with_warning` fallback and a direct target that has a protocol-valid
 /// same-family translation.
@@ -3499,11 +3884,20 @@ fn strip_nonportable_state(
     req: &mut InternalRequest,
     report: &OpaqueHydrationReport,
     placeholder: Option<&'static str>,
+    preserves_anthropic_thinking: bool,
 ) -> usize {
     let mut placed = 0usize;
     for msg in &mut req.messages {
-        msg.parts
-            .retain(|p| !matches!(p, crate::types::Part::Thinking { .. }));
+        msg.parts.retain(|part| match part {
+            crate::types::Part::Thinking { signature, .. } => {
+                preserves_anthropic_thinking
+                    && signature
+                        .as_deref()
+                        .is_some_and(|signature| !signature.is_empty())
+            }
+            crate::types::Part::RedactedThinking { .. } => preserves_anthropic_thinking,
+            _ => true,
+        });
         for part in &mut msg.parts {
             if let crate::types::Part::ToolCall { id, signature, .. } = part {
                 *signature = None;
@@ -3519,7 +3913,7 @@ fn strip_nonportable_state(
             }
         }
     }
-    strip_opaque_raw_body(req);
+    strip_opaque_raw_body(req, preserves_anthropic_thinking);
     placed
 }
 
@@ -3877,21 +4271,55 @@ impl ToolStreamState {
         let mut out = Vec::with_capacity(events.len());
         for event in events {
             let normalized = match event {
-                StreamEvent::ThinkingDelta { text, signature }
-                    if text.is_empty() && signature.is_some() =>
-                {
+                StreamEvent::ThinkingDelta {
+                    block_index,
+                    text,
+                    signature,
+                } if text.is_empty() && signature.is_some() => {
                     // Signature-only part: remember it for the tool call that
                     // should follow, but still emit the raw event unchanged so
                     // the client encoder behaves exactly as before.
                     self.pending_signature = signature.clone();
-                    StreamEvent::ThinkingDelta { text, signature }
+                    StreamEvent::ThinkingDelta {
+                        block_index,
+                        text,
+                        signature,
+                    }
                 }
-                StreamEvent::ThinkingDelta { text, signature } => {
+                StreamEvent::ThinkingDelta {
+                    block_index,
+                    text,
+                    signature,
+                } => {
                     // Real thinking content is not a signature-only marker;
                     // drop any stale pending signature so it cannot leak onto
                     // an unrelated later tool call.
                     self.pending_signature = None;
-                    StreamEvent::ThinkingDelta { text, signature }
+                    StreamEvent::ThinkingDelta {
+                        block_index,
+                        text,
+                        signature,
+                    }
+                }
+                StreamEvent::ThinkingBlockStart {
+                    index,
+                    thinking,
+                    signature,
+                } => {
+                    self.pending_signature = None;
+                    StreamEvent::ThinkingBlockStart {
+                        index,
+                        thinking,
+                        signature,
+                    }
+                }
+                StreamEvent::ThinkingBlockStop { index } => {
+                    self.pending_signature = None;
+                    StreamEvent::ThinkingBlockStop { index }
+                }
+                StreamEvent::RedactedThinking { index, data } => {
+                    self.pending_signature = None;
+                    StreamEvent::RedactedThinking { index, data }
                 }
                 StreamEvent::TextDelta(text) => {
                     self.pending_signature = None;
@@ -4394,9 +4822,10 @@ async fn drive_stream(
     .await;
 }
 
-/// Same-format passthrough streaming (FR-2.7, FR-2.10). Raw frames are
-/// preserved, but no client bytes are emitted until a semantic upstream event
-/// has been validated.
+/// Same-format passthrough streaming (FR-2.7, FR-2.10). Event payloads are
+/// forwarded without JSON re-encoding, but the SSE framer normalizes line
+/// endings and this driver reconstructs frame delimiters. No client bytes are
+/// emitted until a semantic upstream event has been validated.
 #[allow(clippy::too_many_arguments)]
 async fn drive_stream_passthrough(
     state: AppState,
@@ -5072,6 +5501,16 @@ async fn finalize_log(
     } else {
         "pre_commit"
     };
+    if status != "success" && status != "client_disconnect" {
+        if let Some((kind, upstream_status)) = provider_failure {
+            trace.failure(
+                Some(attempt.target.account.label.clone()),
+                error_message.as_deref().unwrap_or("upstream stream failed"),
+                kind,
+                upstream_status,
+            );
+        }
+    }
     trace.finish(match status {
         "success" => "success",
         "client_disconnect" => "cancelled",
@@ -5627,6 +6066,36 @@ mod route_policy_tests {
         }
     }
 
+    #[test]
+    fn final_direct_timeout_uses_the_shared_policy_status() {
+        let error = failure_to_error(&timeout_failure("timed out"), &target());
+        assert_eq!(
+            error.http_status(),
+            FailureKind::Timeout.policy().client_status.unwrap()
+        );
+        assert_eq!(error.http_status(), 504);
+    }
+
+    #[test]
+    fn host_policy_rejection_has_structured_trace_and_policy_status() {
+        let mut trace = RouteTrace::new("req_test".into(), "model".into());
+        let error = policy_rejection(
+            &mut trace,
+            Some("account-test".into()),
+            "request feature is unsupported",
+        );
+
+        assert_eq!(error.http_status(), 400);
+        let step = trace.steps.last().unwrap();
+        assert_eq!(step.failure_kind.as_deref(), Some("policy_rejected"));
+        assert_eq!(step.failure_category.as_deref(), Some("policy_rejection"));
+        assert_eq!(step.failure_reason.as_deref(), Some("policy_rejected"));
+        assert_eq!(step.fallback_rule.as_deref(), Some("never"));
+        assert_eq!(step.account_health_effect.as_deref(), Some("none"));
+        assert_eq!(step.client_status, Some(400));
+        assert_eq!(step.retry_hint.as_deref(), Some("none"));
+    }
+
     fn route(triggers: Value) -> db::RouteRow {
         db::RouteRow {
             id: "route_test".into(),
@@ -5719,6 +6188,9 @@ mod route_policy_tests {
             secret_enc: String::new(),
             key_mask: String::new(),
             status: "healthy".into(),
+            status_reason: "healthy".into(),
+            status_changed_at: None,
+            account_state_version: 0,
             cooldown_until: None,
             quota_reset_at: None,
             quota_type: "none".into(),
@@ -6463,6 +6935,55 @@ mod route_policy_tests {
     }
 
     #[tokio::test]
+    async fn successful_recovery_reloads_registry_only_after_a_transition() {
+        let (state, root, _, _, account_ids) = adaptive_dry_run_state().await;
+        let account_id = &account_ids[0];
+
+        let initial_state_version = state
+            .registry
+            .account(account_id)
+            .unwrap()
+            .account_state_version;
+        sqlx::query("UPDATE accounts SET last_probe_at='db-only' WHERE id=?")
+            .bind(account_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        recover_successful_account(&state, account_id, initial_state_version, false).await;
+        assert!(state
+            .registry
+            .account(account_id)
+            .unwrap()
+            .last_probe_at
+            .is_none());
+
+        db::record_account_failure(&state.pool, account_id, 1, 30)
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        assert!(state
+            .registry
+            .account(account_id)
+            .unwrap()
+            .circuit_open_until
+            .is_some());
+
+        let probe_state_version = state
+            .registry
+            .account(account_id)
+            .unwrap()
+            .account_state_version;
+        recover_successful_account(&state, account_id, probe_state_version, true).await;
+        let recovered = state.registry.account(account_id).unwrap();
+        assert!(recovered.circuit_open_until.is_none());
+        assert_eq!(recovered.consecutive_failures, 0);
+        assert_eq!(recovered.last_probe_at.as_deref(), Some("db-only"));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn dry_run_reports_no_selection_when_all_adaptive_targets_are_saturated() {
         let (state, root, provider_id, model_id, account_ids) = adaptive_dry_run_state().await;
         let mut permits = Vec::new();
@@ -6985,13 +7506,14 @@ mod route_policy_tests {
     fn signature_only_then_function_call_attaches_pending_signature() {
         let mut state = ToolStreamState::new("req_test");
         let first = state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("SIG".into()),
         }]);
         // The raw thinking event is passed through unchanged.
         assert!(matches!(
             &first[0],
-            StreamEvent::ThinkingDelta { text, signature: Some(sig) }
+            StreamEvent::ThinkingDelta { text, signature: Some(sig), .. }
                 if text.is_empty() && sig == "SIG"
         ));
 
@@ -7036,10 +7558,12 @@ mod route_policy_tests {
         let mut thinking_state = ToolStreamState::new("req_thinking");
         let thinking_events = thinking_state.normalize(vec![
             StreamEvent::ThinkingDelta {
+                block_index: None,
                 text: "reasoning...".into(),
                 signature: None,
             },
             StreamEvent::ThinkingDelta {
+                block_index: None,
                 text: String::new(),
                 signature: Some("SIG_THINK".into()),
             },
@@ -7069,6 +7593,7 @@ mod route_policy_tests {
         let text_events = text_state.normalize(vec![
             StreamEvent::TextDelta("visible response".into()),
             StreamEvent::ThinkingDelta {
+                block_index: None,
                 text: String::new(),
                 signature: Some("SIG_TEXT".into()),
             },
@@ -7099,6 +7624,7 @@ mod route_policy_tests {
     fn pending_signature_not_copied_to_parallel_calls() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("SIG_A".into()),
         }]);
@@ -7132,6 +7658,7 @@ mod route_policy_tests {
     fn explicit_tool_call_signature_wins_over_pending() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("PENDING".into()),
         }]);
@@ -7153,6 +7680,7 @@ mod route_policy_tests {
         // unrelated tool call) must not leak the earlier signature onward.
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("STALE".into()),
         }]);
@@ -7176,6 +7704,7 @@ mod route_policy_tests {
     fn pending_signature_cleared_by_refusal_delta() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("STALE".into()),
         }]);
@@ -7200,10 +7729,12 @@ mod route_policy_tests {
     fn pending_signature_cleared_by_real_thinking_delta() {
         let mut state = ToolStreamState::new("req_test");
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: String::new(),
             signature: Some("STALE".into()),
         }]);
         state.normalize(vec![StreamEvent::ThinkingDelta {
+            block_index: None,
             text: "real reasoning".into(),
             signature: None,
         }]);
@@ -7253,9 +7784,12 @@ mod route_policy_tests {
         let target = target();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         let report = OpaqueHydrationReport::default();
-        apply_portability(&mut req, &route, &target, true, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, true, &report, None, false, &mut trace,
+        )
+        .unwrap();
 
-        assert!(!request_has_opaque_state(&req));
+        assert!(!request_has_nonportable_inline_state(&req, false, true));
         assert!(!trace.warnings.is_empty());
         let raw: Value = serde_json::from_str(req.raw_body.as_deref().unwrap()).unwrap();
         assert_eq!(raw["messages"][0]["content"].as_array().unwrap().len(), 1);
@@ -7276,10 +7810,17 @@ mod route_policy_tests {
         route.portability_policy = "reject".into();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         let report = OpaqueHydrationReport::default();
-        assert!(
-            apply_portability(&mut req, &route, &target(), true, &report, None, &mut trace)
-                .is_err()
-        );
+        assert!(apply_portability(
+            &mut req,
+            &route,
+            &target(),
+            true,
+            &report,
+            None,
+            false,
+            &mut trace,
+        )
+        .is_err());
     }
 
     #[test]
@@ -7294,7 +7835,10 @@ mod route_policy_tests {
             incompatible: 1,
             ..Default::default()
         };
-        apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, false, &report, None, false, &mut trace,
+        )
+        .unwrap();
         assert_eq!(trace.warnings.len(), 1);
     }
 
@@ -7339,6 +7883,7 @@ mod route_policy_tests {
             false,
             &report,
             Some("PLACEHOLDER"),
+            false,
             &mut trace,
         )
         .unwrap();
@@ -7386,7 +7931,10 @@ mod route_policy_tests {
             ..Default::default()
         };
 
-        apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, false, &report, None, false, &mut trace,
+        )
+        .unwrap();
 
         assert!(matches!(
             &req.messages[0].parts[0],
@@ -7410,9 +7958,10 @@ mod route_policy_tests {
             incompatible: 1,
             ..Default::default()
         };
-        assert!(
-            apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).is_err()
-        );
+        assert!(apply_portability(
+            &mut req, &route, &target, false, &report, None, false, &mut trace,
+        )
+        .is_err());
     }
 
     #[test]
@@ -7422,7 +7971,10 @@ mod route_policy_tests {
         let target = target();
         let mut trace = RouteTrace::new("req_test".into(), "route".into());
         let report = OpaqueHydrationReport::default();
-        apply_portability(&mut req, &route, &target, false, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, false, &report, None, false, &mut trace,
+        )
+        .unwrap();
         assert!(trace.warnings.is_empty());
     }
 
@@ -7496,9 +8048,12 @@ mod route_policy_tests {
             ..Default::default()
         };
 
-        let inline = request_has_opaque_state(&req);
+        let inline = request_has_nonportable_inline_state(&req, false, true);
         assert!(inline);
-        apply_portability(&mut req, &route, &target, inline, &report, None, &mut trace).unwrap();
+        apply_portability(
+            &mut req, &route, &target, inline, &report, None, false, &mut trace,
+        )
+        .unwrap();
         hydrate_opaque_state(&mut req, &report);
 
         assert_eq!(req.messages[0].parts.len(), 1);

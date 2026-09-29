@@ -25,7 +25,7 @@ use kinetix::{
     types::{AuthScheme, WireFormat},
 };
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 const CLIENT_KEY: &str = "sk-kinetix-responses-pipeline-test";
 const RPM_DISCONNECT_KEY: &str = "sk-kinetix-disconnect-rpm-test";
@@ -38,17 +38,21 @@ struct CapturedRequest {
     method: Method,
     path: String,
     body: Value,
+    authorization: Option<String>,
 }
 
 #[derive(Clone, Default)]
 struct MockUpstream {
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    stale_auth_started: Arc<Notify>,
+    release_stale_auth: Arc<Notify>,
 }
 
 async fn upstream(
     State(mock): State<MockUpstream>,
     method: Method,
     uri: Uri,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let input = body.get("input");
@@ -77,6 +81,10 @@ async fn upstream(
         method,
         path: uri.path().to_string(),
         body,
+        authorization: headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
     });
 
     match test_case.as_str() {
@@ -102,6 +110,65 @@ async fn upstream(
                 ));
             }))
             .unwrap(),
+        "stale_auth" => {
+            if headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                == Some("Bearer previous")
+            {
+                mock.stale_auth_started.notify_one();
+                mock.release_stale_auth.notified().await;
+                Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"error":{"message":"invalid credential"}}"#))
+                    .unwrap()
+            } else {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "id": "resp_rotated_credential",
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "rotated"}]
+                            }],
+                            "usage": {"input_tokens": 1, "output_tokens": 1}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap()
+            }
+        }
+        "probe_race" => {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "id": "resp_probe_race",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "probe recovered"}]
+                        }],
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }
+        "timeout" => {
+            tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        }
         "stream_refusal" => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
@@ -262,8 +329,24 @@ async fn call_chat(state: &AppState) -> (StatusCode, String) {
     (status, String::from_utf8(body.to_vec()).unwrap())
 }
 
-#[tokio::test]
-async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_end_to_end() {
+// The merged end-to-end future exceeds libtest's default thread stack.
+#[test]
+fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_end_to_end() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(responses_passthrough_policy_refusal_and_incomplete_aggregation_inner())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner() {
     let mock = MockUpstream::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -666,7 +749,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
         json!({"top_k": 23}),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected_top_k}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected_top_k}");
 
     let (status, route_override) = call_responses(
         &state,
@@ -768,8 +851,18 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
     );
     assert_eq!(translated_full["tools"][0]["name"], "weather");
 
+    let (status, timeout_body) = call_responses(
+        &state,
+        "mock-openai-responses/upstream-responses-model",
+        "timeout",
+        false,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{timeout_body}");
+
     let requests = mock.requests.lock().await;
-    assert_eq!(requests.len(), 11);
+    assert_eq!(requests.len(), 12);
     for (request, test_case) in requests
         .iter()
         .take(2)
@@ -828,8 +921,271 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
         requests[10].body.pointer("/messages/0/content/0/text"),
         Some(&json!("case:translated_full"))
     );
+    assert_eq!(requests[11].body["model"], UPSTREAM_MODEL);
+    assert_eq!(requests[11].body["input"], "case:timeout");
     drop(requests);
 
+    // Use a fresh provider circuit and route so earlier test traffic cannot
+    // affect this concurrency regression.
+    let probe_provider_id = db::insert_provider(
+        &state.pool,
+        &db::NewProvider {
+            name: "mock-openai-probe-race",
+            base_url: &base_url,
+            wire_format: WireFormat::Openai,
+            auth_scheme: AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: json!({}),
+            timeout_ms: 2_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: true,
+            wire_plugin: "",
+            credential_plugin: "",
+            model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let probe_account_id = db::insert_account(
+        &state.pool,
+        &probe_provider_id,
+        "probe-race-account",
+        &state.crypto.encrypt("probe-race-key").unwrap(),
+        "probe-race-key",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+    let probe_model_id = db::insert_model(
+        &state.pool,
+        &db::NewModel {
+            provider_id: &probe_provider_id,
+            upstream_id: UPSTREAM_MODEL,
+            display_name: "Probe race model",
+            enabled: true,
+            context_window: None,
+            max_output_tokens: Some(1024),
+            capabilities: json!({"text": true}),
+            prices: json!({}),
+            parameters: json!({}),
+            thinking_map: json!({}),
+            extra_request: json!({}),
+            discovery: json!({"configured_transport": "openai-responses"}),
+        },
+    )
+    .await
+    .unwrap();
+    let probe_route_id = db::insert_route(
+        &state.pool,
+        &db::NewRoute {
+            name: "probe-race-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &state.pool,
+        &probe_route_id,
+        None,
+        &probe_model_id,
+        1,
+        1,
+        "{}",
+        "{}",
+    )
+    .await
+    .unwrap();
+    db::record_account_failure(&state.pool, &probe_account_id, 1, -1)
+        .await
+        .unwrap();
+    state.registry.reload(&state.pool).await.unwrap();
+
+    let (first, second) = tokio::join!(
+        call_responses(&state, "probe-race-route", "probe_race", false, json!({})),
+        call_responses(&state, "probe-race-route", "probe_race", false, json!({})),
+    );
+    assert_eq!(
+        usize::from(first.0.is_success()) + usize::from(second.0.is_success()),
+        1,
+        "exactly one concurrent request should win the half-open probe: {first:?}, {second:?}"
+    );
+    let probe_dispatches = mock
+        .requests
+        .lock()
+        .await
+        .iter()
+        .filter(|request| request.body["input"] == "case:probe_race")
+        .count();
+    assert_eq!(probe_dispatches, 1, "only one upstream probe may dispatch");
+
+    // An in-flight request that used a revoked manual key must not disable a
+    // replacement credential after the operator rotates it.
+    let stale_account_id = db::insert_account(
+        &state.pool,
+        &provider_id,
+        "stale-auth-account",
+        &state.crypto.encrypt("previous").unwrap(),
+        "previous",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+    let stale_route_id = db::insert_route(
+        &state.pool,
+        &db::NewRoute {
+            name: "stale-auth-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &state.pool,
+        &stale_route_id,
+        Some(&stale_account_id),
+        &model_id,
+        1,
+        1,
+        "{}",
+        "{}",
+    )
+    .await
+    .unwrap();
+    state.registry.reload(&state.pool).await.unwrap();
+    let attempt_account = db::get_account(&state.pool, &stale_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let stale_request_state = state.clone();
+    let stale_request = tokio::spawn(async move {
+        call_responses(
+            &stale_request_state,
+            "stale-auth-route",
+            "stale_auth",
+            false,
+            json!({}),
+        )
+        .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        mock.stale_auth_started.notified(),
+    )
+    .await
+    .expect("old-key request should reach the held upstream response");
+    let stale_request_capture = mock
+        .requests
+        .lock()
+        .await
+        .iter()
+        .find(|request| request.body["input"] == "case:stale_auth")
+        .cloned()
+        .expect("stale-auth request should be captured");
+    assert_eq!(
+        stale_request_capture.authorization.as_deref(),
+        Some("Bearer previous")
+    );
+
+    let rotated_body: kinetix::admin::AccountBody = serde_json::from_value(json!({
+        "provider_id": provider_id,
+        "label": "stale-auth-account",
+        "api_key": "replacement",
+        "priority": 1,
+        "weight": 1,
+        "soft_quota_usd": null,
+        "quota_type": "none",
+        "status": null
+    }))
+    .unwrap();
+    let _ = kinetix::admin::update_account(
+        State(state.clone()),
+        kinetix::auth::AdminAuth {
+            actor: "test-admin".into(),
+            token: "test-admin-token".into(),
+        },
+        axum::extract::Path(stale_account_id.clone()),
+        Json(rotated_body),
+    )
+    .await
+    .expect("manual credential rotation should succeed");
+    let rotated_account = db::get_account(&state.pool, &stale_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rotated_account.account_state_version > attempt_account.account_state_version);
+    assert_eq!(rotated_account.status, "healthy");
+    assert_eq!(rotated_account.key_mask, crypto::mask_secret("replacement"));
+
+    mock.release_stale_auth.notify_one();
+    let _ = stale_request.await.unwrap();
+    let after_stale_failure = db::get_account(&state.pool, &stale_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_stale_failure.status, "healthy",
+        "a 401 from the replaced key must not disable the new credential"
+    );
+    assert_eq!(
+        after_stale_failure.key_mask,
+        crypto::mask_secret("replacement")
+    );
+    assert_eq!(
+        state
+            .crypto
+            .decrypt(&after_stale_failure.secret_enc)
+            .unwrap(),
+        "replacement"
+    );
+    let (status, body) =
+        call_responses(&state, "stale-auth-route", "stale_auth", false, json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rotated credential should remain eligible: {body}"
+    );
+    let rotated_request = mock
+        .requests
+        .lock()
+        .await
+        .iter()
+        .filter(|request| request.body["input"] == "case:stale_auth")
+        .last()
+        .cloned()
+        .expect("replacement credential request should be captured");
+    assert_eq!(
+        rotated_request.authorization.as_deref(),
+        Some("Bearer replacement")
+    );
     let first = call_raw_responses(
         &state,
         json!({

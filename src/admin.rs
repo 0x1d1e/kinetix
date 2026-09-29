@@ -7344,7 +7344,7 @@ pub async fn test_account(
         .unwrap_or(0);
 
     if ok {
-        let _ = db::touch_probe_at(&state.pool, &id).await;
+        let _ = db::record_manual_probe_at(&state.pool, &id).await;
         let _ = db::reset_account_failures(&state.pool, &id).await;
     }
     let _ = db::insert_audit(
@@ -7461,6 +7461,43 @@ fn default_true() -> bool {
     true
 }
 
+const MAX_CONTINUATION_FAMILIES: usize = 32;
+const MAX_CONTINUATION_FAMILY_LENGTH: usize = 128;
+
+fn validate_continuation_families(value: &Value) -> Result<Vec<String>, ApiError> {
+    let Some(families) = value.get("continuation_families") else {
+        return Ok(Vec::new());
+    };
+    let families = families.as_array().ok_or_else(|| {
+        ApiError::bad("capabilities.continuation_families must be an array of strings")
+    })?;
+    if families.len() > MAX_CONTINUATION_FAMILIES {
+        return Err(ApiError::bad(format!(
+            "capabilities.continuation_families may contain at most {MAX_CONTINUATION_FAMILIES} values"
+        )));
+    }
+
+    let mut normalized = Vec::with_capacity(families.len());
+    for family in families {
+        let family = family.as_str().ok_or_else(|| {
+            ApiError::bad("capabilities.continuation_families must contain only strings")
+        })?;
+        let family = family.trim();
+        if family.is_empty()
+            || family.len() > MAX_CONTINUATION_FAMILY_LENGTH
+            || family.chars().any(char::is_control)
+        {
+            return Err(ApiError::bad(
+                "continuation family names must be non-empty, at most 128 bytes, and contain no control characters",
+            ));
+        }
+        if !normalized.iter().any(|existing| existing == family) {
+            normalized.push(family.to_string());
+        }
+    }
+    Ok(normalized)
+}
+
 fn normalize_model_capabilities(value: &Value) -> Value {
     let Some(input) = value.as_object() else {
         return json!({});
@@ -7488,7 +7525,42 @@ fn normalize_model_capabilities(value: &Value) -> Value {
             out.insert(canonical.to_string(), Value::Bool(value));
         }
     }
+    if let Ok(families) = validate_continuation_families(value) {
+        if !families.is_empty() {
+            out.insert("continuation_families".into(), json!(families));
+        }
+    }
     Value::Object(out)
+}
+
+#[cfg(test)]
+mod continuation_family_tests {
+    use super::*;
+
+    #[test]
+    fn continuation_families_are_trimmed_and_deduplicated() {
+        let capabilities = json!({"continuation_families": [" example:v1 ", "example:v1"]});
+        assert_eq!(
+            validate_continuation_families(&capabilities).unwrap(),
+            vec!["example:v1"]
+        );
+        assert_eq!(
+            normalize_model_capabilities(&capabilities)["continuation_families"],
+            json!(["example:v1"])
+        );
+    }
+
+    #[test]
+    fn invalid_continuation_families_are_rejected() {
+        for capabilities in [
+            json!({"continuation_families": "example:v1"}),
+            json!({"continuation_families": [" "]}),
+            json!({"continuation_families": [1]}),
+            json!({"continuation_families": ["invalid\nfamily"]}),
+        ] {
+            assert!(validate_continuation_families(&capabilities).is_err());
+        }
+    }
 }
 
 fn validate_thinking_map(thinking_map: &ThinkingMap) -> Result<(), ApiError> {
@@ -7547,6 +7619,7 @@ pub async fn create_model(
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
     let transport_override =
         validate_model_transport_override(&provider, body.transport_override.as_deref())?;
+    validate_continuation_families(&body.capabilities)?;
     let caps = normalize_model_capabilities(&body.capabilities);
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     validate_thinking_map(&body.thinking_map)?;
@@ -7691,6 +7764,7 @@ pub async fn update_model(
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
     let transport_override =
         validate_model_transport_override(&provider, body.transport_override.as_deref())?;
+    validate_continuation_families(&body.capabilities)?;
     let caps = normalize_model_capabilities(&body.capabilities);
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     let existing_discovery = discovery_object(&model);
@@ -7833,7 +7907,7 @@ pub async fn list_accounts(
     Query(query): Query<AccountListQuery>,
 ) -> ApiResult {
     let accounts = if let Some(provider_id) = query.provider_id.as_deref() {
-        db::accounts_for_provider(&state.pool, provider_id)
+        db::list_accounts_for_provider(&state.pool, provider_id)
             .await
             .map_err(ApiError::internal)?
     } else {
@@ -7875,13 +7949,17 @@ fn account_json(
         .find(|p| p.id == a.provider_id)
         .map(|p| p.name.clone())
         .unwrap_or_default();
+    let lifecycle = crate::pool::lifecycle_at(a, chrono::Utc::now());
     json!({
         "id": a.id,
         "provider_id": a.provider_id,
         "provider_name": provider_name,
         "label": a.label,
         "key_mask": a.key_mask,
-        "status": a.status,
+        "status": lifecycle.status.as_admin_str(),
+        "status_reason": lifecycle.reason_code,
+        "status_changed_at": lifecycle.status_changed_at,
+        "retry_at": lifecycle.retry_at,
         "cooldown_until": a.cooldown_until,
         "quota_reset_at": a.quota_reset_at,
         "quota_type": a.quota_type,
@@ -7981,20 +8059,18 @@ pub async fn update_account(
     Path(id): Path<String>,
     Json(body): Json<AccountBody>,
 ) -> ApiResult {
-    db::update_account(
-        &state.pool,
-        &id,
-        &body.label,
-        body.status.as_deref().unwrap_or("healthy"),
-        body.priority,
-        body.weight,
-        body.soft_quota_usd,
-        &body.quota_type,
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    // Optionally rotate a manually enrolled credential.
-    if let Some(api_key) = body.api_key.filter(|k| !k.trim().is_empty()) {
+    if body
+        .status
+        .as_deref()
+        .is_some_and(|status| !matches!(status, "healthy" | "disabled"))
+    {
+        return Err(ApiError::bad(
+            "account status must be either healthy or disabled",
+        ));
+    }
+    // Validate and prepare credential rotation before applying any account
+    // configuration or lifecycle changes, so rejected edits are side-effect free.
+    let rotated_credential = if let Some(api_key) = body.api_key.filter(|k| !k.trim().is_empty()) {
         let account = db::get_account(&state.pool, &id)
             .await
             .map_err(ApiError::internal)?
@@ -8007,14 +8083,26 @@ pub async fn update_account(
             return Err(ApiError::bad(error));
         }
         let enc = state.crypto.encrypt(&api_key).map_err(ApiError::internal)?;
-        sqlx::query("UPDATE accounts SET secret_enc=?, key_mask=? WHERE id=?")
-            .bind(enc)
-            .bind(crypto::mask_secret(&api_key))
-            .bind(&id)
-            .execute(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    }
+        Some((enc, crypto::mask_secret(&api_key)))
+    } else {
+        None
+    };
+
+    db::update_account(
+        &state.pool,
+        &id,
+        &body.label,
+        body.status.as_deref(),
+        body.priority,
+        body.weight,
+        body.soft_quota_usd,
+        &body.quota_type,
+        rotated_credential
+            .as_ref()
+            .map(|(encrypted_key, key_mask)| (encrypted_key.as_str(), key_mask.as_str())),
+    )
+    .await
+    .map_err(ApiError::internal)?;
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -8498,6 +8586,9 @@ pub async fn validate_model_edit(
         &body.parameters,
     );
     let mut validation_problems = body.thinking_map.validation_errors();
+    if let Err(error) = validate_continuation_families(&body.capabilities) {
+        validation_problems.push(error.1);
+    }
     if let Some(transport) = body
         .transport_override
         .as_deref()
@@ -10528,6 +10619,7 @@ pub async fn import_config(
         let Some(pid) = provider_ids.get(provider) else {
             continue;
         };
+        validate_continuation_families(&m["capabilities"])?;
         let caps = normalize_model_capabilities(&m["capabilities"]);
         let prices: Prices = serde_json::from_value(m["prices"].clone()).unwrap_or_default();
         let parameters = m["parameters"].clone();
@@ -11004,7 +11096,8 @@ async fn reconcile_provider_account_mode(
                          status='healthy', cooldown_until=NULL, quota_reset_at=NULL,
                          quota_type='none', quota_window_s=NULL, soft_quota_usd=NULL,
                          priority=1, weight=1, last_error=NULL, last_probe_at=NULL,
-                         circuit_open_until=NULL, consecutive_failures=0
+                         circuit_open_until=NULL, consecutive_failures=0,
+                         account_state_version=account_state_version + 1
                      WHERE id=?",
                 )
                 .bind(&empty_secret)
@@ -11073,6 +11166,7 @@ async fn reconcile_provider_account_mode(
     Ok(())
 }
 
+#[cfg(test)]
 async fn reconcile_provider_credential_semantics(
     state: &AppState,
     provider_id: &str,
@@ -14717,7 +14811,12 @@ mod reasoning_discovery_control_plane_tests {
 #[cfg(test)]
 mod credential_enrollment_regression_tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::Barrier;
+    use tower::ServiceExt;
 
     struct ExpiredCredential;
 
@@ -17874,6 +17973,527 @@ mod credential_enrollment_regression_tests {
         assert!(!audit.iter().any(|entry| {
             entry.action == "plugin_account_authorized" && entry.target_id == account_id
         }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reset_endpoint_keeps_manually_disabled_accounts_disabled() {
+        let (state, root) = test_state("reset-manually-disabled").await;
+        let provider_id = insert_provider(
+            &state,
+            "manual-disable",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("test-key").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "disabled-account",
+            &encrypted,
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        db::update_account(
+            &state.pool,
+            &account_id,
+            "disabled-account",
+            Some("disabled"),
+            1,
+            1,
+            None,
+            "none",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let _response = reset_account(
+            State(state.clone()),
+            crate::auth::AdminAuth {
+                actor: "admin".into(),
+                token: "test-admin".into(),
+            },
+            Path(account_id.clone()),
+        )
+        .await
+        .unwrap();
+
+        let account = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.status, "disabled");
+        db::set_account_status(
+            &state.pool,
+            &account_id,
+            "healthy",
+            "probe_healthy",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let before_recovery = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!db::recover_account_after_success(
+            &state.pool,
+            &account_id,
+            before_recovery.account_state_version,
+            false,
+        )
+        .await
+        .unwrap());
+        let account = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.status, "disabled");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn account_edits_preserve_disabled_state_and_admin_lists_its_lifecycle() {
+        let (state, root) = test_state("disabled-lifecycle-api").await;
+        let provider_id = insert_provider(
+            &state,
+            "disabled-lifecycle",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("test-key").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "disabled-account",
+            &encrypted,
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        db::update_account(
+            &state.pool,
+            &account_id,
+            "disabled-account",
+            Some("disabled"),
+            1,
+            1,
+            None,
+            "none",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let _response = update_account(
+            State(state.clone()),
+            auth(),
+            Path(account_id.clone()),
+            Json(AccountBody {
+                provider_id: provider_id.clone(),
+                label: "renamed-disabled-account".into(),
+                api_key: None,
+                priority: 1,
+                weight: 1,
+                soft_quota_usd: None,
+                quota_type: "none".into(),
+                status: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let account = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.status, "disabled");
+        assert_eq!(account.status_reason, "operator_disabled");
+        assert!(account.status_changed_at.is_some());
+
+        let fixed_timestamp = "2000-01-01T00:00:00Z";
+        sqlx::query("UPDATE accounts SET status_changed_at=? WHERE id=?")
+            .bind(fixed_timestamp)
+            .bind(&account_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let _response = update_account(
+            State(state.clone()),
+            auth(),
+            Path(account_id.clone()),
+            Json(AccountBody {
+                provider_id: provider_id.clone(),
+                label: "renamed-disabled-account".into(),
+                api_key: None,
+                priority: 1,
+                weight: 1,
+                soft_quota_usd: None,
+                quota_type: "none".into(),
+                status: Some("disabled".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let account = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.status_changed_at.as_deref(), Some(fixed_timestamp));
+
+        let Json(body) = list_accounts(
+            State(state.clone()),
+            auth(),
+            Query(AccountListQuery {
+                provider_id: Some(provider_id),
+            }),
+        )
+        .await
+        .unwrap();
+        let listed = body["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|listed| listed["id"] == account_id)
+            .unwrap();
+        assert_eq!(listed["status"], "disabled");
+        assert_eq!(listed["status_reason"], "operator_disabled");
+        assert!(listed["status_changed_at"].is_string());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn account_update_rejects_runtime_and_unknown_statuses() {
+        let (state, root) = test_state("invalid-account-status").await;
+        let provider_id = insert_provider(
+            &state,
+            "invalid-account-status",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("test-key").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "account",
+            &encrypted,
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let app = crate::router::build(state.clone());
+
+        for status in ["cooldown", "exhausted", "degraded", "unknown"] {
+            match status {
+                "cooldown" => {
+                    db::set_account_status(
+                        &state.pool,
+                        &account_id,
+                        "cooldown",
+                        "rate_limited",
+                        Some(&future),
+                        None,
+                        Some("rate limited"),
+                    )
+                    .await
+                    .unwrap();
+                }
+                "exhausted" => {
+                    db::set_account_status(
+                        &state.pool,
+                        &account_id,
+                        "exhausted",
+                        "account_quota_exhausted",
+                        None,
+                        Some(&future),
+                        Some("quota exhausted"),
+                    )
+                    .await
+                    .unwrap();
+                }
+                "degraded" => {
+                    db::set_account_status(
+                        &state.pool,
+                        &account_id,
+                        "healthy",
+                        "healthy",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    db::record_account_failure(&state.pool, &account_id, 1, 60)
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+
+            let before = db::get_account(&state.pool, &account_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri(format!("/admin/api/accounts/{account_id}"))
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .header("x-kinetix-admin-token", "test-admin")
+                        .body(axum::body::Body::from(
+                            json!({
+                                "provider_id": provider_id,
+                                "label": "account",
+                                "api_key": null,
+                                "priority": 1,
+                                "weight": 1,
+                                "soft_quota_usd": null,
+                                "quota_type": "none",
+                                "status": status,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "status {status}"
+            );
+
+            let after = db::get_account(&state.pool, &account_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.status, before.status);
+            assert_eq!(after.status_reason, before.status_reason);
+            assert_eq!(after.cooldown_until, before.cooldown_until);
+            assert_eq!(after.quota_reset_at, before.quota_reset_at);
+            assert_eq!(after.circuit_open_until, before.circuit_open_until);
+            assert_eq!(after.consecutive_failures, before.consecutive_failures);
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credential_rotation_is_published_with_its_account_generation() {
+        const ROTATIONS: usize = 24;
+        let (state, root) = test_state("atomic-credential-rotation").await;
+        let provider_id = insert_provider(
+            &state,
+            "atomic-credential-rotation",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let initial_key = "initial-manual-credential";
+        let encrypted = state.crypto.encrypt(initial_key).unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "generation-0",
+            &encrypted,
+            &crypto::mask_secret(initial_key),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let initial_version = state.registry.snapshot().accounts[&account_id].account_state_version;
+        let barrier = Arc::new(Barrier::new(2));
+        let rotation_active = Arc::new(AtomicBool::new(true));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let saw_rotation = Arc::new(AtomicBool::new(false));
+
+        let reader_state = state.clone();
+        let reader_id = account_id.clone();
+        let reader_barrier = barrier.clone();
+        let reader_active = rotation_active.clone();
+        let reader_count = reads.clone();
+        let reader_saw_rotation = saw_rotation.clone();
+        let reader = tokio::spawn(async move {
+            reader_barrier.wait().await;
+            while reader_active.load(Ordering::Acquire) {
+                reader_state
+                    .registry
+                    .reload(&reader_state.pool)
+                    .await
+                    .unwrap();
+                let account = reader_state.registry.snapshot().accounts[&reader_id].clone();
+                let generation =
+                    usize::try_from(account.account_state_version - initial_version).unwrap();
+                assert!(generation <= ROTATIONS);
+                let expected_key = if generation == 0 {
+                    initial_key.to_owned()
+                } else {
+                    format!("rotated-credential-{generation}")
+                };
+                assert_eq!(
+                    reader_state.crypto.decrypt(&account.secret_enc).unwrap(),
+                    expected_key
+                );
+                assert_eq!(account.key_mask, crypto::mask_secret(&expected_key));
+                assert_eq!(account.label, format!("generation-{generation}"));
+                reader_count.fetch_add(1, Ordering::Relaxed);
+                if generation > 0 {
+                    reader_saw_rotation.store(true, Ordering::Relaxed);
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        barrier.wait().await;
+        for generation in 1..=ROTATIONS {
+            let _response = update_account(
+                State(state.clone()),
+                auth(),
+                Path(account_id.clone()),
+                Json(AccountBody {
+                    provider_id: provider_id.clone(),
+                    label: format!("generation-{generation}"),
+                    api_key: Some(format!("rotated-credential-{generation}")),
+                    priority: 1,
+                    weight: 1,
+                    soft_quota_usd: None,
+                    quota_type: "none".into(),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        rotation_active.store(false, Ordering::Release);
+        reader.await.unwrap();
+
+        assert!(reads.load(Ordering::Relaxed) > 0);
+        assert!(saw_rotation.load(Ordering::Relaxed));
+        state.registry.reload(&state.pool).await.unwrap();
+        let final_account = &state.registry.snapshot().accounts[&account_id];
+        assert_eq!(
+            final_account.account_state_version,
+            initial_version + ROTATIONS as i64
+        );
+        assert_eq!(
+            state.crypto.decrypt(&final_account.secret_enc).unwrap(),
+            format!("rotated-credential-{ROTATIONS}")
+        );
+        assert_eq!(
+            final_account.key_mask,
+            crypto::mask_secret(&format!("rotated-credential-{ROTATIONS}"))
+        );
+        assert_eq!(final_account.label, format!("generation-{ROTATIONS}"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn rejected_credential_rotation_does_not_mutate_account_lifecycle() {
+        let (state, root) = test_state("rejected-account-credential-rotation").await;
+        let provider_id = insert_provider(
+            &state,
+            "rejected-account-credential-rotation",
+            crate::plugins::CredentialMode::AuthFlow,
+            Some("plugin.test"),
+            Some("oauth"),
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("existing-oauth-credential").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "account",
+            &encrypted,
+            "oauth:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let cooldown_until = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        db::set_account_status(
+            &state.pool,
+            &account_id,
+            "cooldown",
+            "rate_limited",
+            Some(&cooldown_until),
+            None,
+            Some("rate limited"),
+        )
+        .await
+        .unwrap();
+        let before = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = update_account(
+            State(state.clone()),
+            auth(),
+            Path(account_id.clone()),
+            Json(AccountBody {
+                provider_id,
+                label: "updated-account".into(),
+                api_key: Some("candidate-manual-credential".into()),
+                priority: 1,
+                weight: 1,
+                soft_quota_usd: None,
+                quota_type: "none".into(),
+                status: Some("healthy".into()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+
+        let after = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.label, before.label);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.status_reason, before.status_reason);
+        assert_eq!(after.status_changed_at, before.status_changed_at);
+        assert_eq!(after.cooldown_until, before.cooldown_until);
+        assert_eq!(after.account_state_version, before.account_state_version);
+        assert_eq!(after.key_mask, before.key_mask);
 
         let _ = std::fs::remove_dir_all(root);
     }

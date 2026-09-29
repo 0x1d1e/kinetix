@@ -9,9 +9,9 @@ use serde_json::{json, Value};
 use crate::types::{FailureKind, FinishReason, StreamEvent, TokenUsage, UpstreamFailure};
 
 pub const RESPONSE_SCHEMA: &str = "kinetix.plugin.response";
-pub const RESPONSE_SCHEMA_VERSION: u64 = 1;
+pub const RESPONSE_SCHEMA_VERSION: u64 = 2;
 
-/// Serialize successful internal events into the canonical v1 response envelope.
+/// Serialize successful internal events into the canonical v2 response envelope.
 pub fn events_to_json(events: &[StreamEvent]) -> String {
     let events: Vec<Value> = events.iter().map(event_to_value).collect();
     let value = json!({
@@ -34,9 +34,9 @@ pub fn json_to_events(s: &str) -> Result<Vec<StreamEvent>, UpstreamFailure> {
 
     if let Some(events) = value.as_array() {
         tracing::warn!(
-            "plugin adapter returned legacy unversioned event array; update it to kinetix.plugin.response v1"
+            "plugin adapter returned legacy unversioned event array; update it to kinetix.plugin.response v2"
         );
-        return decode_events(events);
+        return decode_events(events, 1);
     }
 
     let object = value
@@ -57,9 +57,9 @@ pub fn json_to_events(s: &str) -> Result<Vec<StreamEvent>, UpstreamFailure> {
         .get("schema_version")
         .and_then(Value::as_u64)
         .ok_or_else(|| contract_failure("missing or non-integer 'schema_version'"))?;
-    if version != RESPONSE_SCHEMA_VERSION {
+    if !matches!(version, 1 | RESPONSE_SCHEMA_VERSION) {
         return Err(contract_failure(format!(
-            "unsupported schema_version {version}; expected {RESPONSE_SCHEMA_VERSION}"
+            "unsupported schema_version {version}; supported versions are 1 and {RESPONSE_SCHEMA_VERSION}"
         )));
     }
 
@@ -68,10 +68,10 @@ pub fn json_to_events(s: &str) -> Result<Vec<StreamEvent>, UpstreamFailure> {
         .and_then(Value::as_array)
         .ok_or_else(|| contract_failure("missing or non-array 'events'"))?;
 
-    decode_events(events)
+    decode_events(events, version)
 }
 
-fn decode_events(events: &[Value]) -> Result<Vec<StreamEvent>, UpstreamFailure> {
+fn decode_events(events: &[Value], version: u64) -> Result<Vec<StreamEvent>, UpstreamFailure> {
     let mut out = Vec::with_capacity(events.len());
 
     for event in events {
@@ -92,7 +92,7 @@ fn decode_events(events: &[Value]) -> Result<Vec<StreamEvent>, UpstreamFailure> 
                 }
                 return Err(error_event_to_failure(event)?);
             }
-            _ => out.push(value_to_event(event)?),
+            _ => out.push(value_to_event(event, version)?),
         }
     }
 
@@ -107,10 +107,34 @@ fn event_to_value(event: &StreamEvent) -> Value {
             "type": "start",
             "upstream_request_id": upstream_request_id,
         }),
-        StreamEvent::ThinkingDelta { text, signature } => json!({
+        StreamEvent::ThinkingBlockStart {
+            index,
+            thinking,
+            signature,
+        } => json!({
+            "type": "thinking_block_start",
+            "index": index,
+            "thinking": thinking,
+            "signature": signature,
+        }),
+        StreamEvent::ThinkingDelta {
+            block_index,
+            text,
+            signature,
+        } => json!({
             "type": "thinking_delta",
+            "block_index": block_index,
             "text": text,
             "signature": signature,
+        }),
+        StreamEvent::ThinkingBlockStop { index } => json!({
+            "type": "thinking_block_stop",
+            "index": index,
+        }),
+        StreamEvent::RedactedThinking { index, data } => json!({
+            "type": "redacted_thinking",
+            "index": index,
+            "data": data,
         }),
         StreamEvent::TextDelta(text) | StreamEvent::RefusalDelta(text) => json!({
             "type": "text_delta",
@@ -148,7 +172,7 @@ fn event_to_value(event: &StreamEvent) -> Value {
     }
 }
 
-fn value_to_event(value: &Value) -> Result<StreamEvent, UpstreamFailure> {
+fn value_to_event(value: &Value, version: u64) -> Result<StreamEvent, UpstreamFailure> {
     let event_type = required_str(value, "type")?;
 
     match event_type {
@@ -156,8 +180,27 @@ fn value_to_event(value: &Value) -> Result<StreamEvent, UpstreamFailure> {
             upstream_request_id: optional_str(value, "upstream_request_id")?.map(str::to_string),
         }),
         "thinking_delta" => Ok(StreamEvent::ThinkingDelta {
+            // In v1 this is an unknown additive field, so ignore it. Its
+            // meaning is defined only by v2; known-field validation stays strict.
+            block_index: if version >= 2 {
+                optional_u32(value, "block_index")?
+            } else {
+                None
+            },
             text: required_str(value, "text")?.to_string(),
             signature: optional_str(value, "signature")?.map(str::to_string),
+        }),
+        "thinking_block_start" if version >= 2 => Ok(StreamEvent::ThinkingBlockStart {
+            index: required_u32(value, "index")?,
+            thinking: required_str(value, "thinking")?.to_string(),
+            signature: optional_str(value, "signature")?.map(str::to_string),
+        }),
+        "thinking_block_stop" if version >= 2 => Ok(StreamEvent::ThinkingBlockStop {
+            index: required_u32(value, "index")?,
+        }),
+        "redacted_thinking" if version >= 2 => Ok(StreamEvent::RedactedThinking {
+            index: required_u32(value, "index")?,
+            data: required_str(value, "data")?.to_string(),
         }),
         "text_delta" => Ok(StreamEvent::TextDelta(
             required_str(value, "text")?.to_string(),
@@ -213,17 +256,8 @@ fn validate_warning(value: &Value) -> Result<(), UpstreamFailure> {
 
 fn error_event_to_failure(value: &Value) -> Result<UpstreamFailure, UpstreamFailure> {
     let kind_name = required_str(value, "kind")?;
-    let kind = match kind_name {
-        "rate_limit" => FailureKind::RateLimit,
-        "quota_exhausted" => FailureKind::QuotaExhausted,
-        "auth_error" => FailureKind::AuthError,
-        "target_error" => FailureKind::TargetError,
-        "server_error" => FailureKind::ServerError,
-        "connection_error" => FailureKind::ConnectionError,
-        "timeout" => FailureKind::Timeout,
-        "bad_request" => FailureKind::BadRequest,
-        other => return Err(contract_failure(format!("unknown error.kind '{other}'"))),
-    };
+    let kind = FailureKind::parse(kind_name)
+        .ok_or_else(|| contract_failure(format!("unknown error.kind '{kind_name}'")))?;
 
     let message = required_str(value, "message")?;
     if message.is_empty() {
@@ -286,6 +320,15 @@ fn required_u32(value: &Value, field: &str) -> Result<u32, UpstreamFailure> {
     u32::try_from(number).map_err(|_| contract_failure(format!("'{field}' exceeds u32 range")))
 }
 
+fn optional_u32(value: &Value, field: &str) -> Result<Option<u32>, UpstreamFailure> {
+    match optional_u64(value, field)? {
+        Some(number) => u32::try_from(number)
+            .map(Some)
+            .map_err(|_| contract_failure(format!("'{field}' exceeds u32 range"))),
+        None => Ok(None),
+    }
+}
+
 fn optional_u16(value: &Value, field: &str) -> Result<Option<u16>, UpstreamFailure> {
     match optional_u64(value, field)? {
         Some(number) => u16::try_from(number)
@@ -297,7 +340,7 @@ fn optional_u16(value: &Value, field: &str) -> Result<Option<u16>, UpstreamFailu
 
 fn contract_failure(message: impl Into<String>) -> UpstreamFailure {
     UpstreamFailure {
-        kind: FailureKind::ServerError,
+        kind: FailureKind::PluginFailure,
         status: None,
         retry_after_secs: None,
         message: format!("plugin response contract: {}", message.into()),
