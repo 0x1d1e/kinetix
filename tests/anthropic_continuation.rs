@@ -50,7 +50,7 @@ async fn upstream(
             .map(str::to_owned),
     });
     drop(requests);
-    if is_first_attempt {
+    if is_first_attempt && body["metadata"]["test_allow_initial_success"] != true {
         // A 500 exercises Route fallback without the outbound transport's
         // separate retry for transient 502/503/504 gateway errors.
         return (StatusCode::INTERNAL_SERVER_ERROR, "try fallback").into_response();
@@ -110,6 +110,7 @@ struct Harness {
     mock: MockUpstream,
     server: tokio::task::JoinHandle<()>,
     root: std::path::PathBuf,
+    initial_origin_key: String,
     history_origin_key: String,
 }
 
@@ -301,6 +302,7 @@ async fn setup(
         mock,
         server,
         root,
+        initial_origin_key: format!("{route_id}|{}|{}", account_ids[0], model_ids[0]),
         history_origin_key: format!("{route_id}|{}|{}", account_ids[2], model_ids[2]),
     }
 }
@@ -350,6 +352,14 @@ async fn run(harness: &Harness, body: Value) -> (u16, Option<String>) {
     (status, warning)
 }
 
+fn first_turn_request() -> Value {
+    json!({
+        "model": "anthropic-route",
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": "first turn"}]
+    })
+}
+
 fn continuation_request() -> Value {
     json!({
         "model": "anthropic-route",
@@ -369,9 +379,20 @@ fn continuation_request() -> Value {
 #[tokio::test]
 async fn compatible_anthropic_fallback_preserves_thinking_and_redacted_state() {
     let harness = setup("strip_with_warning", "claude-sonnet-5", true).await;
-    let (status, warning) = run(&harness, continuation_request()).await;
-    assert_eq!(status, 200);
-    assert_eq!(warning, None, "compatible continuation should not warn");
+    harness
+        .state
+        .sticky_remember("session-a", harness.initial_origin_key.clone());
+    let response =
+        dispatch_with_session(&harness, continuation_request(), Some("session-a".into())).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-kinetix-warning"),
+        None,
+        "compatible continuation should not warn"
+    );
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
 
     let requests = harness.mock.requests.lock().await;
     assert_eq!(
@@ -398,6 +419,109 @@ async fn compatible_anthropic_fallback_preserves_thinking_and_redacted_state() {
             "type": "redacted_thinking",
             "data": "opaque-redacted-state"
         })));
+    drop(requests);
+    cleanup(harness).await;
+}
+
+#[tokio::test]
+async fn missing_session_provenance_does_not_guess_first_route_target() {
+    let harness = setup("strip_with_warning", "claude-opus-5", false).await;
+
+    let mut first_request = first_turn_request();
+    first_request["stream"] = json!(true);
+    let first_response = dispatch(&harness, first_request).await;
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_bytes = axum::body::to_bytes(first_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let first_body = String::from_utf8(first_bytes.to_vec()).unwrap();
+    assert!(first_body.contains(r#""thinking":"foo""#));
+    assert!(first_body.contains(r#""signature":"sig""#));
+    assert!(first_body.contains("opaque-redacted-state"));
+
+    let second_request = json!({
+        "model": "anthropic-route",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": "first turn"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "foobar", "signature": "sig"},
+                {"type": "redacted_thinking", "data": "opaque-redacted-state"},
+                {"type": "tool_use", "id": "toolu_mock", "name": "lookup", "input": {"city": "Paris"}}
+            ]},
+            {"role": "user", "content": "second turn"}
+        ]
+    });
+    let second_response = dispatch(&harness, second_request).await;
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let warning = second_response
+        .headers()
+        .get("x-kinetix-warning")
+        .and_then(|value| value.to_str().ok())
+        .expect("unknown continuation origin must be reported");
+    assert!(warning.contains("omitted"));
+    let _ = axum::body::to_bytes(second_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    let requests = harness.mock.requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].authorization.as_deref(), Some("Bearer key-a"));
+    assert_eq!(requests[1].authorization.as_deref(), Some("Bearer key-b"));
+    assert_eq!(requests[2].authorization.as_deref(), Some("Bearer key-a"));
+    let second_turn_content = requests[2].body["messages"][1]["content"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !second_turn_content.iter().any(|part| {
+            matches!(
+                part["type"].as_str(),
+                Some("thinking" | "redacted_thinking")
+            )
+        }),
+        "B's continuation state must not be replayed to recovered A without provenance"
+    );
+    drop(requests);
+    cleanup(harness).await;
+}
+
+#[tokio::test]
+async fn compatible_raw_passthrough_strips_unsigned_thinking() {
+    let harness = setup("strip_with_warning", "claude-sonnet-5", true).await;
+    harness
+        .state
+        .sticky_remember("session-a", harness.initial_origin_key.clone());
+    let mut bootstrap = first_turn_request();
+    bootstrap["metadata"] = json!({"test_allow_initial_success": true});
+    let first = dispatch_with_session(&harness, bootstrap, Some("session-a".into())).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(first.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    let mut request = continuation_request();
+    request["messages"][1]["content"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("signature");
+    let response = dispatch_with_session(&harness, request, Some("session-a".into())).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key("x-kinetix-warning"));
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    let requests = harness.mock.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].authorization.as_deref(), Some("Bearer key-a"));
+    assert_eq!(requests[1].authorization.as_deref(), Some("Bearer key-a"));
+    let content = requests[1].body["messages"][1]["content"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !content.iter().any(|part| part["type"] == "thinking"),
+        "unsigned thinking must not leak through raw-body passthrough"
+    );
     drop(requests);
     cleanup(harness).await;
 }
@@ -553,6 +677,10 @@ async fn incompatible_anthropic_fallback_obeys_reject_policy() {
         result.is_err(),
         "reject policy must stop before fallback dispatch"
     );
-    assert_eq!(harness.mock.requests.lock().await.len(), 1);
+    assert_eq!(
+        harness.mock.requests.lock().await.len(),
+        0,
+        "reject policy must fail closed before dispatch when historical provenance is unknown"
+    );
     cleanup(harness).await;
 }

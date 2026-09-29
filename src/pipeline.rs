@@ -786,10 +786,15 @@ pub async fn run(
                 .map(continuation_origin)
         })
     });
-    let initial_origin = targets.first().map(continuation_origin);
+    let possible_history_origins = targets.iter().map(continuation_origin).collect::<Vec<_>>();
+    let initial_origin = possible_history_origins.first().cloned();
     // Anthropic continuation state was produced by successful conversation
     // history, not by any fallback candidate dispatched during this request.
-    let history_origin = session_origin.as_ref().or(initial_origin.as_ref());
+    // Without a session, a multi-target Route has no known producer; only
+    // preserve reasoning when every candidate is explicitly compatible.
+    let history_origin = session_origin
+        .as_ref()
+        .or_else(|| (possible_history_origins.len() == 1).then(|| &possible_history_origins[0]));
 
     // Sticky routing and prompt-cache affinity share the same bounded session
     // mapping: both prefer the last successful target while still allowing
@@ -1048,9 +1053,17 @@ pub async fn run(
         // Anthropic continuation is safe for the same provider/model, or when
         // both models explicitly share an operator-declared continuation family.
         // Wire-format and upstream model-name equality alone are insufficient.
+        let history_is_compatible = history_origin.map_or_else(
+            || {
+                possible_history_origins
+                    .iter()
+                    .all(|origin| anthropic_continuation_is_compatible(Some(origin), target))
+            },
+            |origin| anthropic_continuation_is_compatible(Some(origin), target),
+        );
         let preserves_anthropic_thinking = format == FrontendFormat::Anthropic
             && adapter.wire_format() == "anthropic"
-            && anthropic_continuation_is_compatible(history_origin, target);
+            && history_is_compatible;
         // Evaluate inline opaque state before hydration so a signature about to
         // be restored for a compatible target is not mistaken for client state.
         let inline_opaque = request_has_nonportable_inline_state(
@@ -3269,7 +3282,10 @@ fn request_has_nonportable_inline_state(
     req.messages.iter().any(|message| {
         message.parts.iter().any(|part| match part {
             crate::types::Part::Thinking { signature, .. } => {
-                !preserves_anthropic_thinking || signature.is_none()
+                !preserves_anthropic_thinking
+                    || !signature
+                        .as_deref()
+                        .is_some_and(|signature| !signature.is_empty())
             }
             crate::types::Part::RedactedThinking { .. } => !preserves_anthropic_thinking,
             crate::types::Part::ToolCall {
@@ -3302,10 +3318,18 @@ fn strip_opaque_raw_body(req: &mut InternalRequest, preserves_anthropic_thinking
         let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
             continue;
         };
-        parts.retain(|part| {
-            let block_type = part.get("type").and_then(Value::as_str);
-            preserves_anthropic_thinking
-                || !matches!(block_type, Some("thinking" | "redacted_thinking"))
+        parts.retain(|part| match part.get("type").and_then(Value::as_str) {
+            Some("thinking") => {
+                preserves_anthropic_thinking
+                    && part
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .is_some_and(|signature| !signature.is_empty())
+            }
+            Some("redacted_thinking") => {
+                preserves_anthropic_thinking && part.get("data").and_then(Value::as_str).is_some()
+            }
+            _ => true,
         });
         for part in parts {
             let block_type = part.get("type").and_then(Value::as_str);
@@ -3524,7 +3548,10 @@ fn strip_nonportable_state(
     for msg in &mut req.messages {
         msg.parts.retain(|part| match part {
             crate::types::Part::Thinking { signature, .. } => {
-                preserves_anthropic_thinking && signature.is_some()
+                preserves_anthropic_thinking
+                    && signature
+                        .as_deref()
+                        .is_some_and(|signature| !signature.is_empty())
             }
             crate::types::Part::RedactedThinking { .. } => preserves_anthropic_thinking,
             _ => true,

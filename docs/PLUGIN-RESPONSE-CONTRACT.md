@@ -54,7 +54,7 @@ Kinetix validates the contract before converting guest output into internal stre
 - Required fields must exist with the documented JSON type; no defaults are guessed.
 - Numeric fields must be non-negative integers and fit the target integer width.
 - Optional fields may be absent or `null`; a wrong non-null type is rejected.
-- Version 1 rejects version 2-only thinking fields and event types.
+- Version 1 ignores `thinking_delta.block_index` as an unknown additive field; block-aware thinking events are version 2-only.
 - Unknown event types are rejected.
 - A terminal `error` event must be the sole event in its envelope so successful deltas cannot be silently discarded with the failure.
 - Terminal error messages and warning messages are redacted again by the host.

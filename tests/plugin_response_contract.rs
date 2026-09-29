@@ -137,6 +137,32 @@ fn v1_golden_fixture_decodes() {
 }
 
 #[test]
+fn v1_ignores_additive_thinking_delta_fields() {
+    for block_index in [json!(7), json!("reserved for v2")] {
+        let fixture = json!({
+            "schema": "kinetix.plugin.response",
+            "schema_version": 1,
+            "events": [{
+                "type": "thinking_delta",
+                "block_index": block_index,
+                "text": "thinking",
+                "future_field": true
+            }]
+        })
+        .to_string();
+        let events = json_to_events(&fixture).expect("unknown v1 event fields are additive");
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::ThinkingDelta {
+                block_index: None,
+                text,
+                signature: None
+            }] if text == "thinking"
+        ));
+    }
+}
+
+#[test]
 fn parallel_tools_and_reasoning_keep_stable_plugin_identity() {
     let events = json_to_events(PARALLEL_TOOLS_REASONING).expect("valid parallel fixture");
 

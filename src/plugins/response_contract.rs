@@ -180,14 +180,11 @@ fn value_to_event(value: &Value, version: u64) -> Result<StreamEvent, UpstreamFa
             upstream_request_id: optional_str(value, "upstream_request_id")?.map(str::to_string),
         }),
         "thinking_delta" => Ok(StreamEvent::ThinkingDelta {
+            // In v1 this is an unknown additive field, so ignore it. Its
+            // meaning is defined only by v2; known-field validation stays strict.
             block_index: if version >= 2 {
                 optional_u32(value, "block_index")?
             } else {
-                if value.get("block_index").is_some() {
-                    return Err(contract_failure(
-                        "'block_index' requires response schema v2",
-                    ));
-                }
                 None
             },
             text: required_str(value, "text")?.to_string(),
