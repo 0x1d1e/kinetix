@@ -25,15 +25,19 @@ UP_LOG="$WORK/upstream.log"
 SMOKE_BOOTSTRAP="$WORK/smoke-bootstrap.toml"
 PRE_DISPATCH_RPM_KEY="sk-kinetix-$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
 PRE_DISPATCH_TPM_KEY="sk-kinetix-$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+ACTIVE_BUDGET_KEY="sk-kinetix-$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+ACTIVE_UNKNOWN_BUDGET_KEY="sk-kinetix-$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
 cp "$ROOT/scripts/smoke-bootstrap.toml" "$SMOKE_BOOTSTRAP" || { echo "failed to prepare smoke bootstrap"; exit 1; }
 PRE_DISPATCH_RPM_KEY="$PRE_DISPATCH_RPM_KEY" \
 PRE_DISPATCH_TPM_KEY="$PRE_DISPATCH_TPM_KEY" \
+ACTIVE_BUDGET_KEY="$ACTIVE_BUDGET_KEY" \
+ACTIVE_UNKNOWN_BUDGET_KEY="$ACTIVE_UNKNOWN_BUDGET_KEY" \
 python3 - "$SMOKE_BOOTSTRAP" <<'PY' || { echo "failed to prepare smoke bootstrap"; exit 1; }
 import os, sys
 from pathlib import Path
 path = Path(sys.argv[1])
 text = path.read_text()
-for name in ("PRE_DISPATCH_RPM_KEY", "PRE_DISPATCH_TPM_KEY"):
+for name in ("PRE_DISPATCH_RPM_KEY", "PRE_DISPATCH_TPM_KEY", "ACTIVE_BUDGET_KEY", "ACTIVE_UNKNOWN_BUDGET_KEY"):
     placeholder = f"__{name}__"
     if text.count(placeholder) != 1:
         raise SystemExit(f"expected one {placeholder} placeholder")
@@ -203,6 +207,74 @@ for _ in $(seq 1 50); do
 done
 check "unknown failed cost stays outside known subtotal" "$FAIL_BUDGET_USAGE" '"known_cost_usd":0.0'
 check "unknown failed cost still makes budget remainder unknown" "$FAIL_BUDGET_USAGE" '"daily_budget_usd":null'
+
+# Active priced reservations reduce client-visible remaining budget and affect
+# admission before the stream settles.
+ACTIVE_BUDGET_SETTLED_CODE="$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' \
+  -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $ACTIVE_BUDGET_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"model":"syn-openai-partial","stream":false,"max_tokens":100,"messages":[{"role":"user","content":"settled budget seed"}]}')"
+check "priced budget seed request succeeds" "$ACTIVE_BUDGET_SETTLED_CODE" '200'
+for _ in $(seq 1 50); do
+  ACTIVE_BUDGET_SETTLED_USAGE="$(curl -s "$BASE/v1/usage" -H "authorization: Bearer $ACTIVE_BUDGET_KEY")"
+  if python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["usage"]["daily"]["requests"] == 1 else 1)' <<<"$ACTIVE_BUDGET_SETTLED_USAGE"; then
+    break
+  fi
+  sleep 0.1
+done
+ACTIVE_BUDGET_REQUEST='{"model":"syn-openai-partial","stream":true,"max_tokens":8000,"messages":[{"role":"user","content":"fixture:hold-budget"}]}'
+curl -s -N --max-time 30 -X POST "$BASE/v1/chat/completions" \
+  -H "authorization: Bearer $ACTIVE_BUDGET_KEY" -H 'content-type: application/json' \
+  -d "$ACTIVE_BUDGET_REQUEST" >"$WORK/active-budget-stream" &
+ACTIVE_BUDGET_STREAM_PID=$!
+for _ in $(seq 1 100); do
+  ACTIVE_BUDGET_USAGE="$(curl -s "$BASE/v1/usage" -H "authorization: Bearer $ACTIVE_BUDGET_KEY")"
+  if python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["admission"]["in_flight"] == 1 else 1)' <<<"$ACTIVE_BUDGET_USAGE"; then
+    break
+  fi
+  sleep 0.05
+done
+ACTIVE_BUDGET_SNAPSHOT_OK="$(python3 - "$ACTIVE_BUDGET_USAGE" <<'PY'
+import json, math, sys
+body = json.loads(sys.argv[1])
+daily = body["admission"]["budget"]["daily"]
+remaining = body["remaining"]["daily_budget_usd"]
+expected = max(1.0 - daily["settled_spend_usd"] - daily["active_reserved_usd"], 0.0)
+assert daily["settled_spend_usd"] > 0.0
+assert daily["active_reserved_usd"] >= 0.8
+assert not daily["unknown_active_cost"]
+assert math.isclose(remaining, expected, rel_tol=0.0, abs_tol=1e-9)
+assert 0.0 < remaining < 0.3
+print("yes")
+PY
+)"
+check "active priced reservation reduces remaining budget" "$ACTIVE_BUDGET_SNAPSHOT_OK" 'yes'
+ACTIVE_BUDGET_FOLLOWUP_CODE="$(curl -s --max-time 20 -o "$WORK/active-budget-followup" -w '%{http_code}' \
+  -X POST "$BASE/v1/chat/completions" -H "authorization: Bearer $ACTIVE_BUDGET_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"model":"syn-openai-partial","stream":false,"max_tokens":3000,"messages":[{"role":"user","content":"budget followup"}]}')"
+check "follow-up is rejected against active budget reservation" "$ACTIVE_BUDGET_FOLLOWUP_CODE" '429'
+kill "$ACTIVE_BUDGET_STREAM_PID" 2>/dev/null || true
+wait "$ACTIVE_BUDGET_STREAM_PID" 2>/dev/null || true
+
+# An active unpriced request makes the remaining budget unknown.
+ACTIVE_UNKNOWN_BUDGET_REQUEST='{"model":"syn-openai","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"fixture:hold-budget"}]}'
+curl -s -N --max-time 30 -X POST "$BASE/v1/chat/completions" \
+  -H "authorization: Bearer $ACTIVE_UNKNOWN_BUDGET_KEY" -H 'content-type: application/json' \
+  -d "$ACTIVE_UNKNOWN_BUDGET_REQUEST" >"$WORK/active-unknown-budget-stream" &
+ACTIVE_UNKNOWN_BUDGET_STREAM_PID=$!
+for _ in $(seq 1 100); do
+  ACTIVE_UNKNOWN_BUDGET_USAGE="$(curl -s "$BASE/v1/usage" -H "authorization: Bearer $ACTIVE_UNKNOWN_BUDGET_KEY")"
+  if python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["admission"]["in_flight"] == 1 else 1)' <<<"$ACTIVE_UNKNOWN_BUDGET_USAGE"; then
+    break
+  fi
+  sleep 0.05
+done
+check "active unpriced request makes remaining budget unknown" "$ACTIVE_UNKNOWN_BUDGET_USAGE" '"daily_budget_usd":null'
+check "active unpriced request is flagged in aggregate snapshot" "$ACTIVE_UNKNOWN_BUDGET_USAGE" '"unknown_active_cost":true'
+check_absent "client budget snapshot hides individual reservations" "$ACTIVE_UNKNOWN_BUDGET_USAGE" 'request_id'
+kill "$ACTIVE_UNKNOWN_BUDGET_STREAM_PID" 2>/dev/null || true
+wait "$ACTIVE_UNKNOWN_BUDGET_STREAM_PID" 2>/dev/null || true
 
 # Partial provider usage must keep cost and budget state unknown.
 PARTIAL_USAGE_KEY="sk-kinetix-smoke-partial-usage-budget"

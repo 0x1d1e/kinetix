@@ -44,6 +44,22 @@ allowed_models = ["syn-openai-partial"]
 daily_budget = 1.0
 
 [[virtual_keys]]
+name = "Active Budget Key"
+key = "__ACTIVE_BUDGET_KEY__"
+owner = "smoke"
+tag = "active-budget"
+allowed_models = ["syn-openai-partial"]
+daily_budget = 1.0
+
+[[virtual_keys]]
+name = "Active Unknown Budget Key"
+key = "__ACTIVE_UNKNOWN_BUDGET_KEY__"
+owner = "smoke"
+tag = "active-unknown-budget"
+allowed_models = ["syn-openai"]
+daily_budget = 1.0
+
+[[virtual_keys]]
 name = "Pre-dispatch RPM Key"
 key = "__PRE_DISPATCH_RPM_KEY__"
 owner = "smoke"

@@ -431,6 +431,8 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(TTFT_MS / 1000.0)
             frame({"id": "syn-1", "object": "chat.completion.chunk", "model": model,
                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+            if _fixture(req, "hold-budget"):
+                time.sleep(5)
             if want_tools:
                 # Emit a function call with the arguments split across frames so
                 # the tool-argument reassembly path is exercised.

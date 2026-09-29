@@ -235,6 +235,19 @@ pub struct AdmissionEstimate {
     pub cost: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdmissionBudgetPeriodSnapshot {
+    pub settled_spend_usd: f64,
+    pub active_reserved_usd: f64,
+    pub has_unknown_active_cost: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdmissionBudgetSnapshot {
+    pub daily: AdmissionBudgetPeriodSnapshot,
+    pub monthly: AdmissionBudgetPeriodSnapshot,
+}
+
 pub struct AdmissionReservation {
     entry: Arc<KeyAdmission>,
     // Instrument the existing reservation lifetime without changing ledger policy.
@@ -333,6 +346,17 @@ impl AdmissionController {
             .get(key_id)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Client-safe aggregate view of settled spend and active budget reservations.
+    pub async fn budget_snapshot(&self, pool: &Pool, key_id: &str) -> AdmissionBudgetSnapshot {
+        let entry = self.entry(key_id);
+        self.ensure_initialized(pool, key_id, &entry).await;
+        let snapshot = entry
+            .ledger
+            .lock()
+            .budget_snapshot(Utc::now(), Instant::now());
+        snapshot
     }
 
     pub fn reserve_concurrency(
@@ -571,6 +595,43 @@ impl KeyLedger {
             }
         }
         (requests, tokens, daily, monthly)
+    }
+
+    fn budget_snapshot(
+        &mut self,
+        now_wall: chrono::DateTime<Utc>,
+        now: Instant,
+    ) -> AdmissionBudgetSnapshot {
+        self.roll_periods(now_wall);
+        self.prune(now);
+        let day = now_wall.date_naive();
+        let month = (now_wall.year(), now_wall.month());
+        let mut snapshot = AdmissionBudgetSnapshot {
+            daily: AdmissionBudgetPeriodSnapshot {
+                settled_spend_usd: self.daily_spend,
+                ..Default::default()
+            },
+            monthly: AdmissionBudgetPeriodSnapshot {
+                settled_spend_usd: self.monthly_spend,
+                ..Default::default()
+            },
+        };
+
+        for active in self.active.values() {
+            if active.day == day {
+                match active.cost {
+                    Some(cost) => snapshot.daily.active_reserved_usd += cost,
+                    None => snapshot.daily.has_unknown_active_cost = true,
+                }
+            }
+            if active.month == month {
+                match active.cost {
+                    Some(cost) => snapshot.monthly.active_reserved_usd += cost,
+                    None => snapshot.monthly.has_unknown_active_cost = true,
+                }
+            }
+        }
+        snapshot
     }
 
     fn check_current(
@@ -1044,6 +1105,64 @@ mod tests {
             16,
         );
         assert_eq!(reservations.len(), 3);
+    }
+
+    #[test]
+    fn budget_snapshot_includes_active_reservations_without_exposing_them_individually() {
+        let (controller, entry) = initialized_controller();
+        let mut key = key();
+        key.daily_budget = Some(1.0);
+        key.monthly_budget = Some(2.0);
+        let reservation = controller
+            .reserve_initialized(
+                entry.clone(),
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.8),
+                },
+            )
+            .unwrap();
+
+        let snapshot = entry
+            .ledger
+            .lock()
+            .budget_snapshot(Utc::now(), Instant::now());
+        assert_eq!(snapshot.daily.settled_spend_usd, 0.0);
+        assert_eq!(snapshot.daily.active_reserved_usd, 0.8);
+        assert!(!snapshot.daily.has_unknown_active_cost);
+        assert_eq!(snapshot.monthly.active_reserved_usd, 0.8);
+        assert!(!snapshot.monthly.has_unknown_active_cost);
+        assert!(controller
+            .reserve_initialized(
+                entry.clone(),
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.3),
+                },
+            )
+            .is_err());
+
+        let unknown = controller
+            .reserve_initialized(
+                entry.clone(),
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: None,
+                },
+            )
+            .unwrap();
+        let snapshot = entry
+            .ledger
+            .lock()
+            .budget_snapshot(Utc::now(), Instant::now());
+        assert!(snapshot.daily.has_unknown_active_cost);
+        assert!(snapshot.monthly.has_unknown_active_cost);
+        assert_eq!(snapshot.daily.active_reserved_usd, 0.8);
+        drop(unknown);
+        drop(reservation);
     }
 
     #[test]

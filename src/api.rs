@@ -568,13 +568,17 @@ pub async fn client_usage(State(state): State<AppState>, headers: HeaderMap) -> 
         }
     };
 
-    let remaining = |limit: Option<f64>, summary: &db::ClientUsageSummary| {
-        let limit = limit.filter(|value| *value > 0.0)?;
-        if summary.unknown_cost_requests > 0 {
-            return None;
-        }
-        Some((limit - summary.known_cost_usd).max(0.0))
-    };
+    let budget = state.admission.budget_snapshot(&state.pool, &key.id).await;
+    let remaining =
+        |limit: Option<f64>,
+         summary: &db::ClientUsageSummary,
+         admission: crate::admission::AdmissionBudgetPeriodSnapshot| {
+            let limit = limit.filter(|value| *value > 0.0)?;
+            if summary.unknown_cost_requests > 0 || admission.has_unknown_active_cost {
+                return None;
+            }
+            Some((limit - admission.settled_spend_usd - admission.active_reserved_usd).max(0.0))
+        };
     Json(serde_json::json!({
         "periods": {
             "daily": { "from": daily_from, "to": now_iso, "timezone": "UTC" },
@@ -589,14 +593,28 @@ pub async fn client_usage(State(state): State<AppState>, headers: HeaderMap) -> 
             "monthly_budget_usd": key.monthly_budget.filter(|value| *value > 0.0),
         },
         "remaining": {
-            "daily_budget_usd": remaining(key.daily_budget, &daily),
-            "monthly_budget_usd": remaining(key.monthly_budget, &monthly),
+            "daily_budget_usd": remaining(key.daily_budget, &daily, budget.daily),
+            "monthly_budget_usd": remaining(key.monthly_budget, &monthly, budget.monthly),
         },
         "resets": {
             "daily": daily_reset.to_rfc3339(),
             "monthly": monthly_reset.to_rfc3339(),
         },
-        "admission": { "in_flight": state.admission.key_inflight(&key.id) },
+        "admission": {
+            "in_flight": state.admission.key_inflight(&key.id),
+            "budget": {
+                "daily": {
+                    "settled_spend_usd": budget.daily.settled_spend_usd,
+                    "active_reserved_usd": budget.daily.active_reserved_usd,
+                    "unknown_active_cost": budget.daily.has_unknown_active_cost,
+                },
+                "monthly": {
+                    "settled_spend_usd": budget.monthly.settled_spend_usd,
+                    "active_reserved_usd": budget.monthly.active_reserved_usd,
+                    "unknown_active_cost": budget.monthly.has_unknown_active_cost,
+                },
+            },
+        },
     }))
     .into_response()
 }

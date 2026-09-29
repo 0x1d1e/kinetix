@@ -119,7 +119,21 @@ rows, with legacy request rows included when no attempt data exists.
   },
   "remaining": { "daily_budget_usd": null, "monthly_budget_usd": null },
   "resets": { "daily": "...", "monthly": "..." },
-  "admission": { "in_flight": 0 }
+  "admission": {
+    "in_flight": 0,
+    "budget": {
+      "daily": {
+        "settled_spend_usd": 0,
+        "active_reserved_usd": 0,
+        "unknown_active_cost": false
+      },
+      "monthly": {
+        "settled_spend_usd": 0,
+        "active_reserved_usd": 0,
+        "unknown_active_cost": false
+      }
+    }
+  }
 }
 ```
 
@@ -127,12 +141,17 @@ rows, with legacy request rows included when no attempt data exists.
 request in the window lacks that token count. `known_cost_usd` is the numeric
 subtotal for priced requests, including `0` when none are priced;
 `unknown_cost_requests` counts unpriced requests and signals that total spend is
-incomplete. Remaining budgets are `null` when any request is unpriced. Admission
-also retains conservative cost reservations for failed requests with unknown
-cost across restarts; these reservations are not reported as known cost. Unset
-limits are `null`. The endpoint never returns model, Route, provider, account,
-or other key identities. Database failures during key authentication or usage
-aggregation return a generic 503; details are logged server-side.
+incomplete. Remaining budgets are `null` when any request is unpriced or an
+active request has unknown cost. Otherwise, remaining budgets subtract settled
+admission spend and active conservative reservations, matching budget admission.
+`admission.budget` exposes only per-period aggregates: settled spend, active
+reserved cost, and whether any active cost is unknown. It never exposes
+individual reservations. Admission also retains conservative cost reservations
+for failed requests with unknown cost across restarts; these reservations are not
+reported as known cost. Unset limits are `null`. The endpoint never returns
+model, Route, provider, account, or other key identities. Database failures
+during key authentication or usage aggregation return a generic 503; details are
+logged server-side.
 
 ## Exports (JSONL + CSV)
 
