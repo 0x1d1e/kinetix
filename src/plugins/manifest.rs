@@ -135,6 +135,27 @@ fn validate_for_host(
         if integration.name.trim().is_empty() {
             bail!("integration '{}' name must not be empty", integration.id);
         }
+        match (&integration.features, &integration.protocols) {
+            (Some(features), Some(protocols)) => {
+                features.validate().map_err(|error| {
+                    anyhow!("integration '{}' features: {error}", integration.id)
+                })?;
+                protocols.validate().map_err(|error| {
+                    anyhow!("integration '{}' protocols: {error}", integration.id)
+                })?;
+                if features.model_discovery != integration.model_source.is_some() {
+                    bail!(
+                        "integration '{}' model_discovery must match whether model_source is declared",
+                        integration.id
+                    );
+                }
+            }
+            (None, None) => {}
+            _ => bail!(
+                "integration '{}' must declare features and protocols together",
+                integration.id
+            ),
+        }
         if let Some(mode) = integration.credential_mode {
             match mode {
                 CredentialMode::AuthFlow
@@ -724,6 +745,50 @@ network_hosts = ["api.foo.example", "*.svc.example"]
 memory = "128MiB"
 storage = "2MiB"
 "#;
+
+    #[test]
+    fn parses_and_validates_versioned_integration_metadata() {
+        let metadata = GOOD.replace(
+            "[[ui.actions]]",
+            "[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = false\nreasoning = true\nstructured_output = false\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"anthropic\"]\nupstream = [\"plugin-native\"]\n\n[[ui.actions]]",
+        );
+        let validated = parse_and_validate(&metadata, HostPolicy::default()).unwrap();
+        let integration = &validated.manifest.integrations[0];
+        assert_eq!(integration.features.as_ref().unwrap().schema_version, 1);
+        assert!(integration.features.as_ref().unwrap().parallel_tools);
+        assert_eq!(
+            integration.protocols.as_ref().unwrap().upstream,
+            ["plugin-native".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_versioned_integration_metadata() {
+        let metadata = GOOD.replace(
+            "[[ui.actions]]",
+            "[integrations.features]\nschema_version = 1\nstreaming = true\ntools = false\nparallel_tools = true\nvision = false\nreasoning = true\nstructured_output = false\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\"]\nupstream = [\"plugin-native\"]\n\n[[ui.actions]]",
+        );
+        let error = parse_and_validate(&metadata, HostPolicy::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("parallel_tools requires tools"),
+            "{error}"
+        );
+
+        let metadata = metadata.replace("tools = false", "tools = true");
+        let metadata =
+            metadata.replace("upstream = [\"plugin-native\"]", "upstream = [\"unknown\"]");
+        let error = parse_and_validate(&metadata, HostPolicy::default()).unwrap_err();
+        assert!(error.to_string().contains("unknown protocol"), "{error}");
+
+        let metadata =
+            metadata.replace("upstream = [\"unknown\"]", "upstream = [\"plugin-native\"]");
+        let metadata = metadata.replace("model_discovery = true", "model_discovery = false");
+        let error = parse_and_validate(&metadata, HostPolicy::default()).unwrap_err();
+        assert!(
+            error.to_string().contains("model_discovery must match"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn validates_a_good_manifest() {

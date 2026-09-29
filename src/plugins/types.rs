@@ -249,6 +249,70 @@ impl CredentialMode {
     }
 }
 
+/// Versioned integration-level feature declarations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationFeaturesV1 {
+    pub schema_version: u32,
+    pub streaming: bool,
+    pub tools: bool,
+    pub parallel_tools: bool,
+    pub vision: bool,
+    pub reasoning: bool,
+    pub structured_output: bool,
+    pub model_discovery: bool,
+    pub quota_probe: bool,
+    pub health_probe: bool,
+}
+
+impl IntegrationFeaturesV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1 {
+            return Err(format!(
+                "unsupported integration feature schema_version {}",
+                self.schema_version
+            ));
+        }
+        if self.parallel_tools && !self.tools {
+            return Err("parallel_tools requires tools".into());
+        }
+        Ok(())
+    }
+}
+
+/// Versioned input and upstream protocol declarations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationProtocolsV1 {
+    pub input: Vec<String>,
+    pub upstream: Vec<String>,
+}
+
+impl IntegrationProtocolsV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        const FORMATS: &[&str] = &[
+            "openai-chat",
+            "openai-responses",
+            "anthropic",
+            "gemini",
+            "plugin-native",
+        ];
+        for (name, formats) in [("input", &self.input), ("upstream", &self.upstream)] {
+            let unique: std::collections::HashSet<_> = formats.iter().collect();
+            if unique.len() != formats.len() {
+                return Err(format!("protocols.{name} must not contain duplicates"));
+            }
+            if formats
+                .iter()
+                .any(|format| !FORMATS.contains(&format.as_str()))
+            {
+                return Err(format!("protocols.{name} contains an unknown protocol"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A user-facing integration assembled from one or more capabilities provided
 /// by the same plugin. This metadata is declarative only: it grants no
 /// authority and contains no browser-executable code.
@@ -269,6 +333,10 @@ pub struct Integration {
     pub auth_flow: Option<String>,
     #[serde(default)]
     pub model_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<IntegrationFeaturesV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocols: Option<IntegrationProtocolsV1>,
     #[serde(default)]
     pub provider: Option<IntegrationProvider>,
 }

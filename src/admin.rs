@@ -13258,6 +13258,8 @@ mod credential_enrollment_tests {
                 credential_strategy: Some("first-strategy".into()),
                 auth_flow: Some("shared-login".into()),
                 model_source: None,
+                features: None,
+                protocols: None,
                 provider: None,
             },
             crate::plugins::Integration {
@@ -13269,6 +13271,8 @@ mod credential_enrollment_tests {
                 credential_strategy: Some("second-strategy".into()),
                 auth_flow: Some("shared-login".into()),
                 model_source: None,
+                features: None,
+                protocols: None,
                 provider: None,
             },
         ];
@@ -14730,10 +14734,11 @@ mod reasoning_discovery_control_plane_tests {
     }
 
     #[test]
-    fn unsupported_plugin_capability_schema_is_ignored() {
+    fn invalid_plugin_capability_schema_is_ignored() {
         for metadata in [
             json!({
                 "schema_version": 3,
+                "transport": {"format": "unknown"},
                 "reasoning": {
                     "supported": true,
                     "mode": "toggle",
@@ -14762,6 +14767,43 @@ mod reasoning_discovery_control_plane_tests {
             assert!(observation.reasoning.is_none());
             assert!(observation.thinking_map.is_none());
         }
+    }
+
+    #[test]
+    fn valid_plugin_v3_capabilities_survive_discovery() {
+        let observation = discovered_observation(
+            model("reasoner"),
+            Some(json!({"id": "reasoner", "owned_by": "example"})),
+            Some(json!({
+                "schema_version": 3,
+                "transport": {
+                    "format": "openai-chat",
+                    "endpoint": "/v1/chat/completions",
+                    "alternatives": [{"format": "anthropic"}]
+                },
+                "reasoning": {
+                    "supported": true,
+                    "mode": "level",
+                    "levels": ["low", "high"],
+                    "default": "high",
+                    "can_disable": false
+                },
+                "tools": {"supported": true},
+                "parallel_tools": {"supported": true}
+            })),
+            WireFormat::Plugin,
+        );
+
+        assert_eq!(observation.reasoning_support, Some(true));
+        assert_eq!(
+            observation.reasoning.as_ref().unwrap().levels,
+            ["low", "high"]
+        );
+        assert_eq!(observation.capabilities.tool_calling, Some(true));
+        assert_eq!(
+            observation.capability_sources["reasoning"],
+            "plugin_capabilities_json"
+        );
     }
 
     #[test]
