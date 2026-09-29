@@ -570,11 +570,34 @@ async fn revoking_a_permission_disables_the_plugin() {
 }
 
 #[tokio::test]
-async fn incompatible_api_is_rejected_before_enable() {
+async fn api_v1_and_v2_manifests_are_accepted_and_v3_is_rejected() {
     let (m, _pool) = manager().await;
-    let bad = GOOD_MANIFEST.replace("plugin_api = \"1\"", "plugin_api = \"2\"");
-    let kxp = build_kxp(&bad, VALID_COMPONENT);
-    let err = m.install(&kxp, None, &[], false).await.unwrap_err();
+    for major in [1, 2] {
+        let manifest = GOOD_MANIFEST
+            .replace("dev.example.foo", &format!("dev.example.foo.v{major}"))
+            .replace("plugin_api = \"1\"", &format!("plugin_api = \"{major}\""));
+        let outcome = m
+            .install(&build_kxp(&manifest, VALID_COMPONENT), None, &[], false)
+            .await
+            .unwrap();
+        assert_eq!(outcome.id, format!("dev.example.foo.v{major}"));
+        assert_eq!(
+            m.get(&outcome.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .manifest()
+                .unwrap()
+                .api_major(),
+            Some(major)
+        );
+    }
+
+    let bad = GOOD_MANIFEST.replace("plugin_api = \"1\"", "plugin_api = \"3\"");
+    let err = m
+        .install(&build_kxp(&bad, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("incompatible plugin_api"), "{err}");
 }
 

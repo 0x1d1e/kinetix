@@ -63,6 +63,18 @@ pub mod adapter_bindings {
     });
 }
 
+/// Session-aware provider adapters use API v2 while sharing the unchanged v1
+/// host capability interfaces.
+pub mod adapter_v2_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit/v2",
+        world: "plugin-adapter-v2",
+        imports: { default: async | trappable },
+        exports: { default: async },
+        anyhow: true,
+    });
+}
+
 pub use bindings::kinetix::plugin as wit;
 
 /// Reserved KV namespace for cached routing facts (§6.4). Values written here
@@ -338,6 +350,18 @@ impl PluginRuntime {
         adapter_bindings::PluginAdapter::instantiate_async(store, component, linker)
             .await
             .map_err(|e| anyhow::anyhow!("instantiating plugin adapter component: {e}"))
+    }
+
+    /// Instantiate a session-aware API-v2 adapter component.
+    pub async fn instantiate_adapter_v2(
+        &self,
+        linker: &Linker<HostCtx>,
+        store: &mut Store<HostCtx>,
+        component: &Component,
+    ) -> Result<adapter_v2_bindings::PluginAdapterV2> {
+        adapter_v2_bindings::PluginAdapterV2::instantiate_async(store, component, linker)
+            .await
+            .map_err(|e| anyhow::anyhow!("instantiating plugin API v2 adapter component: {e}"))
     }
 
     /// Arm a wall-time budget for a store (§14, §15): the returned guard bumps

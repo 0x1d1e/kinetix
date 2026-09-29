@@ -20,7 +20,8 @@ use crate::db::Pool;
 use super::manifest::{self, HostPolicy};
 use super::package::{self, Package, SignatureStatus};
 use super::runtime::{
-    bindings, wit, DeadlineGuard, HostBacking, HostCtx, PluginFault, PluginRuntime, CONFIG_PREFIX,
+    adapter_bindings, adapter_v2_bindings, bindings, wit, DeadlineGuard, HostBacking, HostCtx,
+    PluginFault, PluginRuntime, CONFIG_PREFIX,
 };
 use super::store::{self, PermissionGrant, PluginRow};
 use super::types::{Capability, Manifest, Permissions, Provided};
@@ -249,6 +250,7 @@ enum ValidationWorld {
     Auth,
     AccountModelSource,
     ProviderAdapter,
+    ProviderAdapterV2,
 }
 
 /// The plugin manager. Cheap to clone (Arc inside).
@@ -1332,6 +1334,7 @@ impl PluginManager {
             ValidationWorld::Auth => "plugin-auth",
             ValidationWorld::AccountModelSource => "plugin-model-source",
             ValidationWorld::ProviderAdapter => "plugin-adapter",
+            ValidationWorld::ProviderAdapterV2 => "plugin-adapter-v2",
         };
         let mut store = self.new_validation_store(plugin_id, limits, "validation");
         let _deadline = self.inner.runtime.arm_deadline(
@@ -1361,6 +1364,12 @@ impl PluginManager {
                 self.inner
                     .runtime
                     .instantiate_adapter(linker, &mut store, component)
+                    .await?;
+            }
+            ValidationWorld::ProviderAdapterV2 => {
+                self.inner
+                    .runtime
+                    .instantiate_adapter_v2(linker, &mut store, component)
                     .await?;
             }
         }
@@ -1426,20 +1435,20 @@ impl PluginManager {
             })?;
         }
         if !provides.provider_adapters.is_empty() {
-            self.validate_component_world(
-                &manifest.id,
-                limits,
-                component,
-                &linker,
-                ValidationWorld::ProviderAdapter,
-            )
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "plugin '{}' failed provider-adapter world validation: {e}",
-                    manifest.id
-                )
-            })?;
+            let (world, world_name) = match manifest.api_major() {
+                Some(1) => (ValidationWorld::ProviderAdapter, "provider-adapter"),
+                Some(2) => (ValidationWorld::ProviderAdapterV2, "provider-adapter-v2"),
+                Some(major) => bail!("unsupported plugin API major {major}"),
+                None => bail!("plugin '{}' has invalid plugin_api", manifest.id),
+            };
+            self.validate_component_world(&manifest.id, limits, component, &linker, world)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "plugin '{}' failed {world_name} world validation: {e}",
+                        manifest.id
+                    )
+                })?;
         }
         Ok(())
     }
@@ -1653,6 +1662,7 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
+        let api_major = manifest.api_major();
         let (validated, grants) = self
             .validated_manifest_with_approved_permissions(id, manifest)
             .await?;
@@ -1661,11 +1671,22 @@ impl PluginManager {
         let component = self.compiled_component(&row)?;
         let linker = self.inner.runtime.linker()?;
         let mut store = self.new_store(&row, &limits, &grants, true, false, "provider_adapter");
-        let plugin = self
-            .inner
-            .runtime
-            .instantiate_adapter(&linker, &mut store, component.as_ref())
-            .await?;
+        let plugin = match api_major {
+            Some(1) => AdapterGuest::Api1(
+                self.inner
+                    .runtime
+                    .instantiate_adapter(&linker, &mut store, component.as_ref())
+                    .await?,
+            ),
+            Some(2) => AdapterGuest::Api2(
+                self.inner
+                    .runtime
+                    .instantiate_adapter_v2(&linker, &mut store, component.as_ref())
+                    .await?,
+            ),
+            Some(major) => bail!("unsupported plugin API major {major}"),
+            None => bail!("plugin '{id}' has invalid plugin_api"),
+        };
         self.claim_circuit_probe(id).await?;
         Ok(AdapterPrepared {
             store,
@@ -1684,11 +1705,7 @@ impl PluginManager {
         let plugin = p.plugin;
         let rt = self.inner.runtime.clone();
         let guard = rt.arm_deadline(&mut p.store, p.wall_time);
-        let res = plugin
-            .provider_adapter()
-            .call_wire_format(&mut p.store)
-            .await
-            .map_err(map_call_error);
+        let res = plugin.call_wire_format(&mut p.store).await;
         self.settle_cancellable(id, "provider_adapter", started, &guard, res)
             .await
     }
@@ -1709,11 +1726,8 @@ impl PluginManager {
         let rt = self.inner.runtime.clone();
         let guard = rt.arm_deadline(&mut p.store, p.wall_time);
         let res = plugin
-            .provider_adapter()
             .call_build_url(&mut p.store, provider_json, model_json)
-            .await
-            .map_err(map_call_error)
-            .and_then(map_adapter_result);
+            .await;
         self.settle_cancellable(id, "provider_adapter", started, &guard, res)
             .await
     }
@@ -1723,6 +1737,7 @@ impl PluginManager {
         id: &str,
         provider_json: &str,
         credential: &str,
+        session_context: Option<&str>,
     ) -> Result<String, PluginFault> {
         let started = self.bump_invocation(id, "provider_adapter");
         let _permits = self.acquire_invocation_permits(id).await;
@@ -1734,11 +1749,8 @@ impl PluginManager {
         let rt = self.inner.runtime.clone();
         let guard = rt.arm_deadline(&mut p.store, p.wall_time);
         let res = plugin
-            .provider_adapter()
-            .call_apply_auth(&mut p.store, provider_json, credential)
-            .await
-            .map_err(map_call_error)
-            .and_then(map_adapter_result);
+            .call_apply_auth(&mut p.store, provider_json, credential, session_context)
+            .await;
         self.settle_cancellable(id, "provider_adapter", started, &guard, res)
             .await
     }
@@ -1749,6 +1761,7 @@ impl PluginManager {
         request_json: &str,
         provider_json: &str,
         model_json: &str,
+        session_context: Option<&str>,
     ) -> Result<String, PluginFault> {
         let started = self.bump_invocation(id, "provider_adapter");
         let _permits = self.acquire_invocation_permits(id).await;
@@ -1760,11 +1773,14 @@ impl PluginManager {
         let rt = self.inner.runtime.clone();
         let guard = rt.arm_deadline(&mut p.store, p.wall_time);
         let res = plugin
-            .provider_adapter()
-            .call_build_body(&mut p.store, request_json, provider_json, model_json)
-            .await
-            .map_err(map_call_error)
-            .and_then(map_adapter_result);
+            .call_build_body(
+                &mut p.store,
+                request_json,
+                provider_json,
+                model_json,
+                session_context,
+            )
+            .await;
         self.settle_cancellable(id, "provider_adapter", started, &guard, res)
             .await
     }
@@ -1786,11 +1802,8 @@ impl PluginManager {
         let rt = self.inner.runtime.clone();
         let guard = rt.arm_deadline(&mut p.store, p.wall_time);
         let res = plugin
-            .provider_adapter()
             .call_classify_error(&mut p.store, status, body, headers_json)
-            .await
-            .map_err(map_call_error)
-            .and_then(map_adapter_result);
+            .await;
         self.settle_cancellable(id, "provider_adapter", started, &guard, res)
             .await
     }
@@ -1809,12 +1822,7 @@ impl PluginManager {
         let plugin = p.plugin;
         let rt = self.inner.runtime.clone();
         let guard = rt.arm_deadline(&mut p.store, p.wall_time);
-        let res = plugin
-            .provider_adapter()
-            .call_parse_stream_chunk(&mut p.store, data)
-            .await
-            .map_err(map_call_error)
-            .and_then(map_adapter_result);
+        let res = plugin.call_parse_stream_chunk(&mut p.store, data).await;
         self.settle_cancellable(id, "provider_adapter", started, &guard, res)
             .await
     }
@@ -1834,11 +1842,8 @@ impl PluginManager {
         let rt = self.inner.runtime.clone();
         let guard = rt.arm_deadline(&mut p.store, p.wall_time);
         let res = plugin
-            .provider_adapter()
             .call_parse_full_response(&mut p.store, body_json)
-            .await
-            .map_err(map_call_error)
-            .and_then(map_adapter_result);
+            .await;
         self.settle_cancellable(id, "provider_adapter", started, &guard, res)
             .await
     }
@@ -2454,8 +2459,179 @@ struct ModelSourcePrepared {
 
 struct AdapterPrepared {
     store: wasmtime::Store<HostCtx>,
-    plugin: crate::plugins::runtime::adapter_bindings::PluginAdapter,
+    plugin: AdapterGuest,
     wall_time: Duration,
+}
+
+enum AdapterGuest {
+    Api1(adapter_bindings::PluginAdapter),
+    Api2(adapter_v2_bindings::PluginAdapterV2),
+}
+
+impl AdapterGuest {
+    async fn call_wire_format(
+        &self,
+        store: &mut wasmtime::Store<HostCtx>,
+    ) -> Result<String, PluginFault> {
+        match self {
+            Self::Api1(plugin) => plugin
+                .provider_adapter()
+                .call_wire_format(store)
+                .await
+                .map_err(map_call_error),
+            Self::Api2(plugin) => plugin
+                .kinetix_plugin2_0_0_provider_adapter()
+                .call_wire_format(store)
+                .await
+                .map_err(map_call_error),
+        }
+    }
+
+    async fn call_build_url(
+        &self,
+        store: &mut wasmtime::Store<HostCtx>,
+        provider_json: &str,
+        model_json: &str,
+    ) -> Result<String, PluginFault> {
+        match self {
+            Self::Api1(plugin) => plugin
+                .provider_adapter()
+                .call_build_url(store, provider_json, model_json)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+            Self::Api2(plugin) => plugin
+                .kinetix_plugin2_0_0_provider_adapter()
+                .call_build_url(store, provider_json, model_json)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+        }
+    }
+
+    async fn call_apply_auth(
+        &self,
+        store: &mut wasmtime::Store<HostCtx>,
+        provider_json: &str,
+        credential: &str,
+        session_context: Option<&str>,
+    ) -> Result<String, PluginFault> {
+        let session = session_context.map(|id| {
+            adapter_v2_bindings::kinetix::plugin2_0_0::types::SessionContext { id: id.into() }
+        });
+        match self {
+            Self::Api1(plugin) => plugin
+                .provider_adapter()
+                .call_apply_auth(store, provider_json, credential)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+            Self::Api2(plugin) => plugin
+                .kinetix_plugin2_0_0_provider_adapter()
+                .call_apply_auth(store, provider_json, credential, session.as_ref())
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+        }
+    }
+
+    async fn call_build_body(
+        &self,
+        store: &mut wasmtime::Store<HostCtx>,
+        request_json: &str,
+        provider_json: &str,
+        model_json: &str,
+        session_context: Option<&str>,
+    ) -> Result<String, PluginFault> {
+        let session = session_context.map(|id| {
+            adapter_v2_bindings::kinetix::plugin2_0_0::types::SessionContext { id: id.into() }
+        });
+        match self {
+            Self::Api1(plugin) => plugin
+                .provider_adapter()
+                .call_build_body(store, request_json, provider_json, model_json)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+            Self::Api2(plugin) => plugin
+                .kinetix_plugin2_0_0_provider_adapter()
+                .call_build_body(
+                    store,
+                    request_json,
+                    provider_json,
+                    model_json,
+                    session.as_ref(),
+                )
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+        }
+    }
+
+    async fn call_classify_error(
+        &self,
+        store: &mut wasmtime::Store<HostCtx>,
+        status: u16,
+        body: &str,
+        headers_json: &str,
+    ) -> Result<String, PluginFault> {
+        match self {
+            Self::Api1(plugin) => plugin
+                .provider_adapter()
+                .call_classify_error(store, status, body, headers_json)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+            Self::Api2(plugin) => plugin
+                .kinetix_plugin2_0_0_provider_adapter()
+                .call_classify_error(store, status, body, headers_json)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+        }
+    }
+
+    async fn call_parse_stream_chunk(
+        &self,
+        store: &mut wasmtime::Store<HostCtx>,
+        data: &str,
+    ) -> Result<String, PluginFault> {
+        match self {
+            Self::Api1(plugin) => plugin
+                .provider_adapter()
+                .call_parse_stream_chunk(store, data)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+            Self::Api2(plugin) => plugin
+                .kinetix_plugin2_0_0_provider_adapter()
+                .call_parse_stream_chunk(store, data)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+        }
+    }
+
+    async fn call_parse_full_response(
+        &self,
+        store: &mut wasmtime::Store<HostCtx>,
+        body_json: &str,
+    ) -> Result<String, PluginFault> {
+        match self {
+            Self::Api1(plugin) => plugin
+                .provider_adapter()
+                .call_parse_full_response(store, body_json)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+            Self::Api2(plugin) => plugin
+                .kinetix_plugin2_0_0_provider_adapter()
+                .call_parse_full_response(store, body_json)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+        }
+    }
 }
 
 /// Map a `wasmtime::Result` error from a guest call into a [`PluginFault`].
@@ -2504,17 +2680,35 @@ fn map_auth_result<T>(
     })
 }
 
-/// Like [`map_plugin_result`] but for the separately-bound adapter world, whose
-/// generated `PluginError` type is distinct from the `plugin` world's.
-fn map_adapter_result<T>(
-    r: Result<T, crate::plugins::runtime::adapter_bindings::kinetix::plugin::types::PluginError>,
-) -> Result<T, PluginFault> {
-    r.map_err(|e| PluginFault::PluginError {
-        code: e.code,
-        message: e.message,
-        retryable: e.retryable,
-        retry_after: e.retry_after,
-    })
+/// Error shapes shared by the separately generated adapter API bindings.
+trait AdapterPluginError {
+    fn into_fault(self) -> PluginFault;
+}
+
+impl AdapterPluginError for adapter_bindings::kinetix::plugin::types::PluginError {
+    fn into_fault(self) -> PluginFault {
+        PluginFault::PluginError {
+            code: self.code,
+            message: self.message,
+            retryable: self.retryable,
+            retry_after: self.retry_after,
+        }
+    }
+}
+
+impl AdapterPluginError for adapter_v2_bindings::kinetix::plugin1_0_0::types::PluginError {
+    fn into_fault(self) -> PluginFault {
+        PluginFault::PluginError {
+            code: self.code,
+            message: self.message,
+            retryable: self.retryable,
+            retry_after: self.retry_after,
+        }
+    }
+}
+
+fn map_adapter_result<T, E: AdapterPluginError>(result: Result<T, E>) -> Result<T, PluginFault> {
+    result.map_err(AdapterPluginError::into_fault)
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]

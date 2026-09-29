@@ -266,10 +266,12 @@ impl Adapter for PluginAdapter {
         let p = Self::provider_json(ctx);
         let credential = ctx.credential.clone();
         let headers_json = self
-            .block(
-                self.manager
-                    .adapter_apply_auth(&self.plugin_id, &p, &credential),
-            )
+            .block(self.manager.adapter_apply_auth(
+                &self.plugin_id,
+                &p,
+                &credential,
+                ctx.session_context,
+            ))
             .map_err(|e| Self::plugin_failure("apply_auth", e))?;
         let headers: Vec<(String, String)> = serde_json::from_str(&headers_json).map_err(|e| {
             Self::protocol_failure("apply_auth", format!("invalid header JSON: {e}"))
@@ -296,10 +298,13 @@ impl Adapter for PluginAdapter {
         let request_json = request_to_json(req);
         let (p, m) = (Self::provider_json(ctx), Self::model_json(ctx));
         let body = self
-            .block(
-                self.manager
-                    .adapter_build_body(&self.plugin_id, &request_json, &p, &m),
-            )
+            .block(self.manager.adapter_build_body(
+                &self.plugin_id,
+                &request_json,
+                &p,
+                &m,
+                ctx.session_context,
+            ))
             .map_err(|e| Self::plugin_failure("build_body", e))?;
         let body: Value = serde_json::from_str(&body)
             .map_err(|e| Self::protocol_failure("build_body", format!("invalid JSON: {e}")))?;

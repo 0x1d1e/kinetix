@@ -10,6 +10,7 @@
 //! that package is unavailable so normal core CI stays hermetic and independent
 //! from the plugin repository/toolchain.
 
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 
 use kinetix::adapters::{AdapterRegistry, UpstreamContext};
@@ -26,6 +27,51 @@ use kinetix::types::{
 fn package_path() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("KINETIX_PLUGIN_E2E_PACKAGE").map(std::path::PathBuf::from)?;
     path.is_file().then_some(path)
+}
+
+/// Repackage an unsigned compatibility fixture under a distinct ID so API-v1
+/// and API-v2 adapters can be installed in the same manager. Signature entries
+/// are dropped because changing the manifest invalidates the package signature.
+fn repackage_with_id(package: &[u8], id: &str) -> Vec<u8> {
+    let mut archive = tar::Archive::new(Cursor::new(package));
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut changed_manifest = false;
+
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().to_string_lossy().into_owned();
+        if path == "signature.ed25519" {
+            continue;
+        }
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).unwrap();
+        if path == "plugin.toml" {
+            let manifest = String::from_utf8(data).unwrap();
+            let lines = manifest
+                .lines()
+                .map(|line| {
+                    if !changed_manifest && line.starts_with("id = ") {
+                        changed_manifest = true;
+                        format!("id = {id:?}")
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            data = lines.into_bytes();
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, data.as_slice())
+            .unwrap();
+    }
+
+    assert!(changed_manifest, "fixture manifest must contain an id");
+    builder.into_inner().unwrap()
 }
 
 async fn manager() -> (PluginManager, Pool) {
@@ -222,8 +268,7 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         .expect("adapter world binds");
     assert_eq!(wf, "antigravity");
 
-    let provider =
-        r#"{"base_url":"https://daily-cloudcode-pa.googleapis.com","extra_headers":"{}"}"#;
+    let provider = r#"{"base_url":"https://daily-cloudcode-pa.googleapis.com","extra_headers":"{\"x-antigravity-project\":\"test-project\"}"}"#;
     let model = r#"{"upstream_id":"gemini-3-flash"}"#;
 
     let url = m.adapter_build_url(id, provider, model).await.unwrap();
@@ -232,13 +277,17 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         "got {url}"
     );
 
-    let headers = m.adapter_apply_auth(id, provider, "tok123").await.unwrap();
+    let host_session = "stable-session-for-e2e";
+    let headers = m
+        .adapter_apply_auth(id, provider, "tok123", Some(host_session))
+        .await
+        .unwrap();
     assert!(headers.contains("Bearer tok123"), "got {headers}");
     assert!(headers.contains("antigravity/ide/"));
 
     let request = r#"{"requested_model":"gemini-3-flash","system":["be nice"],"messages":[{"role":"user","parts":[{"type":"text","text":"hi"}]}],"tools":[{"name":"my-tool!","description":"d","parameters":{"type":"object"}}],"thinking":{"level":"high"},"stream":true}"#;
     let body = m
-        .adapter_build_body(id, request, provider, model)
+        .adapter_build_body(id, request, provider, model, Some(host_session))
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -259,6 +308,14 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         v["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
         "high"
     );
+    let native_session = v["request"]["sessionId"].as_str().unwrap();
+    assert_ne!(native_session, host_session);
+    let repeated_body = m
+        .adapter_build_body(id, request, provider, model, Some(host_session))
+        .await
+        .unwrap();
+    let repeated: serde_json::Value = serde_json::from_str(&repeated_body).unwrap();
+    assert_eq!(repeated["request"]["sessionId"], native_session);
 
     // The actual installed manifest drives the exact production adapter
     // registration path. Missing the Antigravity opt-in must fail this before
@@ -347,6 +404,7 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         provider: &provider_row,
         model: &model_row,
         account_id: Some("account_test"),
+        session_context: Some(host_session),
         credential: "tok123".into(),
     };
     let registered_body = registered
@@ -355,6 +413,17 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
     assert_eq!(
         registered_body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
         "high"
+    );
+    let registered_session = registered_body["request"]["sessionId"]
+        .as_str()
+        .expect("session-aware adapter should produce a native session ID");
+    assert_ne!(registered_session, host_session);
+    let repeated_registered_body = registered
+        .build_body(&ctx, &canonical)
+        .expect("registered Antigravity adapter should build repeated requests");
+    assert_eq!(
+        repeated_registered_body["request"]["sessionId"],
+        registered_session
     );
 
     // A real Antigravity SSE chunk parses to canonical events.
@@ -374,6 +443,98 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
     assert!(arr
         .iter()
         .any(|e| e["type"] == "start" && e["upstream_request_id"] == "resp_1"));
+}
+
+/// A released API-v1 component and a session-aware API-v2 component can both
+/// load and execute through the same host manager. The legacy adapter retains
+/// its original call shape; only API v2 receives the session identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_v1_and_session_aware_api_v2_adapters_load_together() {
+    let Some(api2_path) = package_path() else {
+        eprintln!("skipping: set KINETIX_PLUGIN_E2E_PACKAGE to an API-v2 .kxp");
+        return;
+    };
+    let Some(api1_path) = std::env::var_os("KINETIX_PLUGIN_API_V1_E2E_PACKAGE")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+    else {
+        eprintln!("skipping: set KINETIX_PLUGIN_API_V1_E2E_PACKAGE to a released API-v1 .kxp");
+        return;
+    };
+
+    let api1_id = "dev.kinetix.antigravity-oauth.v1-compat";
+    let api1 = repackage_with_id(&std::fs::read(api1_path).unwrap(), api1_id);
+    let api2 = std::fs::read(api2_path).unwrap();
+    let (m, _pool) = manager().await;
+
+    assert_eq!(
+        m.install(&api1, None, &[], false).await.unwrap().id,
+        api1_id
+    );
+    let api2_id = m.install(&api2, None, &[], false).await.unwrap().id;
+    assert_ne!(api1_id, api2_id);
+    assert_eq!(
+        m.get(api1_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest()
+            .unwrap()
+            .api_major(),
+        Some(1)
+    );
+    assert_eq!(
+        m.get(&api2_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest()
+            .unwrap()
+            .api_major(),
+        Some(2)
+    );
+
+    for id in [api1_id, api2_id.as_str()] {
+        m.approve_permissions(id).await.unwrap();
+        m.enable(id).await.unwrap();
+        assert_eq!(m.adapter_wire_format(id).await.unwrap(), "antigravity");
+    }
+
+    let provider = r#"{"base_url":"https://daily-cloudcode-pa.googleapis.com","extra_headers":"{\"x-antigravity-project\":\"compat-test\"}"}"#;
+    let model = r#"{"upstream_id":"gemini-3-flash"}"#;
+    let request = r#"{"requested_model":"gemini-3-flash","system":[],"messages":[{"role":"user","parts":[{"type":"text","text":"hello"}]}],"stream":true}"#;
+    let host_session = "compat-session-identity";
+
+    let legacy_headers = m
+        .adapter_apply_auth(api1_id, provider, "legacy-token", Some(host_session))
+        .await
+        .unwrap();
+    assert!(legacy_headers.contains("Bearer legacy-token"));
+    let legacy_body = m
+        .adapter_build_body(api1_id, request, provider, model, Some(host_session))
+        .await
+        .unwrap();
+    let legacy_body: serde_json::Value = serde_json::from_str(&legacy_body).unwrap();
+    let legacy_session = legacy_body["request"]["sessionId"].as_str().unwrap();
+    assert_ne!(legacy_session, host_session);
+    let legacy_without_context = m
+        .adapter_build_body(api1_id, request, provider, model, None)
+        .await
+        .unwrap();
+    let legacy_without_context: serde_json::Value =
+        serde_json::from_str(&legacy_without_context).unwrap();
+    assert_eq!(
+        legacy_without_context["request"]["sessionId"],
+        legacy_session
+    );
+
+    let current_body = m
+        .adapter_build_body(&api2_id, request, provider, model, Some(host_session))
+        .await
+        .unwrap();
+    let current_body: serde_json::Value = serde_json::from_str(&current_body).unwrap();
+    let native_session = current_body["request"]["sessionId"].as_str().unwrap();
+    assert_ne!(native_session, host_session);
 }
 
 /// Error classification maps Antigravity's 429 + reset hint onto the host's

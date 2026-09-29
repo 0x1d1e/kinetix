@@ -1,0 +1,289 @@
+// Kinetix plugin host API v1. This WIT file is the public plugin contract.
+//
+// A plugin is a WebAssembly component that imports the host capabilities it is
+// granted and exports the capability interfaces it provides. The host never
+// hands a plugin ambient authority: every import is a controlled host call.
+//
+// The adapter/streaming surface is intentionally kept in a
+// separate world (`plugin-adapter`) so that a buffered-only contract can never
+// be mistaken for the adapter contract.
+
+package kinetix:plugin@1.0.0;
+
+/// Shared value types exchanged across the host boundary.
+interface types {
+  /// A structured, classified plugin failure.
+  record plugin-error {
+    /// One of the failure codes, e.g. "rate_limited", "plugin_internal".
+    code: string,
+    /// Redacted, client-safe message.
+    message: string,
+    retryable: bool,
+    /// Optional retry-after hint in seconds.
+    retry-after: option<u64>,
+    /// Optional reset instant (RFC3339) for quota exhaustion.
+    reset-at: option<string>,
+  }
+
+  record account-ref {
+    provider-id: string,
+    account-id: string,
+  }
+
+  /// A reference to a credential the host owns. The plugin never receives the
+  /// secret bytes when it uses this form.
+  variant credential-ref {
+    account(account-ref),
+    named(string),
+  }
+
+  record http-request {
+    method: string,
+    url: string,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+    /// When set, the host injects the scoped credential after policy checks.
+    credential: option<credential-ref>,
+  }
+
+  record http-response {
+    status: u16,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+    /// True when the host truncated `body` at the plugin's response-size
+    /// budget. A truncated response is evidence the plugin must not
+    /// silently treat as complete.
+    body-truncated: bool,
+  }
+
+  /// A discovery observation. Unknown fields stay `none`; the plugin never
+  /// overwrites explicit admin edits.
+  record discovered-model {
+    id: string,
+    display-name: option<string>,
+    context-window: option<u64>,
+    max-output-tokens: option<u64>,
+    capabilities-json: option<string>,
+    raw-metadata: option<string>,
+  }
+
+  /// Health evidence. Core translates this into account state.
+  record health-observation {
+    /// healthy | degraded | unavailable | unknown
+    state: string,
+    quota-state: option<string>,
+    reset-at: option<string>,
+    retry-after: option<u64>,
+    detail-code: option<string>,
+  }
+
+  /// An opaque credential lease. The handle is meaningful only to the
+  /// host.
+  record credential-lease {
+    handle: string,
+    expires-at: option<string>,
+    refresh-after: option<string>,
+    /// healthy | expiring | unusable
+    health: string,
+  }
+
+  /// Result of a plugin-owned account authorization flow. Core persists
+  /// `secret-json` only after it validates one-time callback state.
+  record auth-result {
+    secret-json: string,
+    account-label: option<string>,
+    metadata-json: option<string>,
+  }
+
+  /// A typed routing fact. Never a target selection.
+  record routing-fact {
+    /// Fully-qualified fact name, e.g. "plugin.dev.example.foo.region".
+    name: string,
+    /// JSON-encoded value.
+    value-json: string,
+    observed-at: option<string>,
+    max-age-ms: option<u64>,
+  }
+}
+
+/// Buffered outbound HTTP, for control-plane capabilities only:
+/// discovery, probes, and credential acquisition. Not the adapter contract.
+interface host-http {
+  use types.{http-request, http-response, plugin-error};
+  send: func(req: http-request) -> result<http-response, plugin-error>;
+}
+
+/// Host-managed plugin KV storage. Scoped to the plugin id. Keys are
+/// ordinary plugin state. The reserved `_cache:` namespace is the only way a
+/// plugin may persist a fact the host will publish as a cached routing fact
+/// writes to this namespace are version-checked and time-bounded by the host.
+interface host-storage {
+  get: func(key: string) -> option<list<u8>>;
+  put: func(key: string, value: list<u8>) -> result<_, string>;
+  delete: func(key: string) -> result<_, string>;
+  /// Publish a cached routing fact during the core-owned background refresh.
+  /// The value is buffered for the current invocation; only after the guest
+  /// call succeeds does the host stamp `observed-at` and atomically replace
+  /// the complete reserved `_cache:<name>` snapshot. Direct put/delete
+  /// access to the `_cache:` namespace is rejected. `value-json` must be JSON.
+  cache-set: func(name: string, value-json: string, max-age-ms: u64) -> result<_, string>;
+}
+
+/// Namespaced, redacted logging.
+interface host-log {
+  enum level {
+    trace,
+    debug,
+    info,
+    warn,
+    error,
+  }
+  log: func(level: level, message: string);
+}
+
+/// Host-provided clock. Clock and randomness are host capabilities, never
+/// ambient authority. A plugin that caches anything time-bounded uses this rather than
+/// guessing.
+interface host-clock {
+  /// Seconds since the Unix epoch.
+  now-unix-seconds: func() -> u64;
+  /// Milliseconds since the Unix epoch.
+  now-unix-millis: func() -> u64;
+}
+
+/// Host-side credential use without plaintext exposure.
+interface host-credential {
+  use types.{credential-ref, http-request, plugin-error};
+  /// Sign/authorize a request with the scoped credential, returning the
+  /// request with auth applied. The secret never crosses to the guest.
+  sign: func(req: http-request, credential: credential-ref) -> result<http-request, plugin-error>;
+  /// Acquire an opaque lease handle the plugin may attach to host-http calls.
+  lease: func(credential: credential-ref) -> result<string, plugin-error>;
+  /// Read the plaintext credential. Only available when the plugin's manifest
+  /// declares the `credential_read` permission — a materially higher-risk grant
+  /// grant for protocols that place the secret in a request body rather than
+  /// an auth header (e.g. an OAuth refresh-token exchange). WASM linear memory
+  /// cannot be reliably zeroized, so this grant is flagged in permission review.
+  read: func(credential: credential-ref) -> result<string, plugin-error>;
+}
+
+world plugin {
+  import host-http;
+  import host-storage;
+  import host-log;
+  import host-credential;
+  import host-clock;
+
+  /// Produce or refresh an account credential.
+  export credential-strategy: interface {
+    use types.{plugin-error, credential-lease};
+    resolve: func(provider-id: string, account-id: string, account-label: string) -> result<credential-lease, plugin-error>;
+    health: func(provider-id: string, account-id: string) -> result<string, plugin-error>;
+    rotate: func(provider-id: string, account-id: string) -> result<_, plugin-error>;
+  }
+
+  /// Provider-specific model discovery.
+  export model-source: interface {
+    use types.{plugin-error, discovered-model};
+    discover: func(provider-id: string, base-url: string, models-path: string) -> result<list<discovered-model>, plugin-error>;
+  }
+
+  /// Bounded account/provider health probe.
+  export health-probe: interface {
+    use types.{plugin-error, health-observation};
+    probe: func(provider-id: string, account-id: string) -> result<health-observation, plugin-error>;
+  }
+
+  /// Typed routing facts. Must be pure or cached; never a target pick.
+  export routing-facts: interface {
+    use types.{plugin-error, routing-fact};
+    /// `request-json` carries only request/config facts core already knows.
+    facts: func(request-json: string) -> result<list<routing-fact>, plugin-error>;
+  }
+
+  /// Narrow read-only hooks.
+  export hooks: interface {
+    use types.{plugin-error};
+    on-request-normalized: func(request-json: string) -> result<_, plugin-error>;
+    on-target-candidate: func(target-json: string) -> result<_, plugin-error>;
+    on-usage-finalized: func(usage-json: string) -> result<_, plugin-error>;
+  }
+}
+
+/// Account authorization world. Kept separate from `plugin` so existing API
+/// v1 components do not gain a mandatory export. Core owns CSRF state and PKCE
+/// material; the plugin owns provider-specific URLs/exchange behavior.
+world plugin-auth {
+  import host-http;
+  import host-storage;
+  import host-log;
+  import host-clock;
+
+  export auth-flow: interface {
+    use types.{plugin-error, auth-result};
+    begin: func(
+      flow-name: string,
+      redirect-uri: string,
+      state: string,
+      pkce-challenge: option<string>
+    ) -> result<string, plugin-error>;
+    exchange: func(
+      flow-name: string,
+      code: string,
+      redirect-uri: string,
+      pkce-verifier: option<string>
+    ) -> result<auth-result, plugin-error>;
+  }
+}
+
+/// Account-aware model discovery world. Kept separate from `plugin` so API-v1
+/// components using the legacy unauthenticated `model-source` export remain
+/// loadable. Core supplies an explicit account reference; host credential
+/// policy still decides whether the guest may use it.
+world plugin-model-source {
+  import host-http;
+  import host-storage;
+  import host-log;
+  import host-credential;
+  import host-clock;
+
+  export account-model-source: interface {
+    use types.{plugin-error, discovered-model, account-ref};
+    discover: func(
+      provider-id: string,
+      account: account-ref,
+      base-url: string,
+      models-path: string
+    ) -> result<list<discovered-model>, plugin-error>;
+  }
+}
+
+/// Adapter world: a separate world so the buffered host-http above
+/// can never be used as the adapter transport. Streaming is a host capability
+/// added in a later revision without changing this world's exports.
+world plugin-adapter {
+  import host-http;
+  import host-storage;
+  import host-log;
+  import host-credential;
+  import host-clock;
+
+  export provider-adapter: interface {
+    use types.{plugin-error};
+    /// The wire-format name this adapter speaks.
+    wire-format: func() -> string;
+    build-url: func(provider-json: string, model-json: string) -> result<string, plugin-error>;
+    /// Return the header list (JSON array of [name, value]) to apply.
+    apply-auth: func(provider-json: string, credential: string) -> result<string, plugin-error>;
+    build-body: func(request-json: string, provider-json: string, model-json: string) -> result<string, plugin-error>;
+    /// Return JSON of the classified failure evidence.
+    classify-error: func(status: u16, body: string, headers-json: string) -> result<string, plugin-error>;
+    /// Parse one upstream SSE `data:` payload into a versioned
+    /// `kinetix.plugin.response` JSON envelope (schema version 1 or 2)
+    /// containing canonical stream events.
+    parse-stream-chunk: func(data: string) -> result<string, plugin-error>;
+    /// Parse a full non-streaming body into the same versioned canonical
+    /// response/event envelope (schema version 1 or 2).
+    parse-full-response: func(body-json: string) -> result<string, plugin-error>;
+  }
+}

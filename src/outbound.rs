@@ -527,6 +527,7 @@ mod tests {
             provider: &provider,
             model: &model,
             account_id: Some("acc"),
+            session_context: None,
             credential: "secret".into(),
         };
         let adapter: Arc<dyn Adapter> = Arc::new(crate::adapters::openai::OpenAiAdapter::new());
@@ -586,6 +587,7 @@ mod tests {
             provider: &provider,
             model: &model,
             account_id: None,
+            session_context: None,
             credential: "secret".into(),
         };
 

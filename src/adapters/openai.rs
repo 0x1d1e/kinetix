@@ -720,6 +720,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let mut req = base_request();
@@ -745,6 +746,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let adapter = OpenAiAdapter;
@@ -777,6 +779,7 @@ mod tests {
             provider: &p,
             model: &capped_model,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let mut capped = serde_json::json!({"max_completion_tokens": 512});
@@ -802,6 +805,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let mut req = base_request();
@@ -836,6 +840,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let mut req = base_request();
@@ -879,6 +884,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let adapter = OpenAiAdapter;
@@ -911,6 +917,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let adapter = OpenAiAdapter;
@@ -950,6 +957,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let adapter = OpenAiAdapter;
@@ -1051,6 +1059,7 @@ mod param_default_tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let adapter = OpenAiAdapter;
@@ -1072,6 +1081,7 @@ mod param_default_tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let mut req = req_without_temperature();

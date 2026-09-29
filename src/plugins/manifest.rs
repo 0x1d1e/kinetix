@@ -7,7 +7,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use super::types::{
-    parse_size, Capability, CredentialMode, Manifest, MANIFEST_VERSION, PLUGIN_API_MAJOR,
+    parse_size, Capability, CredentialMode, Manifest, MANIFEST_VERSION, SUPPORTED_PLUGIN_API_MAJORS,
 };
 
 /// The result of validating a manifest, including the effective host limits.
@@ -88,9 +88,9 @@ fn validate_for_host(
     semver::Version::parse(&manifest.version)
         .map_err(|e| anyhow!("invalid manifest `version` '{}': {e}", manifest.version))?;
     match manifest.api_major() {
-        Some(major) if major == PLUGIN_API_MAJOR => {}
+        Some(major) if SUPPORTED_PLUGIN_API_MAJORS.contains(&major) => {}
         Some(major) => bail!(
-            "incompatible plugin_api '{}': host implements major {PLUGIN_API_MAJOR}, plugin requests {major}",
+            "incompatible plugin_api '{}': host supports majors {SUPPORTED_PLUGIN_API_MAJORS:?}, plugin requests {major}",
             manifest.plugin_api
         ),
         None => bail!("invalid plugin_api '{}'", manifest.plugin_api),
@@ -758,9 +758,20 @@ storage = "2MiB"
     }
 
     #[test]
+    fn accepts_api_v1_and_v2_manifests() {
+        for major in [1, 2] {
+            let manifest = GOOD.replace("plugin_api = \"1\"", &format!("plugin_api = \"{major}\""));
+            let validated = parse_and_validate(&manifest, HostPolicy::default()).unwrap();
+            assert!(validated.manifest.compatible());
+            assert_eq!(validated.manifest.api_major(), Some(major));
+        }
+    }
+
+    #[test]
     fn rejects_incompatible_api() {
-        let bad = GOOD.replace("plugin_api = \"1\"", "plugin_api = \"2\"");
-        assert!(parse_and_validate(&bad, HostPolicy::default()).is_err());
+        let bad = GOOD.replace("plugin_api = \"1\"", "plugin_api = \"3\"");
+        let error = parse_and_validate(&bad, HostPolicy::default()).unwrap_err();
+        assert!(error.to_string().contains("host supports majors [1, 2]"));
     }
 
     #[test]
@@ -770,10 +781,14 @@ storage = "2MiB"
             let host = semver::Version::parse(host).unwrap();
             assert!(manifest.compatible_with_host_version(&host));
         }
+    }
 
+    #[test]
+    fn supported_api_v2_is_compatible_with_this_host_version() {
         let api_v2 = GOOD.replace("plugin_api = \"1\"", "plugin_api = \"2\"");
         let api_v2: Manifest = toml::from_str(&api_v2).unwrap();
-        assert!(!api_v2.compatible_with_host_version(&semver::Version::parse("1.5.0").unwrap()));
+        let host = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        assert!(api_v2.compatible_with_host_version(&host));
     }
 
     #[test]
