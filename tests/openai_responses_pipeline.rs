@@ -77,6 +77,11 @@ async fn upstream(
         })
         .unwrap_or_default()
         .to_string();
+    let upstream_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     mock.requests.lock().await.push(CapturedRequest {
         method,
         path: uri.path().to_string(),
@@ -183,6 +188,24 @@ async fn upstream(
             .body(Body::from(
                 "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial translated answer\"}}\n\n",
             ))
+            .unwrap(),
+        "hidden_reasoning_fallback" if upstream_model == "upstream-anthropic-model" => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(concat!(
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"private reasoning\"}}\n\n",
+                    "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"temporarily unavailable\"}}\n\n"
+                )))
+                .unwrap()
+        }
+        "hidden_reasoning_fallback" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from(concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fallback answer\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n"
+            )))
             .unwrap(),
         "translated_full" => Response::builder()
             .status(StatusCode::OK)
@@ -550,6 +573,37 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
     .await
     .unwrap();
 
+    let hidden_reasoning_route_id = db::insert_route(
+        &pool,
+        &db::NewRoute {
+            name: "responses-hidden-reasoning-fallback-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(2),
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .unwrap();
+    for (model_id, priority) in [(&translated_model_id, 1), (&model_id, 2)] {
+        db::insert_route_target(
+            &pool,
+            &hidden_reasoning_route_id,
+            None,
+            model_id,
+            priority,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .unwrap();
+    }
+
     db::insert_virtual_key(
         &pool,
         &db::VirtualKeyRow {
@@ -839,6 +893,21 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
     );
     assert_eq!(failed_event["response"]["tools"][0]["name"], "weather");
 
+    let (status, hidden_reasoning_fallback) = call_responses(
+        &state,
+        "responses-hidden-reasoning-fallback-route",
+        "hidden_reasoning_fallback",
+        true,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{hidden_reasoning_fallback}");
+    assert!(
+        hidden_reasoning_fallback.contains("fallback answer"),
+        "retryable failure after hidden reasoning should use the fallback target: {hidden_reasoning_fallback}"
+    );
+    assert!(!hidden_reasoning_fallback.contains("private reasoning"));
+
     let (status, translated_full) = call_responses(
         &state,
         "responses-translated-route",
@@ -875,7 +944,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{timeout_body}");
 
     let requests = mock.requests.lock().await;
-    assert_eq!(requests.len(), 12);
+    assert_eq!(requests.len(), 14);
     for (request, test_case) in requests
         .iter()
         .take(2)
@@ -932,10 +1001,18 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
     assert_eq!(requests[10].path, "/v1/messages");
     assert_eq!(
         requests[10].body.pointer("/messages/0/content/0/text"),
-        Some(&json!("case:translated_full"))
+        Some(&json!("case:hidden_reasoning_fallback"))
     );
     assert_eq!(requests[11].body["model"], UPSTREAM_MODEL);
-    assert_eq!(requests[11].body["input"], "case:timeout");
+    assert_eq!(requests[11].body["input"], "case:hidden_reasoning_fallback");
+    assert_eq!(requests[12].method, Method::POST);
+    assert_eq!(requests[12].path, "/v1/messages");
+    assert_eq!(
+        requests[12].body.pointer("/messages/0/content/0/text"),
+        Some(&json!("case:translated_full"))
+    );
+    assert_eq!(requests[13].body["model"], UPSTREAM_MODEL);
+    assert_eq!(requests[13].body["input"], "case:timeout");
     drop(requests);
 
     // Use a fresh provider circuit and route so earlier test traffic cannot

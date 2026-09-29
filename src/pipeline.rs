@@ -471,9 +471,10 @@ struct Attempt {
     passthrough: bool,
     /// Adaptive target-local permit held for the full upstream lifecycle.
     traffic_permit: Option<crate::upstream_traffic::TrafficPermit>,
-    /// Provider-wide breaker attempt.
+    /// Provider-wide breaker attempt. Half-open recovery/failure is committed
+    /// only when the stream reaches a terminal outcome.
     provider_attempt: crate::provider_circuit::ProviderAttempt,
-    /// Half-open recovery is committed at response validation, before stream completion.
+    /// First-event validation is recorded separately from terminal recovery.
     provider_circuit_transition: Option<crate::provider_circuit::ProviderCircuitTransition>,
     /// Target-attempt-local start, excluding routing and credential work.
     attempt_started: Instant,
@@ -1651,6 +1652,26 @@ pub(crate) async fn run_with_disconnect(
                 );
                 if resp.status().is_success() {
                     let upstream_request_id = extract_upstream_request_id(&resp);
+                    let responses = if format == FrontendFormat::OpenAiResponses {
+                        match frontends::responses::response_fields_from_request(&target_req) {
+                            Ok(fields) => fields,
+                            Err(error) => {
+                                return Ok(crate::api::error_response(
+                                    format,
+                                    &meta.request_id,
+                                    error,
+                                ));
+                            }
+                        }
+                    } else {
+                        frontends::ResponsesResponseFields::default()
+                    };
+                    let encoder_ctx = EncoderCtx {
+                        model_name: target_req.requested_model.clone(),
+                        request_id: meta.request_id.clone(),
+                        created: chrono::Utc::now().timestamp(),
+                        responses,
+                    };
                     let first_event_remaining =
                         phase_deadline.saturating_duration_since(Instant::now());
                     let is_sse = resp
@@ -1672,6 +1693,9 @@ pub(crate) async fn run_with_disconnect(
                             resp,
                             &adapter,
                             true,
+                            format,
+                            use_passthrough,
+                            &encoder_ctx,
                             first_event_remaining,
                             provider_timeout,
                         )
@@ -1683,6 +1707,9 @@ pub(crate) async fn run_with_disconnect(
                                 resp,
                                 &adapter,
                                 false,
+                                format,
+                                use_passthrough,
+                                &encoder_ctx,
                                 first_event_remaining,
                                 provider_timeout,
                             ),
@@ -1830,7 +1857,16 @@ pub(crate) async fn run_with_disconnect(
                         attempt_started,
                     };
                     return Ok(stream_response(
-                        state, snap, format, meta, target_req, attempt, started, key, trace,
+                        state,
+                        snap,
+                        format,
+                        meta,
+                        target_req,
+                        attempt,
+                        encoder_ctx,
+                        started,
+                        key,
+                        trace,
                     )
                     .await);
                 }
@@ -2497,11 +2533,12 @@ fn trace_provider_circuit_transition(
     transition: crate::provider_circuit::ProviderCircuitTransition,
 ) {
     if transition.opened {
-        trace.step(
-            "provider_circuit",
-            Some(provider_name.to_string()),
-            "provider circuit opened after a qualifying failure",
-        );
+        let detail = if transition.validated_first_event {
+            "provider circuit opened after a terminal failure following first-event validation"
+        } else {
+            "provider circuit opened after a qualifying failure"
+        };
+        trace.step("provider_circuit", Some(provider_name.to_string()), detail);
     }
 }
 
@@ -2916,12 +2953,16 @@ fn payload_error_failure(adapter: &Arc<dyn Adapter>, payload: &str) -> Option<Up
 }
 
 /// Validate a successful HTTP response before the client response is committed.
-/// SSE stays retryable until the first semantic model event. Normal JSON is
-/// parsed completely through the adapter's full-response path.
+/// SSE stays retryable until the destination encoder produces client-visible
+/// bytes (or passthrough observes a semantic event). Normal JSON is parsed
+/// completely through the adapter's full-response path.
 async fn prepare_success_response(
     mut response: reqwest::Response,
     adapter: &Arc<dyn Adapter>,
     aggregate_sse: bool,
+    format: FrontendFormat,
+    passthrough: bool,
+    encoder_ctx: &EncoderCtx,
     first_event_timeout: Duration,
     idle_timeout: Duration,
 ) -> Result<PreparedUpstream, PreparedResponseFailure> {
@@ -3013,6 +3054,7 @@ async fn prepare_success_response(
     let mut framer = crate::sse::SseFramer::new();
     let mut prefetched = Vec::new();
     let mut precommit_usage = TokenUsage::default();
+    let mut visibility_encoder = (!passthrough).then(|| Encoder::new(format, encoder_ctx.clone()));
     loop {
         match response.chunk().await {
             Ok(Some(bytes)) => {
@@ -3047,7 +3089,18 @@ async fn prepare_success_response(
                             precommit_usage.merge(value);
                         }
                     }
-                    if events.iter().any(is_semantic_event) {
+                    let client_visible = if passthrough {
+                        events.iter().any(is_semantic_event)
+                    } else {
+                        events.iter().any(|event| {
+                            !visibility_encoder
+                                .as_mut()
+                                .expect("translated response has a visibility encoder")
+                                .encode(event.clone())
+                                .is_empty()
+                        })
+                    };
+                    if client_visible {
                         return Ok(PreparedUpstream {
                             stream: Some(response),
                             prefetched,
@@ -4876,6 +4929,7 @@ async fn stream_response(
     mut meta: RequestMeta,
     req: InternalRequest,
     attempt: Attempt,
+    encoder_ctx: EncoderCtx,
     started: Instant,
     key: Option<db::VirtualKeyRow>,
     trace: RouteTrace,
@@ -4886,20 +4940,6 @@ async fn stream_response(
 
     let model_display = attempt.target.model.display_name.clone();
     let request_id = meta.request_id.clone();
-    let responses = if format == FrontendFormat::OpenAiResponses {
-        match frontends::responses::response_fields_from_request(&req) {
-            Ok(fields) => fields,
-            Err(error) => return crate::api::error_response(format, &request_id, error),
-        }
-    } else {
-        frontends::ResponsesResponseFields::default()
-    };
-    let encoder_ctx = EncoderCtx {
-        model_name: req.requested_model.clone(),
-        request_id: request_id.clone(),
-        created: chrono::Utc::now().timestamp(),
-        responses,
-    };
 
     // Anthropic message_start usage is normally available during pre-commit
     // validation, so expose the best cache status known without delaying the stream.
