@@ -196,14 +196,16 @@ fn token_count_exact_target(
     let allowed_providers = key.allowed_providers();
 
     let eligible = |target: &ResolvedTarget| {
-        let capabilities_match = !target.provider.strict()
-            || crate::adapters::resolve_execution_profile_for_target(
-                &target.provider,
-                &target.model,
-                Some(target.account.id.as_str()),
-            )
-            .map(|profile| profile_satisfies_needs(&profile.capabilities, &needs))
-            .unwrap_or(false);
+        let capabilities_match =
+            integration_feature_ceiling_satisfies_needs(&target.provider, &needs)
+                && (!target.provider.strict()
+                    || crate::adapters::resolve_execution_profile_for_target(
+                        &target.provider,
+                        &target.model,
+                        Some(target.account.id.as_str()),
+                    )
+                    .map(|profile| profile_satisfies_needs(&profile.capabilities, &needs))
+                    .unwrap_or(false));
         (allowed_providers.is_empty() || allowed_providers.contains(&target.provider.id))
             && capabilities_match
     };
@@ -245,7 +247,7 @@ fn token_count_exact_target(
                 &model,
                 Some(account.id.as_str()),
             )?;
-            if provider.strict() && !profile_satisfies_needs(&profile.capabilities, &needs) {
+            if !provider_satisfies_needs(&provider, &profile.capabilities, &needs) {
                 return Err(ProxyError::unsupported(
                     "resolved model cannot satisfy this token-count request",
                 ));
@@ -1024,7 +1026,7 @@ pub(crate) async fn run_with_disconnect(
                 continue;
             }
         };
-        if target.provider.strict() && !profile_satisfies_needs(&profile.capabilities, &needs) {
+        if !provider_satisfies_needs(&target.provider, &profile.capabilities, &needs) {
             trace.step(
                 "skip",
                 Some(target.model.display_name.clone()),
@@ -4027,15 +4029,41 @@ fn target_profile_supports_request(
     target: &ResolvedTarget,
     needs: &crate::types::CapabilityNeeds,
 ) -> bool {
-    crate::adapters::resolve_execution_profile_for_target(
-        &target.provider,
-        &target.model,
-        Some(target.account.id.as_str()),
-    )
-    .map(|profile| {
-        !target.provider.strict() || profile_satisfies_needs(&profile.capabilities, needs)
-    })
-    .unwrap_or(false)
+    integration_feature_ceiling_satisfies_needs(&target.provider, needs)
+        && (!target.provider.strict()
+            || crate::adapters::resolve_execution_profile_for_target(
+                &target.provider,
+                &target.model,
+                Some(target.account.id.as_str()),
+            )
+            .map(|profile| profile_satisfies_needs(&profile.capabilities, needs))
+            .unwrap_or(false))
+}
+
+/// Integration declarations are hard ceilings even for permissive providers;
+/// model capability metadata remains advisory in that mode.
+fn integration_feature_ceiling_satisfies_needs(
+    provider: &db::ProviderRow,
+    needs: &crate::types::CapabilityNeeds,
+) -> bool {
+    let ceiling = match provider.integration_feature_ceiling() {
+        Ok(Some(ceiling)) => ceiling,
+        Ok(None) => return true,
+        Err(_) => return false,
+    };
+    (!needs.vision || ceiling.vision)
+        && (!needs.tools || ceiling.tools)
+        && (!needs.reasoning || ceiling.reasoning)
+        && (!needs.structured_output || ceiling.structured_output)
+}
+
+fn provider_satisfies_needs(
+    provider: &db::ProviderRow,
+    capabilities: &crate::adapters::ModelCapabilityFlags,
+    needs: &crate::types::CapabilityNeeds,
+) -> bool {
+    integration_feature_ceiling_satisfies_needs(provider, needs)
+        && (!provider.strict() || profile_satisfies_needs(capabilities, needs))
 }
 
 fn profile_satisfies_needs(
@@ -4045,6 +4073,7 @@ fn profile_satisfies_needs(
     (!needs.vision || capabilities.vision != Some(false))
         && (!needs.tools || capabilities.tool_calling != Some(false))
         && (!needs.reasoning || capabilities.reasoning != Some(false))
+        && (!needs.structured_output || capabilities.structured_output != Some(false))
 }
 
 fn check_param_policy(
@@ -5661,6 +5690,8 @@ pub struct DryRunRequest {
     #[serde(default)]
     pub has_reasoning: bool,
     #[serde(default)]
+    pub has_structured_output: bool,
+    #[serde(default)]
     pub input_tokens: Option<u64>,
     /// Providers the calling key is restricted to (FR-12.19); empty = no
     /// restriction. The dashboard passes the selected key's allowlist so the
@@ -5690,6 +5721,7 @@ pub async fn dry_run(
         vision: descriptor.has_images,
         tools: descriptor.has_tools,
         reasoning: descriptor.has_reasoning,
+        structured_output: descriptor.has_structured_output,
     };
 
     let (targets, route) = match resolved {
@@ -7029,6 +7061,133 @@ mod route_policy_tests {
         }));
 
         drop(permits);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn integration_ceiling_vetoes_capability_requests_for_permissive_provider() {
+        let (state, root, provider_id, model_id, _) = adaptive_dry_run_state().await;
+        let ceiling = crate::plugins::types::IntegrationFeaturesV1 {
+            schema_version: 1,
+            streaming: true,
+            tools: true,
+            parallel_tools: false,
+            vision: false,
+            reasoning: false,
+            structured_output: false,
+            model_discovery: false,
+            quota_probe: false,
+            health_probe: false,
+        };
+        db::set_provider_integration_features(&state.pool, &provider_id, Some(&ceiling))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE providers SET source_plugin_id=?, source_integration_id=? WHERE id=?")
+            .bind("plugin.test")
+            .bind("ceiling")
+            .bind(&provider_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE models SET capabilities=? WHERE id=?")
+            .bind(
+                serde_json::json!({
+                    "vision": true,
+                    "reasoning": true,
+                    "structured_output": true,
+                    "tool_calling": true,
+                    "parallel_tools": true
+                })
+                .to_string(),
+            )
+            .bind(&model_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let provider = state.registry.provider(&provider_id).unwrap();
+        assert!(!provider.strict());
+        assert_eq!(provider.source_plugin_id.as_deref(), Some("plugin.test"));
+        assert_eq!(provider.source_integration_id.as_deref(), Some("ceiling"));
+
+        for request in [
+            DryRunRequest {
+                has_images: true,
+                ..Default::default()
+            },
+            DryRunRequest {
+                has_reasoning: true,
+                ..Default::default()
+            },
+            DryRunRequest {
+                has_structured_output: true,
+                ..Default::default()
+            },
+        ] {
+            let result = dry_run(&state, "adaptive-dry-run", &request).await.unwrap();
+            assert!(
+                result["would_select"].is_null(),
+                "request unexpectedly routed despite explicit integration veto: {result}"
+            );
+            assert!(result["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|candidate| {
+                    candidate["not_selected_reasons"]
+                        .as_array()
+                        .is_some_and(|reasons| {
+                            reasons
+                                .iter()
+                                .any(|reason| reason.as_str() == Some("capabilities"))
+                        })
+                }));
+        }
+
+        let request_bodies = [
+            serde_json::json!({
+                "model": "adaptive-dry-run",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": { "url": "https://example.com/image.png" }
+                    }]
+                }]
+            }),
+            serde_json::json!({
+                "model": "adaptive-dry-run",
+                "messages": [{ "role": "user", "content": "think" }],
+                "reasoning_effort": "high"
+            }),
+            serde_json::json!({
+                "model": "adaptive-dry-run",
+                "messages": [{ "role": "user", "content": "return JSON" }],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": { "name": "answer", "schema": { "type": "object" } }
+                }
+            }),
+        ];
+        for body in request_bodies {
+            let request = crate::frontends::openai::decode_request(body).unwrap();
+            let error = run(
+                &state,
+                crate::frontends::FrontendFormat::OpenAi,
+                None,
+                request,
+                uuid::Uuid::new_v4().to_string(),
+                false,
+                None,
+                Vec::new(),
+            )
+            .await
+            .expect_err("request with an integration-vetoed capability must be rejected");
+            assert_eq!(error.kind, crate::types::ErrorKind::Unsupported);
+            assert!(error.message.contains("target capabilities do not satisfy"));
+        }
+
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }

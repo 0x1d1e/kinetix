@@ -106,6 +106,9 @@ impl Capabilities {
         if needs.reasoning && !self.reasoning {
             return false;
         }
+        if needs.structured_output && !self.structured_output {
+            return false;
+        }
         true
     }
 }
@@ -115,6 +118,7 @@ pub struct CapabilityNeeds {
     pub vision: bool,
     pub tools: bool,
     pub reasoning: bool,
+    pub structured_output: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -446,10 +450,20 @@ impl InternalRequest {
             .messages
             .iter()
             .any(|m| m.parts.iter().any(|p| matches!(p, Part::Image(_))));
+        let structured_output = self.extra.get("response_format").is_some_and(|format| {
+            format
+                .get("json_schema")
+                .is_some_and(|schema| !schema.is_null())
+                || matches!(
+                    format.get("type").and_then(serde_json::Value::as_str),
+                    Some("json_object" | "json_schema")
+                )
+        });
         CapabilityNeeds {
             vision,
             tools: !self.tools.is_empty(),
             reasoning: self.thinking.is_some(),
+            structured_output,
         }
     }
 
@@ -1153,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn satisfies_enforces_reasoning_capability() {
+    fn satisfies_enforces_reasoning_and_structured_output_capabilities() {
         // A model that does not declare reasoning must not satisfy a request
         // that carries reasoning controls (FR-10.9/FR-12.11).
         let caps = Capabilities {
@@ -1168,18 +1182,28 @@ mod tests {
             vision: false,
             tools: false,
             reasoning: true,
+            structured_output: false,
         };
         assert!(!caps.satisfies(&reasoning_needed));
+        let structured_output_needed = CapabilityNeeds {
+            vision: false,
+            tools: false,
+            reasoning: false,
+            structured_output: true,
+        };
+        assert!(!caps.satisfies(&structured_output_needed));
         let text_only = CapabilityNeeds {
             vision: false,
             tools: false,
             reasoning: false,
+            structured_output: false,
         };
         assert!(caps.satisfies(&text_only));
         let vision_needed = CapabilityNeeds {
             vision: true,
             tools: false,
             reasoning: false,
+            structured_output: false,
         };
         assert!(caps.satisfies(&vision_needed));
     }

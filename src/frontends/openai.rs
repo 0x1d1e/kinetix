@@ -609,6 +609,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn structured_response_formats_require_structured_output_capability() {
+        for response_format in [
+            json!({ "type": "json_object" }),
+            json!({
+                "type": "json_schema",
+                "json_schema": { "name": "answer", "schema": { "type": "object" } }
+            }),
+        ] {
+            let request = decode_request(json!({
+                "model": "test-model",
+                "messages": [{ "role": "user", "content": "answer" }],
+                "response_format": response_format
+            }))
+            .unwrap();
+            assert!(request.capability_needs().structured_output);
+        }
+    }
+
+    #[test]
     fn streams_canonical_refusals_as_assistant_text() {
         let mut encoder = OpenAiEncoder::new(EncoderCtx {
             model_name: "example".into(),
