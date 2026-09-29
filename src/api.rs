@@ -527,6 +527,16 @@ pub async fn client_usage(State(state): State<AppState>, headers: HeaderMap) -> 
     }
 
     let now = chrono::Utc::now();
+    client_usage_for_key(&state, &key, format, request_id, now).await
+}
+
+async fn client_usage_for_key(
+    state: &AppState,
+    key: &crate::db::VirtualKeyRow,
+    format: FrontendFormat,
+    request_id: String,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Response {
     let daily_start = now
         .date_naive()
         .and_hms_opt(0, 0, 0)
@@ -568,7 +578,11 @@ pub async fn client_usage(State(state): State<AppState>, headers: HeaderMap) -> 
         }
     };
 
-    let budget = match state.admission.budget_snapshot(&state.pool, &key.id).await {
+    let budget = match state
+        .admission
+        .budget_snapshot_at(&state.pool, &key.id, now, std::time::Instant::now())
+        .await
+    {
         Ok(budget) => budget,
         Err(error) => {
             tracing::error!(%error, key_id = %key.id, "client usage admission snapshot failed");
@@ -1071,6 +1085,82 @@ mod client_usage_tests {
         let body = response_json(response).await;
         assert_eq!(body["remaining"]["daily_budget_usd"], 3.75);
         assert_eq!(body["remaining"]["monthly_budget_usd"], 48.75);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn usage_snapshot_uses_captured_utc_period_across_midnight() {
+        let (state, root) = test_state("usage-period-rollover").await;
+        let key = test_key("period-key", "period-client-key", "active");
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        let captured_at = chrono::Utc::now()
+            .date_naive()
+            .pred_opt()
+            .unwrap()
+            .and_hms_milli_opt(23, 59, 59, 999)
+            .unwrap()
+            .and_utc();
+        let mut row = usage_row(&key.id, Some(10), Some(20), Some(0.8));
+        row.ts = captured_at
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .to_rfc3339();
+        db::insert_usage_log(&state.pool, &row).await.unwrap();
+        assert!(chrono::Utc::now().date_naive() > captured_at.date_naive());
+
+        let response = client_usage_for_key(
+            &state,
+            &key,
+            FrontendFormat::OpenAi,
+            "period-rollover-test".into(),
+            captured_at,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let expected_daily_from = captured_at
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .to_rfc3339();
+        let expected_daily_reset = (captured_at.date_naive() + chrono::Duration::days(1))
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .to_rfc3339();
+        let expected_monthly_from = captured_at
+            .date_naive()
+            .with_day(1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .to_rfc3339();
+        let next_month = if captured_at.month() == 12 {
+            chrono::NaiveDate::from_ymd_opt(captured_at.year() + 1, 1, 1)
+        } else {
+            chrono::NaiveDate::from_ymd_opt(captured_at.year(), captured_at.month() + 1, 1)
+        }
+        .unwrap();
+        let expected_monthly_reset = next_month
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .to_rfc3339();
+        assert_eq!(body["periods"]["daily"]["from"], expected_daily_from);
+        assert_eq!(body["periods"]["daily"]["to"], captured_at.to_rfc3339());
+        assert_eq!(body["resets"]["daily"], expected_daily_reset);
+        assert_eq!(body["usage"]["daily"]["requests"], 1);
+        assert_eq!(body["usage"]["daily"]["known_cost_usd"], 0.8);
+        assert_eq!(body["remaining"]["daily_budget_usd"], 4.2);
+        assert_eq!(body["periods"]["monthly"]["from"], expected_monthly_from);
+        assert_eq!(body["periods"]["monthly"]["to"], captured_at.to_rfc3339());
+        assert_eq!(body["resets"]["monthly"], expected_monthly_reset);
+        assert_eq!(body["usage"]["monthly"]["requests"], 1);
+        assert_eq!(body["remaining"]["monthly_budget_usd"], 49.2);
         let _ = std::fs::remove_dir_all(root);
     }
 

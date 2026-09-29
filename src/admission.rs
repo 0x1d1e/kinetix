@@ -364,12 +364,21 @@ impl AdmissionController {
         pool: &Pool,
         key_id: &str,
     ) -> anyhow::Result<AdmissionBudgetSnapshot> {
+        self.budget_snapshot_at(pool, key_id, Utc::now(), Instant::now())
+            .await
+    }
+
+    pub async fn budget_snapshot_at(
+        &self,
+        pool: &Pool,
+        key_id: &str,
+        wall_now: chrono::DateTime<Utc>,
+        instant_now: Instant,
+    ) -> anyhow::Result<AdmissionBudgetSnapshot> {
         let entry = self.entry(key_id);
-        self.ensure_initialized(pool, key_id, &entry).await?;
-        let snapshot = entry
-            .ledger
-            .lock()
-            .budget_snapshot(Utc::now(), Instant::now());
+        self.ensure_initialized_at(pool, key_id, &entry, wall_now, instant_now)
+            .await?;
+        let snapshot = entry.ledger.lock().budget_snapshot(wall_now, instant_now);
         Ok(snapshot)
     }
 
