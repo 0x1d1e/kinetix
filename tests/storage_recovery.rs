@@ -347,8 +347,8 @@ async fn startup_retries_preserve_snapshot_until_pricing_repair_succeeds() {
 
     for (provider_id, model_id) in [("provider-a", "model-a"), ("provider-b", "model-b")] {
         sqlx::query(
-            "INSERT INTO providers (id, name, base_url, wire_format, auth_scheme, credential_mode, created_at)
-             VALUES (?, ?, 'https://example.invalid/v1', 'openai', 'bearer', 'oauth', '2026-09-28T00:00:00Z')",
+            "INSERT INTO providers (id, name, base_url, wire_format, auth_scheme, credential_mode, pricing_scope, created_at)
+             VALUES (?, ?, 'https://example.invalid/v1', 'openai', 'bearer', 'oauth', 'integration', '2026-09-28T00:00:00Z')",
         )
         .bind(provider_id)
         .bind(provider_id)
@@ -484,7 +484,14 @@ async fn startup_retries_preserve_snapshot_until_pricing_repair_succeeds() {
     .fetch_one(&backup)
     .await
     .unwrap();
-    assert_eq!(old_schema_has_pricing_scope, 0);
+    assert_eq!(old_schema_has_pricing_scope, 1);
+    let old_schema_has_account_state_version: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name='account_state_version'",
+    )
+    .fetch_one(&backup)
+    .await
+    .unwrap();
+    assert_eq!(old_schema_has_account_state_version, 0);
     backup.close().await;
 
     let pool = db::connect(&url).await.unwrap();

@@ -426,7 +426,7 @@ export default function App() {
       }),
     );
 
-  const handleUpdateAccount = (acc: Account) =>
+  const handleUpdateAccount = (acc: Account, status?: Account['status']) =>
     withRefresh(() =>
       Kinetix.updateAccount(acc.id, {
         provider_id: acc.providerId,
@@ -435,7 +435,7 @@ export default function App() {
         weight: acc.weight,
         soft_quota_usd: acc.softQuotaSpendLimit ?? null,
         quota_type: acc.quotaType,
-        status: acc.status,
+        ...(status ? { status } : {}),
       }),
     );
 

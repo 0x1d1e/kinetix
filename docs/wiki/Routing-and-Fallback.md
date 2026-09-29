@@ -138,11 +138,30 @@ Plugins implementing the `RoutingFactProvider` capability can export typed facts
   Anthropic: a single terminal `error` event). Nothing is silently spliced.
 - The attempt loop is bounded by `max_attempts` (default 5, capped) and a 30-second
   pre-commit deadline, with bounded backoff between attempts (100 ms → 1 s).
-- Account-scoped failures update account state: **429/rate limit → cooldown**
-  (honoring `Retry-After`), **quota → exhausted**, and **auth → disabled**.
-  Generic **5xx/connection/timeout** failures are request-local: they may trigger
-  bounded retry/Route fallback before commit, but do not cool down the credential
-  or increment its account circuit breaker.
+The host, native adapters, and plugins use the same failure kinds:
+`rate_limit`, `quota_exhausted`, `auth_error`, `target_error`, `server_error`,
+`connection_error`, `timeout`, `bad_request`, `malformed_upstream`,
+`plugin_failure`, `policy_rejected`, and `client_cancelled`.
+
+| Failure kind(s) | Account health | Route fallback | Client status |
+| --- | --- | --- | --- |
+| `rate_limit` | Cooldown; use `Retry-After` when available. | `on429` (enabled by default). | 429 |
+| `quota_exhausted` | Exhausted until the quota reset. | `onQuota` (enabled by default). | 429 |
+| `auth_error` | Disable the rejected credential. | Try another account/target. | 502 |
+| `target_error` | No credential state change. | Try another logical Route target; direct requests do not rotate accounts for this error. | Preserve upstream 403/404, otherwise 502 |
+| `server_error`, `connection_error`, `malformed_upstream` | No account cooldown; qualifying upstream failures may affect the provider circuit. | `on5xx` (enabled by default). | 502 |
+| `timeout` | No account cooldown. | `onTimeout` (enabled by default). | 504 |
+| `plugin_failure` | No provider/account health effect. | `on5xx` (enabled by default). | 502 |
+| `bad_request`, `policy_rejected` | No account state change. | Never. | 400 |
+| `client_cancelled` | No provider/plugin health effect. | Never. | No error response |
+
+Core portability, parameter-policy, unsupported-translation, and thinking-translation rejections are traced as `policy_rejected` and return 400. Other unsupported model or configuration responses retain their own status. Route Trace records the shared failure policy fields for these host rejections too.
+
+A Route can disable the `on429`, `onQuota`, `on5xx`, and `onTimeout` triggers;
+missing triggers default to enabled. Auth and target-local failures remain eligible
+for fallback, while non-retryable request, policy, and cancellation failures never
+fall back. Account circuit health counts credential-scoped failures separately
+from provider-level circuit evidence.
 
 ## Portability policy
 

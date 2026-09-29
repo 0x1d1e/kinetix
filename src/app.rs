@@ -301,16 +301,21 @@ impl AppState {
             return Ok(false);
         }
 
-        crate::db::set_account_status(
+        let disabled = crate::db::set_account_status_if_version(
             &self.pool,
             &account.id,
+            account.account_state_version,
             "disabled",
+            "credential_rejected",
             None,
             None,
             Some(&format!("{context}: {}", error.message)),
         )
         .await
         .with_context(|| format!("failed to persist disabling invalid account {}", account.id))?;
+        if !disabled {
+            return Ok(false);
+        }
         self.credential_refresh
             .forget(&account.provider_id, &account.id);
         self.registry.reload(&self.pool).await.with_context(|| {

@@ -98,7 +98,10 @@ trace records a `provider_circuit` step at the transition, including transitions
 recorded while finalizing a committed stream; it does not require a later target to
 be rejected by that circuit. Each target attempt includes its structured
 `resolved_transport` value (for example, `openai-responses`) so transport and
-endpoint decisions can be diagnosed without exposing credentials.
+endpoint decisions can be diagnosed without exposing credentials. Classified
+failures include `failure_kind`, `failure_category`, `failure_reason`,
+`fallback_rule`, `account_health_effect`, `client_status`, and `retry_hint`.
+Account skip steps include the lifecycle reason and any known `retry_at`.
 
 When a request evaluates plugin routing facts (`plugin.<id>.<name>`) or targets a plugin-backed provider (`wire_plugin` / `credential_plugin`), the Route Trace records:
 - Evaluated fact values and their source (`plugin_id`, `plugin_version`, `capability`).

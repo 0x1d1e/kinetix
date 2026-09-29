@@ -168,7 +168,16 @@ export function mapAccount(j: any): Account {
     providerName: str(j.provider_name),
     label: str(j.label),
     keyMasked: str(j.key_mask),
-    status: (j.status as Account['status']) || 'healthy',
+    status:
+      j.status === 'cooldown' ||
+      j.status === 'exhausted' ||
+      j.status === 'disabled' ||
+      j.status === 'degraded'
+        ? j.status
+        : 'healthy',
+    statusReason: str(j.status_reason, 'unknown'),
+    statusChangedAt: j.status_changed_at ?? null,
+    retryAt: j.retry_at ?? null,
     cooldownUntil: j.cooldown_until ?? null,
     quotaResetTime: j.quota_reset_at ?? null,
     quotaType: (j.quota_type as Account['quotaType']) || 'none',

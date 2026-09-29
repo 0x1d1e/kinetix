@@ -122,22 +122,22 @@ impl PluginAdapter {
             PluginFault::PluginError {
                 code, retryable, ..
             } => match code.as_str() {
-                "bad_request" | "invalid_request" | "unsupported" => FailureKind::BadRequest,
-                "auth_error" | "unauthorized" => FailureKind::AuthError,
-                "target_error" => FailureKind::TargetError,
-                "rate_limit" => FailureKind::RateLimit,
-                "quota_exhausted" => FailureKind::QuotaExhausted,
-                "timeout" => FailureKind::Timeout,
-                "connection_error" => FailureKind::ConnectionError,
-                "server_error" | "protocol_error" | "plugin_internal" => FailureKind::ServerError,
-                _ if *retryable => FailureKind::ServerError,
-                _ => FailureKind::BadRequest,
+                "invalid_request" | "unsupported" => FailureKind::BadRequest,
+                "unauthorized" => FailureKind::AuthError,
+                "protocol_error" | "plugin_internal" => FailureKind::PluginFailure,
+                _ => FailureKind::parse(code).unwrap_or_else(|| {
+                    if *retryable {
+                        FailureKind::PluginFailure
+                    } else {
+                        FailureKind::BadRequest
+                    }
+                }),
             },
             PluginFault::Trap(_)
             | PluginFault::PermissionDenied(_)
             | PluginFault::InvalidResult(_)
-            | PluginFault::Internal(_) => FailureKind::ServerError,
-            PluginFault::Cancelled => FailureKind::ConnectionError,
+            | PluginFault::Internal(_) => FailureKind::PluginFailure,
+            PluginFault::Cancelled => FailureKind::ClientCancelled,
         };
         let retry_after_secs = match &fault {
             PluginFault::PluginError { retry_after, .. } => *retry_after,
@@ -154,7 +154,7 @@ impl PluginAdapter {
 
     fn protocol_failure(stage: &str, message: impl Into<String>) -> UpstreamFailure {
         UpstreamFailure {
-            kind: FailureKind::ServerError,
+            kind: FailureKind::PluginFailure,
             status: None,
             retry_after_secs: None,
             message: format!("plugin adapter {stage}: {}", message.into()),
@@ -337,7 +337,7 @@ impl Adapter for PluginAdapter {
                     .adapter_parse_stream_chunk(&self.plugin_id, data),
             )
             .map_err(|e| UpstreamFailure {
-                kind: FailureKind::ServerError,
+                kind: FailureKind::PluginFailure,
                 status: None,
                 retry_after_secs: None,
                 message: format!("plugin adapter parse_stream_chunk: {}", e.message()),
@@ -354,7 +354,7 @@ impl Adapter for PluginAdapter {
                     .adapter_parse_full_response(&self.plugin_id, &body_json),
             )
             .map_err(|e| UpstreamFailure {
-                kind: FailureKind::ServerError,
+                kind: FailureKind::PluginFailure,
                 status: None,
                 retry_after_secs: None,
                 message: format!("plugin adapter parse_full_response: {}", e.message()),
@@ -492,17 +492,7 @@ pub fn failure_to_json(f: &UpstreamFailure) -> String {
 /// Decode classified failure evidence from the guest.
 pub fn json_to_failure(s: &str) -> Option<UpstreamFailure> {
     let v: Value = serde_json::from_str(s).ok()?;
-    let kind = match v.get("kind").and_then(|x| x.as_str())? {
-        "rate_limit" => FailureKind::RateLimit,
-        "quota_exhausted" => FailureKind::QuotaExhausted,
-        "auth_error" => FailureKind::AuthError,
-        "target_error" => FailureKind::TargetError,
-        "server_error" => FailureKind::ServerError,
-        "connection_error" => FailureKind::ConnectionError,
-        "timeout" => FailureKind::Timeout,
-        "bad_request" => FailureKind::BadRequest,
-        _ => FailureKind::ServerError,
-    };
+    let kind = FailureKind::parse(v.get("kind").and_then(Value::as_str)?)?;
     Some(UpstreamFailure {
         kind,
         status: v.get("status").and_then(|x| x.as_u64()).map(|x| x as u16),
@@ -521,16 +511,7 @@ pub fn json_to_failure(s: &str) -> Option<UpstreamFailure> {
 }
 
 fn failure_kind_str(kind: FailureKind) -> &'static str {
-    match kind {
-        FailureKind::RateLimit => "rate_limit",
-        FailureKind::QuotaExhausted => "quota_exhausted",
-        FailureKind::AuthError => "auth_error",
-        FailureKind::TargetError => "target_error",
-        FailureKind::ServerError => "server_error",
-        FailureKind::ConnectionError => "connection_error",
-        FailureKind::Timeout => "timeout",
-        FailureKind::BadRequest => "bad_request",
-    }
+    kind.as_str()
 }
 
 /// Status-only classification used when the guest cannot be reached.
@@ -645,6 +626,34 @@ mod tests {
         assert_eq!(fallback_failure(429).kind, FailureKind::RateLimit);
         assert_eq!(fallback_failure(400).kind, FailureKind::BadRequest);
         assert_eq!(fallback_failure(503).kind, FailureKind::ServerError);
+    }
+
+    #[test]
+    fn plugin_failure_codec_round_trips_the_shared_taxonomy() {
+        for kind in [
+            FailureKind::RateLimit,
+            FailureKind::QuotaExhausted,
+            FailureKind::AuthError,
+            FailureKind::TargetError,
+            FailureKind::ServerError,
+            FailureKind::ConnectionError,
+            FailureKind::Timeout,
+            FailureKind::BadRequest,
+            FailureKind::MalformedUpstream,
+            FailureKind::PluginFailure,
+            FailureKind::PolicyRejected,
+            FailureKind::ClientCancelled,
+        ] {
+            let failure = UpstreamFailure {
+                kind,
+                status: None,
+                retry_after_secs: None,
+                message: "failure".into(),
+                quota_reset_at: None,
+            };
+            let round_trip = json_to_failure(&failure_to_json(&failure)).unwrap();
+            assert_eq!(round_trip.kind, kind);
+        }
     }
 
     #[test]
@@ -848,6 +857,20 @@ mod tests {
             },
         );
         assert_eq!(request_error.kind, FailureKind::BadRequest);
+
+        let unknown_non_retryable = PluginAdapter::plugin_failure(
+            "build_body",
+            PluginFault::PluginError {
+                code: "policy_rejected".into(),
+                message: "not allowed".into(),
+                retryable: false,
+                retry_after: None,
+            },
+        );
+        assert_eq!(unknown_non_retryable.kind, FailureKind::PolicyRejected);
+
+        let cancelled = PluginAdapter::plugin_failure("parse_stream_chunk", PluginFault::Cancelled);
+        assert_eq!(cancelled.kind, FailureKind::ClientCancelled);
 
         let timeout = PluginAdapter::plugin_failure("apply_auth", PluginFault::Timeout);
         assert_eq!(timeout.kind, FailureKind::Timeout);

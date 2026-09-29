@@ -475,7 +475,7 @@
         [
           "n > 1",
           "passthrough",
-          "rejected (422)",
+          "rejected (400)",
           "Multiple completions cannot be represented faithfully on translated paths.",
           [
             "chat.native.openai.provider_extensions",
@@ -485,7 +485,7 @@
         [
           "logprobs / top_logprobs",
           "passthrough",
-          "rejected (422)",
+          "rejected (400)",
           "No canonical cross-format representation.",
           [
             "chat.translate.gemini.unsupported_fields.reject"
@@ -494,7 +494,7 @@
         [
           "response_format.json_schema",
           "passthrough",
-          "rejected (422)",
+          "rejected (400)",
           "Structured schema enforcement cannot be guaranteed cross-format.",
           [
             "chat.translate.gemini.unsupported_fields.reject"
@@ -503,7 +503,7 @@
         [
           "modalities / audio output",
           "passthrough",
-          "rejected (422)",
+          "rejected (400)",
           "Audio output is not in the v1 canonical model.",
           [
             "chat.translate.gemini.unsupported_fields.reject"
@@ -512,7 +512,7 @@
         [
           "prediction",
           "passthrough",
-          "rejected (422)",
+          "rejected (400)",
           "Prediction semantics are not portable.",
           [
             "chat.translate.gemini.unsupported_fields.reject"
@@ -521,7 +521,7 @@
         [
           "unsupported nested content (file/audio/refusal/reasoning_details)",
           "passthrough",
-          "rejected (422)",
+          "rejected (400)",
           "Behaviorally significant nested content is never silently dropped.",
           [
             "chat.translate.gemini.nested_content.reject"
@@ -669,7 +669,7 @@
         [
           "multimodal tool_result / documents / server-tool-only blocks",
           "passthrough when upstream supports them",
-          "rejected (422)",
+          "rejected (400)",
           "Unsupported semantic content fails explicitly.",
           [
             "messages.translate.multimodal_tool_result.reject"

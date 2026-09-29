@@ -1577,6 +1577,11 @@ pub struct AccountRow {
     pub secret_enc: String,
     pub key_mask: String,
     pub status: String,
+    pub status_reason: String,
+    pub status_changed_at: Option<String>,
+    /// Optimistic generation for lifecycle and account configuration updates.
+    #[serde(skip)]
+    pub account_state_version: i64,
     pub cooldown_until: Option<String>,
     pub quota_reset_at: Option<String>,
     pub quota_type: String,
@@ -1608,6 +1613,16 @@ pub async fn accounts_for_provider(pool: &Pool, provider_id: &str) -> Result<Vec
     .await?)
 }
 
+/// List all accounts for an admin view, including disabled accounts.
+pub async fn list_accounts_for_provider(pool: &Pool, provider_id: &str) -> Result<Vec<AccountRow>> {
+    Ok(sqlx::query_as::<_, AccountRow>(
+        "SELECT * FROM accounts WHERE provider_id = ? ORDER BY priority, created_at",
+    )
+    .bind(provider_id)
+    .fetch_all(pool)
+    .await?)
+}
+
 pub async fn get_account(pool: &Pool, id: &str) -> Result<Option<AccountRow>> {
     Ok(
         sqlx::query_as::<_, AccountRow>("SELECT * FROM accounts WHERE id = ?")
@@ -1631,14 +1646,15 @@ pub async fn insert_account(
     let id = format!("acc_{}", uuid::Uuid::new_v4().simple());
     sqlx::query(
         "INSERT INTO accounts
-         (id, provider_id, label, secret_enc, key_mask, status, quota_type, soft_quota_usd, priority, weight, created_at)
-         VALUES (?,?,?,?,?,'healthy',?,?,?,?,?)",
+         (id, provider_id, label, secret_enc, key_mask, status, status_reason, status_changed_at, quota_type, soft_quota_usd, priority, weight, created_at)
+         VALUES (?,?,?,?,?,'healthy','account_created',?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(provider_id)
     .bind(label)
     .bind(secret_enc)
     .bind(key_mask)
+    .bind(now_iso())
     .bind(quota_type)
     .bind(soft_quota_usd)
     .bind(priority)
@@ -1653,24 +1669,62 @@ pub async fn update_account(
     pool: &Pool,
     id: &str,
     label: &str,
-    status: &str,
+    status: Option<&str>,
     priority: i64,
     weight: i64,
     soft_quota_usd: Option<f64>,
     quota_type: &str,
+    credential: Option<(&str, &str)>,
 ) -> Result<()> {
-    sqlx::query(
-        "UPDATE accounts SET label=?, status=?, priority=?, weight=?, soft_quota_usd=?, quota_type=? WHERE id=?",
-    )
-    .bind(label)
-    .bind(status)
-    .bind(priority)
-    .bind(weight)
-    .bind(soft_quota_usd)
-    .bind(quota_type)
-    .bind(id)
-    .execute(pool)
-    .await?;
+    if let Some(status) = status {
+        if !matches!(status, "healthy" | "disabled") {
+            anyhow::bail!("account status must be either healthy or disabled");
+        }
+        let reason = if status == "disabled" {
+            "operator_disabled"
+        } else {
+            "operator_enabled"
+        };
+        sqlx::query(
+            "UPDATE accounts SET label=?, status=?, status_reason=?, \
+             status_changed_at=CASE WHEN status=? AND status_reason=? THEN status_changed_at ELSE ? END, \
+             priority=?, weight=?, soft_quota_usd=?, quota_type=?, cooldown_until=NULL, \
+             quota_reset_at=NULL, last_error=NULL, circuit_open_until=NULL, \
+             consecutive_failures=0, secret_enc=COALESCE(?, secret_enc), \
+             key_mask=COALESCE(?, key_mask), account_state_version=account_state_version + 1 WHERE id=?",
+        )
+        .bind(label)
+        .bind(status)
+        .bind(reason)
+        .bind(status)
+        .bind(reason)
+        .bind(now_iso())
+        .bind(priority)
+        .bind(weight)
+        .bind(soft_quota_usd)
+        .bind(quota_type)
+        .bind(credential.map(|(secret_enc, _)| secret_enc))
+        .bind(credential.map(|(_, key_mask)| key_mask))
+        .bind(id)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE accounts SET label=?, priority=?, weight=?, soft_quota_usd=?, quota_type=?, \
+             secret_enc=COALESCE(?, secret_enc), key_mask=COALESCE(?, key_mask), \
+             account_state_version=account_state_version + 1 WHERE id=?",
+        )
+        .bind(label)
+        .bind(priority)
+        .bind(weight)
+        .bind(soft_quota_usd)
+        .bind(quota_type)
+        .bind(credential.map(|(secret_enc, _)| secret_enc))
+        .bind(credential.map(|(_, key_mask)| key_mask))
+        .bind(id)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -1678,37 +1732,138 @@ pub async fn set_account_status(
     pool: &Pool,
     id: &str,
     status: &str,
+    reason_code: &str,
     cooldown_until: Option<&str>,
     quota_reset_at: Option<&str>,
     last_error: Option<&str>,
 ) -> Result<()> {
-    // A healthy status is a recovery: clear any lingering circuit window so
-    // `effective_status` reports Healthy again (FR-4.7).
-    if status == "healthy" {
-        sqlx::query(
-            "UPDATE accounts SET status=?, cooldown_until=?, quota_reset_at=?, last_error=?, \
-             circuit_open_until=NULL, consecutive_failures=0 WHERE id=?",
-        )
-        .bind(status)
-        .bind(cooldown_until)
-        .bind(quota_reset_at)
-        .bind(last_error)
-        .bind(id)
-        .execute(pool)
-        .await?;
-        return Ok(());
-    }
+    // Runtime and probe updates cannot re-enable an operator-disabled account.
+    let clears_circuit = status == "healthy";
     sqlx::query(
-        "UPDATE accounts SET status=?, cooldown_until=?, quota_reset_at=?, last_error=? WHERE id=?",
+        "UPDATE accounts SET status=?, status_reason=?, \
+         status_changed_at=CASE WHEN status=? AND status_reason=? THEN status_changed_at ELSE ? END, \
+         cooldown_until=?, quota_reset_at=?, last_error=?, \
+         circuit_open_until=CASE WHEN ? THEN NULL ELSE circuit_open_until END, \
+         consecutive_failures=CASE WHEN ? THEN 0 ELSE consecutive_failures END, \
+         account_state_version=account_state_version + 1 \
+         WHERE id=? AND status != 'disabled'",
     )
     .bind(status)
+    .bind(reason_code)
+    .bind(status)
+    .bind(reason_code)
+    .bind(now_iso())
     .bind(cooldown_until)
     .bind(quota_reset_at)
     .bind(last_error)
+    .bind(clears_circuit)
+    .bind(clears_circuit)
     .bind(id)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Apply a runtime lifecycle update only if the request still observes the
+/// account generation from which its credential was resolved.
+pub async fn set_account_status_if_version(
+    pool: &Pool,
+    id: &str,
+    observed_state_version: i64,
+    status: &str,
+    reason_code: &str,
+    cooldown_until: Option<&str>,
+    quota_reset_at: Option<&str>,
+    last_error: Option<&str>,
+) -> Result<bool> {
+    let clears_circuit = status == "healthy";
+    let result = sqlx::query(
+        "UPDATE accounts SET status=?, status_reason=?, \
+         status_changed_at=CASE WHEN status=? AND status_reason=? THEN status_changed_at ELSE ? END, \
+         cooldown_until=?, quota_reset_at=?, last_error=?, \
+         circuit_open_until=CASE WHEN ? THEN NULL ELSE circuit_open_until END, \
+         consecutive_failures=CASE WHEN ? THEN 0 ELSE consecutive_failures END, \
+         account_state_version=account_state_version + 1 \
+         WHERE id=? AND status != 'disabled' AND account_state_version=?",
+    )
+    .bind(status)
+    .bind(reason_code)
+    .bind(status)
+    .bind(reason_code)
+    .bind(now_iso())
+    .bind(cooldown_until)
+    .bind(quota_reset_at)
+    .bind(last_error)
+    .bind(clears_circuit)
+    .bind(clears_circuit)
+    .bind(id)
+    .bind(observed_state_version)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Clear circuit-breaker state after a valid upstream response. The observed
+/// account-state version makes an older in-flight success a no-op after any
+/// newer lifecycle or failure update. An open circuit can only be cleared by a
+/// request selected as its bounded half-open probe.
+pub async fn recover_account_after_success(
+    pool: &Pool,
+    id: &str,
+    observed_state_version: i64,
+    is_half_open_probe: bool,
+) -> Result<bool> {
+    let now = now_iso();
+    let result = sqlx::query(
+        "UPDATE accounts SET \
+         status=CASE \
+             WHEN status='cooldown' AND julianday(cooldown_until) <= julianday(?) THEN 'healthy' \
+             WHEN status='exhausted' AND julianday(quota_reset_at) <= julianday(?) THEN 'healthy' \
+             ELSE status END, \
+         status_reason=CASE \
+             WHEN status='cooldown' AND julianday(cooldown_until) <= julianday(?) THEN 'cooldown_elapsed' \
+             WHEN status='exhausted' AND julianday(quota_reset_at) <= julianday(?) THEN 'quota_reset' \
+             WHEN status='healthy' AND circuit_open_until IS NOT NULL AND status_reason='circuit_open' THEN 'circuit_recovered' \
+             ELSE status_reason END, \
+         status_changed_at=CASE \
+             WHEN (status='cooldown' AND julianday(cooldown_until) <= julianday(?)) \
+               OR (status='exhausted' AND julianday(quota_reset_at) <= julianday(?)) \
+               OR (status='healthy' AND circuit_open_until IS NOT NULL AND status_reason='circuit_open') \
+             THEN ? ELSE status_changed_at END, \
+         cooldown_until=CASE WHEN status='cooldown' AND julianday(cooldown_until) <= julianday(?) THEN NULL ELSE cooldown_until END, \
+         quota_reset_at=CASE WHEN status='exhausted' AND julianday(quota_reset_at) <= julianday(?) THEN NULL ELSE quota_reset_at END, \
+         last_error=CASE \
+             WHEN status='healthy' \
+               OR (status='cooldown' AND julianday(cooldown_until) <= julianday(?)) \
+               OR (status='exhausted' AND julianday(quota_reset_at) <= julianday(?)) \
+             THEN NULL ELSE last_error END, \
+         circuit_open_until=NULL, consecutive_failures=0, \
+         account_state_version=account_state_version + 1 \
+         WHERE id=? AND status != 'disabled' AND account_state_version=? \
+         AND ((circuit_open_until IS NULL AND (consecutive_failures != 0 \
+                  OR (status='cooldown' AND julianday(cooldown_until) <= julianday(?)) \
+                  OR (status='exhausted' AND julianday(quota_reset_at) <= julianday(?)))) \
+              OR (? AND circuit_open_until IS NOT NULL))",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(id)
+    .bind(observed_state_version)
+    .bind(&now)
+    .bind(&now)
+    .bind(is_half_open_probe)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn delete_account(pool: &Pool, id: &str) -> Result<()> {
@@ -1719,6 +1874,56 @@ pub async fn delete_account(pool: &Pool, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Apply an account-scoped upstream failure and its lifecycle transition in
+/// one compare-and-update. Returning `None` means the attempt's account
+/// generation is stale or the account is already disabled.
+pub async fn apply_account_failure(
+    pool: &Pool,
+    id: &str,
+    observed_state_version: i64,
+    status: &str,
+    reason_code: &str,
+    cooldown_until: Option<&str>,
+    quota_reset_at: Option<&str>,
+    last_error: &str,
+    circuit_threshold: i64,
+    open_secs: i64,
+) -> Result<Option<i64>> {
+    if !matches!(status, "cooldown" | "exhausted" | "disabled") {
+        anyhow::bail!("invalid account failure status: {status}");
+    }
+    let counts_toward_circuit = status != "disabled";
+    let open_until = (Utc::now() + chrono::Duration::seconds(open_secs)).to_rfc3339();
+    let redacted_error = crate::crypto::redact(last_error);
+    let failure_count = sqlx::query_scalar(
+        "UPDATE accounts SET status=?, status_reason=?, \
+         status_changed_at=CASE WHEN status=? AND status_reason=? THEN status_changed_at ELSE ? END, \
+         cooldown_until=?, quota_reset_at=?, last_error=?, \
+         consecutive_failures=consecutive_failures + CASE WHEN ? THEN 1 ELSE 0 END, \
+         circuit_open_until=CASE WHEN ? AND consecutive_failures + 1 >= ? THEN ? ELSE circuit_open_until END, \
+         account_state_version=account_state_version + 1 \
+         WHERE id=? AND status != 'disabled' AND account_state_version=? \
+         RETURNING consecutive_failures",
+    )
+    .bind(status)
+    .bind(reason_code)
+    .bind(status)
+    .bind(reason_code)
+    .bind(now_iso())
+    .bind(cooldown_until)
+    .bind(quota_reset_at)
+    .bind(redacted_error)
+    .bind(counts_toward_circuit)
+    .bind(counts_toward_circuit)
+    .bind(circuit_threshold)
+    .bind(open_until)
+    .bind(id)
+    .bind(observed_state_version)
+    .fetch_optional(pool)
+    .await?;
+    Ok(failure_count)
+}
+
 /// Bump the consecutive-failure counter and open the circuit when the
 /// threshold is reached (FR-4.7). Returns the new failure count.
 pub async fn record_account_failure(
@@ -1727,10 +1932,14 @@ pub async fn record_account_failure(
     circuit_threshold: i64,
     open_secs: i64,
 ) -> Result<i64> {
-    sqlx::query("UPDATE accounts SET consecutive_failures = consecutive_failures + 1 WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE accounts SET consecutive_failures = consecutive_failures + 1, \
+         account_state_version = account_state_version + 1 \
+         WHERE id = ? AND status != 'disabled'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
     let row = sqlx::query("SELECT consecutive_failures FROM accounts WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
@@ -1740,8 +1949,14 @@ pub async fn record_account_failure(
         .unwrap_or(0);
     if n >= circuit_threshold {
         let until = (Utc::now() + chrono::Duration::seconds(open_secs)).to_rfc3339();
-        sqlx::query("UPDATE accounts SET circuit_open_until = ? WHERE id = ?")
+        sqlx::query(
+            "UPDATE accounts SET circuit_open_until = ?, \
+             status_reason = CASE WHEN status = 'healthy' THEN 'circuit_open' ELSE status_reason END, \
+             status_changed_at = CASE WHEN status = 'healthy' AND circuit_open_until IS NULL THEN ? ELSE status_changed_at END \
+             WHERE id = ? AND status != 'disabled'",
+        )
             .bind(until)
+            .bind(now_iso())
             .bind(id)
             .execute(pool)
             .await?;
@@ -1752,7 +1967,8 @@ pub async fn record_account_failure(
 /// Clear the circuit breaker and failure counter after a successful probe.
 pub async fn reset_account_failures(pool: &Pool, id: &str) -> Result<()> {
     sqlx::query(
-        "UPDATE accounts SET consecutive_failures = 0, circuit_open_until = NULL WHERE id = ?",
+        "UPDATE accounts SET consecutive_failures = 0, circuit_open_until = NULL, \
+         account_state_version = account_state_version + 1 WHERE id = ?",
     )
     .bind(id)
     .execute(pool)
@@ -1760,9 +1976,42 @@ pub async fn reset_account_failures(pool: &Pool, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Record the instant an account was last actively probed (half-open recovery,
-/// FR-4.7). Kept separate from the status write so it is a pure timestamp touch.
-pub async fn touch_probe_at(pool: &Pool, id: &str) -> Result<()> {
+/// Atomically reserve an eligible half-open account probe. The immutable
+/// registry version prevents a stale candidate from claiming after lifecycle
+/// state changes; the conditional timestamp update permits one winner per gap.
+pub async fn claim_half_open_probe_at(
+    pool: &Pool,
+    id: &str,
+    observed_state_version: i64,
+    now: DateTime<Utc>,
+    min_gap_secs: i64,
+) -> Result<bool> {
+    let probe_after = (now.clone() - chrono::Duration::seconds(min_gap_secs.max(0))).to_rfc3339();
+    let now = now.to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE accounts SET last_probe_at=? \
+         WHERE id=? AND status != 'disabled' AND account_state_version=? \
+           AND circuit_open_until IS NOT NULL \
+           AND julianday(circuit_open_until) <= julianday(?) \
+           AND (status != 'cooldown' OR (cooldown_until IS NOT NULL AND julianday(cooldown_until) <= julianday(?))) \
+           AND (status != 'exhausted' OR (quota_reset_at IS NOT NULL AND julianday(quota_reset_at) <= julianday(?))) \
+           AND (last_probe_at IS NULL OR julianday(last_probe_at) <= julianday(?))",
+    )
+    .bind(&now)
+    .bind(id)
+    .bind(observed_state_version)
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .bind(&probe_after)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Record the timestamp of an explicit administrator-initiated account test.
+/// Automatic half-open dispatch must use [`claim_half_open_probe_at`].
+pub async fn record_manual_probe_at(pool: &Pool, id: &str) -> Result<()> {
     sqlx::query("UPDATE accounts SET last_probe_at = ? WHERE id = ?")
         .bind(Utc::now().to_rfc3339())
         .bind(id)
@@ -4101,6 +4350,503 @@ mod price_version_identity_tests {
         assert_eq!(versions, 0);
 
         drop(pool);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod account_success_recovery_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::sync::oneshot;
+
+    async fn recovery_account(tag: &str) -> (Pool, String, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-account-recovery-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}", root.join("kinetix.db").display());
+        let pool = connect(&database_url).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let provider_id = insert_provider(
+            &pool,
+            &NewProvider {
+                name: "recovery-test",
+                base_url: "https://example.invalid/v1",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let account_id = insert_account(
+            &pool,
+            &provider_id,
+            "recovery-test",
+            "encrypted",
+            "key…",
+            1,
+            1,
+            None,
+            "",
+        )
+        .await
+        .unwrap();
+        (pool, account_id, root)
+    }
+
+    #[tokio::test]
+    async fn account_failure_transition_is_atomic_and_generation_guarded() {
+        let (pool, account_id, root) = recovery_account("failure-generation").await;
+        let before = get_account(&pool, &account_id).await.unwrap().unwrap();
+        let cooldown_until = (Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+
+        assert_eq!(
+            apply_account_failure(
+                &pool,
+                &account_id,
+                before.account_state_version,
+                "cooldown",
+                "rate_limited",
+                Some(cooldown_until.as_str()),
+                None,
+                "rate limit",
+                1,
+                60,
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
+        let after_failure = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert_eq!(after_failure.status, "cooldown");
+        assert_eq!(after_failure.status_reason, "rate_limited");
+        assert_eq!(
+            after_failure.cooldown_until.as_deref(),
+            Some(cooldown_until.as_str())
+        );
+        assert_eq!(after_failure.consecutive_failures, 1);
+        assert!(after_failure.circuit_open_until.is_some());
+        assert_eq!(
+            after_failure.account_state_version,
+            before.account_state_version + 1
+        );
+
+        assert_eq!(
+            apply_account_failure(
+                &pool,
+                &account_id,
+                before.account_state_version,
+                "disabled",
+                "auth_error",
+                None,
+                None,
+                "stale unauthorized response",
+                4,
+                30,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        let after_stale_failure = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert_eq!(after_stale_failure.status, "cooldown");
+        assert_eq!(after_stale_failure.status_reason, "rate_limited");
+        assert_eq!(
+            after_stale_failure.last_error.as_deref(),
+            Some("rate limit")
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn stale_success_after_failure_transition(
+        tag: &str,
+        status: &str,
+        reason: &str,
+        cooldown_until: Option<String>,
+        quota_reset_at: Option<String>,
+    ) {
+        let (pool, account_id, root) = recovery_account(tag).await;
+        let attempt_account = get_account(&pool, &account_id).await.unwrap().unwrap();
+        let observed_state_version = attempt_account.account_state_version;
+        let (started_tx, started_rx) = oneshot::channel();
+        let (continue_tx, continue_rx) = oneshot::channel();
+        let success_pool = pool.clone();
+        let success_account_id = account_id.clone();
+        let success = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            continue_rx.await.unwrap();
+            recover_account_after_success(
+                &success_pool,
+                &success_account_id,
+                observed_state_version,
+                false,
+            )
+            .await
+            .unwrap()
+        });
+
+        // Model a request already in flight before another request records its
+        // newer lifecycle transition; let its 2xx recovery run afterward.
+        started_rx.await.unwrap();
+        set_account_status(
+            &pool,
+            &account_id,
+            status,
+            reason,
+            cooldown_until.as_deref(),
+            quota_reset_at.as_deref(),
+            Some("newer failure"),
+        )
+        .await
+        .unwrap();
+        continue_tx.send(()).unwrap();
+
+        assert!(!success.await.unwrap());
+        let account = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert_eq!(account.status, status);
+        assert_eq!(account.status_reason, reason);
+        assert_eq!(account.cooldown_until, cooldown_until);
+        assert_eq!(account.quota_reset_at, quota_reset_at);
+        assert_eq!(account.last_error.as_deref(), Some("newer failure"));
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn in_flight_success_does_not_clear_newer_rate_limit_cooldown() {
+        stale_success_after_failure_transition(
+            "rate-limit",
+            "cooldown",
+            "rate_limited",
+            Some((Utc::now() + chrono::Duration::minutes(1)).to_rfc3339()),
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn in_flight_success_does_not_clear_newer_quota_reset() {
+        stale_success_after_failure_transition(
+            "quota",
+            "exhausted",
+            "account_quota_exhausted",
+            None,
+            Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn in_flight_success_preserves_failure_recorded_by_pipeline() {
+        let (pool, account_id, root) = recovery_account("stale-circuit-success").await;
+        let attempt_account = get_account(&pool, &account_id).await.unwrap().unwrap();
+        let observed_state_version = attempt_account.account_state_version;
+        let (started_tx, started_rx) = oneshot::channel();
+        let (continue_tx, continue_rx) = oneshot::channel();
+        let success_pool = pool.clone();
+        let success_account_id = account_id.clone();
+        let success = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            continue_rx.await.unwrap();
+            recover_account_after_success(
+                &success_pool,
+                &success_account_id,
+                observed_state_version,
+                false,
+            )
+            .await
+            .unwrap()
+        });
+
+        // This is the same failure-evidence write used by handle_key_failure.
+        started_rx.await.unwrap();
+        assert_eq!(
+            record_account_failure(&pool, &account_id, 1, 60)
+                .await
+                .unwrap(),
+            1
+        );
+        let failed = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert!(failed.circuit_open_until.is_some());
+        assert_eq!(failed.consecutive_failures, 1);
+
+        // A valid 2xx from the older in-flight attempt must not clear B's failure.
+        continue_tx.send(()).unwrap();
+        assert!(!success.await.unwrap());
+        let account = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert!(account.circuit_open_until.is_some());
+        assert_eq!(account.consecutive_failures, 1);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn expired_lifecycle_with_open_circuit_is_probeable(
+        tag: &str,
+        status: &str,
+        reason: &str,
+        cooldown: bool,
+    ) {
+        let (pool, account_id, root) = recovery_account(tag).await;
+        let started = Utc::now();
+        let expires = (started + chrono::Duration::seconds(1)).to_rfc3339();
+        set_account_status(
+            &pool,
+            &account_id,
+            status,
+            reason,
+            cooldown.then_some(expires.as_str()),
+            (!cooldown).then_some(expires.as_str()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..3 {
+            record_account_failure(&pool, &account_id, 3, 2)
+                .await
+                .unwrap();
+        }
+        let account = get_account(&pool, &account_id).await.unwrap().unwrap();
+        let after_windows = started + chrono::Duration::seconds(4);
+        assert_eq!(
+            crate::pool::effective_status_at(&account, after_windows),
+            crate::pool::AccountStatus::CircuitOpen
+        );
+        assert!(
+            crate::pool::should_probe_at(&account, after_windows),
+            "expired {status} lifecycle and circuit windows must allow a bounded probe"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn expired_rate_limit_with_expired_circuit_allows_half_open_probe() {
+        expired_lifecycle_with_open_circuit_is_probeable(
+            "expired-rate-limit-probe",
+            "cooldown",
+            "rate_limited",
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn expired_quota_with_expired_circuit_allows_half_open_probe() {
+        expired_lifecycle_with_open_circuit_is_probeable(
+            "expired-quota-probe",
+            "exhausted",
+            "account_quota_exhausted",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn account_updates_reject_runtime_owned_statuses() {
+        let (pool, account_id, root) = recovery_account("invalid-admin-status").await;
+        let until = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        set_account_status(
+            &pool,
+            &account_id,
+            "cooldown",
+            "rate_limited",
+            Some(&until),
+            None,
+            Some("rate limited"),
+        )
+        .await
+        .unwrap();
+        let before = get_account(&pool, &account_id).await.unwrap().unwrap();
+
+        assert!(update_account(
+            &pool,
+            &account_id,
+            "renamed",
+            Some("cooldown"),
+            2,
+            1,
+            None,
+            "none",
+            None,
+        )
+        .await
+        .is_err());
+
+        let after = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert_eq!(after.label, before.label);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.status_reason, before.status_reason);
+        assert_eq!(after.cooldown_until, before.cooldown_until);
+        assert_eq!(after.account_state_version, before.account_state_version);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn success_clears_circuit_state_without_rewriting_account_status() {
+        let (pool, account_id, root) = recovery_account("circuit").await;
+        record_account_failure(&pool, &account_id, 1, 30)
+            .await
+            .unwrap();
+
+        let account = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert!(recover_account_after_success(
+            &pool,
+            &account_id,
+            account.account_state_version,
+            true,
+        )
+        .await
+        .unwrap());
+        let account = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert_eq!(account.status, "healthy");
+        assert_eq!(account.status_reason, "circuit_recovered");
+        assert!(account.circuit_open_until.is_none());
+        assert_eq!(account.consecutive_failures, 0);
+        assert!(account.cooldown_until.is_none());
+        assert!(account.quota_reset_at.is_none());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn expired_lifecycle_success_recovers(
+        tag: &str,
+        status: &str,
+        reason: &str,
+        expected_reason: &str,
+        is_cooldown: bool,
+    ) {
+        let (pool, account_id, root) = recovery_account(tag).await;
+        let expired = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        set_account_status(
+            &pool,
+            &account_id,
+            status,
+            reason,
+            is_cooldown.then_some(expired.as_str()),
+            (!is_cooldown).then_some(expired.as_str()),
+            Some("old upstream failure"),
+        )
+        .await
+        .unwrap();
+        record_account_failure(&pool, &account_id, 3, 60)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE accounts SET status_changed_at='2000-01-01T00:00:00Z' WHERE id=?")
+            .bind(&account_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = get_account(&pool, &account_id).await.unwrap().unwrap();
+
+        assert!(recover_account_after_success(
+            &pool,
+            &account_id,
+            before.account_state_version,
+            false,
+        )
+        .await
+        .unwrap());
+        let after = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert_eq!(after.status, "healthy");
+        assert_eq!(after.status_reason, expected_reason);
+        assert_ne!(after.status_changed_at, before.status_changed_at);
+        assert!(after
+            .status_changed_at
+            .as_deref()
+            .and_then(parse_dt)
+            .is_some_and(|changed| changed >= Utc::now() - chrono::Duration::seconds(2)));
+        assert!(after.cooldown_until.is_none());
+        assert!(after.quota_reset_at.is_none());
+        assert!(after.last_error.is_none());
+        assert!(after.circuit_open_until.is_none());
+        assert_eq!(after.consecutive_failures, 0);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn successful_traffic_persists_expired_cooldown_recovery() {
+        expired_lifecycle_success_recovers(
+            "expired-cooldown-success",
+            "cooldown",
+            "rate_limited",
+            "cooldown_elapsed",
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn successful_traffic_persists_expired_quota_recovery() {
+        expired_lifecycle_success_recovers(
+            "expired-quota-success",
+            "exhausted",
+            "account_quota_exhausted",
+            "quota_reset",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_half_open_claims_have_exactly_one_winner() {
+        let (pool, account_id, root) = recovery_account("probe-claim-race").await;
+        record_account_failure(&pool, &account_id, 1, -1)
+            .await
+            .unwrap();
+        let account = get_account(&pool, &account_id).await.unwrap().unwrap();
+        let now = Utc::now();
+
+        let (first, second) = tokio::join!(
+            claim_half_open_probe_at(
+                &pool,
+                &account_id,
+                account.account_state_version,
+                now,
+                crate::pool::HALF_OPEN_PROBE_MIN_GAP_SECS,
+            ),
+            claim_half_open_probe_at(
+                &pool,
+                &account_id,
+                account.account_state_version,
+                now,
+                crate::pool::HALF_OPEN_PROBE_MIN_GAP_SECS,
+            ),
+        );
+        assert_eq!(
+            usize::from(first.unwrap()) + usize::from(second.unwrap()),
+            1
+        );
+
+        pool.close().await;
         let _ = std::fs::remove_dir_all(root);
     }
 }

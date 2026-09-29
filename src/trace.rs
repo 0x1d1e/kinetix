@@ -36,6 +36,21 @@ pub struct TraceStep {
     /// Transport resolved for this target attempt (admin/internal metadata).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_transport: Option<String>,
+    /// Shared failure classification and policy effects, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_health_effect: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_hint: Option<String>,
     /// Wall-clock offset from request start.
     pub elapsed_ms: u64,
 }
@@ -114,6 +129,13 @@ impl RouteTrace {
             predicate: None,
             detail: detail.into(),
             resolved_transport: None,
+            failure_kind: None,
+            failure_category: None,
+            failure_reason: None,
+            fallback_rule: None,
+            account_health_effect: None,
+            client_status: None,
+            retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
     }
@@ -126,6 +148,13 @@ impl RouteTrace {
             predicate: None,
             detail: "target execution profile resolved".into(),
             resolved_transport: Some(transport.to_string()),
+            failure_kind: None,
+            failure_category: None,
+            failure_reason: None,
+            fallback_rule: None,
+            account_health_effect: None,
+            client_status: None,
+            retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
     }
@@ -144,6 +173,13 @@ impl RouteTrace {
             predicate,
             detail: detail.into(),
             resolved_transport: None,
+            failure_kind: None,
+            failure_category: None,
+            failure_reason: None,
+            fallback_rule: None,
+            account_health_effect: None,
+            client_status: None,
+            retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
     }
@@ -157,6 +193,13 @@ impl RouteTrace {
             predicate: None,
             detail: w.clone(),
             resolved_transport: None,
+            failure_kind: None,
+            failure_category: None,
+            failure_reason: None,
+            fallback_rule: None,
+            account_health_effect: None,
+            client_status: None,
+            retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
         self.warnings.push(w);
@@ -190,6 +233,40 @@ impl RouteTrace {
             predicate: None,
             detail: format!("= {value}"),
             resolved_transport: None,
+            failure_kind: None,
+            failure_category: None,
+            failure_reason: None,
+            fallback_rule: None,
+            account_health_effect: None,
+            client_status: None,
+            retry_hint: None,
+            elapsed_ms: self.started.elapsed().as_millis() as u64,
+        });
+    }
+
+    /// Record a classified upstream failure and its shared policy effects.
+    pub fn failure(
+        &mut self,
+        target: Option<String>,
+        detail: impl Into<String>,
+        kind: crate::types::FailureKind,
+        upstream_status: Option<u16>,
+    ) {
+        let policy = kind.policy();
+        self.steps.push(TraceStep {
+            stage: "attempt".into(),
+            target,
+            eligible: None,
+            predicate: None,
+            detail: detail.into(),
+            resolved_transport: None,
+            failure_kind: Some(kind.as_str().into()),
+            failure_category: Some(policy.category.as_str().into()),
+            failure_reason: Some(kind.reason_code().into()),
+            fallback_rule: Some(policy.fallback.as_str().into()),
+            account_health_effect: Some(policy.account_health.as_str().into()),
+            client_status: kind.client_status(upstream_status),
+            retry_hint: Some(policy.retry_hint.as_str().into()),
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
     }
@@ -207,6 +284,13 @@ impl RouteTrace {
             predicate: Some("unknown".into()),
             detail: format!("fact provider failed: {reason}"),
             resolved_transport: None,
+            failure_kind: None,
+            failure_category: None,
+            failure_reason: None,
+            fallback_rule: None,
+            account_health_effect: None,
+            client_status: None,
+            retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
     }
