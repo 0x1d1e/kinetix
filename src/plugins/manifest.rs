@@ -64,6 +64,16 @@ pub fn parse_and_validate(toml_str: &str, policy: HostPolicy) -> Result<Validate
 
 /// Validate an already-parsed manifest.
 pub fn validate(manifest: Manifest, policy: HostPolicy) -> Result<ValidatedManifest> {
+    let host_version = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("CARGO_PKG_VERSION must be valid semantic version");
+    validate_for_host(manifest, policy, &host_version)
+}
+
+fn validate_for_host(
+    manifest: Manifest,
+    policy: HostPolicy,
+    host_version: &semver::Version,
+) -> Result<ValidatedManifest> {
     if manifest.manifest_version != MANIFEST_VERSION {
         bail!(
             "unsupported manifest_version {} (host supports {})",
@@ -75,9 +85,8 @@ pub fn validate(manifest: Manifest, policy: HostPolicy) -> Result<ValidatedManif
     if manifest.name.trim().is_empty() {
         bail!("manifest `name` must not be empty");
     }
-    if manifest.version.trim().is_empty() {
-        bail!("manifest `version` must not be empty");
-    }
+    semver::Version::parse(&manifest.version)
+        .map_err(|e| anyhow!("invalid manifest `version` '{}': {e}", manifest.version))?;
     match manifest.api_major() {
         Some(major) if major == PLUGIN_API_MAJOR => {}
         Some(major) => bail!(
@@ -86,13 +95,22 @@ pub fn validate(manifest: Manifest, policy: HostPolicy) -> Result<ValidatedManif
         ),
         None => bail!("invalid plugin_api '{}'", manifest.plugin_api),
     }
+    validate_host_compatibility(&manifest, host_version)?;
 
     let provided = manifest.provides.provided();
     if provided.is_empty() {
         bail!("manifest provides no capabilities");
     }
+    let mut capability_names = std::collections::HashSet::new();
     for p in &provided {
         validate_capability_name(p.capability, &p.name)?;
+        if !capability_names.insert((p.capability, p.name.as_str())) {
+            bail!(
+                "duplicate {} capability name '{}'",
+                p.capability.manifest_key(),
+                p.name
+            );
+        }
     }
     if manifest.provides.thinking_translation && manifest.provides.provider_adapters.is_empty() {
         bail!("provides.thinking_translation requires at least one provider_adapter");
@@ -437,10 +455,18 @@ pub fn validate(manifest: Manifest, policy: HostPolicy) -> Result<ValidatedManif
         }
     }
 
+    let mut network_hosts = std::collections::HashSet::new();
     for host in &manifest.permissions.network_hosts {
         validate_network_host(host)?;
+        if !network_hosts.insert(host.as_str()) {
+            bail!("duplicate network_hosts entry '{host}'");
+        }
     }
+    let mut credential_scopes = std::collections::HashSet::new();
     for scope in &manifest.permissions.credential_scopes {
+        if !credential_scopes.insert(scope.as_str()) {
+            bail!("duplicate credential_scopes entry '{scope}'");
+        }
         if scope == "*" {
             continue;
         }
@@ -500,6 +526,38 @@ pub fn validate(manifest: Manifest, policy: HostPolicy) -> Result<ValidatedManif
         manifest,
         effective,
     })
+}
+
+fn validate_host_compatibility(manifest: &Manifest, host_version: &semver::Version) -> Result<()> {
+    let min_host = manifest
+        .compatibility
+        .min_host_version
+        .as_deref()
+        .map(semver::Version::parse)
+        .transpose()
+        .map_err(|e| anyhow!("invalid compatibility.min_host_version: {e}"))?;
+    let max_host = manifest
+        .compatibility
+        .max_host_version
+        .as_deref()
+        .map(semver::Version::parse)
+        .transpose()
+        .map_err(|e| anyhow!("invalid compatibility.max_host_version: {e}"))?;
+
+    if matches!((&min_host, &max_host), (Some(min), Some(max)) if min > max) {
+        bail!("compatibility.min_host_version must not exceed max_host_version");
+    }
+    if let Some(min) = &min_host {
+        if host_version < min {
+            bail!("plugin requires Kinetix >= {min}, but this host is {host_version}");
+        }
+    }
+    if let Some(max) = &max_host {
+        if host_version > max {
+            bail!("plugin supports Kinetix <= {max}, but this host is {host_version}");
+        }
+    }
+    Ok(())
 }
 
 /// Apply host policy to the manifest's requested limits (§5, §14). The plugin
@@ -703,6 +761,95 @@ storage = "2MiB"
     fn rejects_incompatible_api() {
         let bad = GOOD.replace("plugin_api = \"1\"", "plugin_api = \"2\"");
         assert!(parse_and_validate(&bad, HostPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn unbounded_api_v1_remains_compatible_across_kinetix_1x() {
+        let manifest: Manifest = toml::from_str(GOOD).unwrap();
+        for host in ["1.0.0", "1.5.0", "1.99.99"] {
+            let host = semver::Version::parse(host).unwrap();
+            assert!(manifest.compatible_with_host_version(&host));
+        }
+
+        let api_v2 = GOOD.replace("plugin_api = \"1\"", "plugin_api = \"2\"");
+        let api_v2: Manifest = toml::from_str(&api_v2).unwrap();
+        assert!(!api_v2.compatible_with_host_version(&semver::Version::parse("1.5.0").unwrap()));
+    }
+
+    #[test]
+    fn host_version_compatibility_range_is_inclusive_and_enforced() {
+        let bounded = GOOD.replace(
+            "plugin_api = \"1\"",
+            "plugin_api = \"1\"\n\n[compatibility]\nmin_host_version = \"1.0.0\"\nmax_host_version = \"2.0.0\"",
+        );
+
+        let below = toml::from_str(&bounded).unwrap();
+        let error = validate_for_host(
+            below,
+            HostPolicy::default(),
+            &semver::Version::parse("0.9.9").unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("requires Kinetix >= 1.0.0"),
+            "{error}"
+        );
+
+        for version in ["1.0.0", "2.0.0"] {
+            let manifest = toml::from_str(&bounded).unwrap();
+            validate_for_host(
+                manifest,
+                HostPolicy::default(),
+                &semver::Version::parse(version).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let above = toml::from_str(&bounded).unwrap();
+        let error = validate_for_host(
+            above,
+            HostPolicy::default(),
+            &semver::Version::parse("2.0.1").unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("supports Kinetix <= 2.0.0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_plugin_and_host_versions() {
+        let bad_release = GOOD.replace("version = \"1.2.0\"", "version = \"release-1\"");
+        assert!(parse_and_validate(&bad_release, HostPolicy::default()).is_err());
+
+        let bad_api = GOOD.replace("plugin_api = \"1\"", "plugin_api = \"1.invalid\"");
+        assert!(parse_and_validate(&bad_api, HostPolicy::default()).is_err());
+
+        let bad_host_range = GOOD.replace(
+            "plugin_api = \"1\"",
+            "plugin_api = \"1\"\n\n[compatibility]\nmin_host_version = \"2.0.0\"\nmax_host_version = \"1.0.0\"",
+        );
+        assert!(parse_and_validate(&bad_host_range, HostPolicy::default()).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_and_duplicate_capability_declarations() {
+        let unknown = GOOD.replace("[provides]", "[provides]\nmodel_source = [\"misspelled\"]");
+        let error = parse_and_validate(&unknown, HostPolicy::default()).unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+
+        let duplicate = GOOD.replace(
+            "model_sources = [\"foo-models\"]",
+            "model_sources = [\"foo-models\", \"foo-models\"]",
+        );
+        let error = parse_and_validate(&duplicate, HostPolicy::default()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate model_sources capability name"),
+            "{error}"
+        );
     }
 
     #[test]

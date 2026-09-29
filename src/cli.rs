@@ -492,8 +492,7 @@ fn config_from_cli(cli: &Cli) -> Result<Config> {
 /// the server. Used by every non-`serve` subcommand.
 async fn open(cli: &Cli) -> Result<(Config, Pool, Crypto)> {
     let config = config_from_cli(cli)?;
-    let pool = db::connect(&config.database_url).await?;
-    db::migrate(&pool).await?;
+    let pool = db::open_and_migrate(&config.database_url, &config.data_dir).await?;
     let crypto = Crypto::new(&config.master_key);
     Ok((config, pool, crypto))
 }
@@ -648,17 +647,14 @@ async fn cmd_doctor(cli: &Cli) -> Result<()> {
             problems += 1;
         }
     }
-    match db::connect(&config.database_url).await {
-        Ok(pool) => {
-            if db::migrate(&pool).await.is_ok() {
-                println!("  [ok]   database reachable and migrated");
-            } else {
-                println!("  [fail] database migration failed");
-                problems += 1;
-            }
+    match db::open_and_migrate(&config.database_url, &config.data_dir).await {
+        Ok(_) => println!("  [ok]   database reachable and migrated"),
+        Err(db::OpenDatabaseError::Connection(error)) => {
+            println!("  [fail] database connection failed: {error}");
+            problems += 1;
         }
-        Err(e) => {
-            println!("  [fail] database unreachable: {e}");
+        Err(db::OpenDatabaseError::Startup(error)) => {
+            println!("  [fail] database startup failed (backup, migration, or repair): {error}");
             problems += 1;
         }
     }
@@ -707,8 +703,7 @@ async fn cmd_password(cli: &Cli, args: PasswordArgs) -> Result<()> {
             let hash = crate::crypto::hash_virtual_key(password.trim());
             std::fs::write(config.paths.config_dir.join("admin_password.hash"), &hash)?;
             // Also persist into the DB setting so a running server picks it up.
-            if let Ok(pool) = db::connect(&config.database_url).await {
-                let _ = db::migrate(&pool).await;
+            if let Ok(pool) = db::open_and_migrate(&config.database_url, &config.data_dir).await {
                 let _ = db::set_setting(&pool, crate::auth::ADMIN_PASSWORD_SETTING, &hash).await;
             }
             println!("Admin password updated. Existing dashboard sessions are invalidated.");

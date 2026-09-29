@@ -44,10 +44,8 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         eprintln!("Generated admin password (shown once — store it now):\n  {pw}");
     }
 
-    // Database + migrations (with a pre-migration backup, NFR-2.4).
-    let pool = db::connect(&config.database_url).await?;
-    db::backup_before_migration(&config.database_url, &config.data_dir);
-    db::migrate(&pool).await?;
+    // Open and migrate with a pre-migration backup when existing data will change.
+    let pool = db::open_and_migrate(&config.database_url, &config.data_dir).await?;
 
     let crypto = Arc::new(Crypto::new(&config.master_key));
 
@@ -121,17 +119,23 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         }
     };
 
-    // Re-register capabilities for plugins that were already enabled in a
-    // previous run, so their credential strategies and adapters are available
-    // without a re-enable. (Install/enable-time registration covers the rest.)
+    // Disable persisted plugins that fail the current manifest or permission
+    // contract before re-registering previously enabled capabilities. This also
+    // ensures invalid legacy rows cannot activate credential strategies or adapters.
     if let Some(manager) = state.plugin_manager().cloned() {
-        match manager.list().await {
-            Ok(rows) => {
-                for row in rows.iter().filter(|r| r.status().is_enabled()) {
-                    crate::admin::register_enabled_plugin_capabilities(&state, &row.id).await;
+        match manager.reconcile_enabled_plugins().await {
+            Ok(()) => match manager.list().await {
+                Ok(rows) => {
+                    for row in rows.iter().filter(|r| r.status().is_enabled()) {
+                        crate::admin::register_enabled_plugin_capabilities(&state, &row.id).await;
+                    }
                 }
-            }
-            Err(e) => tracing::warn!(error = %e, "could not enumerate plugins at startup"),
+                Err(e) => tracing::warn!(error = %e, "could not enumerate plugins at startup"),
+            },
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not reconcile enabled plugins at startup; plugin capabilities unavailable"
+            ),
         }
     }
 
