@@ -513,6 +513,89 @@ async fn filtered_session_origin_remains_provenance_for_continuation_portability
 }
 
 #[tokio::test]
+async fn account_rotation_keeps_same_model_session_continuation_provenance() {
+    let harness = setup("reject", "claude-opus-5", false).await;
+    let mut key_parts = harness.initial_origin_key.split('|');
+    let _route_id = key_parts.next().unwrap();
+    let account_a_id = key_parts.next().unwrap().to_owned();
+    let model_id = key_parts.next().unwrap().to_owned();
+    let model = db::get_model(&harness.state.pool, &model_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let session = "session-account-rotation";
+    let mut first_request = first_turn_request();
+    first_request["metadata"] = json!({"test_allow_initial_success": true});
+    let first = dispatch_with_session(&harness, first_request, Some(session.to_owned())).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(first.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        harness
+            .state
+            .sticky_lookup(session, std::time::Duration::from_secs(60)),
+        Some(harness.initial_origin_key.clone())
+    );
+
+    // Add replacement B for the same provider/model, then remove A. The generic
+    // Route target now resolves to B while the sticky affinity key still names A.
+    let encrypted_secret = harness.state.crypto.encrypt("key-a-rotated").unwrap();
+    db::insert_account(
+        &harness.state.pool,
+        &model.provider_id,
+        "anthropic-a-rotated",
+        &encrypted_secret,
+        "key-a-rotated",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+    db::delete_account(&harness.state.pool, &account_a_id)
+        .await
+        .unwrap();
+    harness
+        .state
+        .registry
+        .reload(&harness.state.pool)
+        .await
+        .unwrap();
+    let continued =
+        dispatch_with_session(&harness, continuation_request(), Some(session.to_owned())).await;
+    assert_eq!(continued.status(), StatusCode::OK);
+    assert_eq!(continued.headers().get("x-kinetix-warning"), None);
+    let _ = axum::body::to_bytes(continued.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    let requests = harness.mock.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].authorization.as_deref(), Some("Bearer key-a"));
+    assert_eq!(
+        requests[1].authorization.as_deref(),
+        Some("Bearer key-a-rotated")
+    );
+    let content = requests[1].body["messages"][1]["content"]
+        .as_array()
+        .unwrap();
+    assert!(content.contains(&json!({
+        "type": "thinking",
+        "thinking": "hidden reasoning",
+        "signature": "signed-state"
+    })));
+    assert!(content.contains(&json!({
+        "type": "redacted_thinking",
+        "data": "opaque-redacted-state"
+    })));
+    drop(requests);
+    cleanup(harness).await;
+}
+
+#[tokio::test]
 async fn missing_session_provenance_does_not_guess_first_route_target() {
     let harness = setup("strip_with_warning", "claude-opus-5", false).await;
 

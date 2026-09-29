@@ -784,12 +784,9 @@ pub async fn run(
     let session_origin_key = session
         .as_deref()
         .and_then(|session| state.sticky_lookup(session, STICKY_TTL));
-    let session_origin = session_origin_key.as_ref().and_then(|key| {
-        route_target_origins
-            .iter()
-            .find(|(candidate_key, _)| candidate_key == key)
-            .map(|(_, origin)| origin.clone())
-    });
+    let session_origin = session_origin_key
+        .as_ref()
+        .and_then(|key| resolve_session_origin(key, &route_target_origins));
     let possible_history_origins = if route.is_some() {
         route_target_origins
             .iter()
@@ -1845,6 +1842,36 @@ pub async fn run(
 
 fn target_key(route: &db::RouteRow, t: &ResolvedTarget) -> String {
     format!("{}|{}|{}", route.id, t.account.id, t.model.id)
+}
+
+fn target_route_model_identity(key: &str) -> Option<(&str, &str)> {
+    let (route_id, remainder) = key.split_once('|')?;
+    let (_, model_id) = remainder.split_once('|')?;
+    Some((route_id, model_id))
+}
+
+fn resolve_session_origin(
+    sticky_key: &str,
+    route_target_origins: &[(String, ContinuationOrigin)],
+) -> Option<ContinuationOrigin> {
+    if let Some((_, origin)) = route_target_origins
+        .iter()
+        .find(|(candidate_key, _)| candidate_key == sticky_key)
+    {
+        return Some(origin.clone());
+    }
+
+    // Account identity is used for affinity, but an account rotation does not
+    // change who produced continuation state when the Route/model still resolves
+    // unambiguously to the same provider, upstream model, and family metadata.
+    let identity = target_route_model_identity(sticky_key)?;
+    let mut candidates = route_target_origins
+        .iter()
+        .filter(|(candidate_key, _)| target_route_model_identity(candidate_key) == Some(identity));
+    let (_, origin) = candidates.next()?;
+    candidates
+        .all(|(_, candidate)| candidate == origin)
+        .then(|| origin.clone())
 }
 
 fn traffic_key(t: &ResolvedTarget) -> crate::upstream_traffic::TargetKey {
@@ -3242,7 +3269,7 @@ async fn order_route_targets(
 /// * `strip_with_warning` — remove the non-portable state, record it in the
 ///   Route Trace, and emit a client-visible warning. Silent stripping is
 ///   forbidden.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct ContinuationOrigin {
     provider_id: String,
     upstream_model_id: String,
