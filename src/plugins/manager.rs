@@ -251,6 +251,7 @@ enum ValidationWorld {
     AccountModelSource,
     ProviderAdapter,
     ProviderAdapterV2,
+    HealthV2,
 }
 
 /// The plugin manager. Cheap to clone (Arc inside).
@@ -1335,6 +1336,7 @@ impl PluginManager {
             ValidationWorld::AccountModelSource => "plugin-model-source",
             ValidationWorld::ProviderAdapter => "plugin-adapter",
             ValidationWorld::ProviderAdapterV2 => "plugin-adapter-v2",
+            ValidationWorld::HealthV2 => "plugin-health-v2",
         };
         let mut store = self.new_validation_store(plugin_id, limits, "validation");
         let _deadline = self.inner.runtime.arm_deadline(
@@ -1370,6 +1372,12 @@ impl PluginManager {
                 self.inner
                     .runtime
                     .instantiate_adapter_v2(linker, &mut store, component)
+                    .await?;
+            }
+            ValidationWorld::HealthV2 => {
+                self.inner
+                    .runtime
+                    .instantiate_health_v2(linker, &mut store, component)
                     .await?;
             }
         }
@@ -1449,6 +1457,22 @@ impl PluginManager {
                         manifest.id
                     )
                 })?;
+        }
+        if self.inner.runtime.has_health_probe_v2(component) {
+            self.validate_component_world(
+                &manifest.id,
+                limits,
+                component,
+                &linker,
+                ValidationWorld::HealthV2,
+            )
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "plugin '{}' failed plugin-health-v2 world validation: {e}",
+                    manifest.id
+                )
+            })?;
         }
         Ok(())
     }
@@ -3041,6 +3065,56 @@ mod tests {
         )
         .unwrap();
         (manager, pool, dir)
+    }
+
+    #[tokio::test]
+    async fn malformed_health_v2_export_fails_component_validation() {
+        let (manager, pool, dir) = concurrency_test_manager().await;
+        let component_bytes = wat::parse_str(
+            r#"
+            (component
+              (core module $m
+                (func (export "wrong-health")))
+              (core instance $i (instantiate $m))
+              (alias core export $i "wrong-health" (core func $f))
+              (type $func-type (func))
+              (func $lifted (type $func-type) (canon lift (core func $f)))
+              (export "health-probe-v2" (func $lifted)))
+            "#,
+        )
+        .unwrap();
+        let component = manager.inner.runtime.compile(&component_bytes).unwrap();
+        let manifest: Manifest = toml::from_str(
+            r#"
+            manifest_version = 1
+            id = "dev.example.malformed-health"
+            name = "Malformed health export"
+            version = "0.1.0"
+            plugin_api = "1"
+            "#,
+        )
+        .unwrap();
+        let limits = manifest::EffectiveLimits {
+            memory: 1024 * 1024,
+            wall_time_ms: 1000,
+            max_outbound_requests: 0,
+            max_http_body: 0,
+            storage: 0,
+        };
+
+        let error = manager
+            .validate_component_contract(&manifest, &limits, &component)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("plugin-health-v2 world validation"),
+            "unexpected validation error: {error}"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

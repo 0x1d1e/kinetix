@@ -1780,6 +1780,7 @@ dependencies = [
  "url",
  "uuid",
  "wasmtime",
+ "wat",
 ]
 
 [[package]]
