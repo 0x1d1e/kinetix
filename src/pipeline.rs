@@ -1957,6 +1957,7 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                 );
                                 reconcile_partial_attempts(&mut meta);
+                                let client_error = failure_to_error(&failure, target);
                                 record_precommit_request_log(
                                     state,
                                     &meta,
@@ -1966,12 +1967,13 @@ pub(crate) async fn run_with_disconnect(
                                     &trace,
                                     upstream_request_id.as_deref(),
                                     &failure,
+                                    &client_error,
                                     termination,
                                     started,
                                     attempts_done,
                                 );
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
-                                return Err(failure_to_error(&failure, target));
+                                return Err(client_error);
                             }
                             last_precommit_failure = Some((
                                 (*target).clone(),
@@ -2286,6 +2288,7 @@ pub(crate) async fn run_with_disconnect(
                                     &trace,
                                     upstream_request_id.as_deref(),
                                     &failure,
+                                    &refresh_error,
                                     termination,
                                     started,
                                     attempts_done,
@@ -2347,6 +2350,7 @@ pub(crate) async fn run_with_disconnect(
                         &trace,
                         upstream_request_id.as_deref(),
                         &failure,
+                        &client_error,
                         termination,
                         started,
                         attempts_done,
@@ -2435,6 +2439,7 @@ pub(crate) async fn run_with_disconnect(
                         None,
                     );
                     reconcile_partial_attempts(&mut meta);
+                    let client_error = failure_to_error(&failure, target);
                     record_precommit_request_log(
                         state,
                         &meta,
@@ -2444,12 +2449,13 @@ pub(crate) async fn run_with_disconnect(
                         &trace,
                         None,
                         &failure,
+                        &client_error,
                         termination,
                         started,
                         attempts_done,
                     );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
-                    return Err(failure_to_error(&failure, target));
+                    return Err(client_error);
                 }
                 last_error = Some(failure_to_error(&failure, target));
                 continue;
@@ -2474,6 +2480,10 @@ pub(crate) async fn run_with_disconnect(
     if let Some((target, upstream_request_id, failure, termination, attempts_done)) =
         last_precommit_failure
     {
+        let request_error = last_error
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| failure_to_error(&failure, &target));
         record_precommit_request_log(
             state,
             &meta,
@@ -2483,6 +2493,7 @@ pub(crate) async fn run_with_disconnect(
             &trace,
             upstream_request_id.as_deref(),
             &failure,
+            &request_error,
             termination,
             started,
             attempts_done,
@@ -6702,6 +6713,22 @@ fn usage_attempt_row(
     }
 }
 
+fn precommit_request_status(failure: &UpstreamFailure) -> &'static str {
+    match failure.kind {
+        FailureKind::RateLimit => "rate_limited",
+        FailureKind::QuotaExhausted => "quota_exhausted",
+        FailureKind::BadRequest | FailureKind::PolicyRejected | FailureKind::TargetError => {
+            "client_error"
+        }
+        FailureKind::Timeout | FailureKind::MalformedUpstream => "stream_error",
+        FailureKind::ClientCancelled => "client_disconnect",
+        FailureKind::AuthError
+        | FailureKind::ServerError
+        | FailureKind::ConnectionError
+        | FailureKind::PluginFailure => "upstream_error",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_precommit_request_log(
     state: &AppState,
@@ -6712,6 +6739,7 @@ fn record_precommit_request_log(
     trace: &RouteTrace,
     upstream_request_id: Option<&str>,
     failure: &UpstreamFailure,
+    client_error: &ProxyError,
     termination: StreamTermination,
     started: Instant,
     attempts_done: usize,
@@ -6735,8 +6763,8 @@ fn record_precommit_request_log(
         route_name: meta.route_name.clone(),
         fallback_hops: attempts_done.saturating_sub(1) as i64,
         fallback_path: serde_json::to_string(&meta.fallback_path).unwrap_or_else(|_| "[]".into()),
-        status: termination.request_status().to_string(),
-        status_code: termination.status_code(),
+        status: precommit_request_status(failure).to_string(),
+        status_code: client_error.http_status() as i64,
         latency_ms: Some(started.elapsed().as_millis() as i64),
         ttft_ms: None,
         input_tokens: usage.input.map(|value| value as i64),

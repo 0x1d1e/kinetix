@@ -241,6 +241,41 @@ async fn upstream(
             .header("content-type", "application/json")
             .body(Body::from(r#"{"error":{"message":"temporarily unavailable"}}"#))
             .unwrap(),
+        "terminal_http_429" => Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limit exceeded"}}"#,
+            ))
+            .unwrap(),
+        "terminal_http_quota_429" => Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"billing_error","message":"quota exhausted"}}"#,
+            ))
+            .unwrap(),
+        "terminal_http_400" => Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"invalid request"}}"#,
+            ))
+            .unwrap(),
+        "terminal_http_403" => Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"permission_error","message":"model forbidden"}}"#,
+            ))
+            .unwrap(),
+        "terminal_http_404" => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"type":"error","error":{"type":"not_found_error","message":"model not found"}}"#,
+            ))
+            .unwrap(),
         "price_lookup_cancel" if upstream_model == "upstream-anthropic-model" => {
             Response::builder()
                 .status(StatusCode::OK)
@@ -873,6 +908,105 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
         }
     }
 
+    let terminal_provider_id = db::insert_provider(
+        &pool,
+        &db::NewProvider {
+            name: "mock-terminal-accounting",
+            base_url: &base_url,
+            wire_format: WireFormat::Openai,
+            auth_scheme: AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: json!({}),
+            timeout_ms: 2_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: true,
+            wire_plugin: "",
+            credential_plugin: "",
+            model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let terminal_model_id = db::insert_model(
+        &pool,
+        &db::NewModel {
+            provider_id: &terminal_provider_id,
+            upstream_id: UPSTREAM_MODEL,
+            display_name: "Terminal accounting model",
+            enabled: true,
+            context_window: None,
+            max_output_tokens: Some(1024),
+            capabilities: json!({"text": true}),
+            prices: json!({}),
+            parameters: json!({}),
+            thinking_map: json!({}),
+            extra_request: json!({}),
+            discovery: json!({"configured_transport": "openai-responses"}),
+        },
+    )
+    .await
+    .unwrap();
+    for test_case in [
+        "terminal_http_503",
+        "terminal_http_429",
+        "terminal_http_quota_429",
+        "terminal_http_400",
+        "terminal_http_403",
+        "terminal_http_404",
+    ] {
+        let account_name = format!("responses-{test_case}-account");
+        let account_id = db::insert_account(
+            &pool,
+            &terminal_provider_id,
+            &account_name,
+            &crypto.encrypt(&format!("{test_case}-key")).unwrap(),
+            &format!("{test_case}-key"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let route_name = format!("responses-{test_case}-route");
+        let terminal_route_id = db::insert_route(
+            &pool,
+            &db::NewRoute {
+                name: &route_name,
+                description: "",
+                strategy: "priority",
+                fallback_triggers: json!({}),
+                portability_policy: "reject",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: Some(1),
+                max_concurrent_requests: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::insert_route_target(
+            &pool,
+            &terminal_route_id,
+            Some(&account_id),
+            &terminal_model_id,
+            1,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .unwrap();
+    }
+
     db::insert_virtual_key(
         &pool,
         &db::VirtualKeyRow {
@@ -1284,25 +1418,60 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
     assert_eq!(requests[13].body["input"], "case:timeout");
     drop(requests);
 
-    let (request_id, status, terminal_503) = call_responses_with_id(
-        &state,
-        "responses-partial-usage-terminal",
-        "terminal_http_503",
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{terminal_503}");
-    let rows = wait_for_usage_rows(&state, &request_id, 1).await;
-    assert_eq!(rows.len(), 1, "terminal HTTP error needs one request row");
-    assert_eq!(rows[0].0, "stream_error");
-    let attempts = usage_attempt_rows_for_request(&state, &request_id).await;
-    assert_eq!(
-        attempts.len(),
-        1,
-        "terminal HTTP error needs one attempt row"
-    );
-    assert_eq!(attempts[0].0, 1);
-    assert_eq!(attempts[0].1, "stream_error");
-    assert_eq!(attempts[0].6, "pre_commit");
+    for (test_case, client_status, request_status, request_status_code) in [
+        (
+            "terminal_http_503",
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            502,
+        ),
+        (
+            "terminal_http_429",
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            429,
+        ),
+        (
+            "terminal_http_quota_429",
+            StatusCode::TOO_MANY_REQUESTS,
+            "quota_exhausted",
+            429,
+        ),
+        (
+            "terminal_http_400",
+            StatusCode::BAD_REQUEST,
+            "client_error",
+            400,
+        ),
+        (
+            "terminal_http_403",
+            StatusCode::FORBIDDEN,
+            "client_error",
+            403,
+        ),
+        (
+            "terminal_http_404",
+            StatusCode::NOT_FOUND,
+            "client_error",
+            404,
+        ),
+    ] {
+        let route = format!("responses-{test_case}-route");
+        let (request_id, status, body) = call_responses_with_id(&state, &route, test_case).await;
+        assert_eq!(status, client_status, "{test_case}: {body}");
+        let rows = wait_for_usage_rows(&state, &request_id, 1).await;
+        assert_eq!(rows.len(), 1, "{test_case} needs one request row");
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1),
+            (request_status, request_status_code),
+            "{test_case} request usage must reflect classified client failure"
+        );
+        let attempts = usage_attempt_rows_for_request(&state, &request_id).await;
+        assert_eq!(attempts.len(), 1, "{test_case} needs one attempt row");
+        assert_eq!(attempts[0].0, 1);
+        assert_eq!(attempts[0].1, "stream_error");
+        assert_eq!(attempts[0].6, "pre_commit");
+    }
 
     let before_unknown_attempt = state.admission.metrics_snapshot();
     let (request_id, status, unknown_fallback) = call_responses_with_id_stream(
