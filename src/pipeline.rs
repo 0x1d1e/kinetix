@@ -83,6 +83,11 @@ fn cache_status_from_usage(usage: &TokenUsage) -> &'static str {
     }
 }
 
+struct PartialAttemptUsage {
+    usage: TokenUsage,
+    cost: Option<f64>,
+}
+
 /// Request-scoped metadata carried into the usage log and Route Trace.
 pub struct RequestMeta {
     pub request_id: String,
@@ -103,6 +108,9 @@ pub struct RequestMeta {
     /// Atomic RPM/TPM/budget reservation owned by this request. A disconnect
     /// after upstream dispatch reconciles it as incomplete instead of canceling it.
     pub admission: Option<crate::admission::AdmissionReservation>,
+    /// Usage and costs from failed precommit provider attempts. Persisted as
+    /// per-attempt rows and included in admission reconciliation.
+    partial_attempts: Vec<PartialAttemptUsage>,
     /// Bounded global, key, and Route in-flight admission; streaming transfers it to the response body.
     pub concurrency: Option<crate::admission::ConcurrencyReservation>,
     /// Set immediately before the inference request is handed to the HTTP client.
@@ -141,6 +149,7 @@ impl RequestMeta {
             session: None,
             admission: None,
             concurrency: None,
+            partial_attempts: Vec::new(),
             upstream_dispatched: AtomicBool::new(false),
             client_disconnect: None,
             disconnected: Arc::new(AtomicBool::new(false)),
@@ -158,7 +167,12 @@ impl Drop for RequestMeta {
                 .is_some_and(crate::client_disconnect::ClientDisconnect::is_cancelled);
         if disconnected_after_dispatch {
             if let Some(admission) = self.admission.take() {
-                admission.reconcile_incomplete();
+                if self.partial_attempts.is_empty() {
+                    admission.reconcile_incomplete();
+                } else {
+                    let (usage, cost) = aggregate_admission_accounting(self, None, None);
+                    admission.reconcile(&usage, cost);
+                }
             }
         }
     }
@@ -519,6 +533,7 @@ pub async fn run(
         session,
         protocol_headers,
         None,
+        None,
     )
     .await
 }
@@ -533,6 +548,7 @@ pub(crate) async fn run_with_disconnect(
     session: Option<String>,
     protocol_headers: Vec<(String, String)>,
     client_disconnect: Option<crate::client_disconnect::ClientDisconnect>,
+    cancellation_trace: Option<Arc<parking_lot::Mutex<Option<RouteTrace>>>>,
 ) -> Result<Response, ProxyError> {
     let started = Instant::now();
     let snap = state.registry.snapshot();
@@ -553,7 +569,13 @@ pub(crate) async fn run_with_disconnect(
         }
         None => None,
     };
-    let mut trace = RouteTrace::new(request_id.clone(), req.requested_model.clone());
+    let mut trace = cancellation_trace
+        .as_ref()
+        .and_then(|snapshot| snapshot.lock().clone())
+        .unwrap_or_else(|| RouteTrace::new(request_id.clone(), req.requested_model.clone()));
+    if let Some(snapshot) = cancellation_trace {
+        trace.attach_cancellation_snapshot(snapshot);
+    }
     let mut meta = RequestMeta::new(
         request_id.clone(),
         format,
@@ -680,6 +702,7 @@ pub(crate) async fn run_with_disconnect(
             meta.route_name = Some(route.name.clone());
             trace.route_id = Some(route.id.clone());
             trace.route_name = Some(route.name.clone());
+            trace.publish_cancellation_snapshot();
             // Retain route-wide producer provenance before request-specific
             // predicates and other eligibility filters remove candidates.
             let route_target_origins = targets
@@ -1725,13 +1748,35 @@ pub(crate) async fn run_with_disconnect(
                     let prepared = match prepared_result {
                         Ok(prepared) => prepared,
                         Err(prepared_failure) => {
-                            let failure = prepared_failure.failure;
+                            let PreparedResponseFailure {
+                                failure,
+                                outcome,
+                                precommit_usage,
+                            } = prepared_failure;
                             let termination = StreamTermination::new(
-                                prepared_failure.outcome,
+                                outcome,
                                 CommitState::PreCommit,
                                 Some(failure.kind),
                                 failure.status,
                             );
+                            if let Some(attempt_usage) = record_precommit_attempt_usage(
+                                state,
+                                &meta,
+                                &target_req,
+                                target,
+                                key.as_ref(),
+                                &trace,
+                                upstream_request_id.as_deref(),
+                                precommit_usage,
+                                &failure,
+                                termination,
+                                attempt_started,
+                                attempts_done,
+                            )
+                            .await
+                            {
+                                meta.partial_attempts.push(attempt_usage);
+                            }
                             if let Some(permit) = traffic_permit.as_ref() {
                                 permit.finish(traffic_outcome_for_failure(failure.kind));
                             }
@@ -1785,6 +1830,7 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                     None,
                                 );
+                                reconcile_partial_attempts(&mut meta);
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
                                 return Err(failure_to_error(&failure, target));
                             }
@@ -2072,6 +2118,7 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                     None,
                                 );
+                                reconcile_partial_attempts(&mut meta);
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
                                 return Err(refresh_error);
                             }
@@ -2127,6 +2174,7 @@ pub(crate) async fn run_with_disconnect(
                         None,
                         None,
                     );
+                    reconcile_partial_attempts(&mut meta);
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
                     return Err(client_error);
                 }
@@ -2193,6 +2241,7 @@ pub(crate) async fn run_with_disconnect(
                         None,
                         None,
                     );
+                    reconcile_partial_attempts(&mut meta);
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
                     return Err(failure_to_error(&failure, target));
                 }
@@ -2204,6 +2253,7 @@ pub(crate) async fn run_with_disconnect(
 
     // 4. Every target unavailable (FR-12.12).
     state.failures_pre_commit.fetch_add(1, Ordering::Relaxed);
+    reconcile_partial_attempts(&mut meta);
     let retry_after = pool::soonest_recovery(&all_accounts)
         .map(|t| ((t - chrono::Utc::now()).num_seconds().max(1)) as u64);
     let name = route
@@ -2901,11 +2951,16 @@ struct PreparedUpstream {
 struct PreparedResponseFailure {
     failure: UpstreamFailure,
     outcome: StreamOutcome,
+    precommit_usage: TokenUsage,
 }
 
 impl PreparedResponseFailure {
     fn new(failure: UpstreamFailure, outcome: StreamOutcome) -> Self {
-        Self { failure, outcome }
+        Self {
+            failure,
+            outcome,
+            precommit_usage: TokenUsage::default(),
+        }
     }
 }
 
@@ -3150,15 +3205,36 @@ async fn prepare_success_response(
 }
 
 async fn prepare_aggregated_sse(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     adapter: &Arc<dyn Adapter>,
     first_event_timeout: Duration,
     idle_timeout: Duration,
 ) -> Result<PreparedUpstream, PreparedResponseFailure> {
+    let mut precommit_usage = TokenUsage::default();
+    let result = prepare_aggregated_sse_inner(
+        response,
+        adapter,
+        first_event_timeout,
+        idle_timeout,
+        &mut precommit_usage,
+    )
+    .await;
+    result.map_err(|mut failure| {
+        failure.precommit_usage = precommit_usage;
+        failure
+    })
+}
+
+async fn prepare_aggregated_sse_inner(
+    mut response: reqwest::Response,
+    adapter: &Arc<dyn Adapter>,
+    first_event_timeout: Duration,
+    idle_timeout: Duration,
+    precommit_usage: &mut TokenUsage,
+) -> Result<PreparedUpstream, PreparedResponseFailure> {
     let first_event_deadline = Instant::now() + first_event_timeout;
     let mut framer = crate::sse::SseFramer::new();
     let mut events_out = Vec::new();
-    let mut precommit_usage = TokenUsage::default();
     let mut semantic_seen = false;
     let mut terminal_seen = false;
 
@@ -3264,7 +3340,7 @@ async fn prepare_aggregated_sse(
                     stream: None,
                     prefetched: Vec::new(),
                     full_events: Some(events_out),
-                    precommit_usage,
+                    precommit_usage: precommit_usage.clone(),
                     is_sse: true,
                 });
             }
@@ -6187,6 +6263,163 @@ fn persisted_request_timing(
     (duration_ms, persisted_ttft_ms(is_sse, ttft_ms))
 }
 
+fn usage_has_reported_tokens(usage: &TokenUsage) -> bool {
+    usage.input.is_some()
+        || usage.output.is_some()
+        || usage.cached.is_some()
+        || usage.cache_write.is_some()
+        || usage.thinking.is_some()
+}
+
+fn aggregate_admission_accounting(
+    meta: &RequestMeta,
+    current_usage: Option<&TokenUsage>,
+    current_cost: Option<f64>,
+) -> (TokenUsage, Option<f64>) {
+    let mut usages = meta
+        .partial_attempts
+        .iter()
+        .map(|attempt| &attempt.usage)
+        .collect::<Vec<_>>();
+    if let Some(usage) = current_usage {
+        usages.push(usage);
+    }
+    let sum_field = |field: fn(&TokenUsage) -> Option<u64>| {
+        if usages.is_empty() {
+            return None;
+        }
+        usages.iter().try_fold(0_u64, |total, usage| {
+            field(usage).map(|value| total.saturating_add(value))
+        })
+    };
+    let usage = TokenUsage {
+        input: sum_field(|usage| usage.input),
+        output: sum_field(|usage| usage.output),
+        ..TokenUsage::default()
+    };
+
+    let cost = if usages.is_empty() {
+        None
+    } else {
+        meta.partial_attempts
+            .iter()
+            .try_fold(0.0, |total, attempt| attempt.cost.map(|cost| total + cost))
+            .and_then(|total| {
+                if current_usage.is_some() {
+                    current_cost.map(|cost| total + cost)
+                } else {
+                    Some(total)
+                }
+            })
+    };
+    (usage, cost)
+}
+
+fn reconcile_partial_attempts(meta: &mut RequestMeta) {
+    if meta.partial_attempts.is_empty() {
+        return;
+    }
+    if let Some(admission) = meta.admission.take() {
+        let (usage, cost) = aggregate_admission_accounting(meta, None, None);
+        admission.reconcile(&usage, cost);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_precommit_attempt_usage(
+    state: &AppState,
+    meta: &RequestMeta,
+    req: &InternalRequest,
+    target: &ResolvedTarget,
+    key: Option<&db::VirtualKeyRow>,
+    trace: &RouteTrace,
+    upstream_request_id: Option<&str>,
+    usage: TokenUsage,
+    failure: &UpstreamFailure,
+    termination: StreamTermination,
+    attempt_started: Instant,
+    attempts_done: usize,
+) -> Option<PartialAttemptUsage> {
+    if !usage_has_reported_tokens(&usage) {
+        return None;
+    }
+
+    let computed_cost = (usage.input.is_some() && usage.output.is_some())
+        .then(|| cost::compute_cost(&target.model.prices(), &usage))
+        .flatten();
+    let (cost, price_version_id) = if let Some(computed_cost) = computed_cost {
+        let prices = target.model.prices();
+        let (source, source_metadata) = target.model.price_provenance();
+        match db::ensure_price_version(
+            &state.pool,
+            &target.model.id,
+            &prices,
+            &source,
+            &source_metadata,
+        )
+        .await
+        {
+            Ok(Some(version_id)) => (Some(computed_cost), Some(version_id)),
+            Ok(None) => (None, None),
+            Err(error) => {
+                tracing::warn!(
+                    model = %target.model.id,
+                    %error,
+                    "failed to resolve price version for failed precommit attempt"
+                );
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let status = termination.request_status();
+    let row = UsageLogRow {
+        id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
+        request_id: meta.request_id.clone(),
+        ts: db::now_iso(),
+        key_id: key.map(|key| key.id.clone()),
+        key_name: key.map(|key| key.name.clone()),
+        client_format: meta.client_format.to_string(),
+        requested_model: req.requested_model.clone(),
+        effective_model: Some(target.model.display_name.clone()),
+        route_id: meta.route_id.clone(),
+        route_name: meta.route_name.clone(),
+        fallback_hops: attempts_done.saturating_sub(1) as i64,
+        fallback_path: serde_json::to_string(&meta.fallback_path).unwrap_or_else(|_| "[]".into()),
+        status: status.to_string(),
+        status_code: termination.status_code(),
+        latency_ms: Some(attempt_started.elapsed().as_millis() as i64),
+        ttft_ms: None,
+        input_tokens: usage.input.map(|value| value as i64),
+        output_tokens: usage.output.map(|value| value as i64),
+        cached_tokens: usage.cached.map(|value| value as i64),
+        cache_write_tokens: usage.cache_write.map(|value| value as i64),
+        thinking_tokens: usage.thinking.map(|value| value as i64),
+        cost_usd: cost,
+        cost_known: cost.is_some() as i64,
+        price_version_id,
+        cache_status: cache_status_from_usage(&usage).to_string(),
+        serving_account_id: Some(target.account.id.clone()),
+        serving_account: Some(target.account.label.clone()),
+        serving_provider: Some(target.provider.name.clone()),
+        upstream_request_id: upstream_request_id.map(str::to_owned),
+        flagged: 0,
+        error_message: Some(failure.message.clone()),
+        usage_confidence: if usage.input.is_some() || usage.output.is_some() {
+            "provider_reported".to_string()
+        } else {
+            "unknown".to_string()
+        },
+        commit_state: termination.commit_state.as_usage_str().to_string(),
+        retry_count: attempts_done.saturating_sub(1) as i64,
+        route_trace_id: Some(trace.opaque_route_id.clone()),
+        opaque_route_id: Some(trace.opaque_route_id.clone()),
+    };
+    state.log_queue.enqueue(row);
+    Some(PartialAttemptUsage { usage, cost })
+}
+
 /// Compute cost and enqueue the usage row (never blocks the request path),
 /// persist the Route Trace, and record the flight-recorder terminal event.
 #[allow(clippy::too_many_arguments)]
@@ -6335,11 +6568,12 @@ async fn finalize_log(
     };
     let cost_known = cost.is_some();
 
-    // Reconcile only when both canonical token totals are complete. The
-    // reservation object keeps its conservative estimate for partial/unknown
-    // streams and cancels itself if the request exits before finalization.
+    // Reconcile against every provider attempt, not only the final fallback
+    // target. Incomplete fields retain the conservative reservation estimate.
     if let Some(admission) = meta.admission.take() {
-        admission.reconcile(&usage, cost);
+        let (admission_usage, admission_cost) =
+            aggregate_admission_accounting(meta, Some(&usage), cost);
+        admission.reconcile(&admission_usage, admission_cost);
     }
 
     // Accounting truthfulness (FR-6.8): provider-reported vs unknown.
@@ -7126,6 +7360,48 @@ mod route_policy_tests {
         assert_eq!(trace.steps[0].stage, "provider_circuit");
         assert_eq!(trace.steps[0].target.as_deref(), Some("provider-a"));
         assert!(trace.steps[0].detail.contains("opened"));
+    }
+
+    #[test]
+    fn partial_precommit_usage_is_added_to_admission_accounting() {
+        let mut meta = RequestMeta::new(
+            "req_partial_usage".into(),
+            FrontendFormat::OpenAiResponses,
+            "route".into(),
+            true,
+        );
+        meta.partial_attempts.push(PartialAttemptUsage {
+            usage: TokenUsage {
+                input: Some(13),
+                output: Some(7),
+                ..TokenUsage::default()
+            },
+            cost: Some(0.000067),
+        });
+        let final_usage = TokenUsage {
+            input: Some(1),
+            output: Some(2),
+            ..TokenUsage::default()
+        };
+        let (usage, cost) =
+            aggregate_admission_accounting(&meta, Some(&final_usage), Some(0.000003));
+        assert_eq!((usage.input, usage.output), (Some(14), Some(9)));
+        assert!((cost.unwrap() - 0.00007).abs() < 1e-12);
+
+        let (failed_usage, failed_cost) = aggregate_admission_accounting(&meta, None, None);
+        assert_eq!(
+            (failed_usage.input, failed_usage.output),
+            (Some(13), Some(7))
+        );
+        assert_eq!(failed_cost, Some(0.000067));
+
+        meta.partial_attempts[0].usage.output = None;
+        meta.partial_attempts[0].cost = None;
+        let (incomplete_usage, incomplete_cost) =
+            aggregate_admission_accounting(&meta, Some(&final_usage), Some(0.000003));
+        assert_eq!(incomplete_usage.input, Some(14));
+        assert_eq!(incomplete_usage.output, None);
+        assert_eq!(incomplete_cost, None);
     }
 
     #[test]

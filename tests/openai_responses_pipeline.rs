@@ -207,6 +207,36 @@ async fn upstream(
                 "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n"
             )))
             .unwrap(),
+        "partial_usage_timeout" | "partial_usage_truncated"
+            if upstream_model == "upstream-anthropic-model" =>
+        {
+            let events = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":13}}}\n\n",
+                "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7},\"delta\":{}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial answer\"}}\n\n"
+            );
+            let body = if test_case == "partial_usage_timeout" {
+                Body::from_stream(async_stream::stream! {
+                    yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(events.as_bytes()));
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                })
+            } else {
+                Body::from(events)
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(body)
+                .unwrap()
+        }
+        "partial_usage_timeout" | "partial_usage_truncated" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from(concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fallback answer\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n"
+            )))
+            .unwrap(),
         "translated_full" => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
@@ -303,6 +333,90 @@ async fn call_raw_responses(state: &AppState, raw_body: String) -> Response {
         HeaderValue::from_str(&format!("Bearer {CLIENT_KEY}")).unwrap(),
     );
     api::responses(State(state.clone()), None, headers, raw_body).await
+}
+
+async fn call_responses_with_id(
+    state: &AppState,
+    model: &str,
+    test_case: &str,
+) -> (String, StatusCode, String) {
+    let response = call_raw_responses(
+        state,
+        json!({"model": model, "input": format!("case:{test_case}"), "stream": false}).to_string(),
+    )
+    .await;
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (
+        request_id,
+        status,
+        String::from_utf8(body.to_vec()).unwrap(),
+    )
+}
+
+async fn usage_rows_for_request(
+    state: &AppState,
+    request_id: &str,
+) -> Vec<(
+    String,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<f64>,
+    i64,
+    String,
+)> {
+    sqlx::query_as(
+        "SELECT status, status_code, input_tokens, output_tokens, cost_usd, cost_known, commit_state \
+         FROM usage_logs WHERE request_id = ? ORDER BY ts ASC",
+    )
+    .bind(request_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap()
+}
+
+async fn cancellation_trace_count(state: &AppState, route_name: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM route_traces WHERE route_name = ? AND stream_outcome = 'client_cancelled'",
+    )
+    .bind(route_name)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap()
+}
+
+async fn wait_for_usage_rows(
+    state: &AppState,
+    request_id: &str,
+    expected: usize,
+) -> Vec<(
+    String,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<f64>,
+    i64,
+    String,
+)> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = usage_rows_for_request(state, request_id).await;
+            if rows.len() >= expected {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("usage attempt rows were not persisted")
 }
 
 fn test_key(
@@ -535,7 +649,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
             context_window: None,
             max_output_tokens: Some(1024),
             capabilities: json!({"text": true}),
-            prices: json!({}),
+            prices: json!({"input_per_1m": 3.0, "output_per_1m": 4.0}),
             parameters: json!({}),
             thinking_map: json!({}),
             extra_request: json!({}),
@@ -602,6 +716,46 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
         )
         .await
         .unwrap();
+    }
+    for (route_name, with_fallback) in [
+        ("responses-partial-usage-fallback", true),
+        ("responses-partial-usage-terminal", false),
+    ] {
+        let partial_usage_route_id = db::insert_route(
+            &pool,
+            &db::NewRoute {
+                name: route_name,
+                description: "",
+                strategy: "priority",
+                fallback_triggers: json!({}),
+                portability_policy: "reject",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: Some(if with_fallback { 2 } else { 1 }),
+                max_concurrent_requests: None,
+            },
+        )
+        .await
+        .unwrap();
+        let targets = if with_fallback {
+            vec![(&translated_model_id, 1), (&model_id, 2)]
+        } else {
+            vec![(&translated_model_id, 1)]
+        };
+        for (target_model_id, priority) in targets {
+            db::insert_route_target(
+                &pool,
+                &partial_usage_route_id,
+                None,
+                target_model_id,
+                priority,
+                1,
+                "{}",
+                "{}",
+            )
+            .await
+            .unwrap();
+        }
     }
 
     db::insert_virtual_key(
@@ -1015,6 +1169,77 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
     assert_eq!(requests[13].body["input"], "case:timeout");
     drop(requests);
 
+    for (test_case, route, expected_status, expected_rows, expected_tokens, fallback) in [
+        (
+            "partial_usage_timeout",
+            "responses-partial-usage-fallback",
+            StatusCode::OK,
+            2,
+            23,
+            true,
+        ),
+        (
+            "partial_usage_truncated",
+            "responses-partial-usage-fallback",
+            StatusCode::OK,
+            2,
+            23,
+            true,
+        ),
+        (
+            "partial_usage_timeout",
+            "responses-partial-usage-terminal",
+            StatusCode::GATEWAY_TIMEOUT,
+            1,
+            20,
+            false,
+        ),
+        (
+            "partial_usage_truncated",
+            "responses-partial-usage-terminal",
+            StatusCode::BAD_GATEWAY,
+            1,
+            20,
+            false,
+        ),
+    ] {
+        let before = state.admission.metrics_snapshot();
+        let (request_id, status, body) = call_responses_with_id(&state, route, test_case).await;
+        assert_eq!(status, expected_status, "{test_case} {route}: {body}");
+        if fallback {
+            assert!(body.contains("fallback answer"), "{test_case}: {body}");
+            assert!(!body.contains("partial answer"), "{test_case}: {body}");
+        }
+        let rows = wait_for_usage_rows(&state, &request_id, expected_rows).await;
+        assert_eq!(rows.len(), expected_rows, "{test_case} {route}: {rows:?}");
+        let failed = rows.iter().find(|row| row.0 == "stream_error").unwrap();
+        assert_eq!(
+            failed.1,
+            if test_case.ends_with("timeout") {
+                504
+            } else {
+                502
+            }
+        );
+        assert_eq!((failed.2, failed.3), (Some(13), Some(7)));
+        assert_eq!(
+            failed.5, 1,
+            "provider-reported partial usage must be priced"
+        );
+        assert!((failed.4.unwrap() - 0.000067).abs() < 1e-12);
+        assert_eq!(failed.6, "pre_commit");
+        if fallback {
+            let succeeded = rows.iter().find(|row| row.0 == "success").unwrap();
+            assert_eq!((succeeded.2, succeeded.3), (Some(1), Some(2)));
+        }
+        let after = state.admission.metrics_snapshot();
+        assert_eq!(
+            after.reconciled_tokens_total,
+            before.reconciled_tokens_total + expected_tokens,
+            "admission must include all provider attempts for {test_case}"
+        );
+    }
+
     // Use a fresh provider circuit and route so earlier test traffic cannot
     // affect this concurrency regression.
     let probe_provider_id = db::insert_provider(
@@ -1378,6 +1603,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
         ),
     ] {
         let before = state.admission.metrics_snapshot();
+        let prior_cancellation_traces = cancellation_trace_count(&state, "responses-route").await;
         assert_eq!(before.inflight_inferences, 0);
         let input = format!("case:{test_case}");
         let abandoned_client = client.clone();
@@ -1430,6 +1656,38 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
             before.reconciled_incomplete_total + 1,
             "{test_case} admission should reconcile conservatively"
         );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if cancellation_trace_count(&state, "responses-route").await
+                    > prior_cancellation_traces
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("precommit client cancellation Route Trace was not persisted");
+        let cancelled_trace: (String, String, String, Option<i64>, Option<String>, String) =
+            sqlx::query_as(
+                "SELECT route_name, commit_state, outcome, fallback_allowed, stream_outcome, steps \
+                 FROM route_traces WHERE route_name = 'responses-route' \
+                 AND stream_outcome = 'client_cancelled' ORDER BY ts DESC LIMIT 1",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(cancelled_trace.0, "responses-route");
+        assert_eq!(cancelled_trace.1, "not_committed");
+        assert_eq!(cancelled_trace.2, "cancelled");
+        assert_eq!(cancelled_trace.3, Some(0));
+        assert_eq!(cancelled_trace.4.as_deref(), Some("client_cancelled"));
+        let trace_steps: serde_json::Value = serde_json::from_str(&cancelled_trace.5).unwrap();
+        assert!(trace_steps.as_array().is_some_and(|steps| {
+            steps
+                .iter()
+                .any(|step| step["stage"] == "stream_termination")
+        }));
 
         let constrained = client
             .post(format!("http://{gateway_addr}/v1/responses"))

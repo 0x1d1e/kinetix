@@ -4202,7 +4202,22 @@ pub async fn insert_route_trace(pool: &Pool, t: &crate::trace::RouteTrace) -> Re
         "INSERT INTO route_traces
          (id, request_id, opaque_route_id, ts, requested_model, route_id, route_name, final_target,
           commit_state, outcome, steps, warnings, stream_outcome, terminal_failure_kind, fallback_allowed)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET
+           request_id=excluded.request_id,
+           opaque_route_id=excluded.opaque_route_id,
+           ts=excluded.ts,
+           requested_model=excluded.requested_model,
+           route_id=excluded.route_id,
+           route_name=excluded.route_name,
+           final_target=excluded.final_target,
+           commit_state=excluded.commit_state,
+           outcome=excluded.outcome,
+           steps=excluded.steps,
+           warnings=excluded.warnings,
+           stream_outcome=excluded.stream_outcome,
+           terminal_failure_kind=excluded.terminal_failure_kind,
+           fallback_allowed=excluded.fallback_allowed",
     )
     .bind(&t.opaque_route_id)
     .bind(&t.request_id)

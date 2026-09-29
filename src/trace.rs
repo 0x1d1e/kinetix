@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -106,6 +107,8 @@ pub struct RouteTrace {
     pub plugin_fact_failures: Vec<PluginFactFailureTrace>,
     #[serde(skip)]
     started: Instant,
+    #[serde(skip)]
+    cancellation_snapshot: Option<Arc<Mutex<Option<RouteTrace>>>>,
 }
 
 impl RouteTrace {
@@ -127,7 +130,24 @@ impl RouteTrace {
             plugin_facts: Vec::new(),
             plugin_fact_failures: Vec::new(),
             started: Instant::now(),
+            cancellation_snapshot: None,
         }
+    }
+
+    /// Mirror routing progress for the API cancellation path, which may drop
+    /// the pipeline future before it can persist its local trace.
+    pub fn attach_cancellation_snapshot(&mut self, snapshot: Arc<Mutex<Option<RouteTrace>>>) {
+        self.cancellation_snapshot = Some(snapshot);
+        self.publish_cancellation_snapshot();
+    }
+
+    pub(crate) fn publish_cancellation_snapshot(&self) {
+        let Some(snapshot) = &self.cancellation_snapshot else {
+            return;
+        };
+        let mut published = self.clone();
+        published.cancellation_snapshot = None;
+        *snapshot.lock() = Some(published);
     }
 
     pub fn step(&mut self, stage: &str, target: Option<String>, detail: impl Into<String>) {
@@ -147,6 +167,7 @@ impl RouteTrace {
             retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
+        self.publish_cancellation_snapshot();
     }
 
     pub fn resolved_transport(&mut self, target: impl Into<String>, transport: &str) {
@@ -166,6 +187,7 @@ impl RouteTrace {
             retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
+        self.publish_cancellation_snapshot();
     }
 
     pub fn candidate(
@@ -191,6 +213,7 @@ impl RouteTrace {
             retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
+        self.publish_cancellation_snapshot();
     }
 
     pub fn warn(&mut self, warning: impl Into<String>) {
@@ -274,6 +297,7 @@ impl RouteTrace {
             retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
+        self.publish_cancellation_snapshot();
     }
 
     /// Record a classified upstream failure and its shared policy effects.
@@ -301,6 +325,7 @@ impl RouteTrace {
             retry_hint: Some(policy.retry_hint.as_str().into()),
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
+        self.publish_cancellation_snapshot();
     }
 
     /// Record a routing-fact provider failure as `unknown` with a reason.
@@ -325,6 +350,7 @@ impl RouteTrace {
             retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
+        self.publish_cancellation_snapshot();
     }
 
     pub fn steps_json(&self) -> String {
