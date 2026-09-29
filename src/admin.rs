@@ -8146,6 +8146,21 @@ fn execution_supported_for_model_type(model_type: Option<&str>) -> bool {
     model_type.is_none()
 }
 
+fn normalize_imported_observation_timestamp(observation: &mut Value) -> Result<(), ApiError> {
+    let fields = observation
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad("discovery observation must be an object"))?;
+    let observed_at = match fields.get("observed_at").and_then(Value::as_str) {
+        Some(value) => chrono::DateTime::parse_from_rfc3339(value)
+            .map_err(|_| ApiError::bad("discovery observed_at must be a valid RFC3339 timestamp"))?
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        None => db::now_iso(),
+    };
+    fields.insert("observed_at".into(), json!(observed_at));
+    Ok(())
+}
+
 fn validate_discovery_execution(discovery: &Value) -> Result<(), ApiError> {
     let imported_from_discovery = discovery
         .get("imported_from_discovery")
@@ -8250,13 +8265,10 @@ pub async fn create_model(
                     .then(|| body.discovery.clone())
             })
             .map(|mut observation| {
-                if let Some(fields) = observation.as_object_mut() {
-                    if !fields.get("observed_at").is_some_and(Value::is_string) {
-                        fields.insert("observed_at".into(), json!(db::now_iso()));
-                    }
-                }
-                observation
+                normalize_imported_observation_timestamp(&mut observation)?;
+                Ok(observation)
             })
+            .transpose()?
     } else {
         None
     };
@@ -16782,7 +16794,10 @@ mod reasoning_discovery_control_plane_tests {
             .unwrap();
         assert_eq!(imported_history.len(), 1);
         let imported_value: Value = serde_json::from_str(&imported_history[0].value_json).unwrap();
-        assert_eq!(imported_value["observed_at"], "2026-09-30T00:00:00Z");
+        assert_eq!(
+            imported_value["observed_at"],
+            "2026-09-30T00:00:00.000000000Z"
+        );
         assert_eq!(imported_value["context_window"], Value::Null);
         assert_eq!(imported_value["capabilities"]["structured_output"], true);
         assert!(row.caps().structured_output);
@@ -17053,6 +17068,62 @@ mod credential_enrollment_regression_tests {
             0,
         );
         (state, root)
+    }
+
+    #[tokio::test]
+    async fn invalid_import_observed_at_is_rejected_before_model_creation() {
+        let (state, root) = test_state("invalid-observation-import").await;
+        let provider_id = "provider-invalid-observation-import";
+        sqlx::query(
+            "INSERT INTO providers (id, name, base_url, wire_format, auth_scheme, created_at)
+             VALUES (?, 'Provider', 'https://example.test', 'openai', 'bearer', ?)",
+        )
+        .bind(provider_id)
+        .bind(db::now_iso())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let error = create_model(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(provider_id.into()),
+            Json(ModelBody {
+                upstream_id: "invalid-observed-at-model".into(),
+                display_name: None,
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({
+                    "imported_from_discovery": true,
+                    "execution_supported": true,
+                    "observed_at": "not-a-date"
+                }),
+                transport_override: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("observed_at"));
+        assert!(
+            db::find_model_by_upstream(&state.pool, provider_id, "invalid-observed-at-model")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        state.pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
