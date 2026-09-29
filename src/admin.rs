@@ -9856,33 +9856,31 @@ pub async fn export_config(
     _auth: AdminAuth,
     Query(q): Query<ExportQuery>,
 ) -> ApiResult {
-    let providers = db::list_providers(&state.pool)
+    export_config_with_pause(state, q.include_secrets, || async {}).await
+}
+
+async fn export_config_with_pause<F, Fut>(
+    state: AppState,
+    include_secrets: bool,
+    after_resources_read: F,
+) -> ApiResult
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let snapshot = db::config_export_snapshot_with_hook(&state.pool, after_resources_read)
         .await
         .map_err(ApiError::internal)?;
-    let mut accounts = Vec::new();
-    let mut models = Vec::new();
-    for p in &providers {
-        for a in db::list_accounts_for_provider(&state.pool, &p.id)
-            .await
-            .map_err(ApiError::internal)?
-        {
-            if a.label != "__kinetix_noauth__" {
-                accounts.push(a);
-            }
-        }
-        for m in db::models_for_provider(&state.pool, &p.id)
-            .await
-            .map_err(ApiError::internal)?
-        {
-            models.push(m);
-        }
-    }
-    let routes = db::list_routes(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-    let aliases = db::list_aliases(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+    let providers = snapshot.providers;
+    let accounts: Vec<_> = snapshot
+        .accounts
+        .into_iter()
+        .filter(|account| account.label != "__kinetix_noauth__")
+        .collect();
+    let models = snapshot.models;
+    let routes = snapshot.routes;
+    let aliases = snapshot.aliases;
+    let route_targets_by_route = snapshot.route_targets;
 
     let provider_name = |id: &str| -> String {
         providers
@@ -9951,7 +9949,7 @@ pub async fn export_config(
                 "priority": a.priority,
                 "weight": a.weight,
             });
-            if q.include_secrets {
+            if include_secrets {
                 v["secret_enc"] = json!(a.secret_enc);
             }
             v
@@ -9998,9 +9996,10 @@ pub async fn export_config(
 
     let mut routes_json = Vec::new();
     for r in &routes {
-        let targets = db::route_targets(&state.pool, &r.id)
-            .await
-            .map_err(ApiError::internal)?;
+        let targets = route_targets_by_route
+            .get(&r.id)
+            .cloned()
+            .unwrap_or_default();
         let targets_json: Vec<Value> = targets
             .iter()
             .map(|t| {
@@ -10050,7 +10049,7 @@ pub async fn export_config(
     Ok(Json(json!({
         "kinetix_config_version": 2,
         "exported_at": db::now_iso(),
-        "secrets_included": q.include_secrets,
+        "secrets_included": include_secrets,
         "providers": providers_json,
         "accounts": accounts_json,
         "models": models_json,
@@ -20815,6 +20814,213 @@ mod credential_enrollment_regression_tests {
 
         let _ = std::fs::remove_dir_all(source_root);
         let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn config_export_uses_one_snapshot_across_concurrent_control_plane_commit() {
+        let (state, root) = test_state("config-export-snapshot").await;
+        let provider_name = "snapshot-provider";
+        let provider_id = insert_provider(
+            &state,
+            provider_name,
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let old_secret = state.crypto.encrypt("old-secret").unwrap();
+        let old_account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "old-account",
+            &old_secret,
+            "old:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let old_model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "old-model",
+                display_name: "Old Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let route_id = db::insert_route(
+            &state.pool,
+            &db::NewRoute {
+                name: "snapshot-route",
+                description: "snapshot consistency test",
+                strategy: "priority",
+                fallback_triggers: json!({}),
+                portability_policy: "strip_with_warning",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: Some(1),
+                max_concurrent_requests: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::insert_route_target(
+            &state.pool,
+            &route_id,
+            Some(&old_account_id),
+            &old_model_id,
+            1,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .unwrap();
+        db::upsert_alias(
+            &state.pool,
+            "snapshot-model-alias",
+            "model",
+            &old_model_id,
+            "snapshot test",
+        )
+        .await
+        .unwrap();
+
+        let (read_started_tx, read_started_rx) = tokio::sync::oneshot::channel();
+        let (resume_export_tx, resume_export_rx) = tokio::sync::oneshot::channel();
+        let export_state = state.clone();
+        let export = tokio::spawn(async move {
+            export_config_with_pause(export_state, true, move || async move {
+                read_started_tx.send(()).unwrap();
+                resume_export_rx.await.unwrap();
+            })
+            .await
+        });
+        read_started_rx.await.unwrap();
+
+        let new_secret = state.crypto.encrypt("new-secret").unwrap();
+        let mut write_tx = state.pool.begin().await.unwrap();
+        let new_account_id = db::insert_account_in_transaction(
+            &mut write_tx,
+            &provider_id,
+            "new-account",
+            &new_secret,
+            "new:****",
+            2,
+            1,
+            None,
+            "none",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let new_model_id = format!("model_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO models
+             (id, provider_id, upstream_id, display_name, enabled, context_window, max_output_tokens,
+              capabilities, prices, parameters, thinking_map, extra_request, discovery, created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&new_model_id)
+        .bind(&provider_id)
+        .bind("new-model")
+        .bind("New Model")
+        .bind(1_i64)
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind("{}")
+        .bind("{}")
+        .bind("{}")
+        .bind("{}")
+        .bind("{}")
+        .bind("{}")
+        .bind(db::now_iso())
+        .execute(&mut *write_tx)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE route_targets SET model_id=?, account_id=? WHERE route_id=?")
+            .bind(&new_model_id)
+            .bind(&new_account_id)
+            .bind(&route_id)
+            .execute(&mut *write_tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE aliases SET target_id=? WHERE alias=?")
+            .bind(&new_model_id)
+            .bind("snapshot-model-alias")
+            .execute(&mut *write_tx)
+            .await
+            .unwrap();
+        write_tx.commit().await.unwrap();
+        resume_export_tx.send(()).unwrap();
+
+        let exported = export.await.unwrap().unwrap().0;
+        let models = exported["models"].as_array().unwrap();
+        let model_names: std::collections::HashSet<String> = models
+            .iter()
+            .map(|model| {
+                format!(
+                    "{}/{}",
+                    model["provider"].as_str().unwrap(),
+                    model["upstream_id"].as_str().unwrap()
+                )
+            })
+            .collect();
+        let target = &exported["routes"][0]["targets"][0];
+        let target_model = target["model"].as_str().unwrap();
+        assert!(model_names.contains(target_model));
+        let account_ref = target["account_ref"].as_str().unwrap();
+        let target_account = exported["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|account| account["ref"] == account_ref)
+            .unwrap();
+        let target_account_label = target_account["label"].as_str().unwrap();
+        let alias_target = exported["aliases"][0]["target"].as_str().unwrap();
+
+        if target_model == format!("{provider_name}/old-model") {
+            assert_eq!(target_account_label, "old-account");
+            assert_eq!(alias_target, target_model);
+            assert!(!model_names.contains(&format!("{provider_name}/new-model")));
+            assert_eq!(exported["accounts"].as_array().unwrap().len(), 1);
+        } else {
+            assert_eq!(target_model, format!("{provider_name}/new-model"));
+            assert_eq!(target_account_label, "new-account");
+            assert_eq!(alias_target, target_model);
+            assert!(model_names.contains(&format!("{provider_name}/old-model")));
+            assert_eq!(exported["accounts"].as_array().unwrap().len(), 2);
+        }
+
+        let dry_run = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true, "{dry_run}");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

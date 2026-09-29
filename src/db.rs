@@ -3272,6 +3272,77 @@ pub struct RouteTargetRow {
     pub predicate: String,
 }
 
+pub(crate) struct ConfigExportSnapshot {
+    pub providers: Vec<ProviderRow>,
+    pub accounts: Vec<AccountRow>,
+    pub models: Vec<ModelRow>,
+    pub routes: Vec<RouteRow>,
+    pub aliases: Vec<AliasRow>,
+    pub route_targets: HashMap<String, Vec<RouteTargetRow>>,
+}
+
+pub(crate) async fn config_export_snapshot_with_hook<F, Fut>(
+    pool: &Pool,
+    after_resources_read: F,
+) -> Result<ConfigExportSnapshot>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut tx = pool.begin().await?;
+    // The first SELECT establishes SQLite's WAL read snapshot for every export row.
+    let providers = sqlx::query_as::<_, ProviderRow>("SELECT * FROM providers ORDER BY created_at")
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut accounts = Vec::new();
+    let mut models = Vec::new();
+    for provider in &providers {
+        accounts.extend(
+            sqlx::query_as::<_, AccountRow>(
+                "SELECT * FROM accounts WHERE provider_id = ? ORDER BY priority, created_at",
+            )
+            .bind(&provider.id)
+            .fetch_all(&mut *tx)
+            .await?,
+        );
+        models.extend(
+            sqlx::query_as::<_, ModelRow>("SELECT * FROM models WHERE provider_id = ?")
+                .bind(&provider.id)
+                .fetch_all(&mut *tx)
+                .await?,
+        );
+    }
+
+    after_resources_read().await;
+
+    let routes = sqlx::query_as::<_, RouteRow>("SELECT * FROM routes ORDER BY created_at")
+        .fetch_all(&mut *tx)
+        .await?;
+    let aliases = sqlx::query_as::<_, AliasRow>("SELECT * FROM aliases ORDER BY alias")
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut route_targets = HashMap::new();
+    for route in &routes {
+        let targets = sqlx::query_as::<_, RouteTargetRow>(
+            "SELECT * FROM route_targets WHERE route_id = ? ORDER BY priority, weight DESC",
+        )
+        .bind(&route.id)
+        .fetch_all(&mut *tx)
+        .await?;
+        route_targets.insert(route.id.clone(), targets);
+    }
+    tx.commit().await?;
+
+    Ok(ConfigExportSnapshot {
+        providers,
+        accounts,
+        models,
+        routes,
+        aliases,
+        route_targets,
+    })
+}
+
 pub async fn list_routes(pool: &Pool) -> Result<Vec<RouteRow>> {
     Ok(
         sqlx::query_as::<_, RouteRow>("SELECT * FROM routes ORDER BY created_at")
