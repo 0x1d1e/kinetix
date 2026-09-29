@@ -8008,18 +8008,12 @@ pub async fn update_account(
         body.weight,
         body.soft_quota_usd,
         &body.quota_type,
+        rotated_credential
+            .as_ref()
+            .map(|(encrypted_key, key_mask)| (encrypted_key.as_str(), key_mask.as_str())),
     )
     .await
     .map_err(ApiError::internal)?;
-    if let Some((encrypted_key, key_mask)) = rotated_credential {
-        sqlx::query("UPDATE accounts SET secret_enc=?, key_mask=? WHERE id=?")
-            .bind(encrypted_key)
-            .bind(key_mask)
-            .bind(&id)
-            .execute(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    }
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -10970,6 +10964,7 @@ async fn reconcile_provider_account_mode(
     Ok(())
 }
 
+#[cfg(test)]
 async fn reconcile_provider_credential_semantics(
     state: &AppState,
     provider_id: &str,
@@ -14614,7 +14609,11 @@ mod reasoning_discovery_control_plane_tests {
 #[cfg(test)]
 mod credential_enrollment_regression_tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::Barrier;
     use tower::ServiceExt;
 
     struct ExpiredCredential;
@@ -17808,6 +17807,7 @@ mod credential_enrollment_regression_tests {
             1,
             None,
             "none",
+            None,
         )
         .await
         .unwrap();
@@ -17894,6 +17894,7 @@ mod credential_enrollment_regression_tests {
             1,
             None,
             "none",
+            None,
         )
         .await
         .unwrap();
@@ -18097,6 +18098,122 @@ mod credential_enrollment_regression_tests {
             assert_eq!(after.circuit_open_until, before.circuit_open_until);
             assert_eq!(after.consecutive_failures, before.consecutive_failures);
         }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credential_rotation_is_published_with_its_account_generation() {
+        const ROTATIONS: usize = 24;
+        let (state, root) = test_state("atomic-credential-rotation").await;
+        let provider_id = insert_provider(
+            &state,
+            "atomic-credential-rotation",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let initial_key = "initial-manual-credential";
+        let encrypted = state.crypto.encrypt(initial_key).unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "generation-0",
+            &encrypted,
+            &crypto::mask_secret(initial_key),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let initial_version = state.registry.snapshot().accounts[&account_id].account_state_version;
+        let barrier = Arc::new(Barrier::new(2));
+        let rotation_active = Arc::new(AtomicBool::new(true));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let saw_rotation = Arc::new(AtomicBool::new(false));
+
+        let reader_state = state.clone();
+        let reader_id = account_id.clone();
+        let reader_barrier = barrier.clone();
+        let reader_active = rotation_active.clone();
+        let reader_count = reads.clone();
+        let reader_saw_rotation = saw_rotation.clone();
+        let reader = tokio::spawn(async move {
+            reader_barrier.wait().await;
+            while reader_active.load(Ordering::Acquire) {
+                reader_state
+                    .registry
+                    .reload(&reader_state.pool)
+                    .await
+                    .unwrap();
+                let account = reader_state.registry.snapshot().accounts[&reader_id].clone();
+                let generation =
+                    usize::try_from(account.account_state_version - initial_version).unwrap();
+                assert!(generation <= ROTATIONS);
+                let expected_key = if generation == 0 {
+                    initial_key.to_owned()
+                } else {
+                    format!("rotated-credential-{generation}")
+                };
+                assert_eq!(
+                    reader_state.crypto.decrypt(&account.secret_enc).unwrap(),
+                    expected_key
+                );
+                assert_eq!(account.key_mask, crypto::mask_secret(&expected_key));
+                assert_eq!(account.label, format!("generation-{generation}"));
+                reader_count.fetch_add(1, Ordering::Relaxed);
+                if generation > 0 {
+                    reader_saw_rotation.store(true, Ordering::Relaxed);
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        barrier.wait().await;
+        for generation in 1..=ROTATIONS {
+            let _response = update_account(
+                State(state.clone()),
+                auth(),
+                Path(account_id.clone()),
+                Json(AccountBody {
+                    provider_id: provider_id.clone(),
+                    label: format!("generation-{generation}"),
+                    api_key: Some(format!("rotated-credential-{generation}")),
+                    priority: 1,
+                    weight: 1,
+                    soft_quota_usd: None,
+                    quota_type: "none".into(),
+                    status: None,
+                }),
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        rotation_active.store(false, Ordering::Release);
+        reader.await.unwrap();
+
+        assert!(reads.load(Ordering::Relaxed) > 0);
+        assert!(saw_rotation.load(Ordering::Relaxed));
+        state.registry.reload(&state.pool).await.unwrap();
+        let final_account = &state.registry.snapshot().accounts[&account_id];
+        assert_eq!(
+            final_account.account_state_version,
+            initial_version + ROTATIONS as i64
+        );
+        assert_eq!(
+            state.crypto.decrypt(&final_account.secret_enc).unwrap(),
+            format!("rotated-credential-{ROTATIONS}")
+        );
+        assert_eq!(
+            final_account.key_mask,
+            crypto::mask_secret(&format!("rotated-credential-{ROTATIONS}"))
+        );
+        assert_eq!(final_account.label, format!("generation-{ROTATIONS}"));
 
         let _ = std::fs::remove_dir_all(root);
     }

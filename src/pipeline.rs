@@ -2014,6 +2014,7 @@ fn median_observed_ttft(
     }
 }
 
+#[cfg(test)]
 fn build_adaptive_scores(
     targets: &[ResolvedTarget],
     snapshots: &std::collections::HashMap<

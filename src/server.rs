@@ -15,7 +15,7 @@ use crate::logqueue::UsageLogQueue;
 use crate::opaque_state::OpaqueStateStore;
 use crate::plugins::{HostPolicy, PluginManager};
 use crate::registry::Registry;
-use crate::{alerts, bootstrap, db, export, pool, router};
+use crate::{alerts, bootstrap, db, export, router};
 
 pub fn init_tracing(json: bool) {
     let filter = EnvFilter::try_from_default_env()

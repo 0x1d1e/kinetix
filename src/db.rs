@@ -954,6 +954,7 @@ pub async fn update_account(
     weight: i64,
     soft_quota_usd: Option<f64>,
     quota_type: &str,
+    credential: Option<(&str, &str)>,
 ) -> Result<()> {
     if let Some(status) = status {
         if !matches!(status, "healthy" | "disabled") {
@@ -969,7 +970,8 @@ pub async fn update_account(
              status_changed_at=CASE WHEN status=? AND status_reason=? THEN status_changed_at ELSE ? END, \
              priority=?, weight=?, soft_quota_usd=?, quota_type=?, cooldown_until=NULL, \
              quota_reset_at=NULL, last_error=NULL, circuit_open_until=NULL, \
-             consecutive_failures=0, account_state_version=account_state_version + 1 WHERE id=?",
+             consecutive_failures=0, secret_enc=COALESCE(?, secret_enc), \
+             key_mask=COALESCE(?, key_mask), account_state_version=account_state_version + 1 WHERE id=?",
         )
         .bind(label)
         .bind(status)
@@ -981,12 +983,15 @@ pub async fn update_account(
         .bind(weight)
         .bind(soft_quota_usd)
         .bind(quota_type)
+        .bind(credential.map(|(secret_enc, _)| secret_enc))
+        .bind(credential.map(|(_, key_mask)| key_mask))
         .bind(id)
         .execute(pool)
         .await?;
     } else {
         sqlx::query(
             "UPDATE accounts SET label=?, priority=?, weight=?, soft_quota_usd=?, quota_type=?, \
+             secret_enc=COALESCE(?, secret_enc), key_mask=COALESCE(?, key_mask), \
              account_state_version=account_state_version + 1 WHERE id=?",
         )
         .bind(label)
@@ -994,6 +999,8 @@ pub async fn update_account(
         .bind(weight)
         .bind(soft_quota_usd)
         .bind(quota_type)
+        .bind(credential.map(|(secret_enc, _)| secret_enc))
+        .bind(credential.map(|(_, key_mask)| key_mask))
         .bind(id)
         .execute(pool)
         .await?;
@@ -3964,6 +3971,7 @@ mod account_success_recovery_tests {
             1,
             None,
             "none",
+            None,
         )
         .await
         .is_err());
