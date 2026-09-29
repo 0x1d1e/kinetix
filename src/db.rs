@@ -1783,25 +1783,37 @@ pub(crate) async fn insert_account_in_transaction(
     weight: i64,
     soft_quota_usd: Option<f64>,
     quota_type: &str,
+    quota_window_s: Option<i64>,
+    enabled: bool,
 ) -> Result<String> {
     let id = format!("acc_{}", uuid::Uuid::new_v4().simple());
+    let status = if enabled { "healthy" } else { "disabled" };
+    let status_reason = if enabled {
+        "account_created"
+    } else {
+        "operator_disabled"
+    };
+    let now = now_iso();
     sqlx::query(
         "INSERT INTO accounts
          (id, provider_id, label, secret_enc, key_mask, status, status_reason, status_changed_at,
-          quota_type, soft_quota_usd, priority, weight, created_at)
-         VALUES (?,?,?,?,?,'healthy','account_created',?,?,?,?,?,?)",
+          quota_type, quota_window_s, soft_quota_usd, priority, weight, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(provider_id)
     .bind(label)
     .bind(secret_enc)
     .bind(key_mask)
-    .bind(now_iso())
+    .bind(status)
+    .bind(status_reason)
+    .bind(&now)
     .bind(quota_type)
+    .bind(quota_window_s)
     .bind(soft_quota_usd)
     .bind(priority)
     .bind(weight)
-    .bind(now_iso())
+    .bind(&now)
     .execute(&mut **tx)
     .await?;
     Ok(id)

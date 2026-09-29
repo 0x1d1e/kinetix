@@ -125,11 +125,16 @@ curl -b cookie.txt -X POST http://127.0.0.1:8080/admin/api/config/import \
 ```
 
 Exports use config version 2 and contain opaque account references so Route
-targets do not depend on source database IDs. Version 1 and unversioned imports
-remain supported. Run with `apply:false` first to review validation problems,
-conflicts, warnings, and missing resources. Applying uses one transaction; a failed import leaves the database unchanged.
-Imports upsert providers, models, Routes, and aliases without deleting them or
-replacing existing credentials with imported secrets. Changing a provider to
+targets do not depend on source database IDs. Refs distinguish accounts even
+when their labels match. Account policy includes `enabled`, quota settings
+(including `quota_window_s`), priority, and weight. Exported `status` is
+informational: restore preserves manual enablement but does not restore transient
+cooldown or circuit state. Version 1 and unversioned imports remain supported.
+Run with `apply:false` first to review validation problems, conflicts, warnings,
+and missing resources. Ambiguous existing account labels are conflicts. Applying
+uses one transaction; a failed import leaves the database unchanged. Imports
+upsert providers, models, Routes, and aliases without deleting them or replacing
+existing credentials with imported secrets. Changing a provider to
 `credential_mode: none` may remove its credential accounts to enforce that mode.
 
 ## Plugin storage and host configuration
