@@ -11027,6 +11027,7 @@ async fn reconcile_provider_account_mode(
     Ok(())
 }
 
+#[cfg(test)]
 async fn reconcile_provider_credential_semantics(
     state: &AppState,
     provider_id: &str,
