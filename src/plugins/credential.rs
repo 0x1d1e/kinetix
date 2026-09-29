@@ -203,16 +203,11 @@ impl CredentialStrategy for PluginCredentialStrategy {
             return Ok(None);
         };
         let now = chrono::Utc::now();
-        let has_timing_hint = lease.expires_at.is_some() || lease.refresh_after.is_some();
-        let refresh_deadline = crate::credential_refresh::lease_refresh_deadline(
-            lease.expires_at.as_deref(),
-            lease.refresh_after.as_deref(),
-            now,
-        );
-        // Missing timing metadata is unknown, not an immediate refresh deadline.
-        // Keep using the lease until the plugin supplies a refresh hint or auth
-        // failure triggers the existing reactive rotation path.
-        if has_timing_hint && refresh_deadline.is_none_or(|deadline| deadline <= now) {
+        let expires_at = lease.expires_at.as_deref().and_then(crate::db::parse_dt);
+        // refresh_after controls proactive renewal, not access-token validity.
+        // Keep the cached lease available until explicit expiry; when expiry is
+        // unknown, keep using it until auth failure triggers reactive rotation.
+        if lease.expires_at.is_some() && expires_at.is_none_or(|deadline| deadline <= now) {
             return Ok(None);
         }
 
@@ -239,11 +234,11 @@ impl CredentialStrategy for PluginCredentialStrategy {
             )
             .await
             .map_err(credential_error)?;
+        let secret = self.lease_secret(&lease.handle).await?;
         self.leases.insert(
             (account.provider_id.clone(), account.id.clone()),
             lease.clone(),
         );
-        let secret = self.lease_secret(&lease.handle).await?;
         Ok(ResolvedCredential {
             secret,
             expires_at: lease.expires_at,
@@ -389,6 +384,256 @@ mod tests {
                 reset_at: None,
             })
         }
+    }
+
+    async fn test_store(name: &str) -> (std::path::PathBuf, Pool, Arc<Crypto>) {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-plugin-credential-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}?mode=rwc", root.join("state.db").display());
+        let pool = db::connect(&database_url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let installed_at = db::now_iso();
+        sqlx::query(
+            r#"INSERT INTO plugins
+               (id, version, plugin_api_major, package_sha256, enabled, signature, manifest_json, component, installed_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind("test.plugin")
+        .bind("0.0.1")
+        .bind(1_i64)
+        .bind("test-package-hash")
+        .bind(1_i64)
+        .bind("unsigned")
+        .bind("{}")
+        .bind(Vec::<u8>::new())
+        .bind(&installed_at)
+        .bind(&installed_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        (root, pool, Arc::new(Crypto::new(&[31_u8; 32])))
+    }
+
+    fn test_account(id: &str, provider_id: &str) -> AccountRow {
+        AccountRow {
+            id: id.into(),
+            provider_id: provider_id.into(),
+            label: "plugin-account".into(),
+            secret_enc: String::new(),
+            key_mask: String::new(),
+            status: "healthy".into(),
+            status_reason: "healthy".into(),
+            status_changed_at: None,
+            account_state_version: 0,
+            cooldown_until: None,
+            quota_reset_at: None,
+            quota_type: "none".into(),
+            quota_window_s: None,
+            soft_quota_usd: None,
+            priority: 1,
+            weight: 1,
+            last_error: None,
+            last_probe_at: None,
+            circuit_open_until: None,
+            consecutive_failures: 0,
+            created_at: db::now_iso(),
+        }
+    }
+
+    struct MissingSecretOnceHost {
+        pool: Pool,
+        crypto: Arc<Crypto>,
+        resolutions: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CredentialPluginHost for MissingSecretOnceHost {
+        async fn resolve_lease(
+            &self,
+            plugin_id: &str,
+            _provider_id: &str,
+            _account_id: &str,
+            _account_label: &str,
+        ) -> Result<PluginCredentialLease, PluginFault> {
+            let generation = self.resolutions.fetch_add(1, Ordering::Relaxed);
+            let handle = format!("materialized-{generation}");
+            if generation > 0 {
+                crate::plugins::store::kv_put(
+                    &self.pool,
+                    &self.crypto,
+                    plugin_id,
+                    &format!("{LEASE_PREFIX}{handle}"),
+                    b"valid-access-token",
+                )
+                .await
+                .map_err(|error| PluginFault::Internal(error.to_string()))?;
+            }
+            let now = chrono::Utc::now();
+            Ok(PluginCredentialLease {
+                handle,
+                expires_at: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
+                refresh_after: Some((now + chrono::Duration::minutes(30)).to_rfc3339()),
+            })
+        }
+
+        async fn rotate_lease(
+            &self,
+            _plugin_id: &str,
+            _provider_id: &str,
+            _account_id: &str,
+        ) -> Result<(), PluginFault> {
+            Ok(())
+        }
+
+        async fn health_state(
+            &self,
+            _plugin_id: &str,
+            _provider_id: &str,
+            _account_id: &str,
+        ) -> Result<PluginHealthObservation, PluginFault> {
+            Ok(PluginHealthObservation {
+                state: "healthy".into(),
+                reset_at: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_lease_remains_available_after_refresh_deadline_during_backoff() {
+        let (root, pool, crypto) = test_store("cached-before-expiry").await;
+        let now = chrono::Utc::now();
+        let host = Arc::new(ChangingLeaseHost {
+            pool: pool.clone(),
+            crypto: crypto.clone(),
+            resolutions: AtomicUsize::new(0),
+            rotations: AtomicUsize::new(0),
+            expires_at: (now + chrono::Duration::hours(1)).to_rfc3339(),
+            refresh_after: (now - chrono::Duration::seconds(1)).to_rfc3339(),
+            change_secret_on_resolve: false,
+            advance_expiry_on_resolve: false,
+            omit_timing_metadata: false,
+        });
+        let concrete_strategy = Arc::new(PluginCredentialStrategy::with_host(
+            host.clone(),
+            pool.clone(),
+            crypto.clone(),
+            "test.plugin",
+        ));
+        let strategy: Arc<dyn CredentialStrategy> = concrete_strategy.clone();
+        let account = test_account("cached-account", "cached-provider");
+        let original = strategy.resolve(&account).await.unwrap();
+
+        let provider_work = crate::provider_work::ProviderWorkCoordinator::default();
+        provider_work
+            .acquire(
+                &account.provider_id,
+                crate::provider_work::ProviderWorkClass::ModelDiscovery,
+            )
+            .await
+            .unwrap()
+            .finish_failure(Some(
+                crate::provider_work::ProviderBackoffEvidence::Transient {
+                    retry_after_secs: None,
+                },
+            ))
+            .await;
+
+        let refresh = crate::credential_refresh::RefreshCoordinator::default();
+        let cached = refresh
+            .resolve_cached(&account.provider_id, strategy, &account)
+            .await
+            .unwrap()
+            .expect("valid cached lease must remain usable until expiry");
+        assert_eq!(cached.secret, original.secret);
+        assert_eq!(host.resolutions.load(Ordering::Relaxed), 1);
+        assert_eq!(host.rotations.load(Ordering::Relaxed), 0);
+
+        let no_expiry_account = test_account("no-expiry-account", "no-expiry-provider");
+        crate::plugins::store::kv_put(
+            &pool,
+            &crypto,
+            "test.plugin",
+            "lease:no-expiry",
+            b"unexpired-by-policy",
+        )
+        .await
+        .unwrap();
+        concrete_strategy.leases.insert(
+            (
+                no_expiry_account.provider_id.clone(),
+                no_expiry_account.id.clone(),
+            ),
+            PluginCredentialLease {
+                handle: "no-expiry".into(),
+                expires_at: None,
+                refresh_after: Some((now - chrono::Duration::seconds(1)).to_rfc3339()),
+            },
+        );
+        assert_eq!(
+            concrete_strategy
+                .resolve_cached(&no_expiry_account)
+                .await
+                .unwrap()
+                .unwrap()
+                .secret,
+            "unexpired-by-policy"
+        );
+
+        let expired_account = test_account("expired-account", "expired-provider");
+        concrete_strategy.leases.insert(
+            (
+                expired_account.provider_id.clone(),
+                expired_account.id.clone(),
+            ),
+            PluginCredentialLease {
+                handle: "already-expired".into(),
+                expires_at: Some((now - chrono::Duration::seconds(1)).to_rfc3339()),
+                refresh_after: None,
+            },
+        );
+        assert!(concrete_strategy
+            .resolve_cached(&expired_account)
+            .await
+            .unwrap()
+            .is_none());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_lease_materialization_is_not_cached() {
+        let (root, pool, crypto) = test_store("missing-lease-secret").await;
+        let host = Arc::new(MissingSecretOnceHost {
+            pool: pool.clone(),
+            crypto: crypto.clone(),
+            resolutions: AtomicUsize::new(0),
+        });
+        let strategy: Arc<dyn CredentialStrategy> = Arc::new(PluginCredentialStrategy::with_host(
+            host.clone(),
+            pool.clone(),
+            crypto,
+            "test.plugin",
+        ));
+        let account = test_account("materialization-account", "materialization-provider");
+        let refresh = crate::credential_refresh::RefreshCoordinator::default();
+
+        assert!(refresh
+            .resolve(&account.provider_id, strategy.clone(), &account)
+            .await
+            .is_err());
+        let recovered = refresh
+            .resolve(&account.provider_id, strategy, &account)
+            .await
+            .expect("a failed lease must not prevent fresh resolution");
+        assert_eq!(recovered.secret, "valid-access-token");
+        assert_eq!(host.resolutions.load(Ordering::Relaxed), 2);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -618,15 +863,15 @@ mod tests {
             .claim_due(chrono::Utc::now())
             .iter()
             .any(|key| key.account_id == timing_refresh_account.id));
-        let second_timing_lease = coordinator
-            .resolve(
+        let did_rotate = coordinator
+            .rotate_scheduled(
                 &timing_refresh_account.provider_id,
                 timing_refresh_strategy,
                 &timing_refresh_account,
             )
             .await
             .unwrap();
-        assert!(!second_timing_lease.rotated);
+        assert!(!did_rotate);
         let now = chrono::Utc::now();
         assert!(
             coordinator

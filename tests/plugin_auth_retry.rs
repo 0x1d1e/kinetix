@@ -254,8 +254,8 @@ impl CredentialStrategy for ResolveRefreshingCredential {
         let now = chrono::Utc::now();
         let credential = ResolvedCredential {
             secret: self.secret.lock().await.clone(),
-            expires_at: Some((now.to_owned() + chrono::Duration::hours(2)).to_rfc3339()),
-            refresh_after: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
+            expires_at: Some((now.to_owned() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((now - chrono::Duration::seconds(1)).to_rfc3339()),
             rotated: stale,
         };
         self.cached
@@ -623,6 +623,7 @@ async fn active_provider_work_backoff_does_not_block_inference_credential_resolu
     consume(response).await;
 
     assert_eq!(strategy.refreshes.load(Ordering::Relaxed), 1);
+    assert_eq!(strategy.rotations.load(Ordering::Relaxed), 0);
     assert_eq!(
         harness.upstream.attempts.lock().await.as_slice(),
         ["Bearer fresh-token"]
