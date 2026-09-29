@@ -10465,23 +10465,23 @@ fn normalize_import_config(mut config: Value) -> Result<(Value, u64, Vec<String>
     Ok((config, version, warnings))
 }
 
-async fn installed_integration_ceilings(
+async fn installed_source_integration(
     state: &AppState,
     provider_name: &str,
     source_plugin_id: Option<&str>,
     source_integration_id: Option<&str>,
-) -> Result<
-    Option<(
-        Option<crate::plugins::types::IntegrationFeaturesV1>,
-        Option<crate::plugins::types::IntegrationProtocolsV1>,
-    )>,
-    String,
-> {
-    let (Some(plugin_id), Some(integration_id), Some(manager)) = (
-        source_plugin_id.filter(|value| !value.trim().is_empty()),
-        source_integration_id.filter(|value| !value.trim().is_empty()),
-        state.plugin_manager(),
-    ) else {
+) -> Result<Option<crate::plugins::types::Integration>, String> {
+    let source_plugin_id = source_plugin_id.filter(|value| !value.trim().is_empty());
+    let source_integration_id = source_integration_id.filter(|value| !value.trim().is_empty());
+    let (Some(plugin_id), Some(integration_id)) = (source_plugin_id, source_integration_id) else {
+        if source_plugin_id.is_some() || source_integration_id.is_some() {
+            return Err(format!(
+                "provider '{provider_name}': source_plugin_id and source_integration_id must be declared together"
+            ));
+        }
+        return Ok(None);
+    };
+    let Some(manager) = state.plugin_manager() else {
         return Ok(None);
     };
     let Some(plugin) = manager
@@ -10524,7 +10524,50 @@ async fn installed_integration_ceilings(
             )
         })?;
     }
-    Ok(Some((features, protocols)))
+    Ok(Some(integration.clone()))
+}
+
+fn validate_imported_integration_bindings(
+    provider_name: &str,
+    plugin_id: &str,
+    integration: &crate::plugins::types::Integration,
+    wire_format: &str,
+    wire_plugin: &str,
+    credential_plugin: &str,
+    model_source_plugin: &str,
+) -> Result<(), String> {
+    let expected_binding = |capability: Option<&str>| {
+        capability
+            .map(|name| format!("plugin:{plugin_id}/{name}"))
+            .unwrap_or_default()
+    };
+    let integration_id = &integration.id;
+    let expected_wire_plugin = expected_binding(integration.provider_adapter.as_deref());
+    if wire_plugin != expected_wire_plugin {
+        return Err(format!(
+            "provider '{provider_name}': wire_plugin does not match source integration '{integration_id}' provider_adapter"
+        ));
+    }
+    let expected_model_source = expected_binding(integration.model_source.as_deref());
+    if model_source_plugin != expected_model_source {
+        return Err(format!(
+            "provider '{provider_name}': model_source_plugin does not match source integration '{integration_id}' model_source"
+        ));
+    }
+    let expected_credential_plugin = expected_binding(integration.credential_strategy.as_deref());
+    if credential_plugin != expected_credential_plugin {
+        return Err(format!(
+            "provider '{provider_name}': credential_plugin does not match source integration '{integration_id}' credential_strategy"
+        ));
+    }
+    if let Some(provider) = &integration.provider {
+        if wire_format != provider.wire_format {
+            return Err(format!(
+                "provider '{provider_name}': wire_format does not match source integration '{integration_id}' provider template"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -10681,7 +10724,7 @@ pub async fn import_config(
                 .as_ref()
                 .and_then(|provider| provider.source_integration_id.as_deref())
         };
-        let installed_ceilings = match installed_integration_ceilings(
+        let installed_integration = match installed_source_integration(
             &state,
             name,
             source_plugin_id,
@@ -10689,12 +10732,15 @@ pub async fn import_config(
         )
         .await
         {
-            Ok(ceilings) => ceilings,
+            Ok(integration) => integration,
             Err(problem) => {
                 problems.push(problem);
                 None
             }
         };
+        let installed_ceilings = installed_integration
+            .as_ref()
+            .map(|integration| (integration.features.clone(), integration.protocols.clone()));
         let (integration_features, integration_protocols) =
             if let Some(ceilings) = installed_ceilings {
                 ceilings
@@ -10800,6 +10846,21 @@ pub async fn import_config(
         let wire_plugin = p["wire_plugin"].as_str().unwrap_or("");
         let credential_plugin = p["credential_plugin"].as_str().unwrap_or("");
         let model_source_plugin = p["model_source_plugin"].as_str().unwrap_or("");
+        if let (Some(plugin_id), Some(integration)) =
+            (source_plugin_id, installed_integration.as_ref())
+        {
+            if let Err(problem) = validate_imported_integration_bindings(
+                name,
+                plugin_id,
+                integration,
+                p["wire_format"].as_str().unwrap_or(""),
+                wire_plugin,
+                credential_plugin,
+                model_source_plugin,
+            ) {
+                problems.push(problem);
+            }
+        }
         if let Err(problem) = validate_imported_provider_credential_semantics(
             &state,
             name,
@@ -23341,6 +23402,37 @@ storage = "2MiB"
             .unwrap()
             .status()
             .is_enabled());
+
+        for invalid_wire_plugin in [
+            "plugin:plugin.other/other-adapter",
+            "plugin:plugin.test/stale-adapter",
+        ] {
+            let mut mismatched_export = exported.clone();
+            mismatched_export["providers"][0]["wire_plugin"] = json!(invalid_wire_plugin);
+            let mismatch_error = import_config(
+                State(target.clone()),
+                auth(),
+                Json(ImportBody {
+                    config: mismatched_export,
+                    apply: true,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(mismatch_error
+                .1
+                .contains("wire_plugin does not match source integration 'native'"));
+        }
+        let provider_after_rejected_mismatch = db::list_providers(&target.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "native-provider")
+            .unwrap();
+        assert_eq!(
+            provider_after_rejected_mismatch.wire_plugin,
+            "plugin:plugin.test/session-echo"
+        );
 
         let imported_while_disabled = import_config(
             State(target.clone()),
