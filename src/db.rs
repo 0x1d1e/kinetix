@@ -1204,6 +1204,40 @@ pub async fn set_provider_integration_protocols(
     Ok(())
 }
 
+pub(crate) async fn set_provider_integration_features_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    features: Option<&crate::plugins::types::IntegrationFeaturesV1>,
+) -> Result<()> {
+    if let Some(features) = features {
+        features.validate().map_err(anyhow::Error::msg)?;
+    }
+    let serialized = features.map(serde_json::to_string).transpose()?;
+    sqlx::query("UPDATE providers SET integration_features=? WHERE id=?")
+        .bind(serialized)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn set_provider_integration_protocols_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    protocols: Option<&crate::plugins::types::IntegrationProtocolsV1>,
+) -> Result<()> {
+    if let Some(protocols) = protocols {
+        protocols.validate().map_err(anyhow::Error::msg)?;
+    }
+    let serialized = protocols.map(serde_json::to_string).transpose()?;
+    sqlx::query("UPDATE providers SET integration_protocols=? WHERE id=?")
+        .bind(serialized)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String> {
     let id = format!("prov_{}", uuid::Uuid::new_v4().simple());
     let pricing_scope = conservative_provider_pricing_scope(
