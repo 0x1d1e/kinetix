@@ -8150,12 +8150,17 @@ fn normalize_imported_observation_timestamp(observation: &mut Value) -> Result<(
     let fields = observation
         .as_object_mut()
         .ok_or_else(|| ApiError::bad("discovery observation must be an object"))?;
-    let observed_at = match fields.get("observed_at").and_then(Value::as_str) {
-        Some(value) => chrono::DateTime::parse_from_rfc3339(value)
-            .map_err(|_| ApiError::bad("discovery observed_at must be a valid RFC3339 timestamp"))?
+    let observed_at = match fields.get("observed_at") {
+        None => db::now_iso(),
+        Some(Value::String(value)) => chrono::DateTime::parse_from_rfc3339(value)
+            .map_err(|_| ApiError::bad("discovery observed_at must be a valid RFC3339 string"))?
             .with_timezone(&chrono::Utc)
             .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-        None => db::now_iso(),
+        Some(_) => {
+            return Err(ApiError::bad(
+                "discovery observed_at must be a valid RFC3339 string",
+            ));
+        }
     };
     fields.insert("observed_at".into(), json!(observed_at));
     Ok(())
@@ -8244,16 +8249,14 @@ pub async fn create_model(
         );
     }
     let initial_latest_observation = if imported_from_discovery {
-        body.discovery
-            .get("latest_observation")
-            .filter(|observation| {
-                observation
-                    .as_object()
-                    .is_some_and(|fields| !fields.is_empty())
-            })
-            .cloned()
-            .or_else(|| {
-                let fields = body.discovery.as_object()?;
+        let observation = match body.discovery.get("latest_observation") {
+            Some(latest) => {
+                let fields = latest.as_object().ok_or_else(|| {
+                    ApiError::bad("discovery latest_observation must be an object")
+                })?;
+                (!fields.is_empty()).then(|| latest.clone())
+            }
+            None => body.discovery.as_object().and_then(|fields| {
                 fields
                     .keys()
                     .any(|key| {
@@ -8263,7 +8266,9 @@ pub async fn create_model(
                         )
                     })
                     .then(|| body.discovery.clone())
-            })
+            }),
+        };
+        observation
             .map(|mut observation| {
                 normalize_imported_observation_timestamp(&mut observation)?;
                 Ok(observation)
@@ -17071,7 +17076,7 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
-    async fn invalid_import_observed_at_is_rejected_before_model_creation() {
+    async fn malformed_import_observations_are_rejected_before_model_creation() {
         let (state, root) = test_state("invalid-observation-import").await;
         let provider_id = "provider-invalid-observation-import";
         sqlx::query(
@@ -17084,43 +17089,70 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
 
-        let error = create_model(
-            State(state.clone()),
-            AdminAuth {
-                actor: "admin".into(),
-                token: "test".into(),
-            },
-            Path(provider_id.into()),
-            Json(ModelBody {
-                upstream_id: "invalid-observed-at-model".into(),
-                display_name: None,
-                enabled: true,
-                context_window: None,
-                max_output_tokens: None,
-                capabilities: json!({}),
-                prices: json!({}),
-                parameters: json!({}),
-                thinking_map: ThinkingMap::default(),
-                extra_request: json!({}),
-                discovery: json!({
+        let cases = [
+            (
+                "invalid-observed-at-string",
+                json!({
                     "imported_from_discovery": true,
                     "execution_supported": true,
                     "observed_at": "not-a-date"
                 }),
-                transport_override: None,
-            }),
-        )
-        .await
-        .unwrap_err();
+            ),
+            (
+                "invalid-observed-at-number",
+                json!({
+                    "imported_from_discovery": true,
+                    "execution_supported": true,
+                    "observed_at": 123
+                }),
+            ),
+            (
+                "invalid-latest-observation-shape",
+                json!({
+                    "imported_from_discovery": true,
+                    "execution_supported": true,
+                    "latest_observation": "invalid"
+                }),
+            ),
+        ];
+        for (upstream_id, discovery) in cases {
+            let result = create_model(
+                State(state.clone()),
+                AdminAuth {
+                    actor: "admin".into(),
+                    token: "test".into(),
+                },
+                Path(provider_id.into()),
+                Json(ModelBody {
+                    upstream_id: upstream_id.into(),
+                    display_name: None,
+                    enabled: true,
+                    context_window: None,
+                    max_output_tokens: None,
+                    capabilities: json!({}),
+                    prices: json!({}),
+                    parameters: json!({}),
+                    thinking_map: ThinkingMap::default(),
+                    extra_request: json!({}),
+                    discovery,
+                    transport_override: None,
+                }),
+            )
+            .await;
+            let error = match result {
+                Ok(_) => panic!("malformed discovery for {upstream_id} was accepted"),
+                Err(error) => error,
+            };
 
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(error.1.contains("observed_at"));
-        assert!(
-            db::find_model_by_upstream(&state.pool, provider_id, "invalid-observed-at-model")
-                .await
-                .unwrap()
-                .is_none()
-        );
+            assert_eq!(error.0, StatusCode::BAD_REQUEST, "{upstream_id}");
+            assert!(
+                db::find_model_by_upstream(&state.pool, provider_id, upstream_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "malformed discovery for {upstream_id} created a model"
+            );
+        }
 
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(root);
