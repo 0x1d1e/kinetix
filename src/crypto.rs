@@ -5,6 +5,7 @@ use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, Result};
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 pub struct Crypto {
@@ -18,6 +19,8 @@ pub struct Crypto {
     /// label. Kept separate so a leaked provider-credential key (or vice
     /// versa) cannot decrypt opaque continuation tokens.
     opaque_state_cipher: Aes256Gcm,
+    /// Dedicated, master-key-derived HMAC key for API-v2 plugin session IDs.
+    plugin_session_hmac_key: [u8; 32],
 }
 
 impl Crypto {
@@ -36,11 +39,29 @@ impl Crypto {
         opaque_hasher.update(master_key);
         let opaque_derived = opaque_hasher.finalize();
         let opaque_key = Key::<Aes256Gcm>::from_slice(&opaque_derived);
+        // Key-separate plugin session IDs from credentials, plugin KV, and
+        // opaque provider state. The same master key yields stable IDs across
+        // process restarts, while the client value itself stays host-internal.
+        let mut session_key_mac = <Hmac<Sha256> as Mac>::new_from_slice(master_key)
+            .expect("HMAC accepts keys of any length");
+        session_key_mac.update(b"kinetix:plugin-session-identity:v1");
+        let plugin_session_hmac_key = session_key_mac.finalize().into_bytes().into();
         Crypto {
             cipher: Aes256Gcm::new(key),
             kv_cipher: Aes256Gcm::new(kv_key),
             opaque_state_cipher: Aes256Gcm::new(opaque_key),
+            plugin_session_hmac_key,
         }
+    }
+
+    /// Derive a stable opaque identity for a recognized client session before
+    /// it crosses the API-v2 plugin boundary. Stability depends on retaining
+    /// the Kinetix master key; raw client identities are never returned.
+    pub fn opaque_plugin_session_identity(&self, raw_session: &str) -> String {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.plugin_session_hmac_key)
+            .expect("HMAC accepts keys of any length");
+        mac.update(raw_session.as_bytes());
+        format!("kxs_v1_{}", hex::encode(mac.finalize().into_bytes()))
     }
 
     /// Encrypt a secret, returning base64(nonce || ciphertext).
@@ -203,6 +224,34 @@ mod tests {
         assert_eq!(c.decrypt_kv(&kv).unwrap(), "refresh-token");
         let cred = c.encrypt("sk-secret").unwrap();
         assert!(c.decrypt_kv(&cred).is_err());
+    }
+
+    #[test]
+    fn plugin_session_identity_is_stable_opaque_and_session_specific() {
+        let raw_session = "customer@example.com";
+        let first_crypto = Crypto::new(&[7u8; 32]);
+        let identity = first_crypto.opaque_plugin_session_identity(raw_session);
+
+        assert_eq!(
+            identity,
+            Crypto::new(&[7u8; 32]).opaque_plugin_session_identity(raw_session),
+            "a persistent master key must preserve session IDs across restarts"
+        );
+        assert_eq!(
+            identity,
+            first_crypto.opaque_plugin_session_identity(raw_session),
+            "retries and fallback attempts must derive the same ID"
+        );
+        assert_ne!(
+            identity,
+            first_crypto.opaque_plugin_session_identity("internal-ticket-123")
+        );
+        assert!(!identity.contains(raw_session));
+        assert_ne!(
+            identity,
+            Crypto::new(&[8u8; 32]).opaque_plugin_session_identity(raw_session),
+            "session IDs are protected by the deployment master key"
+        );
     }
 
     #[test]

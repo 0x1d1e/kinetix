@@ -1695,6 +1695,12 @@ impl PluginManager {
         })
     }
 
+    /// Replace raw client session values with stable host-keyed identities
+    /// before passing session context across a plugin ABI boundary.
+    fn opaque_plugin_session_context(&self, raw_session: Option<&str>) -> Option<String> {
+        raw_session.map(|session| self.inner.crypto.opaque_plugin_session_identity(session))
+    }
+
     pub async fn adapter_wire_format(&self, id: &str) -> Result<String, PluginFault> {
         let started = self.bump_invocation(id, "provider_adapter");
         let _permits = self.acquire_invocation_permits(id).await;
@@ -1737,7 +1743,7 @@ impl PluginManager {
         id: &str,
         provider_json: &str,
         credential: &str,
-        session_context: Option<&str>,
+        raw_session_context: Option<&str>,
     ) -> Result<String, PluginFault> {
         let started = self.bump_invocation(id, "provider_adapter");
         let _permits = self.acquire_invocation_permits(id).await;
@@ -1748,8 +1754,14 @@ impl PluginManager {
         let plugin = p.plugin;
         let rt = self.inner.runtime.clone();
         let guard = rt.arm_deadline(&mut p.store, p.wall_time);
+        let opaque_session_context = self.opaque_plugin_session_context(raw_session_context);
         let res = plugin
-            .call_apply_auth(&mut p.store, provider_json, credential, session_context)
+            .call_apply_auth(
+                &mut p.store,
+                provider_json,
+                credential,
+                opaque_session_context.as_deref(),
+            )
             .await;
         self.settle_cancellable(id, "provider_adapter", started, &guard, res)
             .await
@@ -1761,7 +1773,7 @@ impl PluginManager {
         request_json: &str,
         provider_json: &str,
         model_json: &str,
-        session_context: Option<&str>,
+        raw_session_context: Option<&str>,
     ) -> Result<String, PluginFault> {
         let started = self.bump_invocation(id, "provider_adapter");
         let _permits = self.acquire_invocation_permits(id).await;
@@ -1772,13 +1784,14 @@ impl PluginManager {
         let plugin = p.plugin;
         let rt = self.inner.runtime.clone();
         let guard = rt.arm_deadline(&mut p.store, p.wall_time);
+        let opaque_session_context = self.opaque_plugin_session_context(raw_session_context);
         let res = plugin
             .call_build_body(
                 &mut p.store,
                 request_json,
                 provider_json,
                 model_json,
-                session_context,
+                opaque_session_context.as_deref(),
             )
             .await;
         self.settle_cancellable(id, "provider_adapter", started, &guard, res)
@@ -2514,9 +2527,9 @@ impl AdapterGuest {
         store: &mut wasmtime::Store<HostCtx>,
         provider_json: &str,
         credential: &str,
-        session_context: Option<&str>,
+        opaque_session_context: Option<&str>,
     ) -> Result<String, PluginFault> {
-        let session = session_context.map(|id| {
+        let session = opaque_session_context.map(|id| {
             adapter_v2_bindings::kinetix::plugin2_0_0::types::SessionContext { id: id.into() }
         });
         match self {
@@ -2541,9 +2554,9 @@ impl AdapterGuest {
         request_json: &str,
         provider_json: &str,
         model_json: &str,
-        session_context: Option<&str>,
+        opaque_session_context: Option<&str>,
     ) -> Result<String, PluginFault> {
-        let session = session_context.map(|id| {
+        let session = opaque_session_context.map(|id| {
             adapter_v2_bindings::kinetix::plugin2_0_0::types::SessionContext { id: id.into() }
         });
         match self {
