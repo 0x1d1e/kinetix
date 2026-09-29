@@ -1005,6 +1005,8 @@ pub struct ProviderRow {
     pub pricing_scope: String,
     #[serde(default)]
     pub integration_features: Option<String>,
+    #[serde(default)]
+    pub integration_protocols: Option<String>,
 }
 
 impl ProviderRow {
@@ -1068,6 +1070,27 @@ impl ProviderRow {
             serde_json::from_str(raw).map_err(|error| error.to_string())?;
         features.validate()?;
         Ok(Some(features))
+    }
+
+    /// Validated input/upstream protocol declarations for an integration-backed
+    /// provider. Missing declarations preserve legacy behavior.
+    pub fn integration_protocol_ceiling(
+        &self,
+    ) -> Result<Option<crate::plugins::types::IntegrationProtocolsV1>, String> {
+        let Some(raw) = self.integration_protocols.as_deref() else {
+            return Ok(None);
+        };
+        let protocols: crate::plugins::types::IntegrationProtocolsV1 =
+            serde_json::from_str(raw).map_err(|error| error.to_string())?;
+        protocols.validate()?;
+        Ok(Some(protocols))
+    }
+
+    pub fn allows_input_protocol(&self, protocol: &str) -> Result<bool, String> {
+        let Some(ceiling) = self.integration_protocol_ceiling()? else {
+            return Ok(true);
+        };
+        Ok(ceiling.allows_input(protocol))
     }
 
     /// Whether a destination host is authorized to receive this provider's
@@ -1157,6 +1180,23 @@ pub async fn set_provider_integration_features(
     }
     let serialized = features.map(serde_json::to_string).transpose()?;
     sqlx::query("UPDATE providers SET integration_features=? WHERE id=?")
+        .bind(serialized)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_provider_integration_protocols(
+    pool: &Pool,
+    id: &str,
+    protocols: Option<&crate::plugins::types::IntegrationProtocolsV1>,
+) -> Result<()> {
+    if let Some(protocols) = protocols {
+        protocols.validate().map_err(anyhow::Error::msg)?;
+    }
+    let serialized = protocols.map(serde_json::to_string).transpose()?;
+    sqlx::query("UPDATE providers SET integration_protocols=? WHERE id=?")
         .bind(serialized)
         .bind(id)
         .execute(pool)

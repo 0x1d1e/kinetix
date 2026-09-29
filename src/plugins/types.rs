@@ -311,6 +311,35 @@ impl IntegrationProtocolsV1 {
         }
         Ok(())
     }
+
+    /// Ensure every declared upstream protocol can be served by this provider
+    /// transport. `plugin-native` is valid only with a configured adapter.
+    pub fn validate_upstream_wire_format(
+        &self,
+        wire_format: &str,
+        has_provider_adapter: bool,
+    ) -> Result<(), String> {
+        self.validate()?;
+        for protocol in &self.upstream {
+            let compatible = match protocol.as_str() {
+                "openai-chat" | "openai-responses" => wire_format == "openai",
+                "anthropic" => wire_format == "anthropic",
+                "gemini" => wire_format == "gemini",
+                "plugin-native" => wire_format == "plugin" && has_provider_adapter,
+                _ => false,
+            };
+            if !compatible {
+                return Err(format!(
+                    "upstream protocol '{protocol}' is incompatible with provider wire_format '{wire_format}'"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn allows_input(&self, protocol: &str) -> bool {
+        self.input.iter().any(|allowed| allowed == protocol)
+    }
 }
 
 /// A user-facing integration assembled from one or more capabilities provided
@@ -667,5 +696,30 @@ mod tests {
         assert_eq!(parse_size("4KiB"), Some(4096));
         assert_eq!(parse_size("1024"), Some(1024));
         assert_eq!(parse_size(""), None);
+    }
+
+    #[test]
+    fn integration_upstream_protocols_must_match_provider_transport() {
+        let protocols = IntegrationProtocolsV1 {
+            input: vec!["openai-chat".into(), "anthropic".into()],
+            upstream: vec!["openai-chat".into(), "openai-responses".into()],
+        };
+        assert!(protocols
+            .validate_upstream_wire_format("openai", false)
+            .is_ok());
+        assert!(protocols
+            .validate_upstream_wire_format("anthropic", false)
+            .is_err());
+
+        let plugin_protocols = IntegrationProtocolsV1 {
+            input: vec!["anthropic".into()],
+            upstream: vec!["plugin-native".into()],
+        };
+        assert!(plugin_protocols
+            .validate_upstream_wire_format("plugin", true)
+            .is_ok());
+        assert!(plugin_protocols
+            .validate_upstream_wire_format("plugin", false)
+            .is_err());
     }
 }

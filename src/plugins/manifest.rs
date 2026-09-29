@@ -288,6 +288,16 @@ fn validate_for_host(
                     integration.id
                 );
             }
+            if let Some(protocols) = &integration.protocols {
+                protocols
+                    .validate_upstream_wire_format(
+                        &provider.wire_format,
+                        integration.provider_adapter.is_some(),
+                    )
+                    .map_err(|error| {
+                        anyhow!("integration '{}' protocols: {error}", integration.id)
+                    })?;
+            }
 
             match provider.auth_scheme.as_str() {
                 "bearer" => {}

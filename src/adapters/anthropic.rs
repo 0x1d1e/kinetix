@@ -1042,6 +1042,7 @@ mod tests {
             source_integration_id: None,
             pricing_scope: "direct_api".into(),
             integration_features: None,
+            integration_protocols: None,
         }
     }
 

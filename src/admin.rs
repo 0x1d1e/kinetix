@@ -12200,6 +12200,34 @@ async fn reconcile_provider_credential_semantics(
     reconcile_provider_account_mode(state, provider_id, credential_mode).await
 }
 
+async fn validate_integration_upstream_protocols(
+    manager: &crate::plugins::PluginManager,
+    protocols: Option<&crate::plugins::types::IntegrationProtocolsV1>,
+    wire_format: &str,
+    wire_plugin: &str,
+) -> Result<(), String> {
+    let Some(protocols) = protocols else {
+        return Ok(());
+    };
+    protocols.validate_upstream_wire_format(wire_format, !wire_plugin.is_empty())?;
+    if protocols
+        .upstream
+        .iter()
+        .any(|protocol| protocol == "plugin-native")
+    {
+        let binding = crate::plugins::PluginRef::parse(wire_plugin)
+            .ok_or_else(|| "plugin-native requires a valid provider adapter binding".to_string())?;
+        let adapter_wire_format = manager
+            .adapter_wire_format(&binding.plugin_id)
+            .await
+            .map_err(|error| format!("provider adapter capability check failed: {error}"))?;
+        if adapter_wire_format.trim().is_empty() {
+            return Err("provider adapter declared an empty native wire format".into());
+        }
+    }
+    Ok(())
+}
+
 async fn reconcile_provider_integration_semantics(
     state: &AppState,
     provider_id: &str,
@@ -12207,6 +12235,7 @@ async fn reconcile_provider_integration_semantics(
     source_plugin_id: &str,
     source_integration_id: &str,
     features: Option<&crate::plugins::types::IntegrationFeaturesV1>,
+    protocols: Option<&crate::plugins::types::IntegrationProtocolsV1>,
     pricing_scope: crate::plugins::PricingScope,
 ) -> Result<(), ApiError> {
     let lock = model_reconciliation_lock(provider_id);
@@ -12254,6 +12283,9 @@ async fn reconcile_provider_integration_semantics(
     .await
     .map_err(ApiError::internal)?;
     db::set_provider_integration_features(&state.pool, provider_id, features)
+        .await
+        .map_err(ApiError::internal)?;
+    db::set_provider_integration_protocols(&state.pool, provider_id, protocols)
         .await
         .map_err(ApiError::internal)?;
     reconcile_provider_account_mode(state, provider_id, credential_mode).await
@@ -12312,6 +12344,23 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                 && provider.model_source_plugin == model_source_plugin
         });
         if let Some(provider) = existing {
+            if let Err(error) = validate_integration_upstream_protocols(
+                &manager,
+                integration.protocols.as_ref(),
+                &provider.wire_format,
+                &provider.wire_plugin,
+            )
+            .await
+            {
+                tracing::warn!(
+                    provider = %provider.id,
+                    plugin = %id,
+                    integration = %integration.id,
+                    %error,
+                    "integration upstream protocols do not match the configured provider"
+                );
+                continue;
+            }
             if let Err(error) = reconcile_provider_integration_semantics(
                 state,
                 &provider.id,
@@ -12319,6 +12368,7 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                 id,
                 &integration.id,
                 integration.features.as_ref(),
+                integration.protocols.as_ref(),
                 template.pricing_scope,
             )
             .await
@@ -12333,6 +12383,23 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
             } else {
                 let _ = state.registry.reload(&state.pool).await;
             }
+            continue;
+        }
+
+        if let Err(error) = validate_integration_upstream_protocols(
+            &manager,
+            integration.protocols.as_ref(),
+            &template.wire_format,
+            &wire_plugin,
+        )
+        .await
+        {
+            tracing::warn!(
+                plugin = %id,
+                integration = %integration.id,
+                %error,
+                "integration upstream protocols do not match the provider template"
+            );
             continue;
         }
 
@@ -12387,6 +12454,7 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                 id,
                 &integration.id,
                 integration.features.as_ref(),
+                integration.protocols.as_ref(),
                 template.pricing_scope,
             )
             .await
@@ -13003,6 +13071,14 @@ pub async fn setup_plugin_integration_provider(
                 && provider.model_source_plugin == model_source_plugin
         });
     if let Some(provider) = existing {
+        validate_integration_upstream_protocols(
+            &manager,
+            integration.protocols.as_ref(),
+            &provider.wire_format,
+            &provider.wire_plugin,
+        )
+        .await
+        .map_err(ApiError::bad)?;
         reconcile_provider_integration_semantics(
             &state,
             &provider.id,
@@ -13010,6 +13086,7 @@ pub async fn setup_plugin_integration_provider(
             &id,
             &integration.id,
             integration.features.as_ref(),
+            integration.protocols.as_ref(),
             template.pricing_scope,
         )
         .await?;
@@ -13024,6 +13101,15 @@ pub async fn setup_plugin_integration_provider(
             "created": false,
         })));
     }
+
+    validate_integration_upstream_protocols(
+        &manager,
+        integration.protocols.as_ref(),
+        &template.wire_format,
+        &wire_plugin,
+    )
+    .await
+    .map_err(ApiError::bad)?;
 
     let credential_hosts = template.credential_hosts.join(",");
     let id_created = db::insert_provider(
@@ -13062,6 +13148,7 @@ pub async fn setup_plugin_integration_provider(
         &id,
         &integration.id,
         integration.features.as_ref(),
+        integration.protocols.as_ref(),
         template.pricing_scope,
     )
     .await?;
@@ -13236,6 +13323,7 @@ mod credential_enrollment_tests {
             source_integration_id: Some("oauth".into()),
             pricing_scope: "integration".into(),
             integration_features: None,
+            integration_protocols: None,
         }
     }
 
@@ -17523,6 +17611,7 @@ mod credential_enrollment_regression_tests {
             crate::plugins::CredentialMode::Manual,
             "plugin.test",
             "direct",
+            None,
             None,
             crate::plugins::PricingScope::DirectApi,
         )
