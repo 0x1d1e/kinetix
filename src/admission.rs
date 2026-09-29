@@ -211,8 +211,10 @@ struct KeyLedger {
     active: HashMap<u64, ActiveReservation>,
     daily_day: Option<NaiveDate>,
     daily_spend: f64,
+    daily_has_unknown_settled_cost: bool,
     monthly_key: Option<(i32, u32)>,
     monthly_spend: f64,
+    monthly_has_unknown_settled_cost: bool,
 }
 
 struct MinuteUse {
@@ -238,6 +240,7 @@ pub struct AdmissionBudgetPeriodSnapshot {
     pub settled_spend_usd: f64,
     pub active_reserved_usd: f64,
     pub has_unknown_active_cost: bool,
+    pub has_unknown_settled_cost: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -583,11 +586,13 @@ impl KeyLedger {
         if self.daily_day != Some(day) {
             self.daily_day = Some(day);
             self.daily_spend = 0.0;
+            self.daily_has_unknown_settled_cost = false;
         }
         let month = (now.year(), now.month());
         if self.monthly_key != Some(month) {
             self.monthly_key = Some(month);
             self.monthly_spend = 0.0;
+            self.monthly_has_unknown_settled_cost = false;
         }
     }
 
@@ -639,10 +644,12 @@ impl KeyLedger {
         let mut snapshot = AdmissionBudgetSnapshot {
             daily: AdmissionBudgetPeriodSnapshot {
                 settled_spend_usd: self.daily_spend,
+                has_unknown_settled_cost: self.daily_has_unknown_settled_cost,
                 ..Default::default()
             },
             monthly: AdmissionBudgetPeriodSnapshot {
                 settled_spend_usd: self.monthly_spend,
+                has_unknown_settled_cost: self.monthly_has_unknown_settled_cost,
                 ..Default::default()
             },
         };
@@ -817,6 +824,10 @@ impl KeyLedger {
         }
 
         // roll_periods() selected the completion period, matching the usage row timestamp.
+        if actual_cost.is_none() {
+            self.daily_has_unknown_settled_cost = true;
+            self.monthly_has_unknown_settled_cost = true;
+        }
         let cost = actual_cost.or(active.cost);
         if let Some(cost) = cost {
             self.daily_spend += cost;
@@ -1402,6 +1413,81 @@ mod tests {
             },
         );
         assert!(second.is_ok());
+    }
+
+    #[test]
+    fn settled_unknown_cost_keeps_conservative_spend_and_unknown_status() {
+        let (controller, entry) = initialized_controller();
+        let mut key = key();
+        key.daily_budget = Some(1.0);
+        key.monthly_budget = Some(1.0);
+        let reservation = controller
+            .reserve_initialized(
+                entry.clone(),
+                &key,
+                AdmissionEstimate {
+                    tokens: 80,
+                    cost: Some(0.8),
+                },
+            )
+            .unwrap();
+        reservation.reconcile(
+            &TokenUsage {
+                input: Some(10),
+                output: None,
+                ..Default::default()
+            },
+            None,
+        );
+
+        let snapshot = entry
+            .ledger
+            .lock()
+            .budget_snapshot(Utc::now(), Instant::now());
+        assert_eq!(snapshot.daily.settled_spend_usd, 0.8);
+        assert_eq!(snapshot.monthly.settled_spend_usd, 0.8);
+        assert!(snapshot.daily.has_unknown_settled_cost);
+        assert!(snapshot.monthly.has_unknown_settled_cost);
+        assert!(controller
+            .reserve_initialized(
+                entry,
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.3),
+                },
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn settled_unknown_cost_flags_roll_with_utc_budget_periods() {
+        let jan_30 = NaiveDate::from_ymd_opt(2026, 1, 30)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let mut ledger = KeyLedger::default();
+        ledger.roll_periods(jan_30);
+        ledger.daily_spend = 0.8;
+        ledger.monthly_spend = 0.8;
+        ledger.daily_has_unknown_settled_cost = true;
+        ledger.monthly_has_unknown_settled_cost = true;
+
+        ledger.roll_periods(jan_30 + chrono::Duration::days(1));
+        assert_eq!(ledger.daily_spend, 0.0);
+        assert!(!ledger.daily_has_unknown_settled_cost);
+        assert_eq!(ledger.monthly_spend, 0.8);
+        assert!(ledger.monthly_has_unknown_settled_cost);
+
+        let feb_1 = NaiveDate::from_ymd_opt(2026, 2, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        ledger.roll_periods(feb_1);
+        assert_eq!(ledger.monthly_spend, 0.0);
+        assert!(!ledger.monthly_has_unknown_settled_cost);
     }
 
     #[tokio::test]

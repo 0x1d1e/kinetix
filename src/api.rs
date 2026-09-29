@@ -584,7 +584,10 @@ pub async fn client_usage(State(state): State<AppState>, headers: HeaderMap) -> 
          summary: &db::ClientUsageSummary,
          admission: crate::admission::AdmissionBudgetPeriodSnapshot| {
             let limit = limit.filter(|value| *value > 0.0)?;
-            if summary.unknown_cost_requests > 0 || admission.has_unknown_active_cost {
+            if summary.unknown_cost_requests > 0
+                || admission.has_unknown_active_cost
+                || admission.has_unknown_settled_cost
+            {
                 return None;
             }
             Some((limit - admission.settled_spend_usd - admission.active_reserved_usd).max(0.0))
@@ -617,11 +620,13 @@ pub async fn client_usage(State(state): State<AppState>, headers: HeaderMap) -> 
                     "settled_spend_usd": budget.daily.settled_spend_usd,
                     "active_reserved_usd": budget.daily.active_reserved_usd,
                     "unknown_active_cost": budget.daily.has_unknown_active_cost,
+                    "unknown_settled_cost": budget.daily.has_unknown_settled_cost,
                 },
                 "monthly": {
                     "settled_spend_usd": budget.monthly.settled_spend_usd,
                     "active_reserved_usd": budget.monthly.active_reserved_usd,
                     "unknown_active_cost": budget.monthly.has_unknown_active_cost,
+                    "unknown_settled_cost": budget.monthly.has_unknown_settled_cost,
                 },
             },
         },
@@ -867,6 +872,48 @@ mod client_usage_tests {
         }
     }
 
+    fn admission_fixture(
+        prices: crate::types::Prices,
+    ) -> (crate::registry::Snapshot, crate::types::InternalRequest) {
+        let mut snapshot = crate::registry::Snapshot::default();
+        let model = crate::db::ModelRow {
+            id: "seed-model".into(),
+            provider_id: "seed-provider".into(),
+            upstream_id: "seed-model".into(),
+            display_name: "Seed model".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: Some(50),
+            capabilities: "{}".into(),
+            prices: serde_json::to_string(&prices).unwrap(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: String::new(),
+            opaque_state_plugin: String::new(),
+        };
+        snapshot.models.insert(model.id.clone(), model);
+        let request = crate::types::InternalRequest {
+            requested_model: "seed-model".into(),
+            system: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            tool_choice_name: None,
+            params: crate::types::SamplingParams {
+                max_tokens: Some(50),
+                ..Default::default()
+            },
+            stream: false,
+            include_usage: false,
+            thinking: None,
+            extra: Default::default(),
+            raw_body: None,
+        };
+        (snapshot, request)
+    }
+
     async fn request_usage(app: &axum::Router, path: &str, secret: Option<&str>) -> Response {
         let mut request = axum::http::Request::builder().method("GET").uri(path);
         if let Some(secret) = secret {
@@ -1042,47 +1089,11 @@ mod client_usage_tests {
         .await
         .unwrap();
 
-        let mut snapshot = crate::registry::Snapshot::default();
-        let model = crate::db::ModelRow {
-            id: "seed-model".into(),
-            provider_id: "seed-provider".into(),
-            upstream_id: "seed-model".into(),
-            display_name: "Seed model".into(),
-            enabled: 1,
-            context_window: None,
-            max_output_tokens: Some(50),
-            capabilities: "{}".into(),
-            prices: serde_json::to_string(&crate::types::Prices {
-                input_per_1m: Some(1_000_000.0),
-                output_per_1m: Some(1_000_000.0),
-                ..Default::default()
-            })
-            .unwrap(),
-            parameters: "{}".into(),
-            thinking_map: "{}".into(),
-            extra_request: "{}".into(),
-            discovery: "{}".into(),
-            created_at: String::new(),
-            opaque_state_plugin: String::new(),
-        };
-        snapshot.models.insert(model.id.clone(), model);
-        let request = crate::types::InternalRequest {
-            requested_model: "seed-model".into(),
-            system: Vec::new(),
-            messages: Vec::new(),
-            tools: Vec::new(),
-            tool_choice: None,
-            tool_choice_name: None,
-            params: crate::types::SamplingParams {
-                max_tokens: Some(50),
-                ..Default::default()
-            },
-            stream: false,
-            include_usage: false,
-            thinking: None,
-            extra: Default::default(),
-            raw_body: None,
-        };
+        let (snapshot, request) = admission_fixture(crate::types::Prices {
+            input_per_1m: Some(1_000_000.0),
+            output_per_1m: Some(1_000_000.0),
+            ..Default::default()
+        });
 
         sqlx::query(
             "ALTER TABLE usage_logs RENAME COLUMN admission_cost_usd TO broken_admission_cost_usd",
@@ -1134,6 +1145,68 @@ mod client_usage_tests {
             .err()
             .expect("persisted budget spend must be re-seeded");
         assert_eq!(budget_error.kind, crate::types::ErrorKind::BudgetExceeded);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn usage_keeps_settled_unknown_cost_after_usage_log_write_failure() {
+        let (state, root) = test_state("settled-unknown-cost-log-failure").await;
+        let key = test_key("unknown-cost-key", "unknown-cost-client-key", "active");
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        let (snapshot, request) = admission_fixture(crate::types::Prices::default());
+        let reservation = state
+            .admission
+            .reserve(&state.pool, &snapshot, &key, &request)
+            .await
+            .unwrap();
+        reservation.reconcile(
+            &crate::types::TokenUsage {
+                input: Some(10),
+                output: Some(20),
+                ..Default::default()
+            },
+            None,
+        );
+
+        sqlx::query(
+            "CREATE TRIGGER force_usage_log_write_failure
+             BEFORE INSERT ON usage_logs
+             BEGIN SELECT RAISE(FAIL, 'forced usage log write failure'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        state
+            .log_queue
+            .enqueue(usage_row(&key.id, Some(10), Some(20), None));
+        for _ in 0..100 {
+            if state.log_queue.dropped() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.log_queue.dropped(), 1);
+        sqlx::query("DROP TRIGGER force_usage_log_write_failure")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let app = crate::router::build(state.clone());
+        let response = request_usage(&app, "/v1/usage", Some("unknown-cost-client-key")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["usage"]["daily"]["requests"], 0);
+        assert_eq!(body["usage"]["monthly"]["requests"], 0);
+        assert!(body["remaining"]["daily_budget_usd"].is_null());
+        assert!(body["remaining"]["monthly_budget_usd"].is_null());
+        assert_eq!(
+            body["admission"]["budget"]["daily"]["unknown_settled_cost"],
+            true
+        );
+        assert_eq!(
+            body["admission"]["budget"]["monthly"]["unknown_settled_cost"],
+            true
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
