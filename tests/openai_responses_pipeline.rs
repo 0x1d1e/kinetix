@@ -178,6 +178,16 @@ async fn upstream(
                 ))
                 .unwrap()
         }
+        "half_open_account_stream_timeout" => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(async_stream::stream! {
+                yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"visible probe event\"}\n\n"
+                ));
+                tokio::time::sleep(Duration::from_millis(2_500)).await;
+            }))
+            .unwrap(),
         "timeout" => {
             tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
             Response::builder()
@@ -231,6 +241,17 @@ async fn upstream(
             .header("content-type", "application/json")
             .body(Body::from(r#"{"error":{"message":"temporarily unavailable"}}"#))
             .unwrap(),
+        "price_lookup_cancel" if upstream_model == "upstream-anthropic-model" => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(concat!(
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":13}}}\n\n",
+                    "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7},\"delta\":{}}\n\n",
+                    "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"temporarily unavailable\"}}\n\n"
+                )))
+                .unwrap()
+        }
         "known_partial_then_cancel"
             if upstream_model == "upstream-anthropic-model" && attempt_number == 1 => {
             Response::builder()
@@ -1539,6 +1560,12 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
         .filter(|request| request.body["input"] == "case:probe_race")
         .count();
     assert_eq!(probe_dispatches, 1, "only one upstream probe may dispatch");
+    let recovered_probe_account = db::get_account(&state.pool, &probe_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(recovered_probe_account.circuit_open_until.is_none());
+    assert_eq!(recovered_probe_account.consecutive_failures, 0);
 
     // An in-flight request that used a revoked manual key must not disable a
     // replacement credential after the operator rotates it.
@@ -2009,6 +2036,220 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
     assert_eq!(
         after.reconciled_tokens_total, before.reconciled_tokens_total,
         "known usage from an earlier attempt cannot stand in for the cancelled attempt"
+    );
+
+    db::update_model_prices(
+        &state.pool,
+        &translated_model_id,
+        &kinetix::types::Prices {
+            input_per_1m: Some(101.0),
+            output_per_1m: Some(102.0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let price_cancel_account_id = db::insert_account(
+        &state.pool,
+        &provider_id,
+        "price-cancel-account",
+        &state.crypto.encrypt("price-cancel-key").unwrap(),
+        "price-cancel-key",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+    let price_cancel_route_id = db::insert_route(
+        &state.pool,
+        &db::NewRoute {
+            name: "price-lookup-cancel-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &state.pool,
+        &price_cancel_route_id,
+        Some(&price_cancel_account_id),
+        &translated_model_id,
+        1,
+        1,
+        "{}",
+        "{}",
+    )
+    .await
+    .unwrap();
+    state.registry.reload(&state.pool).await.unwrap();
+
+    let mut price_lock = state.pool.begin().await.unwrap();
+    sqlx::query("UPDATE accounts SET last_error = 'hold price lookup writer' WHERE id = ?")
+        .bind(&price_cancel_account_id)
+        .execute(&mut *price_lock)
+        .await
+        .unwrap();
+    let price_cancel_client = client.clone();
+    let price_cancel_request = tokio::spawn(async move {
+        price_cancel_client
+            .post(format!("http://{gateway_addr}/v1/responses"))
+            .header("authorization", format!("Bearer {CLIENT_KEY}"))
+            .json(&json!({
+                "model": "price-lookup-cancel-route",
+                "input": "case:price_lookup_cancel",
+                "stream": true
+            }))
+            .send()
+            .await
+    });
+    let price_attempt_dispatched = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if mock.requests.lock().await.iter().any(|request| {
+                request
+                    .body
+                    .to_string()
+                    .contains("case:price_lookup_cancel")
+            }) {
+                break true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        price_attempt_dispatched,
+        "price lookup cancellation attempt was not dispatched; finished={}, captured={:?}",
+        price_cancel_request.is_finished(),
+        mock.requests
+            .lock()
+            .await
+            .iter()
+            .map(|request| &request.body)
+            .collect::<Vec<_>>()
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !price_cancel_request.is_finished(),
+        "the held price-version write should keep precommit finalization pending"
+    );
+    price_cancel_request.abort();
+    let _ = price_cancel_request.await;
+    price_lock.commit().await.unwrap();
+
+    let price_cancel_request_id = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(request_id) = sqlx::query_scalar::<_, String>(
+                "SELECT request_id FROM usage_logs WHERE route_name = ? AND status = 'client_disconnect' ORDER BY ts DESC LIMIT 1",
+            )
+            .bind("price-lookup-cancel-route")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap()
+            {
+                break request_id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cancelled price lookup request accounting was not persisted");
+    let price_cancel_rows = usage_rows_for_request(&state, &price_cancel_request_id).await;
+    assert_eq!(price_cancel_rows.len(), 1);
+    assert_eq!(price_cancel_rows[0].0, "client_disconnect");
+    assert_eq!(price_cancel_rows[0].1, 499);
+    assert_eq!(
+        (price_cancel_rows[0].2, price_cancel_rows[0].3),
+        (Some(13), Some(7)),
+        "observed partial usage must be staged before awaiting price-version persistence"
+    );
+    let price_cancel_attempts =
+        usage_attempt_rows_for_request(&state, &price_cancel_request_id).await;
+    assert_eq!(price_cancel_attempts.len(), 1);
+    assert_eq!(price_cancel_attempts[0].1, "stream_error");
+    assert_eq!(
+        (price_cancel_attempts[0].2, price_cancel_attempts[0].3),
+        (Some(13), Some(7))
+    );
+
+    let terminal_probe_account_id = db::insert_account(
+        &state.pool,
+        &provider_id,
+        "terminal-probe-account",
+        &state.crypto.encrypt("terminal-probe-key").unwrap(),
+        "terminal-probe-key",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+    let terminal_probe_route_id = db::insert_route(
+        &state.pool,
+        &db::NewRoute {
+            name: "terminal-probe-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &state.pool,
+        &terminal_probe_route_id,
+        Some(&terminal_probe_account_id),
+        &model_id,
+        1,
+        1,
+        "{}",
+        "{}",
+    )
+    .await
+    .unwrap();
+    db::record_account_failure(&state.pool, &terminal_probe_account_id, 1, -1)
+        .await
+        .unwrap();
+    state.registry.reload(&state.pool).await.unwrap();
+
+    let (status, body) = call_responses(
+        &state,
+        "terminal-probe-route",
+        "half_open_account_stream_timeout",
+        true,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("visible probe event"), "{body}");
+    let terminal_probe_account = db::get_account(&state.pool, &terminal_probe_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        terminal_probe_account.circuit_open_until.is_some(),
+        "a half-open account must not recover before its stream completes: {terminal_probe_account:?}"
+    );
+    assert_eq!(terminal_probe_account.consecutive_failures, 1);
+    assert!(terminal_probe_account.last_probe_at.is_some());
+    assert_eq!(
+        kinetix::pool::effective_status(&terminal_probe_account),
+        kinetix::pool::AccountStatus::CircuitOpen
     );
 
     gateway_server.abort();

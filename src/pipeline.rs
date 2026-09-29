@@ -597,6 +597,8 @@ struct Attempt {
     provider_attempt: crate::provider_circuit::ProviderAttempt,
     /// First-event validation is recorded separately from terminal recovery.
     provider_circuit_transition: Option<crate::provider_circuit::ProviderCircuitTransition>,
+    /// Account recovery is committed only after a completed terminal outcome.
+    account_probe: bool,
     /// Target-attempt-local start, excluding routing and credential work.
     attempt_started: Instant,
 }
@@ -2018,16 +2020,6 @@ pub(crate) async fn run_with_disconnect(
                         "upstream_validated",
                         if prepared.is_sse { "sse" } else { "json" },
                     );
-                    // A validated response may recover only the account state
-                    // version it observed; half-open probes explicitly authorize
-                    // clearing an open circuit.
-                    recover_successful_account(
-                        state,
-                        &target.account.id,
-                        target.account.account_state_version,
-                        probing,
-                    )
-                    .await;
                     let provider_circuit_transition =
                         mark_provider_probe_validated(&provider_attempt);
                     let attempt = Attempt {
@@ -2044,6 +2036,7 @@ pub(crate) async fn run_with_disconnect(
                         traffic_permit,
                         provider_attempt,
                         provider_circuit_transition,
+                        account_probe: probing,
                         attempt_started,
                     };
                     return Ok(stream_response(
@@ -6609,7 +6602,29 @@ async fn record_precommit_attempt_usage(
     let computed_cost = (usage.input.is_some() && usage.output.is_some())
         .then(|| cost::compute_cost(&target.model.prices(), &usage))
         .flatten();
-    let (cost, price_version_id) = if let Some(computed_cost) = computed_cost {
+    let attempt_number = meta.partial_attempts.len() + 1;
+    let row = usage_attempt_row(
+        meta,
+        target,
+        key,
+        upstream_request_id,
+        attempt_number,
+        &usage,
+        None,
+        None,
+        termination,
+        Some(&failure.message),
+        &trace.opaque_route_id,
+    );
+    let staged_attempt_index = meta.partial_attempts.len();
+    meta.partial_attempts.push(PartialAttemptUsage {
+        usage,
+        cost: None,
+        row,
+    });
+    meta.active_precommit_attempt = None;
+
+    if let Some(computed_cost) = computed_cost {
         let prices = target.model.prices();
         let (source, source_metadata) = target.model.price_provenance();
         match db::ensure_price_version(
@@ -6621,37 +6636,21 @@ async fn record_precommit_attempt_usage(
         )
         .await
         {
-            Ok(Some(version_id)) => (Some(computed_cost), Some(version_id)),
-            Ok(None) => (None, None),
-            Err(error) => {
-                tracing::warn!(
-                    model = %target.model.id,
-                    %error,
-                    "failed to resolve price version for failed precommit attempt"
-                );
-                (None, None)
+            Ok(Some(version_id)) => {
+                let staged = &mut meta.partial_attempts[staged_attempt_index];
+                staged.cost = Some(computed_cost);
+                staged.row.cost_usd = Some(computed_cost);
+                staged.row.cost_known = 1;
+                staged.row.price_version_id = Some(version_id);
             }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                model = %target.model.id,
+                %error,
+                "failed to resolve price version for failed precommit attempt"
+            ),
         }
-    } else {
-        (None, None)
-    };
-    let attempt_number = meta.partial_attempts.len() + 1;
-    let row = usage_attempt_row(
-        meta,
-        target,
-        key,
-        upstream_request_id,
-        attempt_number,
-        &usage,
-        cost,
-        price_version_id.as_deref(),
-        termination,
-        Some(&failure.message),
-        &trace.opaque_route_id,
-    );
-    meta.partial_attempts
-        .push(PartialAttemptUsage { usage, cost, row });
-    meta.active_precommit_attempt = None;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6792,6 +6791,15 @@ async fn finalize_log(
 ) {
     let status = termination.request_status();
     let status_code = termination.status_code();
+    if termination.outcome == StreamOutcome::Completed {
+        recover_successful_account(
+            state,
+            &attempt.target.account.id,
+            attempt.target.account.account_state_version,
+            attempt.account_probe,
+        )
+        .await;
+    }
     let provider_failure = termination
         .outcome
         .is_upstream_failure()
