@@ -4849,6 +4849,7 @@ async fn discover_models_native(
             provider,
             model: &dummy_model,
             account_id: Some(account.id.as_str()),
+            session_context: None,
             credential,
         };
         let resp = crate::outbound::send_provider_request(
@@ -5000,6 +5001,7 @@ pub async fn test_provider(
         provider: &provider,
         model: &model,
         account_id: Some(account.id.as_str()),
+        session_context: None,
         credential,
     };
     let mut internal = crate::types::InternalRequest {
@@ -7106,6 +7108,7 @@ pub async fn probe_model_capability(
         provider: &provider,
         model: &execution_model,
         account_id: Some(account.id.as_str()),
+        session_context: None,
         credential,
     };
     let url = adapter

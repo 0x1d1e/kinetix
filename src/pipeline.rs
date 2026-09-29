@@ -345,6 +345,7 @@ pub async fn count_tokens(
         provider: &target.provider,
         model: &target.model,
         account_id: Some(target.account.id.as_str()),
+        session_context: None,
         credential,
     };
     let Some(url) = adapter.count_tokens_url(&ctx)? else {
@@ -1275,6 +1276,7 @@ pub(crate) async fn run_with_disconnect(
             provider: &target.provider,
             model: &execution_model,
             account_id: Some(target.account.id.as_str()),
+            session_context: meta.session.as_deref(),
             credential,
         };
 
@@ -7127,6 +7129,7 @@ mod route_policy_tests {
             provider: &p,
             model: &m,
             account_id: Some("acc_test"),
+            session_context: None,
             credential: "sk-ant-api03-test".into(),
         };
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
@@ -7167,6 +7170,7 @@ mod route_policy_tests {
             provider: &p,
             model: &m,
             account_id: Some("acc_test"),
+            session_context: None,
             credential: "sk-ant-api03-test".into(),
         };
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
@@ -7204,6 +7208,7 @@ mod route_policy_tests {
             provider: &p,
             model: &m,
             account_id: Some("acc_test"),
+            session_context: None,
             credential: "sk-ant-api03-test".into(),
         };
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
@@ -7239,6 +7244,7 @@ mod route_policy_tests {
             provider: &p,
             model: &m,
             account_id: Some("acc_test"),
+            session_context: None,
             credential: "sk-ant-api03-test".into(),
         };
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
@@ -7275,6 +7281,7 @@ mod route_policy_tests {
             provider: &p,
             model: &m,
             account_id: Some("acc_test"),
+            session_context: None,
             credential: "sk-ant-api03-test".into(),
         };
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
@@ -7311,6 +7318,7 @@ mod route_policy_tests {
             provider: &p,
             model: &m,
             account_id: Some("acc_test"),
+            session_context: None,
             credential: "sk-ant-api03-test".into(),
         };
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
@@ -8114,6 +8122,7 @@ mod route_policy_tests {
             provider: &target.provider,
             model: &target.model,
             account_id: Some(target.account.id.as_str()),
+            session_context: None,
             credential: "test".into(),
         };
         let body = build_upstream_body(adapter.as_ref(), &ctx, &req, false).unwrap();
@@ -8175,6 +8184,7 @@ mod route_policy_tests {
             provider: &target.provider,
             model: &target.model,
             account_id: Some(target.account.id.as_str()),
+            session_context: None,
             credential: "test".into(),
         };
         let adapter = crate::adapters::openai::OpenAiAdapter::new();
@@ -8304,6 +8314,7 @@ mod route_policy_tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let mut req = request();
@@ -8332,6 +8343,7 @@ mod route_policy_tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
 

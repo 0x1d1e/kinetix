@@ -1,0 +1,51 @@
+// Kinetix plugin API v2, introduced for session-aware provider adapters.
+// The main plugin, auth, and model-discovery worlds remain API v1 and are
+// imported by the host using their stable v1 interfaces.
+
+package kinetix:plugin@2.0.0;
+
+interface types {
+  /// Opaque identity for a recognized client session. Stable across turns and
+  /// retries; absent when the host cannot establish a session. Never an
+  /// account, route, or user-secret identifier.
+  record session-context {
+    id: string,
+  }
+}
+
+interface provider-adapter {
+  use types.{session-context};
+  use kinetix:plugin/types@1.0.0.{plugin-error};
+
+  /// The wire-format name this adapter speaks.
+  wire-format: func() -> string;
+  build-url: func(provider-json: string, model-json: string) -> result<string, plugin-error>;
+  /// Return the header list (JSON array of [name, value]) to apply.
+  apply-auth: func(
+    provider-json: string,
+    credential: string,
+    session: option<session-context>
+  ) -> result<string, plugin-error>;
+  build-body: func(
+    request-json: string,
+    provider-json: string,
+    model-json: string,
+    session: option<session-context>
+  ) -> result<string, plugin-error>;
+  /// Return JSON of the classified failure evidence.
+  classify-error: func(status: u16, body: string, headers-json: string) -> result<string, plugin-error>;
+  /// Parse one upstream SSE `data:` payload into a versioned canonical envelope.
+  parse-stream-chunk: func(data: string) -> result<string, plugin-error>;
+  /// Parse a full non-streaming body into a versioned canonical envelope.
+  parse-full-response: func(body-json: string) -> result<string, plugin-error>;
+}
+
+world plugin-adapter-v2 {
+  import kinetix:plugin/host-http@1.0.0;
+  import kinetix:plugin/host-storage@1.0.0;
+  import kinetix:plugin/host-log@1.0.0;
+  import kinetix:plugin/host-credential@1.0.0;
+  import kinetix:plugin/host-clock@1.0.0;
+
+  export provider-adapter;
+}

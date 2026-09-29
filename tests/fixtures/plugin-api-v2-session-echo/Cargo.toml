@@ -1,0 +1,15 @@
+[package]
+name = "kinetix-plugin-api-v2-session-echo-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+api-v2 = []
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde_json = "1"
+wit-bindgen = "0.62"

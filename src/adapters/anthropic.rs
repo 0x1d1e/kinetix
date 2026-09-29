@@ -1092,6 +1092,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let req = crate::frontends::anthropic::decode_request(json!({
@@ -1136,6 +1137,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "sk-ant-api03-regular-key".into(),
         };
         assert_eq!(
@@ -1172,6 +1174,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "oauth-token".into(),
         };
 
@@ -1221,6 +1224,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "oauth-token".into(),
         };
 
@@ -1247,6 +1251,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "sk-ant-api03-regular-key".into(),
         };
 
@@ -1265,6 +1270,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let mut req = base_request();
@@ -1296,6 +1302,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "sk-ant-api03-regular-key".into(),
         };
         let mut body = json!({
@@ -1371,6 +1378,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "oauth-token".into(),
         };
 
@@ -1406,12 +1414,14 @@ mod tests {
             provider: &p,
             model: &sonnet,
             account_id: None,
+            session_context: None,
             credential: "oauth-token".into(),
         };
         let opus_ctx = UpstreamContext {
             provider: &p,
             model: &opus,
             account_id: None,
+            session_context: None,
             credential: "oauth-token".into(),
         };
         let sonnet_body = AnthropicAdapter::new()
@@ -1433,6 +1443,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "sk-ant-api03-regular-key".into(),
         };
 
@@ -1455,6 +1466,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "sk-ant-api03-regular-key".into(),
         };
 
@@ -1484,6 +1496,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "sk-ant-api03-regular-key".into(),
         };
 
@@ -1509,6 +1522,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "sk-ant-api03-regular-key".into(),
         };
 
@@ -1534,6 +1548,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "sk-ant-api03-regular-key".into(),
         };
 
@@ -1553,6 +1568,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
@@ -1572,6 +1588,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "some-opaque-or-exchanged-credential".into(),
         };
 
@@ -1591,6 +1608,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
@@ -1614,6 +1632,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 
@@ -1641,6 +1660,7 @@ mod tests {
             provider: &p,
             model: &m,
             account_id: None,
+            session_context: None,
             credential: "sk-ant-oat01-test-oauth-token".into(),
         };
 

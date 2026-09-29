@@ -5,8 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The host plugin API major version this build implements.
-pub const PLUGIN_API_MAJOR: u32 = 1;
+/// The latest plugin API major version this build implements.
+pub const PLUGIN_API_MAJOR: u32 = 2;
+
+/// API majors accepted concurrently by this host. API v2 adds a separately
+/// versioned session-aware adapter world; all other API-v1 worlds remain live.
+pub const SUPPORTED_PLUGIN_API_MAJORS: [u32; 2] = [1, PLUGIN_API_MAJOR];
 
 /// The supported manifest schema version.
 pub const MANIFEST_VERSION: u32 = 1;
@@ -446,7 +450,11 @@ impl Manifest {
 
     /// Whether the manifest is compatible with a specific Kinetix host.
     pub fn compatible_with_host_version(&self, host_version: &semver::Version) -> bool {
-        if self.manifest_version != MANIFEST_VERSION || self.api_major() != Some(PLUGIN_API_MAJOR) {
+        if self.manifest_version != MANIFEST_VERSION
+            || !self
+                .api_major()
+                .is_some_and(|major| SUPPORTED_PLUGIN_API_MAJORS.contains(&major))
+        {
             return false;
         }
         let min_host = self

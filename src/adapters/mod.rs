@@ -549,6 +549,9 @@ pub struct UpstreamContext<'a> {
     /// Selected account identity. This is non-secret context for account-scoped
     /// plugin state; built-in adapters do not use it.
     pub account_id: Option<&'a str>,
+    /// Raw recognized client-session value, retained inside Kinetix for
+    /// routing. PluginManager derives an opaque identity before API-v2 calls.
+    pub session_context: Option<&'a str>,
     /// The decrypted credential for the chosen account.
     pub credential: String,
 }

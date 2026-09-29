@@ -1345,6 +1345,7 @@ mod schema_tests {
             provider: &provider,
             model: &model,
             account_id: None,
+            session_context: None,
             credential: "k".into(),
         };
         let req = InternalRequest {
