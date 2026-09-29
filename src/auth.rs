@@ -375,7 +375,10 @@ pub async fn authenticate_virtual_key(
     let hash = crypto::hash_virtual_key(presented);
     let row = db::get_virtual_key_by_hash(&state.pool, &hash)
         .await
-        .map_err(|e| ProxyError::internal(e.to_string()))?;
+        .map_err(|error| {
+            tracing::error!(%error, "virtual key authentication query failed");
+            ProxyError::unavailable("authentication temporarily unavailable")
+        })?;
     match row {
         Some(row) if crypto::constant_time_eq(&row.key_hash, &hash) => Ok(row),
         _ => Err(ProxyError::unauthorized(

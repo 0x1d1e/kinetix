@@ -131,7 +131,8 @@ incomplete. Remaining budgets are `null` when any request is unpriced. Admission
 also retains conservative cost reservations for failed requests with unknown
 cost across restarts; these reservations are not reported as known cost. Unset
 limits are `null`. The endpoint never returns model, Route, provider, account,
-or other key identities.
+or other key identities. Database failures during key authentication or usage
+aggregation return a generic 503; details are logged server-side.
 
 ## Exports (JSONL + CSV)
 

@@ -559,7 +559,12 @@ pub async fn client_usage(State(state): State<AppState>, headers: HeaderMap) -> 
     ) {
         Ok(summaries) => summaries,
         Err(error) => {
-            return error_response(format, &request_id, ProxyError::internal(error.to_string()))
+            tracing::error!(%error, "client usage query failed");
+            return error_response(
+                format,
+                &request_id,
+                ProxyError::unavailable("usage temporarily unavailable"),
+            );
         }
     };
 

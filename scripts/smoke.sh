@@ -71,6 +71,24 @@ check_absent() { # check_absent <label> <actual> <forbidden-substring>
   fi
 }
 
+check_body_contains() { # avoid echoing potentially sensitive error bodies on failure
+  if [[ "$2" == *"$3"* ]]; then
+    echo "  ok   $1"
+  else
+    echo "  FAIL $1"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+check_body_absent() {
+  if [[ "$2" != *"$3"* ]]; then
+    echo "  ok   $1"
+  else
+    echo "  FAIL $1"
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
 restart_kinetix() {
   kill "$KPID" 2>/dev/null || true
   wait "$KPID" 2>/dev/null || true
@@ -349,6 +367,46 @@ check "opaque route id is hidden from the response" \
      -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
      -d '{"model":"syn-openai","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}')" \
   'x-kinetix-route-id'
+
+# Induce database failures only after all other smoke checks, then restore each
+# table immediately so the running server can shut down cleanly.
+python3 - "$DB" <<'PY' || { echo "failed to induce usage summary database failure"; exit 1; }
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=10) as connection:
+    connection.execute("ALTER TABLE usage_logs RENAME TO usage_logs_smoke_backup")
+PY
+USAGE_DB_FAILURE_CODE="$(curl -s --max-time 10 -o "$WORK/usage-db-failure-response" -w '%{http_code}' "$BASE/v1/usage" -H "authorization: Bearer $KEY")"
+USAGE_DB_FAILURE_BODY="$(<"$WORK/usage-db-failure-response")"
+python3 - "$DB" <<'PY' || { echo "failed to restore usage logs table"; exit 1; }
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=10) as connection:
+    connection.execute("ALTER TABLE usage_logs_smoke_backup RENAME TO usage_logs")
+PY
+check "usage database failure returns unavailable" "$USAGE_DB_FAILURE_CODE" '503'
+check_body_contains "usage database failure returns generic message" "$USAGE_DB_FAILURE_BODY" 'usage temporarily unavailable'
+check_body_absent "usage response hides table name" "$USAGE_DB_FAILURE_BODY" 'usage_logs'
+check_body_absent "usage response hides database path" "$USAGE_DB_FAILURE_BODY" "$DB"
+check_body_absent "usage response hides SQL details" "$USAGE_DB_FAILURE_BODY" 'SELECT'
+check_body_absent "usage response hides original SQLite error" "$USAGE_DB_FAILURE_BODY" 'no such table'
+
+python3 - "$DB" <<'PY' || { echo "failed to induce virtual key authentication database failure"; exit 1; }
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=10) as connection:
+    connection.execute("ALTER TABLE virtual_keys RENAME TO virtual_keys_smoke_backup")
+PY
+AUTH_DB_FAILURE_CODE="$(curl -s --max-time 10 -o "$WORK/auth-db-failure-response" -w '%{http_code}' "$BASE/v1/usage" -H "authorization: Bearer $KEY")"
+AUTH_DB_FAILURE_BODY="$(<"$WORK/auth-db-failure-response")"
+python3 - "$DB" <<'PY' || { echo "failed to restore virtual keys table"; exit 1; }
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1], timeout=10) as connection:
+    connection.execute("ALTER TABLE virtual_keys_smoke_backup RENAME TO virtual_keys")
+PY
+check "authentication database failure returns unavailable" "$AUTH_DB_FAILURE_CODE" '503'
+check_body_contains "authentication database failure returns generic message" "$AUTH_DB_FAILURE_BODY" 'authentication temporarily unavailable'
+check_body_absent "authentication response hides table name" "$AUTH_DB_FAILURE_BODY" 'virtual_keys'
+check_body_absent "authentication response hides database path" "$AUTH_DB_FAILURE_BODY" "$DB"
+check_body_absent "authentication response hides SQL details" "$AUTH_DB_FAILURE_BODY" 'SELECT'
+check_body_absent "authentication response hides original SQLite error" "$AUTH_DB_FAILURE_BODY" 'no such table'
 
 echo
 if [ "$FAILURES" -eq 0 ]; then
