@@ -1179,6 +1179,52 @@ pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String>
     Ok(id)
 }
 
+pub(crate) async fn insert_provider_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    p: &NewProvider<'_>,
+    pricing_scope: &str,
+) -> Result<String> {
+    if !matches!(pricing_scope, "direct_api" | "integration") {
+        anyhow::bail!("invalid provider pricing scope '{pricing_scope}'");
+    }
+    let id = format!("prov_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO providers
+         (id, name, base_url, wire_format, auth_scheme, custom_header_name, custom_param_name,
+          extra_headers, timeout_ms, capability_mode, models_path, rate_limit_rules, enabled,
+          follow_redirects, credential_hosts, allow_insecure_tls, created_at,
+          wire_plugin, credential_plugin, model_source_plugin, credential_mode,
+          source_plugin_id, source_integration_id, pricing_scope)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&id)
+    .bind(p.name)
+    .bind(p.base_url)
+    .bind(p.wire_format.as_str())
+    .bind(auth_scheme_str(p.auth_scheme))
+    .bind(p.custom_header_name)
+    .bind(p.custom_param_name)
+    .bind(p.extra_headers.to_string())
+    .bind(p.timeout_ms)
+    .bind(p.capability_mode)
+    .bind(p.models_path)
+    .bind(p.rate_limit_rules.to_string())
+    .bind(p.follow_redirects as i64)
+    .bind(p.credential_hosts)
+    .bind(p.allow_insecure_tls as i64)
+    .bind(now_iso())
+    .bind(p.wire_plugin)
+    .bind(p.credential_plugin)
+    .bind(p.model_source_plugin)
+    .bind(p.credential_mode)
+    .bind(p.source_plugin_id)
+    .bind(p.source_integration_id)
+    .bind(pricing_scope)
+    .execute(&mut **tx)
+    .await?;
+    Ok(id)
+}
+
 pub fn auth_scheme_str(s: AuthScheme) -> &'static str {
     match s {
         AuthScheme::Bearer => "bearer",
@@ -1257,6 +1303,66 @@ pub async fn update_provider(
         revoke_external_catalog_effective_pricing_in_transaction(&mut tx, id).await?;
     }
     tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn update_provider_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    p: &NewProvider<'_>,
+    pricing_scope: &str,
+) -> Result<()> {
+    let existing = sqlx::query_as::<_, ProviderRow>("SELECT * FROM providers WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?;
+    let drivers_changed = existing.credential_mode != p.credential_mode
+        || existing.source_plugin_id.as_deref() != p.source_plugin_id
+        || existing.source_integration_id.as_deref() != p.source_integration_id
+        || existing.wire_plugin != p.wire_plugin
+        || existing.credential_plugin != p.credential_plugin
+        || existing.model_source_plugin != p.model_source_plugin;
+    let catalog_identity_changed = existing.base_url != p.base_url || drivers_changed;
+    if !matches!(pricing_scope, "direct_api" | "integration") {
+        anyhow::bail!("invalid provider pricing scope '{pricing_scope}'");
+    }
+
+    sqlx::query(
+        "UPDATE providers SET name=?, base_url=?, wire_format=?, auth_scheme=?, custom_header_name=?,
+         custom_param_name=?, extra_headers=?, timeout_ms=?, capability_mode=?, models_path=?,
+         rate_limit_rules=?, follow_redirects=?, credential_hosts=?, allow_insecure_tls=?,
+         wire_plugin=?, credential_plugin=?, model_source_plugin=?, credential_mode=?,
+         source_plugin_id=?, source_integration_id=?, pricing_scope=? WHERE id=?",
+    )
+    .bind(p.name)
+    .bind(p.base_url)
+    .bind(p.wire_format.as_str())
+    .bind(auth_scheme_str(p.auth_scheme))
+    .bind(p.custom_header_name)
+    .bind(p.custom_param_name)
+    .bind(p.extra_headers.to_string())
+    .bind(p.timeout_ms)
+    .bind(p.capability_mode)
+    .bind(p.models_path)
+    .bind(p.rate_limit_rules.to_string())
+    .bind(p.follow_redirects as i64)
+    .bind(p.credential_hosts)
+    .bind(p.allow_insecure_tls as i64)
+    .bind(p.wire_plugin)
+    .bind(p.credential_plugin)
+    .bind(p.model_source_plugin)
+    .bind(p.credential_mode)
+    .bind(p.source_plugin_id)
+    .bind(p.source_integration_id)
+    .bind(pricing_scope)
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+
+    if pricing_scope == "integration" || catalog_identity_changed {
+        revoke_external_catalog_effective_pricing_in_transaction(tx, id).await?;
+    }
     Ok(())
 }
 
@@ -1663,6 +1769,40 @@ pub async fn insert_account(
     .bind(weight)
     .bind(now_iso())
     .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+pub(crate) async fn insert_account_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    provider_id: &str,
+    label: &str,
+    secret_enc: &str,
+    key_mask: &str,
+    priority: i64,
+    weight: i64,
+    soft_quota_usd: Option<f64>,
+    quota_type: &str,
+) -> Result<String> {
+    let id = format!("acc_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO accounts
+         (id, provider_id, label, secret_enc, key_mask, status, status_reason, status_changed_at,
+          quota_type, soft_quota_usd, priority, weight, created_at)
+         VALUES (?,?,?,?,?,'healthy','account_created',?,?,?,?,?,?)",
+    )
+    .bind(&id)
+    .bind(provider_id)
+    .bind(label)
+    .bind(secret_enc)
+    .bind(key_mask)
+    .bind(now_iso())
+    .bind(quota_type)
+    .bind(soft_quota_usd)
+    .bind(priority)
+    .bind(weight)
+    .bind(now_iso())
+    .execute(&mut **tx)
     .await?;
     Ok(id)
 }
@@ -2480,6 +2620,31 @@ pub async fn commit_model_creation(
     Ok((id, version_id))
 }
 
+pub(crate) async fn commit_model_creation_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    creation: &ModelCreation<'_>,
+) -> Result<(String, Option<String>)> {
+    let id = insert_model_in_transaction(tx, &creation.model).await?;
+    set_model_transport_override_in_transaction(tx, &id, creation.transport).await?;
+    merge_model_discovery_in_transaction(tx, &id, creation.discovery_patch).await?;
+    if let Some(plugin_id) = creation.opaque_state_plugin {
+        set_model_opaque_state_plugin_in_transaction(tx, &id, plugin_id).await?;
+    }
+    let version_id = if let Some(pricing) = creation.pricing.as_ref() {
+        apply_effective_model_pricing_transaction(
+            tx,
+            &id,
+            pricing.prices,
+            pricing.source,
+            pricing.metadata,
+        )
+        .await?
+    } else {
+        None
+    };
+    Ok((id, version_id))
+}
+
 /// Apply one operator-owned model mutation as a single database transaction.
 /// Runtime-visible fields, ownership metadata, transport, reconciliation state,
 /// and immutable/effective pricing either all commit or all roll back.
@@ -2513,6 +2678,29 @@ pub async fn commit_model_operator_mutation(
 
     tx.commit().await?;
     Ok(version_id)
+}
+
+pub(crate) async fn commit_model_operator_mutation_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    mutation: &ModelOperatorMutation<'_>,
+) -> Result<Option<String>> {
+    update_model_configuration_in_transaction(tx, mutation).await?;
+    if mutation.update_transport {
+        set_model_transport_override_in_transaction(tx, mutation.id, mutation.transport).await?;
+    }
+    merge_model_discovery_in_transaction(tx, mutation.id, mutation.discovery_patch).await?;
+    if let Some(pricing) = mutation.pricing.as_ref() {
+        apply_effective_model_pricing_transaction(
+            tx,
+            mutation.id,
+            pricing.prices,
+            pricing.source,
+            pricing.metadata,
+        )
+        .await
+    } else {
+        Ok(None)
+    }
 }
 
 pub async fn update_model_prices(pool: &Pool, id: &str, prices: &Prices) -> Result<()> {
@@ -2637,6 +2825,19 @@ fn price_version_lock(model_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> 
         .entry(model_id.to_string())
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+pub(crate) async fn lock_model_price_versions(
+    model_ids: &[String],
+) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+    let mut ids = model_ids.to_vec();
+    ids.sort();
+    ids.dedup();
+    let mut guards = Vec::with_capacity(ids.len());
+    for id in ids {
+        guards.push(price_version_lock(&id).lock_owned().await);
+    }
+    guards
 }
 
 /// Resolve the immutable snapshot backing an effective price.
