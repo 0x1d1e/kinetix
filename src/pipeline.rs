@@ -828,31 +828,8 @@ pub(crate) async fn run_with_disconnect(
         }
     }
 
-    // Circuit-open deferral (FR-4.2/FR-4.7): a target whose circuit is open and
-    // is not yet due for a probe is moved behind all other candidates, but is
-    // NOT removed — if every alternative fails it is still attempted and can
-    // recover the account (half-open probing still applies in the loop).
-    let (mut probeable, mut deferred): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
-    for t in targets.drain(..) {
-        let status = pool::effective_status(&t.account);
-        if matches!(status, pool::AccountStatus::CircuitOpen) && !pool::should_probe(&t.account) {
-            deferred.push(t);
-        } else {
-            probeable.push(t);
-        }
-    }
-    if !probeable.is_empty() && !deferred.is_empty() {
-        trace.step(
-            "candidate",
-            None,
-            format!(
-                "{} circuit-open target(s) deferred behind healthy candidates",
-                deferred.len()
-            ),
-        );
-    }
-    probeable.append(&mut deferred);
-    let mut targets = probeable;
+    // Circuit deferral is applied by the shared dispatch planner after Route
+    // strategy ordering and before affinity promotion.
 
     if targets.is_empty() {
         trace.finish("no_eligible_target");
@@ -900,28 +877,140 @@ pub(crate) async fn run_with_disconnect(
             .then(|| &possible_history_origins[0])
     });
 
-    // Sticky routing and prompt-cache affinity share the same bounded session
-    // mapping: both prefer the last successful target while still allowing
-    // ordinary health/fallback logic to move away from it.
-    if let (Some(route), Some(sticky_key)) = (&route, session_origin_key.as_ref()) {
-        if route.cache_affinity != 0 || route.sticky_routing != 0 {
-            if let Some(pos) = targets
+    // The shared planner owns affinity promotion as well as the ordered
+    // pre-dispatch frontier. Runtime supplies its realized strategy order and
+    // executes the resulting candidate plan.
+    let affinity_candidate_id = match (route.as_ref(), session_origin_key.as_ref()) {
+        (Some(route), Some(sticky_key))
+            if route.cache_affinity != 0 || route.sticky_routing != 0 =>
+        {
+            targets
                 .iter()
-                .position(|t| target_key(route, t) == *sticky_key)
-            {
-                targets.rotate_left(pos);
-                trace.step(
-                    "candidate",
-                    Some(targets[0].account.label.clone()),
-                    if route.sticky_routing != 0 {
-                        "sticky-routing: previous session target promoted (FR-7.5)"
-                    } else {
-                        "cache-affinity: session target promoted (FR-7.3)"
-                    },
-                );
-            }
+                .find(|target| target_key(route, target) == *sticky_key)
+                .map(adaptive_candidate_key)
+        }
+        _ => None,
+    };
+    let quota_fallback_allowed =
+        allow_fallback && route_allows_fallback(route.as_ref(), FailureKind::QuotaExhausted);
+    let mut dispatch_candidates = Vec::with_capacity(targets.len());
+    for (rank, target) in targets.iter().enumerate() {
+        let status = pool::effective_status(&target.account);
+        let account_eligible =
+            matches!(status, pool::AccountStatus::Healthy) || pool::should_probe(&target.account);
+        let account_quota_reached = if account_eligible {
+            Some(
+                pool::soft_quota_reached(&state.pool, &target.account)
+                    .await
+                    .unwrap_or(false),
+            )
+        } else {
+            None
+        };
+        let provider_circuit_available = if account_eligible && account_quota_reached != Some(true)
+        {
+            Some(
+                state
+                    .provider_circuits
+                    .availability(&target.provider.id)
+                    .available,
+            )
+        } else {
+            None
+        };
+        let facts = crate::pre_dispatch::PreDispatchFacts {
+            request_eligible: true,
+            account_eligible,
+            account_quota_reached,
+            quota_fallback_allowed,
+            provider_circuit_available,
+            route_capacity_available: true,
+            quota_override_available: true,
+            adaptive_capacity_available: true,
+        };
+        let id = adaptive_candidate_key(target);
+        let defer_for_circuit = matches!(status, pool::AccountStatus::CircuitOpen)
+            && !pool::should_probe(&target.account);
+        dispatch_candidates.push(crate::pre_dispatch::DispatchCandidate {
+            id,
+            rank: Some(rank),
+            group_id: target.route_target_id.clone(),
+            account_priority: target.account.priority,
+            weight: target.weight,
+            defer_for_circuit,
+            facts,
+        });
+    }
+    let dispatch_plan = crate::pre_dispatch::plan_dispatch(
+        &dispatch_candidates,
+        route.is_some(),
+        if route
+            .as_ref()
+            .is_some_and(|route| route.strategy == "weighted")
+        {
+            crate::pre_dispatch::DispatchStrategy::Weighted
+        } else {
+            crate::pre_dispatch::DispatchStrategy::Ordered
+        },
+        affinity_candidate_id.as_deref(),
+        false,
+    );
+    let dispatch_records_by_id: std::collections::HashMap<_, _> = dispatch_plan
+        .candidates
+        .iter()
+        .map(|record| (record.candidate_id.clone(), record.clone()))
+        .collect();
+    let mut targets_by_id: std::collections::HashMap<_, _> = targets
+        .into_iter()
+        .map(|target| (adaptive_candidate_key(&target), target))
+        .collect();
+    let mut pending_targets: std::collections::VecDeque<_> = dispatch_plan
+        .ordered_candidate_ids
+        .iter()
+        .filter_map(|candidate_id| targets_by_id.remove(candidate_id))
+        .collect();
+    if let Some(affinity_id) = affinity_candidate_id.as_deref() {
+        if pending_targets
+            .front()
+            .is_some_and(|target| adaptive_candidate_key(target) == affinity_id)
+        {
+            let target = pending_targets.front().expect("affinity target exists");
+            trace.step(
+                "candidate",
+                Some(target.account.label.clone()),
+                if route
+                    .as_ref()
+                    .is_some_and(|route| route.sticky_routing != 0)
+                {
+                    "sticky-routing: previous session target promoted (FR-7.5)"
+                } else {
+                    "cache-affinity: session target promoted (FR-7.3)"
+                },
+            );
         }
     }
+    for record in &dispatch_plan.candidates {
+        let Some(target) = targets_by_id.get(&record.candidate_id).or_else(|| {
+            pending_targets
+                .iter()
+                .find(|target| adaptive_candidate_key(target) == record.candidate_id)
+        }) else {
+            continue;
+        };
+        trace.step(
+            "candidate",
+            Some(target.account.label.clone()),
+            format!(
+                "dispatch plan rank={:?} decision={:?} reason={}",
+                record.strategy_rank, record.decision, record.decision_reason
+            ),
+        );
+    }
+    trace.step(
+        "candidate",
+        None,
+        format!("dispatch frontier outcome={:?}", dispatch_plan.outcome),
+    );
 
     // 3. Attempt loop: all fallback happens before any client bytes.
     let mut last_error: Option<ProxyError> = None;
@@ -930,8 +1019,6 @@ pub(crate) async fn run_with_disconnect(
     let mut previous_origin: Option<ContinuationOrigin> = None;
     let mut skip_logical_target: Option<String> = None;
     let deadline = started + MAX_PRE_COMMIT_DEADLINE;
-
-    let mut pending_targets: std::collections::VecDeque<_> = targets.into();
     let mut auth_retried_accounts = std::collections::HashSet::new();
 
     while let Some(target_owned) = pending_targets.pop_front() {
@@ -957,34 +1044,19 @@ pub(crate) async fn run_with_disconnect(
         }
         all_accounts.push(target.account.clone());
 
-        // Shared pre-dispatch planning preserves runtime gate order. Request
-        // eligibility was applied before Route strategy ordering; account
-        // health and quota are resolved before provider-circuit availability.
+        let candidate_id = adaptive_candidate_key(target);
+        let dispatch_record = dispatch_records_by_id
+            .get(&candidate_id)
+            .expect("runtime candidate has a dispatch-plan record");
         let status = pool::effective_status(&target.account);
-        let account_probe_eligible =
-            matches!(status, pool::AccountStatus::Healthy) || pool::should_probe(&target.account);
-        let mut pre_dispatch_facts = crate::pre_dispatch::PreDispatchFacts {
-            request_eligible: true,
-            account_eligible: account_probe_eligible,
-            account_quota_reached: None,
-            quota_fallback_allowed: allow_fallback
-                && route_allows_fallback(route.as_ref(), FailureKind::QuotaExhausted),
-            provider_circuit_available: None,
-            route_capacity_available: true,
-            quota_override_available: true,
-            adaptive_capacity_available: true,
-        };
-        match crate::pre_dispatch::plan_candidate(pre_dispatch_facts) {
-            crate::pre_dispatch::PreDispatchDecision::CheckAccountQuota => {}
-            crate::pre_dispatch::PreDispatchDecision::AccountUnavailable => {
-                let why = account_skip_detail(target, status);
-                meta.fallback_path
-                    .push(format!("{}:{why}", target.account.label));
-                trace.step("skip", Some(target.account.label.clone()), why);
-                state.record_skip();
-                continue;
-            }
-            other => unreachable!("unexpected pre-quota planning result: {other:?}"),
+        if dispatch_record.decision == crate::pre_dispatch::PreDispatchDecision::AccountUnavailable
+        {
+            let why = account_skip_detail(target, status);
+            meta.fallback_path
+                .push(format!("{}:{why}", target.account.label));
+            trace.step("skip", Some(target.account.label.clone()), why);
+            state.record_skip();
+            continue;
         }
         let probing = !matches!(status, pool::AccountStatus::Healthy);
         if probing {
@@ -1000,14 +1072,9 @@ pub(crate) async fn run_with_disconnect(
             );
         }
 
-        // Soft quota check (FR-12.8). The planner decides whether this quota
-        // ends the request before any provider-circuit check is performed.
-        pre_dispatch_facts.account_quota_reached = Some(
-            pool::soft_quota_reached(&state.pool, &target.account)
-                .await
-                .unwrap_or(false),
-        );
-        match crate::pre_dispatch::plan_candidate(pre_dispatch_facts) {
+        // The dispatch plan has already evaluated account quota before the
+        // provider circuit. Execute its quota decision before transport checks.
+        match dispatch_record.decision {
             crate::pre_dispatch::PreDispatchDecision::SkipAfterQuota
             | crate::pre_dispatch::PreDispatchDecision::RateLimited => {
                 let reset_at = (chrono::Utc::now()
@@ -1032,7 +1099,8 @@ pub(crate) async fn run_with_disconnect(
                     format!("model={} soft quota reached", target.model.display_name),
                 );
                 state.record_skip();
-                if !pre_dispatch_facts.quota_fallback_allowed {
+                if dispatch_record.decision == crate::pre_dispatch::PreDispatchDecision::RateLimited
+                {
                     trace.finish("failed");
                     state.live.finish(
                         &meta.request_id,
@@ -1046,8 +1114,10 @@ pub(crate) async fn run_with_disconnect(
                 }
                 continue;
             }
-            crate::pre_dispatch::PreDispatchDecision::CheckProviderCircuit => {}
-            other => unreachable!("unexpected post-quota planning result: {other:?}"),
+            crate::pre_dispatch::PreDispatchDecision::CheckProviderCircuit
+            | crate::pre_dispatch::PreDispatchDecision::ProviderCircuitUnavailable
+            | crate::pre_dispatch::PreDispatchDecision::Dispatchable => {}
+            other => unreachable!("unexpected dispatch-plan result: {other:?}"),
         }
 
         // Resolve target transport and its execution metadata before any
@@ -1086,20 +1156,14 @@ pub(crate) async fn run_with_disconnect(
 
         // Check provider eligibility before credential work, but do not reserve
         // the exclusive HALF_OPEN network probe until immediately before dispatch.
-        let provider_circuit = state.provider_circuits.check_available(&target.provider.id);
-        pre_dispatch_facts.provider_circuit_available = Some(provider_circuit.is_ok());
-        match crate::pre_dispatch::plan_candidate(pre_dispatch_facts) {
-            crate::pre_dispatch::PreDispatchDecision::ProviderCircuitUnavailable => {
-                let Err(reject) = provider_circuit else {
-                    unreachable!("planner rejected an available provider circuit")
-                };
-                last_error = Some(record_provider_circuit_reject(
-                    state, target, &mut meta, &mut trace, reject,
-                ));
-                continue;
-            }
-            crate::pre_dispatch::PreDispatchDecision::Dispatchable => {}
-            other => unreachable!("unexpected post-circuit planning result: {other:?}"),
+        // This is an execution-time availability check, not another selection
+        // pass. The canonical plan already fixed candidate order and fallback
+        // policy; this check only catches circuit changes before credential work.
+        if let Err(reject) = state.provider_circuits.check_available(&target.provider.id) {
+            last_error = Some(record_provider_circuit_reject(
+                state, target, &mut meta, &mut trace, reject,
+            ));
+            continue;
         }
         let correlation_policy = if target.provider.credential_mode == "none" {
             crate::provider_circuit::ProviderCorrelationPolicy::AccountlessTargets
@@ -6130,155 +6194,6 @@ pub struct DryRunRequest {
     pub session: Option<String>,
 }
 
-fn route_selection_is_stochastic(
-    route: Option<&db::RouteRow>,
-    candidates: &[ResolvedTarget],
-    selection_candidates: &[(usize, String, bool, bool, bool)],
-    affinity_candidate_id: Option<&str>,
-    quota_fallback_allowed: bool,
-) -> bool {
-    let state_by_id: std::collections::HashMap<_, _> = selection_candidates
-        .iter()
-        .map(|(rank, id, eligible, quota_check_reached, quota_reached)| {
-            (
-                id.as_str(),
-                (
-                    *rank,
-                    *eligible && !*quota_reached,
-                    *quota_check_reached && *quota_reached,
-                ),
-            )
-        })
-        .collect();
-    let dispatchable = |candidate: &ResolvedTarget| {
-        state_by_id
-            .get(adaptive_candidate_key(candidate).as_str())
-            .is_some_and(|(_, eligible, _)| *eligible)
-    };
-    let quota_stops = |candidate: &ResolvedTarget| {
-        !quota_fallback_allowed
-            && state_by_id
-                .get(adaptive_candidate_key(candidate).as_str())
-                .is_some_and(|(_, _, quota_reached)| *quota_reached)
-    };
-
-    // Runtime promotes the exact remembered candidate after strategy ordering.
-    // If it can pass the pre-dispatch gates, no randomized ordering can change
-    // the first attempt.
-    if let Some(affinity_id) = affinity_candidate_id {
-        if candidates.iter().any(|candidate| {
-            adaptive_candidate_key(candidate) == affinity_id
-                && (dispatchable(candidate) || quota_stops(candidate))
-        }) {
-            return false;
-        }
-    }
-
-    let account_frontier_is_stochastic = |group: &[&ResolvedTarget]| {
-        let active: Vec<_> = group
-            .iter()
-            .copied()
-            .filter(|candidate| dispatchable(candidate) || quota_stops(candidate))
-            .collect();
-        let Some(first_priority) = active
-            .iter()
-            .map(|candidate| candidate.account.priority)
-            .min()
-        else {
-            return false;
-        };
-        let first_tier: Vec<_> = active
-            .into_iter()
-            .filter(|candidate| candidate.account.priority == first_priority)
-            .collect();
-        let dispatch_count = first_tier
-            .iter()
-            .filter(|candidate| dispatchable(candidate))
-            .count();
-        let quota_stop_count = first_tier
-            .iter()
-            .filter(|candidate| quota_stops(candidate))
-            .count();
-        dispatch_count > 1 || (dispatch_count > 0 && quota_stop_count > 0)
-    };
-
-    let Some(route) = route else {
-        let group: Vec<_> = candidates.iter().collect();
-        return account_frontier_is_stochastic(&group);
-    };
-
-    let mut groups: std::collections::HashMap<String, Vec<&ResolvedTarget>> =
-        std::collections::HashMap::new();
-    let mut group_order: Vec<(usize, String)> = Vec::new();
-    for (rank, id, _, _, _) in selection_candidates {
-        let Some(candidate) = candidates
-            .iter()
-            .find(|candidate| adaptive_candidate_key(candidate) == *id)
-        else {
-            continue;
-        };
-        let group_id = candidate
-            .route_target_id
-            .clone()
-            .unwrap_or_else(|| format!("account:{}", candidate.account.id));
-        if !groups.contains_key(&group_id) {
-            group_order.push((*rank, group_id.clone()));
-        }
-        groups.entry(group_id).or_default().push(candidate);
-    }
-
-    if route.strategy == "weighted" {
-        // Every positive-weight route target can be ordered first. Compare the
-        // possible outcomes at each target's first dispatchable account tier,
-        // after quota and other pre-dispatch gates have removed blocked rows.
-        let mut possible_dispatches = HashSet::new();
-        let mut possible_quota_stop = false;
-        for group in groups.values() {
-            if account_frontier_is_stochastic(group) {
-                return true;
-            }
-            let active: Vec<_> = group
-                .iter()
-                .copied()
-                .filter(|candidate| dispatchable(candidate) || quota_stops(candidate))
-                .collect();
-            let Some(first_priority) = active
-                .iter()
-                .map(|candidate| candidate.account.priority)
-                .min()
-            else {
-                continue;
-            };
-            for candidate in active
-                .into_iter()
-                .filter(|candidate| candidate.account.priority == first_priority)
-            {
-                if dispatchable(candidate) {
-                    possible_dispatches.insert(adaptive_candidate_key(candidate));
-                }
-                possible_quota_stop |= quota_stops(candidate);
-            }
-        }
-        return possible_dispatches.len() > 1
-            || (possible_quota_stop && !possible_dispatches.is_empty());
-    }
-
-    // Non-weighted Route strategies have a deterministic logical target order.
-    // Only its first reachable target group can dispatch first; account ties in
-    // that group's first reachable priority tier remain randomized.
-    group_order.sort_by_key(|(rank, _)| *rank);
-    group_order
-        .into_iter()
-        .find_map(|(_, group_id)| {
-            let group = groups.get(&group_id)?;
-            let active = group
-                .iter()
-                .any(|candidate| dispatchable(candidate) || quota_stops(candidate));
-            active.then(|| account_frontier_is_stochastic(group))
-        })
-        .unwrap_or(false)
-}
-
 pub async fn dry_run(
     state: &AppState,
     requested_model: &str,
@@ -6376,39 +6291,25 @@ pub async fn dry_run(
     let dry_run_traffic = adaptive_route.then(|| snapshot_traffic_targets(state, &hard_eligible));
     let mut affinity_candidate_id = None;
     let route_rank = if let Some(route) = &route {
-        let mut ordered =
+        let ordered =
             order_route_targets_for_simulation(state, route, hard_eligible, simulation_seed)
                 .await
                 .targets;
-        let (mut dispatchable, mut deferred): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
-        for target in ordered.drain(..) {
-            if matches!(
-                pool::effective_status(&target.account),
-                pool::AccountStatus::CircuitOpen
-            ) && !pool::should_probe(&target.account)
-            {
-                deferred.push(target);
-            } else {
-                dispatchable.push(target);
-            }
-        }
-        dispatchable.append(&mut deferred);
         if let (Some(session), true) = (
             descriptor.session.as_deref(),
             route.cache_affinity != 0 || route.sticky_routing != 0,
         ) {
             if let Some(sticky_key) = state.sticky_lookup(session, STICKY_TTL) {
-                if let Some(index) = dispatchable
+                if let Some(target) = ordered
                     .iter()
-                    .position(|target| target_key(route, target) == sticky_key)
+                    .find(|target| target_key(route, target) == sticky_key)
                 {
-                    affinity_candidate_id = Some(adaptive_candidate_key(&dispatchable[index]));
-                    dispatchable.rotate_left(index);
+                    affinity_candidate_id = Some(adaptive_candidate_key(target));
                 }
             }
         }
         Some(
-            dispatchable
+            ordered
                 .iter()
                 .enumerate()
                 .map(|(rank, target)| (adaptive_candidate_key(target), rank))
@@ -6425,7 +6326,7 @@ pub async fn dry_run(
     };
 
     let mut candidates = Vec::new();
-    let mut selection_candidates = Vec::new();
+    let mut dispatch_candidates = Vec::with_capacity(targets.len());
     let allow_fallback = descriptor.allow_fallback.unwrap_or(true);
     let quota_fallback_allowed =
         allow_fallback && route_allows_fallback(route.as_ref(), FailureKind::QuotaExhausted);
@@ -6472,38 +6373,20 @@ pub async fn dry_run(
             quota_override_available,
             adaptive_capacity_available: adaptive_capacity_ok,
         };
-        let would_select = matches!(
-            crate::pre_dispatch::plan_candidate(pre_dispatch_facts),
-            crate::pre_dispatch::PreDispatchDecision::Dispatchable
-        );
-        let eligible_without_account_quota = matches!(
-            crate::pre_dispatch::plan_candidate(crate::pre_dispatch::PreDispatchFacts {
-                account_quota_reached: Some(false),
-                ..pre_dispatch_facts
-            }),
-            crate::pre_dispatch::PreDispatchDecision::Dispatchable
-        );
-        let quota_check_reached = matches!(
-            crate::pre_dispatch::plan_candidate(crate::pre_dispatch::PreDispatchFacts {
-                account_quota_reached: None,
-                provider_circuit_available: None,
-                ..pre_dispatch_facts
-            }),
-            crate::pre_dispatch::PreDispatchDecision::CheckAccountQuota
-        );
         let candidate_id = adaptive_candidate_key(t);
         let rank = route_rank
             .as_ref()
             .and_then(|ranks| ranks.get(&candidate_id).copied());
-        if let Some(rank) = rank {
-            selection_candidates.push((
-                rank,
-                candidate_id.clone(),
-                eligible_without_account_quota,
-                quota_check_reached,
-                account_quota_reached,
-            ));
-        }
+        dispatch_candidates.push(crate::pre_dispatch::DispatchCandidate {
+            id: candidate_id.clone(),
+            rank,
+            group_id: t.route_target_id.clone(),
+            account_priority: t.account.priority,
+            weight: t.weight,
+            defer_for_circuit: matches!(status, pool::AccountStatus::CircuitOpen)
+                && !half_open_probe,
+            facts: pre_dispatch_facts,
+        });
         let mut reasons = Vec::new();
         if !elig.eligible {
             reasons.push("predicate".to_string());
@@ -6574,129 +6457,93 @@ pub async fn dry_run(
             "provider_circuit_retry_at": provider_circuit.retry_at,
             "route_capacity_available": route_capacity,
             "adaptive_capacity_available": adaptive_route.then_some(adaptive_capacity_ok),
-            "eligible": would_select,
             "not_selected_reasons": reasons,
         }));
     }
 
-    selection_candidates.sort_by_key(|candidate| candidate.0);
-    let stochastic_selection = route_selection_is_stochastic(
-        route.as_ref(),
-        &targets,
-        &selection_candidates,
-        affinity_candidate_id.as_deref(),
-        quota_fallback_allowed,
-    );
-    let mut selected: Option<String> = None;
-    let mut selected_identity: Option<String> = None;
-    let mut quota_blocked: Option<(usize, String)> = None;
-    if !stochastic_selection {
-        for (
-            rank,
-            candidate_id,
-            eligible_without_account_quota,
-            quota_check_reached,
-            quota_reached,
-        ) in &selection_candidates
+    let dispatch_plan = crate::pre_dispatch::plan_dispatch(
+        &dispatch_candidates,
+        route.is_some(),
+        if route
+            .as_ref()
+            .is_some_and(|route| route.strategy == "weighted")
         {
-            if *quota_check_reached && *quota_reached {
-                if !quota_fallback_allowed {
-                    quota_blocked = Some((*rank, candidate_id.clone()));
-                    break;
-                }
-                continue;
-            }
-            if *eligible_without_account_quota {
-                selected_identity = Some(candidate_id.clone());
-                selected = candidates
-                    .iter()
-                    .find(|candidate| candidate["candidate_id"] == *candidate_id)
-                    .and_then(|candidate| candidate["target"].as_str())
-                    .map(str::to_owned);
-                break;
-            }
-        }
-    }
+            crate::pre_dispatch::DispatchStrategy::Weighted
+        } else {
+            crate::pre_dispatch::DispatchStrategy::Ordered
+        },
+        affinity_candidate_id.as_deref(),
+        true,
+    );
+    let records_by_id: std::collections::HashMap<_, _> = dispatch_plan
+        .candidates
+        .iter()
+        .map(|record| (record.candidate_id.as_str(), record))
+        .collect();
+    let selected_identity = match &dispatch_plan.outcome {
+        crate::pre_dispatch::DispatchOutcome::Selected(candidate_id) => Some(candidate_id.as_str()),
+        _ => None,
+    };
+    let selected = selected_identity.and_then(|candidate_id| {
+        candidates
+            .iter()
+            .find(|candidate| candidate["candidate_id"] == candidate_id)
+            .and_then(|candidate| candidate["target"].as_str())
+            .map(str::to_owned)
+    });
+    let stochastic_selection = dispatch_plan.stochastic_selection;
+    let has_quota_stop = dispatch_plan
+        .candidates
+        .iter()
+        .any(|record| record.decision == crate::pre_dispatch::PreDispatchDecision::RateLimited);
 
     for candidate in &mut candidates {
         let candidate_id = candidate["candidate_id"].as_str().unwrap_or_default();
-        let rank = selection_candidates
-            .iter()
-            .find(|ordered| ordered.1 == candidate_id)
-            .map(|ordered| ordered.0);
-        let is_selected = candidate_id == selected_identity.as_deref().unwrap_or_default();
-        let blocks_on_quota = quota_blocked
-            .as_ref()
-            .is_some_and(|(_, blocked_id)| blocked_id == candidate_id);
-        let unreachable_after_quota = quota_blocked
-            .as_ref()
-            .zip(rank)
-            .is_some_and(|((blocked_rank, _), rank)| rank > *blocked_rank);
-
-        let decision_reason = if is_selected {
-            if route.is_some() {
-                "selected_by_route_strategy"
-            } else {
-                "selected_by_account_pool"
-            }
-        } else if blocks_on_quota {
-            "quota_fallback_disabled"
-        } else if unreachable_after_quota {
-            "unreachable_after_quota_failure"
-        } else if stochastic_selection && candidate["eligible"].as_bool() == Some(true) {
-            "stochastic_selection"
-        } else if candidate["eligible"].as_bool() == Some(true) {
-            if route.is_some() {
-                "higher_ranked_candidate_selected"
-            } else {
-                "another_account_ordered_first"
-            }
+        let record = records_by_id
+            .get(candidate_id)
+            .expect("every dry-run candidate has a dispatch-plan record");
+        candidate["strategy_rank"] = if stochastic_selection {
+            serde_json::Value::Null
         } else {
-            "ineligible"
+            serde_json::json!(record.strategy_rank)
         };
-        candidate["selected"] = serde_json::json!(is_selected);
-        candidate["decision_reason"] = serde_json::json!(decision_reason);
-        if blocks_on_quota || unreachable_after_quota {
+        candidate["eligible"] = serde_json::json!(
+            record.decision == crate::pre_dispatch::PreDispatchDecision::Dispatchable
+        );
+        candidate["selected"] = serde_json::json!(record.selected);
+        candidate["decision_reason"] = serde_json::json!(record.decision_reason);
+        if record.decision_reason != "selected_by_route_strategy"
+            && record.decision_reason != "selected_by_account_pool"
+            && record.decision_reason != "ineligible"
+        {
             if let Some(reasons) = candidate["not_selected_reasons"].as_array_mut() {
-                reasons.push(serde_json::json!(decision_reason));
+                reasons.push(serde_json::json!(record.decision_reason));
             }
-        } else if stochastic_selection && candidate["eligible"].as_bool() == Some(true) {
-            if let Some(reasons) = candidate["not_selected_reasons"].as_array_mut() {
-                reasons.push(serde_json::json!("stochastic_selection"));
-            }
-        } else if !is_selected && candidate["eligible"].as_bool() == Some(true) {
-            if let Some(reasons) = candidate["not_selected_reasons"].as_array_mut() {
-                reasons.push(serde_json::json!(if route.is_some() {
-                    "higher_ranked_candidate_selected"
-                } else {
-                    "another_account_ordered_first"
-                }));
-            }
-        }
-        if stochastic_selection {
-            candidate["strategy_rank"] = serde_json::Value::Null;
         }
     }
 
-    let stochastic_outcome = stochastic_selection
-        && selection_candidates.iter().any(
-            |(_, _, eligible, quota_check_reached, quota_reached)| {
-                *eligible || (*quota_check_reached && *quota_reached)
-            },
-        );
-    let outcome = if stochastic_outcome {
-        "stochastic"
-    } else if quota_blocked.is_some() {
-        "rate_limited"
-    } else if selected.is_some() {
-        "selected"
-    } else {
-        "no_eligible_target"
+    let outcome = match &dispatch_plan.outcome {
+        crate::pre_dispatch::DispatchOutcome::Stochastic => "stochastic",
+        crate::pre_dispatch::DispatchOutcome::RateLimited(_) => "rate_limited",
+        crate::pre_dispatch::DispatchOutcome::Selected(_) => "selected",
+        crate::pre_dispatch::DispatchOutcome::NoEligibleTarget => "no_eligible_target",
     };
     let selection_mode = if stochastic_selection {
         "stochastic"
     } else {
         "deterministic"
+    };
+    let selection_note = if stochastic_selection && !quota_fallback_allowed && has_quota_stop {
+        "Runtime selection is stochastic; selecting a quota-exhausted account can return HTTP 429 because fallback on quota is disabled."
+    } else if stochastic_selection {
+        "Runtime selection is stochastic; no exact target can be predicted."
+    } else if matches!(
+        &dispatch_plan.outcome,
+        crate::pre_dispatch::DispatchOutcome::RateLimited(_)
+    ) {
+        "Quota is exhausted and either request-level or Route fallback is disabled; runtime would return HTTP 429 before upstream dispatch."
+    } else {
+        "Selection follows the current candidate ordering and availability snapshot."
     };
 
     Ok(serde_json::json!({
@@ -6708,17 +6555,7 @@ pub async fn dry_run(
         "would_select": selected,
         "selection_mode": selection_mode,
         "outcome": outcome,
-        "selection_note": if stochastic_outcome && !quota_fallback_allowed && selection_candidates.iter().any(|(_, _, _, quota_check_reached, quota_reached)| *quota_check_reached && *quota_reached) {
-            "Runtime selection is stochastic; selecting a quota-exhausted account can return HTTP 429 because fallback on quota is disabled."
-        } else if stochastic_outcome {
-            "Runtime selection is stochastic; no exact target can be predicted."
-        } else if stochastic_selection {
-            "Runtime ordering is stochastic, but no target is currently eligible for dispatch."
-        } else if quota_blocked.is_some() {
-            "Quota is exhausted and either request-level or Route fallback is disabled; runtime would return HTTP 429 before upstream dispatch."
-        } else {
-            "Selection follows the current candidate ordering and availability snapshot."
-        },
+        "selection_note": selection_note,
         "plugin_fact_failures": plugin_facts.failures.iter().map(|(plugin, reason)| {
             serde_json::json!({"plugin": plugin, "reason": reason})
         }).collect::<Vec<_>>(),
