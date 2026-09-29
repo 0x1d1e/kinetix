@@ -156,6 +156,101 @@ impl HostBacking for Backing {
     }
 }
 
+/// Validation gets an isolated in-memory KV namespace and no credential or
+/// network authority, so a guest start function cannot mutate installed state.
+#[derive(Default)]
+struct ValidationBacking {
+    entries: Mutex<HashMap<(String, String), Vec<u8>>>,
+}
+
+#[async_trait::async_trait]
+impl HostBacking for ValidationBacking {
+    async fn kv_get(&self, plugin_id: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(plugin_id.to_string(), key.to_string()))
+            .cloned())
+    }
+    async fn kv_put_limited(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        value: &[u8],
+        quota: u64,
+    ) -> Result<()> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map_key = (plugin_id.to_string(), key.to_string());
+        let old_size = entries
+            .get(&map_key)
+            .map(|bytes| bytes.len() as u64)
+            .unwrap_or(0);
+        let used = entries
+            .iter()
+            .filter(|((owner, _), _)| owner == plugin_id)
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>();
+        let new_used = used
+            .saturating_sub(old_size)
+            .saturating_add(value.len() as u64);
+        if new_used > quota {
+            bail!("plugin validation storage quota exceeded");
+        }
+        entries.insert(map_key, value.to_vec());
+        Ok(())
+    }
+    async fn kv_delete(&self, plugin_id: &str, key: &str) -> Result<()> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(plugin_id.to_string(), key.to_string()));
+        Ok(())
+    }
+    fn record_http_request(&self, plugin_id: &str, capability: &str) {
+        tracing::debug!(plugin = %plugin_id, capability, "plugin validation attempted outbound HTTP");
+    }
+    async fn credential_scope_allows(
+        &self,
+        _plugin_id: &str,
+        _provider_id: &str,
+        _scopes: &[String],
+    ) -> Result<bool> {
+        Ok(false)
+    }
+    fn log(&self, plugin_id: &str, level: &str, message: &str) {
+        match level {
+            "error" => tracing::error!(plugin = %plugin_id, "plugin validation: {message}"),
+            "warn" => tracing::warn!(plugin = %plugin_id, "plugin validation: {message}"),
+            "info" => tracing::info!(plugin = %plugin_id, "plugin validation: {message}"),
+            "debug" => tracing::debug!(plugin = %plugin_id, "plugin validation: {message}"),
+            _ => tracing::trace!(plugin = %plugin_id, "plugin validation: {message}"),
+        }
+    }
+    async fn resolve_secret(
+        &self,
+        _plugin_id: &str,
+        _provider_id: &str,
+        _account_id: &str,
+    ) -> Result<String> {
+        bail!("plugin validation cannot access credentials")
+    }
+    async fn credential_egress_hosts(&self, _provider_id: &str) -> Result<Vec<String>> {
+        bail!("plugin validation cannot access credential egress hosts")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ValidationWorld {
+    Plugin,
+    Auth,
+    AccountModelSource,
+    ProviderAdapter,
+}
+
 /// The plugin manager. Cheap to clone (Arc inside).
 #[derive(Clone)]
 pub struct PluginManager {
@@ -391,6 +486,12 @@ impl PluginManager {
                 .compile(&pkg.component)
                 .map_err(|e| anyhow!("{e}"))?,
         );
+        self.validate_component_contract(
+            &validated.manifest,
+            &validated.effective,
+            compiled.as_ref(),
+        )
+        .await?;
 
         // Preserve the exact accepted package before publishing its active
         // metadata. The filename is content-addressed so the version string
@@ -547,7 +648,10 @@ impl PluginManager {
         let current_manifest = current
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        let (retained, _pkg, validated) = self.load_retained_package(id, sha256).await?;
+        let (retained, pkg, validated) = self.load_retained_package(id, sha256).await?;
+        let component = self.inner.runtime.compile(&pkg.component)?;
+        self.validate_component_contract(&validated.manifest, &validated.effective, &component)
+            .await?;
 
         Ok(RollbackPreview {
             id: id.to_string(),
@@ -588,6 +692,12 @@ impl PluginManager {
                 .compile(&pkg.component)
                 .map_err(|e| anyhow!("{e}"))?,
         );
+        self.validate_component_contract(
+            &validated.manifest,
+            &validated.effective,
+            compiled.as_ref(),
+        )
+        .await?;
 
         let source = format!("rollback:{}", retained.package_sha256);
         store::upsert_plugin(
@@ -638,20 +748,16 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        if !manifest.compatible() {
-            bail!("plugin '{id}' is not API-compatible with this host");
-        }
-        let grants = self.ensure_permissions_approved(id, &manifest).await?;
-        let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
-        // Instantiate to prove the component links against our host API.
-        let mut store = self.new_store(&row, &limits, &grants, false, true, "validation");
-        let component = self.compiled_component(&row)?;
-        let linker = self.inner.runtime.linker()?;
-        let _ = self
-            .inner
-            .runtime
-            .instantiate(&linker, &mut store, component.as_ref())
+        let (validated, _) = self
+            .validated_manifest_with_approved_permissions(id, manifest)
             .await?;
+        let component = self.compiled_component(&row)?;
+        self.validate_component_contract(
+            &validated.manifest,
+            &validated.effective,
+            component.as_ref(),
+        )
+        .await?;
         store::set_enabled(&self.inner.pool, id, true).await?;
         store::clear_plugin_failures(&self.inner.pool, id).await?;
         Ok(())
@@ -659,6 +765,63 @@ impl PluginManager {
 
     pub async fn disable(&self, id: &str) -> Result<()> {
         store::set_enabled(&self.inner.pool, id, false).await?;
+        Ok(())
+    }
+
+    /// Disable enabled plugins whose persisted manifest, approved grants, or
+    /// active component no longer satisfy the current host contract.
+    pub async fn reconcile_enabled_plugins(&self) -> Result<()> {
+        let rows = store::list_plugins(&self.inner.pool).await?;
+        for row in rows.into_iter().filter(|row| row.status().is_enabled()) {
+            let validated = match row.manifest() {
+                Some(manifest) => match self.validate_persisted_manifest(manifest) {
+                    Ok(validated) => validated,
+                    Err(error) => {
+                        tracing::warn!(
+                            plugin = %row.id,
+                            error = %error,
+                            "disabling plugin that fails startup validation"
+                        );
+                        store::set_enabled(&self.inner.pool, &row.id, false).await?;
+                        continue;
+                    }
+                },
+                None => {
+                    tracing::warn!(plugin = %row.id, "disabling plugin with an unreadable manifest");
+                    store::set_enabled(&self.inner.pool, &row.id, false).await?;
+                    continue;
+                }
+            };
+            let approved = self.approved_permissions(&row.id).await?;
+            if !permission_grants_match(&permission_grants(&validated.manifest), &approved) {
+                tracing::warn!(
+                    plugin = %row.id,
+                    "disabling plugin whose approved permissions no longer match its manifest"
+                );
+                store::set_enabled(&self.inner.pool, &row.id, false).await?;
+                continue;
+            }
+
+            let contract_result = match self.compiled_component(&row) {
+                Ok(component) => {
+                    self.validate_component_contract(
+                        &validated.manifest,
+                        &validated.effective,
+                        component.as_ref(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = contract_result {
+                tracing::warn!(
+                    plugin = %row.id,
+                    error = %error,
+                    "disabling plugin that fails startup component validation"
+                );
+                store::set_enabled(&self.inner.pool, &row.id, false).await?;
+            }
+        }
         Ok(())
     }
 
@@ -823,8 +986,8 @@ impl PluginManager {
     /// requested key must be declared by the manifest; the grant is written
     /// with exactly the requested scope (e.g. a subset of `network_hosts`), so
     /// the operator is not forced to rubber-stamp the full declaration.
-    /// `ensure_permissions_approved` still requires the effective grant set to
-    /// match the manifest exactly before enablement.
+    /// Enablement and runtime use still require the effective grant set to
+    /// match the validated manifest exactly.
     pub async fn approve_permissions_scoped(
         &self,
         id: &str,
@@ -895,37 +1058,42 @@ impl PluginManager {
         self.disable(id).await
     }
 
-    /// Return approved grants only when they exactly match the current manifest.
-    async fn ensure_permissions_approved(
+    /// Validate a persisted manifest against the current host contract.
+    fn validate_persisted_manifest(
+        &self,
+        manifest: Manifest,
+    ) -> Result<manifest::ValidatedManifest> {
+        manifest::validate(manifest, self.inner.policy)
+    }
+
+    /// Validate a persisted manifest and return grants only when they exactly
+    /// match its current permission declarations.
+    async fn validated_manifest_with_approved_permissions(
         &self,
         id: &str,
-        manifest: &Manifest,
-    ) -> Result<Vec<PermissionGrant>> {
-        let requested = permission_grants(manifest);
-        let approved: Vec<PermissionGrant> = store::permissions(&self.inner.pool, id)
+        manifest: Manifest,
+    ) -> Result<(manifest::ValidatedManifest, Vec<PermissionGrant>)> {
+        let validated = self.validate_persisted_manifest(manifest)?;
+        let requested = permission_grants(&validated.manifest);
+        let approved = self.approved_permissions(id).await?;
+
+        if !permission_grants_match(&requested, &approved) {
+            bail!(
+                "plugin '{id}' permissions are not approved for the current manifest; run kinetix plugin approve {id}"
+            );
+        }
+        Ok((validated, approved))
+    }
+
+    async fn approved_permissions(&self, id: &str) -> Result<Vec<PermissionGrant>> {
+        Ok(store::permissions(&self.inner.pool, id)
             .await?
             .into_iter()
             .map(|row| PermissionGrant {
                 permission: row.permission,
                 value_json: row.value_json,
             })
-            .collect();
-
-        let requested_set: std::collections::BTreeSet<_> = requested
-            .iter()
-            .map(|g| (g.permission.clone(), g.value_json.clone()))
-            .collect();
-        let approved_set: std::collections::BTreeSet<_> = approved
-            .iter()
-            .map(|g| (g.permission.clone(), g.value_json.clone()))
-            .collect();
-
-        if requested_set != approved_set {
-            bail!(
-                "plugin '{id}' permissions are not approved for the current manifest; run kinetix plugin approve {id}"
-            );
-        }
-        Ok(approved)
+            .collect())
     }
 
     /// Read the plugin's host-stamped cached routing facts (§6.4) for the
@@ -973,7 +1141,7 @@ impl PluginManager {
             return false;
         };
         if self
-            .ensure_permissions_approved(id, &manifest)
+            .validated_manifest_with_approved_permissions(id, manifest)
             .await
             .is_err()
         {
@@ -1123,6 +1291,159 @@ impl PluginManager {
         self.inner.runtime.new_store(ctx, limits.memory)
     }
 
+    fn new_validation_store(
+        &self,
+        plugin_id: &str,
+        limits: &manifest::EffectiveLimits,
+        capability: &str,
+    ) -> wasmtime::Store<HostCtx> {
+        let ctx = HostCtx {
+            plugin_id: plugin_id.to_string(),
+            capability: capability.to_string(),
+            network_hosts: Vec::new(),
+            credential_read: false,
+            credential_sign: false,
+            credential_scopes: Vec::new(),
+            storage_quota: limits.storage,
+            pending_cache: BTreeMap::new(),
+            max_outbound_requests: 0,
+            max_http_body: 0,
+            adapter_stream: false,
+            buffered_http_allowed: false,
+            allow_private_network: false,
+            http_timeout: Duration::from_millis(limits.wall_time_ms.max(1)),
+            outbound_count: 0,
+            backing: Arc::new(ValidationBacking::default()),
+            limits: wasmtime::StoreLimitsBuilder::new().build(),
+        };
+        self.inner.runtime.new_store(ctx, limits.memory)
+    }
+
+    async fn validate_component_world(
+        &self,
+        plugin_id: &str,
+        limits: &manifest::EffectiveLimits,
+        component: &wasmtime::component::Component,
+        linker: &wasmtime::component::Linker<HostCtx>,
+        world: ValidationWorld,
+    ) -> Result<()> {
+        let world_name = match world {
+            ValidationWorld::Plugin => "plugin",
+            ValidationWorld::Auth => "plugin-auth",
+            ValidationWorld::AccountModelSource => "plugin-model-source",
+            ValidationWorld::ProviderAdapter => "plugin-adapter",
+        };
+        let mut store = self.new_validation_store(plugin_id, limits, "validation");
+        let _deadline = self.inner.runtime.arm_deadline(
+            &mut store,
+            Duration::from_millis(limits.wall_time_ms.max(1)),
+        );
+        match world {
+            ValidationWorld::Plugin => {
+                self.inner
+                    .runtime
+                    .instantiate(linker, &mut store, component)
+                    .await?;
+            }
+            ValidationWorld::Auth => {
+                self.inner
+                    .runtime
+                    .instantiate_auth(linker, &mut store, component)
+                    .await?;
+            }
+            ValidationWorld::AccountModelSource => {
+                self.inner
+                    .runtime
+                    .instantiate_model_source(linker, &mut store, component)
+                    .await?;
+            }
+            ValidationWorld::ProviderAdapter => {
+                self.inner
+                    .runtime
+                    .instantiate_adapter(linker, &mut store, component)
+                    .await?;
+            }
+        }
+        tracing::debug!(plugin = %plugin_id, world = world_name, "plugin component world validated");
+        Ok(())
+    }
+
+    async fn validate_component_contract(
+        &self,
+        manifest: &Manifest,
+        limits: &manifest::EffectiveLimits,
+        component: &wasmtime::component::Component,
+    ) -> Result<()> {
+        let provides = &manifest.provides;
+        let has_plugin_world = !provides.credential_strategies.is_empty()
+            || !provides.model_sources.is_empty()
+            || !provides.health_probes.is_empty()
+            || !provides.routing_facts.is_empty()
+            || !provides.hooks.is_empty();
+        let linker = self.inner.runtime.linker()?;
+
+        if has_plugin_world {
+            self.validate_component_world(
+                &manifest.id,
+                limits,
+                component,
+                &linker,
+                ValidationWorld::Plugin,
+            )
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "plugin '{}' failed plugin-world validation: {e}",
+                    manifest.id
+                )
+            })?;
+        }
+        if !provides.auth_flows.is_empty() {
+            self.validate_component_world(
+                &manifest.id,
+                limits,
+                component,
+                &linker,
+                ValidationWorld::Auth,
+            )
+            .await
+            .map_err(|e| anyhow!("plugin '{}' failed auth-world validation: {e}", manifest.id))?;
+        }
+        if !provides.account_model_sources.is_empty() {
+            self.validate_component_world(
+                &manifest.id,
+                limits,
+                component,
+                &linker,
+                ValidationWorld::AccountModelSource,
+            )
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "plugin '{}' failed account model-source world validation: {e}",
+                    manifest.id
+                )
+            })?;
+        }
+        if !provides.provider_adapters.is_empty() {
+            self.validate_component_world(
+                &manifest.id,
+                limits,
+                component,
+                &linker,
+                ValidationWorld::ProviderAdapter,
+            )
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "plugin '{}' failed provider-adapter world validation: {e}",
+                    manifest.id
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     /// Prepare a ready-to-call instance for a plugin.
     async fn prepare(
         &self,
@@ -1140,9 +1461,11 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        let grants = self.ensure_permissions_approved(id, &manifest).await?;
+        let (validated, grants) = self
+            .validated_manifest_with_approved_permissions(id, manifest)
+            .await?;
         self.ensure_circuit_ready(id).await?;
-        let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
+        let limits = validated.effective;
         let component = self.compiled_component(&row)?;
         let linker = self.inner.runtime.linker()?;
         let mut store = self.new_store(
@@ -1178,8 +1501,10 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        let grants = self.ensure_permissions_approved(id, &manifest).await?;
-        let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
+        let (validated, grants) = self
+            .validated_manifest_with_approved_permissions(id, manifest)
+            .await?;
+        let limits = validated.effective;
         let component = self.inner.runtime.compile(&row.component)?;
         let linker = self.inner.runtime.linker()?;
         let mut store = self.new_store(&row, &limits, &grants, false, true, "model_source");
@@ -1207,9 +1532,11 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        let grants = self.ensure_permissions_approved(id, &manifest).await?;
+        let (validated, grants) = self
+            .validated_manifest_with_approved_permissions(id, manifest)
+            .await?;
         self.ensure_circuit_ready(id).await?;
-        let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
+        let limits = validated.effective;
         let component = self.compiled_component(&row)?;
         let linker = self.inner.runtime.linker()?;
         let mut store = self.new_store(&row, &limits, &grants, false, true, "auth_flow");
@@ -1326,9 +1653,11 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        let grants = self.ensure_permissions_approved(id, &manifest).await?;
+        let (validated, grants) = self
+            .validated_manifest_with_approved_permissions(id, manifest)
+            .await?;
         self.ensure_circuit_ready(id).await?;
-        let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
+        let limits = validated.effective;
         let component = self.compiled_component(&row)?;
         let linker = self.inner.runtime.linker()?;
         let mut store = self.new_store(&row, &limits, &grants, true, false, "provider_adapter");
@@ -1938,25 +2267,15 @@ impl PluginManager {
         let manifest = row
             .manifest()
             .ok_or_else(|| anyhow!("plugin '{id}' has an unreadable manifest"))?;
-        let limits = manifest::effective_limits(&manifest, self.inner.policy)?;
+        let validated = self.validate_persisted_manifest(manifest)?;
         let component = self.compiled_component(&row)?;
-        let linker = self.inner.runtime.linker()?;
-        // Validation proves linking with no runtime authority granted.
-        let mut store = self.new_store(&row, &limits, &[], false, false, "validation");
-        let _ = self
-            .inner
-            .runtime
-            .instantiate(&linker, &mut store, component.as_ref())
-            .await?;
-        if !manifest.provides.account_model_sources.is_empty() {
-            let mut model_store = self.new_store(&row, &limits, &[], false, false, "validation");
-            let _ = self
-                .inner
-                .runtime
-                .instantiate_model_source(&linker, &mut model_store, &component)
-                .await?;
-        }
-        Ok(manifest.provides.provided())
+        self.validate_component_contract(
+            &validated.manifest,
+            &validated.effective,
+            component.as_ref(),
+        )
+        .await?;
+        Ok(validated.manifest.provides.provided())
     }
 
     /// Resolve a `plugin:<id>/<capability>` reference to an enabled plugin that
@@ -2345,6 +2664,18 @@ pub fn permission_grants(manifest: &Manifest) -> Vec<PermissionGrant> {
     grants
 }
 
+fn permission_grants_match(requested: &[PermissionGrant], approved: &[PermissionGrant]) -> bool {
+    let requested_set: std::collections::BTreeSet<_> = requested
+        .iter()
+        .map(|grant| (grant.permission.as_str(), grant.value_json.as_str()))
+        .collect();
+    let approved_set: std::collections::BTreeSet<_> = approved
+        .iter()
+        .map(|grant| (grant.permission.as_str(), grant.value_json.as_str()))
+        .collect();
+    requested_set == approved_set
+}
+
 /// The set of capabilities an enabled plugin provides, for the dashboard.
 pub fn manifest_summary(row: &PluginRow) -> serde_json::Value {
     let manifest = row.manifest();
@@ -2353,6 +2684,10 @@ pub fn manifest_summary(row: &PluginRow) -> serde_json::Value {
         "name": manifest.as_ref().map(|m| m.name.clone()).unwrap_or_else(|| row.id.clone()),
         "version": row.version,
         "plugin_api_major": row.plugin_api_major,
+        "compatibility": manifest
+            .as_ref()
+            .map(|m| m.compatibility.clone())
+            .unwrap_or_default(),
         "sha256": row.package_sha256,
         "signature": row.signature,
         "status": row.status().as_str(),

@@ -31,9 +31,40 @@ memory = "64MiB"
 storage = "2MiB"
 "#;
 
-/// A minimal valid component (magic + component-model version, no sections)
-/// that compiles but does not implement the plugin world, so it can be
-/// installed but not enabled.
+const AUTH_MANIFEST: &str = r#"
+manifest_version = 1
+id = "dev.example.auth"
+name = "Auth"
+version = "1.0.0"
+plugin_api = "1"
+[provides]
+auth_flows = ["foo-login"]
+"#;
+
+const ACCOUNT_MODELS_MANIFEST: &str = r#"
+manifest_version = 1
+id = "dev.example.account-models"
+name = "Account Models"
+version = "1.0.0"
+plugin_api = "1"
+[provides]
+account_model_sources = ["foo-models"]
+"#;
+
+const ADAPTER_MANIFEST: &str = r#"
+manifest_version = 1
+id = "dev.example.adapter"
+name = "Adapter"
+version = "1.0.0"
+plugin_api = "1"
+[provides]
+provider_adapters = ["foo-adapter"]
+"#;
+
+/// Frozen API-v1 component fixture. Add new fixtures for later API revisions;
+/// do not regenerate this against the current WIT when the contract evolves.
+const VALID_COMPONENT: &[u8] = include_bytes!("fixtures/plugin-v1.component.wasm");
+/// A valid empty component that deliberately omits every plugin-world export.
 const EMPTY_COMPONENT: &[u8] = b"\0asm\x0d\0\x01\0";
 
 async fn manager() -> (PluginManager, Pool) {
@@ -70,10 +101,48 @@ fn build_kxp(manifest: &str, wasm: &[u8]) -> Vec<u8> {
     builder.into_inner().unwrap()
 }
 
+async fn set_persisted_manifest_version(pool: &Pool, id: &str, version: &str) {
+    let stored: String = sqlx::query_scalar("SELECT manifest_json FROM plugins WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    manifest["version"] = serde_json::Value::String(version.into());
+    sqlx::query("UPDATE plugins SET manifest_json = ? WHERE id = ?")
+        .bind(manifest.to_string())
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn plugin_summary_exposes_host_version_bounds() {
+    let (m, _pool) = manager().await;
+    let manifest = GOOD_MANIFEST.replace(
+        "plugin_api = \"1\"",
+        "plugin_api = \"1\"\n\n[compatibility]\nmin_host_version = \"0.1.0\"\nmax_host_version = \"99.0.0\"",
+    );
+    m.install(&build_kxp(&manifest, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+
+    let row = m.get("dev.example.foo").await.unwrap().unwrap();
+    let summary = kinetix::plugins::manager::manifest_summary(&row);
+    assert_eq!(
+        summary["compatibility"],
+        serde_json::json!({
+            "min_host_version": "0.1.0",
+            "max_host_version": "99.0.0",
+        })
+    );
+}
+
 #[tokio::test]
 async fn install_is_disabled_and_records_provenance() {
     let (m, pool) = manager().await;
-    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     let outcome = m.install(&kxp, None, &[], false).await.unwrap();
     assert_eq!(outcome.id, "dev.example.foo");
     assert_eq!(outcome.version, "1.2.0");
@@ -93,9 +162,118 @@ async fn install_is_disabled_and_records_provenance() {
 }
 
 #[tokio::test]
+async fn legacy_invalid_manifest_is_rejected_by_validate_and_enable() {
+    let (m, pool) = manager().await;
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
+    m.install(&kxp, None, &[], false).await.unwrap();
+
+    set_persisted_manifest_version(&pool, "dev.example.foo", "not-semver").await;
+
+    let validate_error = m.validate("dev.example.foo").await.unwrap_err();
+    assert!(validate_error
+        .to_string()
+        .contains("invalid manifest `version`"));
+
+    let enable_error = m.enable("dev.example.foo").await.unwrap_err();
+    assert!(enable_error
+        .to_string()
+        .contains("invalid manifest `version`"));
+}
+
+#[tokio::test]
+async fn invalid_enabled_manifest_fails_closed_at_runtime() {
+    let (m, pool) = manager().await;
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
+    m.install(&kxp, None, &[], false).await.unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+    m.enable("dev.example.foo").await.unwrap();
+
+    set_persisted_manifest_version(&pool, "dev.example.foo", "release-1").await;
+
+    assert!(!m.is_usable("dev.example.foo").await);
+    assert!(m
+        .resolve_binding("plugin:dev.example.foo/foo-models", Capability::ModelSource)
+        .await
+        .is_none());
+    let error = m
+        .model_discover(
+            "dev.example.foo",
+            "provider-foo",
+            "https://api.foo.example",
+            "/models",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("invalid manifest `version`"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn startup_reconciliation_disables_invalid_enabled_manifests() {
+    let (m, pool) = manager().await;
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
+    m.install(&kxp, None, &[], false).await.unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+    m.enable("dev.example.foo").await.unwrap();
+    set_persisted_manifest_version(&pool, "dev.example.foo", "release-1").await;
+
+    m.reconcile_enabled_plugins().await.unwrap();
+
+    let row = m.get("dev.example.foo").await.unwrap().unwrap();
+    assert_eq!(row.enabled, 0);
+    assert!(!m.is_usable("dev.example.foo").await);
+}
+
+#[tokio::test]
+async fn startup_reconciliation_disables_plugin_missing_declared_adapter_world() {
+    let (m, pool) = manager().await;
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
+    m.install(&kxp, None, &[], false).await.unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+    m.enable("dev.example.foo").await.unwrap();
+
+    let healthy_manifest = GOOD_MANIFEST
+        .replace("dev.example.foo", "dev.example.bar")
+        .replace("foo-models", "bar-models")
+        .replace("foo-facts", "bar-facts");
+    let healthy_kxp = build_kxp(&healthy_manifest, VALID_COMPONENT);
+    m.install(&healthy_kxp, None, &[], false).await.unwrap();
+    m.approve_permissions("dev.example.bar").await.unwrap();
+    m.enable("dev.example.bar").await.unwrap();
+
+    // Simulate a legacy enabled row: the old manifest and component were
+    // accepted because enablement checked only the base plugin world.
+    let stored: String = sqlx::query_scalar("SELECT manifest_json FROM plugins WHERE id = ?")
+        .bind("dev.example.foo")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    manifest["provides"]["provider_adapters"] = serde_json::json!(["foo-adapter"]);
+    sqlx::query("UPDATE plugins SET manifest_json = ? WHERE id = ?")
+        .bind(manifest.to_string())
+        .bind("dev.example.foo")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    m.reconcile_enabled_plugins().await.unwrap();
+
+    let row = m.get("dev.example.foo").await.unwrap().unwrap();
+    assert_eq!(row.enabled, 0);
+    assert!(!m.is_usable("dev.example.foo").await);
+
+    let healthy_row = m.get("dev.example.bar").await.unwrap().unwrap();
+    assert_eq!(healthy_row.enabled, 1);
+    assert!(m.is_usable("dev.example.bar").await);
+}
+
+#[tokio::test]
 async fn install_preserves_exact_package_and_provenance() {
     let (m, pool) = manager().await;
-    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     let outcome = m.install(&kxp, None, &[], false).await.unwrap();
 
     let packages = kinetix::plugins::store::list_packages(&pool, "dev.example.foo")
@@ -113,7 +291,7 @@ async fn install_preserves_exact_package_and_provenance() {
 #[tokio::test]
 async fn compiled_component_cache_warms_lazily_after_restart() {
     let (m, pool) = manager().await;
-    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     m.install(&kxp, None, &[], false).await.unwrap();
 
     let restarted = PluginManager::new(
@@ -128,15 +306,13 @@ async fn compiled_component_cache_warms_lazily_after_restart() {
     assert_eq!(before.component_cache_hits, 0);
     assert_eq!(before.component_cache_misses, 0);
 
-    // The test component intentionally lacks the complete guest world, so
-    // validation fails at instantiation after compilation. The compiled code
-    // must still remain reusable for the next attempt.
-    assert!(restarted.validate("dev.example.foo").await.is_err());
+    // Validation succeeds after restart and warms the compiled component cache.
+    restarted.validate("dev.example.foo").await.unwrap();
     let after_first = restarted.counters();
     assert_eq!(after_first.component_cache_hits, 0);
     assert_eq!(after_first.component_cache_misses, 1);
 
-    assert!(restarted.validate("dev.example.foo").await.is_err());
+    restarted.validate("dev.example.foo").await.unwrap();
     let after_second = restarted.counters();
     assert_eq!(after_second.component_cache_hits, 1);
     assert_eq!(after_second.component_cache_misses, 1);
@@ -145,7 +321,7 @@ async fn compiled_component_cache_warms_lazily_after_restart() {
 #[tokio::test]
 async fn hash_mismatch_is_rejected() {
     let (m, _pool) = manager().await;
-    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     let err = m
         .install(&kxp, Some(&"0".repeat(64)), &[], false)
         .await
@@ -156,7 +332,7 @@ async fn hash_mismatch_is_rejected() {
 #[tokio::test]
 async fn enable_requires_explicit_permission_approval() {
     let (m, _pool) = manager().await;
-    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     m.install(&kxp, None, &[], false).await.unwrap();
 
     let err = m.enable("dev.example.foo").await.unwrap_err();
@@ -170,7 +346,7 @@ async fn enable_requires_explicit_permission_approval() {
 #[tokio::test]
 async fn upgrade_disables_plugin_and_clears_previous_approvals() {
     let (m, pool) = manager().await;
-    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     m.install(&kxp, None, &[], false).await.unwrap();
     m.approve_permissions("dev.example.foo").await.unwrap();
     kinetix::plugins::store::set_enabled(&pool, "dev.example.foo", true)
@@ -178,7 +354,7 @@ async fn upgrade_disables_plugin_and_clears_previous_approvals() {
         .unwrap();
 
     let upgraded = GOOD_MANIFEST.replace("version = \"1.2.0\"", "version = \"1.3.0\"");
-    let upgraded_kxp = build_kxp(&upgraded, EMPTY_COMPONENT);
+    let upgraded_kxp = build_kxp(&upgraded, VALID_COMPONENT);
     m.install(&upgraded_kxp, None, &[], false).await.unwrap();
 
     let row = m.get("dev.example.foo").await.unwrap().unwrap();
@@ -202,11 +378,11 @@ async fn upgrade_disables_plugin_and_clears_previous_approvals() {
 #[tokio::test]
 async fn rollback_revalidates_retained_package_and_clears_authority() {
     let (m, pool) = manager().await;
-    let original = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let original = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     let original_outcome = m.install(&original, None, &[], false).await.unwrap();
 
     let upgraded = GOOD_MANIFEST.replace("version = \"1.2.0\"", "version = \"1.3.0\"");
-    let upgraded_kxp = build_kxp(&upgraded, EMPTY_COMPONENT);
+    let upgraded_kxp = build_kxp(&upgraded, VALID_COMPONENT);
     m.install(&upgraded_kxp, None, &[], false).await.unwrap();
     m.approve_permissions("dev.example.foo").await.unwrap();
     kinetix::plugins::store::set_enabled(&pool, "dev.example.foo", true)
@@ -234,7 +410,7 @@ async fn rollback_revalidates_retained_package_and_clears_authority() {
 #[tokio::test]
 async fn rollback_preview_reports_semantic_permission_diff() {
     let (m, _pool) = manager().await;
-    let original = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let original = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     let original_outcome = m.install(&original, None, &[], false).await.unwrap();
 
     let upgraded = GOOD_MANIFEST
@@ -247,7 +423,7 @@ async fn rollback_preview_reports_semantic_permission_diff() {
             "credential_scopes = [\"provider:foo\"]",
             "credential_scopes = [\"provider:foo\", \"provider:bar\"]\ncredential_read = true",
         );
-    m.install(&build_kxp(&upgraded, EMPTY_COMPONENT), None, &[], false)
+    m.install(&build_kxp(&upgraded, VALID_COMPONENT), None, &[], false)
         .await
         .unwrap();
 
@@ -276,11 +452,11 @@ async fn rollback_preview_reports_semantic_permission_diff() {
 #[tokio::test]
 async fn rollback_rejects_tampered_retained_package() {
     let (m, pool) = manager().await;
-    let original = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let original = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     let original_outcome = m.install(&original, None, &[], false).await.unwrap();
 
     let upgraded = GOOD_MANIFEST.replace("version = \"1.2.0\"", "version = \"1.3.0\"");
-    m.install(&build_kxp(&upgraded, EMPTY_COMPONENT), None, &[], false)
+    m.install(&build_kxp(&upgraded, VALID_COMPONENT), None, &[], false)
         .await
         .unwrap();
 
@@ -304,7 +480,7 @@ async fn rollback_rejects_tampered_retained_package() {
 #[tokio::test]
 async fn reinstall_from_retained_package_recovers_after_removal() {
     let (m, pool) = manager().await;
-    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     let outcome = m.install(&kxp, None, &[], false).await.unwrap();
     let sha = outcome.package_sha256.clone();
 
@@ -338,7 +514,7 @@ async fn reinstall_from_retained_package_recovers_after_removal() {
 #[tokio::test]
 async fn scoped_permission_approval_grants_only_the_requested_subset() {
     let (m, pool) = manager().await;
-    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     m.install(&kxp, None, &[], false).await.unwrap();
 
     // Approve a strict subset of the declared network hosts.
@@ -375,7 +551,7 @@ async fn scoped_permission_approval_grants_only_the_requested_subset() {
 #[tokio::test]
 async fn revoking_a_permission_disables_the_plugin() {
     let (m, pool) = manager().await;
-    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     m.install(&kxp, None, &[], false).await.unwrap();
     m.approve_permissions("dev.example.foo").await.unwrap();
     kinetix::plugins::store::set_enabled(&pool, "dev.example.foo", true)
@@ -397,9 +573,38 @@ async fn revoking_a_permission_disables_the_plugin() {
 async fn incompatible_api_is_rejected_before_enable() {
     let (m, _pool) = manager().await;
     let bad = GOOD_MANIFEST.replace("plugin_api = \"1\"", "plugin_api = \"2\"");
-    let kxp = build_kxp(&bad, EMPTY_COMPONENT);
+    let kxp = build_kxp(&bad, VALID_COMPONENT);
     let err = m.install(&kxp, None, &[], false).await.unwrap_err();
     assert!(err.to_string().contains("incompatible plugin_api"), "{err}");
+}
+
+#[tokio::test]
+async fn install_rejects_host_version_outside_manifest_range() {
+    let (m, _pool) = manager().await;
+    let host_major = env!("CARGO_PKG_VERSION")
+        .split('.')
+        .next()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let required_version = format!("{}.0.0", host_major.saturating_add(1));
+    let manifest = GOOD_MANIFEST.replace(
+        "plugin_api = \"1\"",
+        &format!(
+            "plugin_api = \"1\"\n\n[compatibility]\nmin_host_version = \"{required_version}\""
+        ),
+    );
+
+    let err = m
+        .install(&build_kxp(&manifest, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(&format!("plugin requires Kinetix >= {required_version}")),
+        "{err}"
+    );
+    assert!(m.get("dev.example.foo").await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -408,7 +613,7 @@ async fn undeclared_capabilities_are_rejected() {
     let bad = GOOD_MANIFEST
         .replace("model_sources = [\"foo-models\"]", "")
         .replace("routing_facts = [\"foo-facts\"]", "");
-    let kxp = build_kxp(&bad, EMPTY_COMPONENT);
+    let kxp = build_kxp(&bad, VALID_COMPONENT);
     let err = m.install(&kxp, None, &[], false).await.unwrap_err();
     assert!(
         err.to_string().contains("provides no capabilities"),
@@ -417,23 +622,57 @@ async fn undeclared_capabilities_are_rejected() {
 }
 
 #[tokio::test]
-async fn component_not_implementing_the_world_fails_to_enable() {
+async fn component_missing_required_exports_is_rejected_during_install() {
     let (m, _pool) = manager().await;
     let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
-    m.install(&kxp, None, &[], false).await.unwrap();
-    m.approve_permissions("dev.example.foo").await.unwrap();
-    // Enable instantiates the component; an empty component does not satisfy the
-    // plugin world, so enablement fails closed (AC#4).
-    let err = m.enable("dev.example.foo").await.unwrap_err();
-    assert!(!err.to_string().is_empty());
-    // It stays disabled.
-    assert_eq!(m.get("dev.example.foo").await.unwrap().unwrap().enabled, 0);
+    let err = m.install(&kxp, None, &[], false).await.unwrap_err();
+    assert!(err.to_string().contains("plugin-world validation"), "{err}");
+    assert!(m.get("dev.example.foo").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn install_validates_all_declared_optional_worlds() {
+    let (m, _pool) = manager().await;
+    for (manifest, component) in [
+        (
+            AUTH_MANIFEST,
+            include_bytes!("fixtures/plugin-auth.component.wasm").as_slice(),
+        ),
+        (
+            ACCOUNT_MODELS_MANIFEST,
+            include_bytes!("fixtures/plugin-model-source.component.wasm").as_slice(),
+        ),
+        (
+            ADAPTER_MANIFEST,
+            include_bytes!("fixtures/plugin-adapter.component.wasm").as_slice(),
+        ),
+    ] {
+        m.install(&build_kxp(manifest, component), None, &[], false)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn install_rejects_missing_declared_optional_worlds() {
+    let (m, _pool) = manager().await;
+    for (manifest, world) in [
+        (AUTH_MANIFEST, "auth-world"),
+        (ACCOUNT_MODELS_MANIFEST, "account model-source world"),
+        (ADAPTER_MANIFEST, "provider-adapter world"),
+    ] {
+        let err = m
+            .install(&build_kxp(manifest, EMPTY_COMPONENT), None, &[], false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(world), "{err}");
+    }
 }
 
 #[tokio::test]
 async fn removing_a_plugin_cascades_stored_state() {
     let (m, pool) = manager().await;
-    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     m.install(&kxp, None, &[], false).await.unwrap();
     let crypto = Crypto::new(&[9u8; 32]);
     kinetix::plugins::store::kv_put(&pool, &crypto, "dev.example.foo", "lease:h1", b"secret")
@@ -465,7 +704,7 @@ async fn removing_a_plugin_cascades_stored_state() {
 #[tokio::test]
 async fn a_reference_to_a_disabled_plugin_does_not_resolve() {
     let (m, _pool) = manager().await;
-    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     m.install(&kxp, None, &[], false).await.unwrap();
     // Installed-disabled: a config binding must not resolve (fail closed, §6.0).
     let resolved = m
@@ -477,7 +716,7 @@ async fn a_reference_to_a_disabled_plugin_does_not_resolve() {
 #[tokio::test]
 async fn kv_is_encrypted_and_namespaced_by_plugin() {
     let (m, pool) = manager().await;
-    let kxp = build_kxp(GOOD_MANIFEST, EMPTY_COMPONENT);
+    let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     m.install(&kxp, None, &[], false).await.unwrap();
     let crypto = Crypto::new(&[9u8; 32]);
     kinetix::plugins::store::kv_put(&pool, &crypto, "dev.example.foo", "k", b"v1")

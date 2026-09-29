@@ -71,17 +71,24 @@ pub fn read_package(bytes: &[u8]) -> Result<Package> {
     let mut readme: Option<String> = None;
     let mut license: Option<String> = None;
     let mut signature: Option<Vec<u8>> = None;
+    let mut seen_entries = std::collections::HashSet::new();
 
     for entry in archive.entries().context("reading .kxp entries")? {
         let mut entry = entry.context("reading .kxp entry")?;
         let path = entry.path().context("reading entry path")?.into_owned();
         // §23: reject traversal and absolute/odd paths outright.
         validate_entry_path(&path)?;
+        if !entry.header().entry_type().is_file() {
+            bail!("archive entry '{}' is not a regular file", path.display());
+        }
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
+        if !seen_entries.insert(name.clone()) {
+            bail!("duplicate archive entry '{name}'");
+        }
         let size = entry.header().size().unwrap_or(0);
 
         match name.as_str() {
@@ -211,6 +218,9 @@ fn validate_entry_path(path: &Path) -> Result<()> {
             _ => {}
         }
     }
+    if s.contains('/') || path.components().count() != 1 {
+        bail!("archive entry '{s}' must be a top-level file");
+    }
     Ok(())
 }
 
@@ -272,7 +282,33 @@ mod tests {
         assert!(validate_entry_path(Path::new("../evil")).is_err());
         assert!(validate_entry_path(Path::new("/etc/passwd")).is_err());
         assert!(validate_entry_path(Path::new("sub/../../evil")).is_err());
+        assert!(validate_entry_path(Path::new("sub/plugin.wasm")).is_err());
         assert!(validate_entry_path(Path::new("plugin.wasm")).is_ok());
+    }
+
+    #[test]
+    fn rejects_duplicate_archive_entries() {
+        let mut builder = tar::Builder::new(Vec::new());
+        append(&mut builder, "plugin.toml", b"first");
+        append(&mut builder, "plugin.toml", b"second");
+        append(&mut builder, "plugin.wasm", b"\\0asm\\x01\\0\\0\\0");
+        let err = read_package(&builder.into_inner().unwrap()).err().unwrap();
+        assert!(err.to_string().contains("duplicate archive entry"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_file_archive_entries() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "directory", std::io::empty())
+            .unwrap();
+        let err = read_package(&builder.into_inner().unwrap()).err().unwrap();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
     #[test]

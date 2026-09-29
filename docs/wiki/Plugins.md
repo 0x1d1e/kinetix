@@ -105,6 +105,24 @@ foo.kxp
 └── LICENSE              # Optional license text
 ```
 
+### Plugin API and host compatibility
+
+`plugin_api = "1"` selects the Plugin API 1 ABI. Kinetix 1.x preserves that ABI: existing API-1 plugins remain loadable on later 1.x hosts unless the plugin declares a host-version bound that excludes the host. A manifest without bounds is not limited to the Kinetix version on which it was built.
+
+API-1 revisions may add capabilities through separate optional worlds or interfaces. They must not remove or rename existing interfaces, change existing function signatures or meanings, or make a new guest export mandatory in an existing world. A breaking ABI change requires `plugin_api = "2"` and a new WIT package major; an API-2 plugin is rejected by an API-1 host.
+
+Kinetix pins its Wasmtime/component-model runtime. Runtime upgrades must pass conformance checks with existing API-1 components before release; a runtime upgrade is not a way to bypass the API compatibility promise.
+
+Plugins can opt into an inclusive Kinetix host-version range using full semantic versions:
+
+```toml
+[compatibility]
+min_host_version = "1.0.0"
+max_host_version = "1.9.99"
+```
+
+Either bound may be omitted. An absent `[compatibility]` table means no host-version bound. A malformed range or a host outside the range is rejected during installation and validation.
+
 ### Manifest Example (`plugin.toml`)
 
 ```toml
@@ -149,6 +167,12 @@ max_outbound_requests = 2
 max_http_body = "1MiB"
 storage = "1MiB"
 ```
+
+### Installation validation
+
+CLI installs, dashboard marketplace installs, and local package installs use the same backend validation before package bytes or active plugin metadata are published. Kinetix rejects malformed or unknown manifest fields, unsupported API/host ranges, invalid or duplicate capabilities, undeclared integration references, invalid permission and limit requests, malformed packages, and hash mismatches when an expected SHA-256 is supplied. Local unsigned packages are allowed; a present signature must be well-formed, and an untrusted signature requires an explicit override. Marketplace artifacts require the catalog's exact SHA-256 and a trusted publisher signature.
+
+Kinetix compiles the component and instantiates every world required by its declared capabilities under validation limits with no network or credential authority and isolated temporary storage. Missing exports or failed initialization abort installation. Accepted plugins remain disabled and receive no permission grants until an operator approves them.
 
 ### Integration descriptors
 
