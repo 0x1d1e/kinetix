@@ -71,6 +71,8 @@ pub struct Capabilities {
     #[serde(default, alias = "toolCalling")]
     pub tool_calling: bool,
     #[serde(default)]
+    pub parallel_tools: bool,
+    #[serde(default)]
     pub audio: bool,
     #[serde(default, alias = "structuredOutput")]
     pub structured_output: bool,
@@ -86,6 +88,7 @@ impl Capabilities {
                 "vision" => c.vision = true,
                 "reasoning" => c.reasoning = true,
                 "tool_calling" | "tools" => c.tool_calling = true,
+                "parallel_tools" => c.parallel_tools = true,
                 "audio" => c.audio = true,
                 "structured_output" | "structuredOutput" => c.structured_output = true,
                 _ => {}
@@ -94,13 +97,16 @@ impl Capabilities {
         c
     }
 
-    /// Whether the configured capabilities can satisfy a request's needs.
-    /// Unconfigured metadata counts as compatible (permissive default, FR-12.8).
+    /// Whether this model's declared capabilities can satisfy model-scoped
+    /// request needs. Streaming is integration-scoped and checked separately.
     pub fn satisfies(&self, needs: &CapabilityNeeds) -> bool {
         if needs.vision && !self.vision {
             return false;
         }
         if needs.tools && !self.tool_calling {
+            return false;
+        }
+        if needs.parallel_tools && !self.parallel_tools {
             return false;
         }
         if needs.reasoning && !self.reasoning {
@@ -117,6 +123,8 @@ impl Capabilities {
 pub struct CapabilityNeeds {
     pub vision: bool,
     pub tools: bool,
+    pub parallel_tools: bool,
+    pub streaming: bool,
     pub reasoning: bool,
     pub structured_output: bool,
 }
@@ -462,6 +470,12 @@ impl InternalRequest {
         CapabilityNeeds {
             vision,
             tools: !self.tools.is_empty(),
+            parallel_tools: self
+                .extra
+                .get("parallel_tool_calls")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true),
+            streaming: self.stream,
             reasoning: self.thinking.is_some(),
             structured_output,
         }
@@ -1175,12 +1189,15 @@ mod tests {
             vision: true,
             reasoning: false,
             tool_calling: true,
+            parallel_tools: false,
             audio: false,
             structured_output: false,
         };
         let reasoning_needed = CapabilityNeeds {
             vision: false,
             tools: false,
+            parallel_tools: false,
+            streaming: false,
             reasoning: true,
             structured_output: false,
         };
@@ -1188,6 +1205,8 @@ mod tests {
         let structured_output_needed = CapabilityNeeds {
             vision: false,
             tools: false,
+            parallel_tools: false,
+            streaming: false,
             reasoning: false,
             structured_output: true,
         };
@@ -1195,6 +1214,8 @@ mod tests {
         let text_only = CapabilityNeeds {
             vision: false,
             tools: false,
+            parallel_tools: false,
+            streaming: false,
             reasoning: false,
             structured_output: false,
         };
@@ -1202,10 +1223,21 @@ mod tests {
         let vision_needed = CapabilityNeeds {
             vision: true,
             tools: false,
+            parallel_tools: false,
+            streaming: false,
             reasoning: false,
             structured_output: false,
         };
         assert!(caps.satisfies(&vision_needed));
+
+        let parallel_tools_needed = CapabilityNeeds {
+            parallel_tools: true,
+            ..Default::default()
+        };
+        assert!(!caps.satisfies(&parallel_tools_needed));
+        let parallel_tools_caps: Capabilities =
+            serde_json::from_value(serde_json::json!({ "parallel_tools": true })).unwrap();
+        assert!(parallel_tools_caps.satisfies(&parallel_tools_needed));
     }
 
     #[test]

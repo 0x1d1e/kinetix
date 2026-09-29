@@ -4053,6 +4053,8 @@ fn integration_feature_ceiling_satisfies_needs(
     };
     (!needs.vision || ceiling.vision)
         && (!needs.tools || ceiling.tools)
+        && (!needs.parallel_tools || ceiling.parallel_tools)
+        && (!needs.streaming || ceiling.streaming)
         && (!needs.reasoning || ceiling.reasoning)
         && (!needs.structured_output || ceiling.structured_output)
 }
@@ -4072,6 +4074,7 @@ fn profile_satisfies_needs(
 ) -> bool {
     (!needs.vision || capabilities.vision != Some(false))
         && (!needs.tools || capabilities.tool_calling != Some(false))
+        && (!needs.parallel_tools || capabilities.parallel_tools != Some(false))
         && (!needs.reasoning || capabilities.reasoning != Some(false))
         && (!needs.structured_output || capabilities.structured_output != Some(false))
 }
@@ -5692,6 +5695,10 @@ pub struct DryRunRequest {
     #[serde(default)]
     pub has_structured_output: bool,
     #[serde(default)]
+    pub has_parallel_tools: bool,
+    #[serde(default)]
+    pub streaming: bool,
+    #[serde(default)]
     pub input_tokens: Option<u64>,
     /// Providers the calling key is restricted to (FR-12.19); empty = no
     /// restriction. The dashboard passes the selected key's allowlist so the
@@ -5720,6 +5727,8 @@ pub async fn dry_run(
     let needs = crate::types::CapabilityNeeds {
         vision: descriptor.has_images,
         tools: descriptor.has_tools,
+        parallel_tools: descriptor.has_parallel_tools,
+        streaming: descriptor.streaming,
         reasoning: descriptor.has_reasoning,
         structured_output: descriptor.has_structured_output,
     };
@@ -7070,7 +7079,7 @@ mod route_policy_tests {
         let (state, root, provider_id, model_id, _) = adaptive_dry_run_state().await;
         let ceiling = crate::plugins::types::IntegrationFeaturesV1 {
             schema_version: 1,
-            streaming: true,
+            streaming: false,
             tools: true,
             parallel_tools: false,
             vision: false,
@@ -7124,6 +7133,15 @@ mod route_policy_tests {
                 has_structured_output: true,
                 ..Default::default()
             },
+            DryRunRequest {
+                streaming: true,
+                ..Default::default()
+            },
+            DryRunRequest {
+                has_tools: true,
+                has_parallel_tools: true,
+                ..Default::default()
+            },
         ] {
             let result = dry_run(&state, "adaptive-dry-run", &request).await.unwrap();
             assert!(
@@ -7169,24 +7187,49 @@ mod route_policy_tests {
                     "json_schema": { "name": "answer", "schema": { "type": "object" } }
                 }
             }),
+            serde_json::json!({
+                "model": "adaptive-dry-run",
+                "messages": [{ "role": "user", "content": "stream this" }],
+                "stream": true
+            }),
+            serde_json::json!({
+                "model": "adaptive-dry-run",
+                "messages": [{ "role": "user", "content": "use tools" }],
+                "parallel_tool_calls": true,
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": { "type": "object", "properties": {} }
+                    }
+                }]
+            }),
         ];
+        let mut errors = Vec::new();
         for body in request_bodies {
             let request = crate::frontends::openai::decode_request(body).unwrap();
-            let error = run(
-                &state,
-                crate::frontends::FrontendFormat::OpenAi,
-                None,
-                request,
-                uuid::Uuid::new_v4().to_string(),
-                false,
-                None,
-                Vec::new(),
-            )
-            .await
-            .expect_err("request with an integration-vetoed capability must be rejected");
-            assert_eq!(error.kind, crate::types::ErrorKind::Unsupported);
-            assert!(error.message.contains("target capabilities do not satisfy"));
+            errors.push(
+                run(
+                    &state,
+                    crate::frontends::FrontendFormat::OpenAi,
+                    None,
+                    request,
+                    uuid::Uuid::new_v4().to_string(),
+                    false,
+                    None,
+                    Vec::new(),
+                )
+                .await
+                .expect_err("request without manual-provider credentials must fail"),
+            );
         }
+        assert!(
+            errors.iter().all(|error| {
+                error.kind == crate::types::ErrorKind::Unsupported
+                    && error.message.contains("target capabilities do not satisfy")
+            }),
+            "requests must be rejected by capability eligibility, got: {errors:?}"
+        );
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);
