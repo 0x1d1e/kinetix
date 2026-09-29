@@ -24,6 +24,10 @@ use kinetix::types::{
     InternalRequest, Message, Part, Role, SamplingParams, ThinkingLevel, WireFormat,
 };
 
+/// These tests exercise the host/guest boundary, not publisher trust; local
+/// builds may be signed with a development key unknown to the test manager.
+const ALLOW_UNTRUSTED_TEST_PACKAGE: bool = true;
+
 /// Path to an externally built `.kxp` used for host/guest conformance.
 fn package_path() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("KINETIX_PLUGIN_E2E_PACKAGE").map(std::path::PathBuf::from)?;
@@ -122,7 +126,10 @@ async fn installs_enables_and_instantiates_a_real_component() {
     let bytes = std::fs::read(&path).unwrap();
     let (m, _pool) = manager().await;
 
-    let outcome = m.install(&bytes, None, &[], false).await.unwrap();
+    let outcome = m
+        .install(&bytes, None, &[], ALLOW_UNTRUSTED_TEST_PACKAGE)
+        .await
+        .unwrap();
     assert_eq!(outcome.id, "dev.kinetix.antigravity-oauth");
     assert!(
         outcome
@@ -182,7 +189,9 @@ async fn invokes_a_real_guest_capability_through_the_host_boundary() {
     };
     let bytes = std::fs::read(&path).unwrap();
     let (m, _pool) = manager().await;
-    m.install(&bytes, None, &[], false).await.unwrap();
+    m.install(&bytes, None, &[], ALLOW_UNTRUSTED_TEST_PACKAGE)
+        .await
+        .unwrap();
     m.approve_permissions("dev.kinetix.antigravity-oauth")
         .await
         .unwrap();
@@ -220,7 +229,9 @@ async fn invokes_real_guest_credential_rotation_through_host_boundary() {
     };
     let bytes = std::fs::read(&path).unwrap();
     let (m, _pool) = manager().await;
-    m.install(&bytes, None, &[], false).await.unwrap();
+    m.install(&bytes, None, &[], ALLOW_UNTRUSTED_TEST_PACKAGE)
+        .await
+        .unwrap();
     m.approve_permissions("dev.kinetix.antigravity-oauth")
         .await
         .unwrap();
@@ -240,7 +251,7 @@ async fn invokes_real_guest_credential_rotation_through_host_boundary() {
 }
 
 #[tokio::test]
-async fn a_real_guest_reports_usable_after_enable() {
+async fn a_real_guest_health_probe_is_declared_resolvable_and_invocable() {
     let Some(path) = package_path() else {
         eprintln!(
             "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
@@ -249,18 +260,37 @@ async fn a_real_guest_reports_usable_after_enable() {
     };
     let bytes = std::fs::read(&path).unwrap();
     let (m, _pool) = manager().await;
-    m.install(&bytes, None, &[], false).await.unwrap();
-    m.approve_permissions("dev.kinetix.antigravity-oauth")
+    let id = "dev.kinetix.antigravity-oauth";
+    let outcome = m
+        .install(&bytes, None, &[], ALLOW_UNTRUSTED_TEST_PACKAGE)
         .await
         .unwrap();
-    m.enable("dev.kinetix.antigravity-oauth").await.unwrap();
+    assert!(outcome.provides.iter().any(|provided| {
+        provided.capability == Capability::HealthProbe && provided.name == "antigravity-oauth"
+    }));
+    m.approve_permissions(id).await.unwrap();
+    m.enable(id).await.unwrap();
+    assert!(m.is_usable(id).await);
 
-    // The plugin does not provide health-probe, so the host reports an unknown
-    // capability rather than invoking a missing export. `credential_strategy`
-    // is provided; asking for health through the credential plugin path is
-    // covered by the plugin's own `health` export below.
-    let usable = m.is_usable("dev.kinetix.antigravity-oauth").await;
-    assert!(usable);
+    let reference = format!("plugin:{id}/antigravity-oauth");
+    assert_eq!(
+        m.resolve_binding(&reference, Capability::HealthProbe)
+            .await
+            .as_deref(),
+        Some(id),
+        "the installed .kxp manifest must resolve the health-probe capability"
+    );
+
+    // Missing credentials return a structured guest error, proving that the
+    // installed package's health-probe export ran through the host boundary.
+    let result = m.health_probe(id, "provider_missing", "acc_missing").await;
+    match result {
+        Err(fault) => {
+            assert_eq!(fault.code(), "credential_expired", "got {fault:?}");
+            assert!(!fault.counts_against_circuit());
+        }
+        Ok(observation) => panic!("unexpected health observation: {observation:?}"),
+    }
 }
 
 /// The second world (`plugin-adapter`, §6.3) is bound from the same component
@@ -275,7 +305,9 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
     };
     let bytes = std::fs::read(&path).unwrap();
     let (m, _pool) = manager().await;
-    m.install(&bytes, None, &[], false).await.unwrap();
+    m.install(&bytes, None, &[], ALLOW_UNTRUSTED_TEST_PACKAGE)
+        .await
+        .unwrap();
     m.approve_permissions("dev.kinetix.antigravity-oauth")
         .await
         .unwrap();
@@ -312,6 +344,7 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["model"], "gemini-3-flash");
+    assert_eq!(v["project"], "test-project");
     assert_eq!(v["userAgent"], "antigravity");
     assert_eq!(v["request"]["contents"][0]["parts"][0]["text"], "hi");
     assert_eq!(v["request"]["contents"][0]["role"], "user");
@@ -794,7 +827,9 @@ async fn adapter_classifies_quota_exhaustion() {
     };
     let bytes = std::fs::read(&path).unwrap();
     let (m, _pool) = manager().await;
-    m.install(&bytes, None, &[], false).await.unwrap();
+    m.install(&bytes, None, &[], ALLOW_UNTRUSTED_TEST_PACKAGE)
+        .await
+        .unwrap();
     m.approve_permissions("dev.kinetix.antigravity-oauth")
         .await
         .unwrap();
