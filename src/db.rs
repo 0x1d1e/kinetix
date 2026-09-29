@@ -859,6 +859,7 @@ pub struct AccountRow {
     pub status: String,
     pub status_reason: String,
     pub status_changed_at: Option<String>,
+    /// Optimistic generation for lifecycle and account configuration updates.
     #[serde(skip)]
     pub account_state_version: i64,
     pub cooldown_until: Option<String>,
@@ -985,7 +986,8 @@ pub async fn update_account(
         .await?;
     } else {
         sqlx::query(
-            "UPDATE accounts SET label=?, priority=?, weight=?, soft_quota_usd=?, quota_type=? WHERE id=?",
+            "UPDATE accounts SET label=?, priority=?, weight=?, soft_quota_usd=?, quota_type=?, \
+             account_state_version=account_state_version + 1 WHERE id=?",
         )
         .bind(label)
         .bind(priority)
@@ -1033,6 +1035,45 @@ pub async fn set_account_status(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Apply a runtime lifecycle update only if the request still observes the
+/// account generation from which its credential was resolved.
+pub async fn set_account_status_if_version(
+    pool: &Pool,
+    id: &str,
+    observed_state_version: i64,
+    status: &str,
+    reason_code: &str,
+    cooldown_until: Option<&str>,
+    quota_reset_at: Option<&str>,
+    last_error: Option<&str>,
+) -> Result<bool> {
+    let clears_circuit = status == "healthy";
+    let result = sqlx::query(
+        "UPDATE accounts SET status=?, status_reason=?, \
+         status_changed_at=CASE WHEN status=? AND status_reason=? THEN status_changed_at ELSE ? END, \
+         cooldown_until=?, quota_reset_at=?, last_error=?, \
+         circuit_open_until=CASE WHEN ? THEN NULL ELSE circuit_open_until END, \
+         consecutive_failures=CASE WHEN ? THEN 0 ELSE consecutive_failures END, \
+         account_state_version=account_state_version + 1 \
+         WHERE id=? AND status != 'disabled' AND account_state_version=?",
+    )
+    .bind(status)
+    .bind(reason_code)
+    .bind(status)
+    .bind(reason_code)
+    .bind(now_iso())
+    .bind(cooldown_until)
+    .bind(quota_reset_at)
+    .bind(last_error)
+    .bind(clears_circuit)
+    .bind(clears_circuit)
+    .bind(id)
+    .bind(observed_state_version)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Clear circuit-breaker state after a valid upstream response. The observed
@@ -1104,6 +1145,56 @@ pub async fn delete_account(pool: &Pool, id: &str) -> Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Apply an account-scoped upstream failure and its lifecycle transition in
+/// one compare-and-update. Returning `None` means the attempt's account
+/// generation is stale or the account is already disabled.
+pub async fn apply_account_failure(
+    pool: &Pool,
+    id: &str,
+    observed_state_version: i64,
+    status: &str,
+    reason_code: &str,
+    cooldown_until: Option<&str>,
+    quota_reset_at: Option<&str>,
+    last_error: &str,
+    circuit_threshold: i64,
+    open_secs: i64,
+) -> Result<Option<i64>> {
+    if !matches!(status, "cooldown" | "exhausted" | "disabled") {
+        anyhow::bail!("invalid account failure status: {status}");
+    }
+    let counts_toward_circuit = status != "disabled";
+    let open_until = (Utc::now() + chrono::Duration::seconds(open_secs)).to_rfc3339();
+    let redacted_error = crate::crypto::redact(last_error);
+    let failure_count = sqlx::query_scalar(
+        "UPDATE accounts SET status=?, status_reason=?, \
+         status_changed_at=CASE WHEN status=? AND status_reason=? THEN status_changed_at ELSE ? END, \
+         cooldown_until=?, quota_reset_at=?, last_error=?, \
+         consecutive_failures=consecutive_failures + CASE WHEN ? THEN 1 ELSE 0 END, \
+         circuit_open_until=CASE WHEN ? AND consecutive_failures + 1 >= ? THEN ? ELSE circuit_open_until END, \
+         account_state_version=account_state_version + 1 \
+         WHERE id=? AND status != 'disabled' AND account_state_version=? \
+         RETURNING consecutive_failures",
+    )
+    .bind(status)
+    .bind(reason_code)
+    .bind(status)
+    .bind(reason_code)
+    .bind(now_iso())
+    .bind(cooldown_until)
+    .bind(quota_reset_at)
+    .bind(redacted_error)
+    .bind(counts_toward_circuit)
+    .bind(counts_toward_circuit)
+    .bind(circuit_threshold)
+    .bind(open_until)
+    .bind(id)
+    .bind(observed_state_version)
+    .fetch_optional(pool)
+    .await?;
+    Ok(failure_count)
 }
 
 /// Bump the consecutive-failure counter and open the circuit when the
@@ -3592,6 +3683,72 @@ mod account_success_recovery_tests {
         .await
         .unwrap();
         (pool, account_id, root)
+    }
+
+    #[tokio::test]
+    async fn account_failure_transition_is_atomic_and_generation_guarded() {
+        let (pool, account_id, root) = recovery_account("failure-generation").await;
+        let before = get_account(&pool, &account_id).await.unwrap().unwrap();
+        let cooldown_until = (Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+
+        assert_eq!(
+            apply_account_failure(
+                &pool,
+                &account_id,
+                before.account_state_version,
+                "cooldown",
+                "rate_limited",
+                Some(cooldown_until.as_str()),
+                None,
+                "rate limit",
+                1,
+                60,
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
+        let after_failure = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert_eq!(after_failure.status, "cooldown");
+        assert_eq!(after_failure.status_reason, "rate_limited");
+        assert_eq!(
+            after_failure.cooldown_until.as_deref(),
+            Some(cooldown_until.as_str())
+        );
+        assert_eq!(after_failure.consecutive_failures, 1);
+        assert!(after_failure.circuit_open_until.is_some());
+        assert_eq!(
+            after_failure.account_state_version,
+            before.account_state_version + 1
+        );
+
+        assert_eq!(
+            apply_account_failure(
+                &pool,
+                &account_id,
+                before.account_state_version,
+                "disabled",
+                "auth_error",
+                None,
+                None,
+                "stale unauthorized response",
+                4,
+                30,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        let after_stale_failure = get_account(&pool, &account_id).await.unwrap().unwrap();
+        assert_eq!(after_stale_failure.status, "cooldown");
+        assert_eq!(after_stale_failure.status_reason, "rate_limited");
+        assert_eq!(
+            after_stale_failure.last_error.as_deref(),
+            Some("rate limit")
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     async fn stale_success_after_failure_transition(

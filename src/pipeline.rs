@@ -871,12 +871,18 @@ pub async fn run(
 
         // Soft quota check (FR-12.8).
         if let Ok(true) = pool::soft_quota_reached(&state.pool, &target.account).await {
-            let _ = pool::mark_exhausted(
+            let reset_at = (chrono::Utc::now()
+                + chrono::Duration::seconds(default_quota_window(&target.account)))
+            .to_rfc3339();
+            let _ = db::set_account_status_if_version(
                 &state.pool,
                 &target.account.id,
+                target.account.account_state_version,
+                "exhausted",
+                "account_quota_exhausted",
                 None,
-                default_quota_window(&target.account),
-                "soft quota reached",
+                Some(&reset_at),
+                Some("soft quota reached"),
             )
             .await;
             meta.fallback_path
@@ -1653,20 +1659,45 @@ pub async fn run(
                                 .unwrap_or(if error.retryable { 5 } else { 30 })
                                 .min(3600);
                             let message = format!("credential refresh failed: {}", error.message);
-                            let _ = pool::mark_rate_limited(
+                            let cooldown_until = (chrono::Utc::now()
+                                + chrono::Duration::seconds(cooldown as i64))
+                            .to_rfc3339();
+                            let cooldown_applied = match db::set_account_status_if_version(
                                 &state.pool,
                                 &target.account.id,
-                                cooldown,
-                                &message,
+                                target.account.account_state_version,
+                                "cooldown",
+                                "rate_limited",
+                                Some(&cooldown_until),
+                                None,
+                                Some(&crate::crypto::redact(&message)),
                             )
-                            .await;
-                            // Keep the request planner's in-memory snapshot in
-                            // sync with the cooldown written above.
-                            let _ = state.registry.reload(&state.pool).await;
-                            let detail = format!(
-                                "{}:credential_refresh(cooldown {}s)",
-                                target.account.label, cooldown
-                            );
+                            .await
+                            {
+                                Ok(applied) => applied,
+                                Err(persist_error) => {
+                                    tracing::error!(
+                                        account = %target.account.id,
+                                        error = %persist_error,
+                                        "failed to persist credential refresh cooldown"
+                                    );
+                                    false
+                                }
+                            };
+                            if cooldown_applied {
+                                let _ = state.registry.reload(&state.pool).await;
+                            }
+                            let detail = if cooldown_applied {
+                                format!(
+                                    "{}:credential_refresh(cooldown {}s)",
+                                    target.account.label, cooldown
+                                )
+                            } else {
+                                format!(
+                                    "{}:credential_refresh(stale lifecycle update ignored)",
+                                    target.account.label
+                                )
+                            };
                             meta.fallback_path.push(detail.clone());
                             trace.step("attempt", Some(target.account.label.clone()), detail);
                             tracing::warn!(
@@ -2679,40 +2710,92 @@ async fn handle_key_failure(
 ) {
     let account_id = &target.account.id;
     let label = target.account.label.clone();
+    let (status, reason_code, cooldown_until, quota_reset_at) = match failure.kind {
+        FailureKind::RateLimit => {
+            let cooldown = failure.retry_after_secs.unwrap_or(30).min(3600);
+            let until =
+                (chrono::Utc::now() + chrono::Duration::seconds(cooldown as i64)).to_rfc3339();
+            (Some("cooldown"), "rate_limited", Some(until), None)
+        }
+        FailureKind::QuotaExhausted => {
+            let reset = failure.quota_reset_at.clone().unwrap_or_else(|| {
+                chrono::Utc::now()
+                    + chrono::Duration::seconds(default_quota_window(&target.account))
+            });
+            (
+                Some("exhausted"),
+                "account_quota_exhausted",
+                None,
+                Some(reset.to_rfc3339()),
+            )
+        }
+        FailureKind::AuthError => (Some("disabled"), failure.kind.reason_code(), None, None),
+        _ => (None, failure.kind.reason_code(), None, None),
+    };
+    let mut persistence_failed = false;
+    let failure_count = if let Some(status) = status {
+        match db::apply_account_failure(
+            &state.pool,
+            account_id,
+            target.account.account_state_version,
+            status,
+            reason_code,
+            cooldown_until.as_deref(),
+            quota_reset_at.as_deref(),
+            &failure.message,
+            CIRCUIT_THRESHOLD,
+            CIRCUIT_OPEN_SECS,
+        )
+        .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                persistence_failed = true;
+                tracing::error!(
+                    account = %account_id,
+                    error = %error,
+                    "failed to persist account-scoped upstream failure"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let transition_applied = failure_count.is_some();
+    let n = failure_count.unwrap_or(0);
     let detail = match failure.kind {
         FailureKind::RateLimit => {
             let cooldown = failure.retry_after_secs.unwrap_or(30).min(3600);
-            let _ =
-                pool::mark_rate_limited(&state.pool, account_id, cooldown, &failure.message).await;
-            let d = format!("{label}:429(cooldown {cooldown}s)");
+            let d = if transition_applied {
+                format!("{label}:429(cooldown {cooldown}s)")
+            } else if persistence_failed {
+                format!("{label}:429(lifecycle update failed)")
+            } else {
+                format!("{label}:429(stale failure ignored)")
+            };
             meta.fallback_path.push(d.clone());
             d
         }
         FailureKind::QuotaExhausted => {
-            let _ = pool::mark_exhausted(
-                &state.pool,
-                account_id,
-                failure.quota_reset_at,
-                default_quota_window(&target.account),
-                &failure.message,
-            )
-            .await;
-            let d = format!("{label}:quota_exhausted");
+            let d = if transition_applied {
+                format!("{label}:quota_exhausted")
+            } else if persistence_failed {
+                format!("{label}:quota_exhausted(lifecycle update failed)")
+            } else {
+                format!("{label}:quota_exhausted(stale failure ignored)")
+            };
             meta.fallback_path.push(d.clone());
             d
         }
         FailureKind::AuthError => {
-            let _ = db::set_account_status(
-                &state.pool,
-                account_id,
-                "disabled",
-                failure.kind.reason_code(),
-                None,
-                None,
-                Some(&failure.message),
-            )
-            .await;
-            let d = format!("{label}:auth_error(disabled)");
+            let d = if transition_applied {
+                format!("{label}:auth_error(disabled)")
+            } else if persistence_failed {
+                format!("{label}:auth_error(lifecycle update failed)")
+            } else {
+                format!("{label}:auth_error(stale failure ignored)")
+            };
             meta.fallback_path.push(d.clone());
             d
         }
@@ -2736,30 +2819,16 @@ async fn handle_key_failure(
         FailureKind::ClientCancelled => "client_cancelled".into(),
     };
 
-    let n = if failure.kind.is_account_scoped() {
-        // Circuit breaker (FR-4.7) only tracks failures with direct evidence
-        // that the selected account/credential itself is unavailable.
-        pool::record_failure(
-            &state.pool,
-            account_id,
-            CIRCUIT_THRESHOLD,
-            CIRCUIT_OPEN_SECS,
-        )
-        .await
-        .unwrap_or(0)
-    } else {
-        0
-    };
     trace.failure(Some(label), detail, failure.kind, failure.status);
-    if n >= CIRCUIT_THRESHOLD {
+    if transition_applied && n >= CIRCUIT_THRESHOLD {
         trace.step(
             "skip",
             None,
             format!("circuit opened for account after {n} consecutive failures"),
         );
     }
-    if failure.kind.is_account_scoped() {
-        // Refresh the registry snapshot so later requests see the new status.
+    if transition_applied {
+        // Refresh only after this request successfully mutated account state.
         let _ = state.registry.reload(&state.pool).await;
     }
 }

@@ -23,7 +23,7 @@ use kinetix::{
     types::{AuthScheme, WireFormat},
 };
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 const CLIENT_KEY: &str = "sk-kinetix-responses-pipeline-test";
 const UPSTREAM_MODEL: &str = "upstream-responses-model";
@@ -33,17 +33,21 @@ struct CapturedRequest {
     method: Method,
     path: String,
     body: Value,
+    authorization: Option<String>,
 }
 
 #[derive(Clone, Default)]
 struct MockUpstream {
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    stale_auth_started: Arc<Notify>,
+    release_stale_auth: Arc<Notify>,
 }
 
 async fn upstream(
     State(mock): State<MockUpstream>,
     method: Method,
     uri: Uri,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
     let input = body.get("input");
@@ -72,9 +76,45 @@ async fn upstream(
         method,
         path: uri.path().to_string(),
         body,
+        authorization: headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
     });
 
     match test_case.as_str() {
+        "stale_auth" => {
+            if headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                == Some("Bearer previous")
+            {
+                mock.stale_auth_started.notify_one();
+                mock.release_stale_auth.notified().await;
+                Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"error":{"message":"invalid credential"}}"#))
+                    .unwrap()
+            } else {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "id": "resp_rotated_credential",
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "rotated"}]
+                            }],
+                            "usage": {"input_tokens": 1, "output_tokens": 1}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap()
+            }
+        }
         "probe_race" => {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             Response::builder()
@@ -884,6 +924,155 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_work_en
         .filter(|request| request.body["input"] == "case:probe_race")
         .count();
     assert_eq!(probe_dispatches, 1, "only one upstream probe may dispatch");
+
+    // An in-flight request that used a revoked manual key must not disable a
+    // replacement credential after the operator rotates it.
+    let stale_account_id = db::insert_account(
+        &state.pool,
+        &provider_id,
+        "stale-auth-account",
+        &state.crypto.encrypt("previous").unwrap(),
+        "previous",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+    let stale_route_id = db::insert_route(
+        &state.pool,
+        &db::NewRoute {
+            name: "stale-auth-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &state.pool,
+        &stale_route_id,
+        Some(&stale_account_id),
+        &model_id,
+        1,
+        1,
+        "{}",
+        "{}",
+    )
+    .await
+    .unwrap();
+    state.registry.reload(&state.pool).await.unwrap();
+    let attempt_account = db::get_account(&state.pool, &stale_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let stale_request_state = state.clone();
+    let stale_request = tokio::spawn(async move {
+        call_responses(
+            &stale_request_state,
+            "stale-auth-route",
+            "stale_auth",
+            false,
+            json!({}),
+        )
+        .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        mock.stale_auth_started.notified(),
+    )
+    .await
+    .expect("old-key request should reach the held upstream response");
+    let stale_request_capture = mock
+        .requests
+        .lock()
+        .await
+        .iter()
+        .find(|request| request.body["input"] == "case:stale_auth")
+        .cloned()
+        .expect("stale-auth request should be captured");
+    assert_eq!(
+        stale_request_capture.authorization.as_deref(),
+        Some("Bearer previous")
+    );
+
+    let rotated_body: kinetix::admin::AccountBody = serde_json::from_value(json!({
+        "provider_id": provider_id,
+        "label": "stale-auth-account",
+        "api_key": "replacement",
+        "priority": 1,
+        "weight": 1,
+        "soft_quota_usd": null,
+        "quota_type": "none",
+        "status": null
+    }))
+    .unwrap();
+    let _ = kinetix::admin::update_account(
+        State(state.clone()),
+        kinetix::auth::AdminAuth {
+            actor: "test-admin".into(),
+            token: "test-admin-token".into(),
+        },
+        axum::extract::Path(stale_account_id.clone()),
+        Json(rotated_body),
+    )
+    .await
+    .expect("manual credential rotation should succeed");
+    let rotated_account = db::get_account(&state.pool, &stale_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rotated_account.account_state_version > attempt_account.account_state_version);
+    assert_eq!(rotated_account.status, "healthy");
+    assert_eq!(rotated_account.key_mask, crypto::mask_secret("replacement"));
+
+    mock.release_stale_auth.notify_one();
+    let _ = stale_request.await.unwrap();
+    let after_stale_failure = db::get_account(&state.pool, &stale_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_stale_failure.status, "healthy",
+        "a 401 from the replaced key must not disable the new credential"
+    );
+    assert_eq!(
+        after_stale_failure.key_mask,
+        crypto::mask_secret("replacement")
+    );
+    assert_eq!(
+        state
+            .crypto
+            .decrypt(&after_stale_failure.secret_enc)
+            .unwrap(),
+        "replacement"
+    );
+    let (status, body) =
+        call_responses(&state, "stale-auth-route", "stale_auth", false, json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rotated credential should remain eligible: {body}"
+    );
+    let rotated_request = mock
+        .requests
+        .lock()
+        .await
+        .iter()
+        .filter(|request| request.body["input"] == "case:stale_auth")
+        .last()
+        .cloned()
+        .expect("replacement credential request should be captured");
+    assert_eq!(
+        rotated_request.authorization.as_deref(),
+        Some("Bearer replacement")
+    );
 
     server.abort();
     let _ = std::fs::remove_dir_all(&root);
