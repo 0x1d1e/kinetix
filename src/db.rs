@@ -5969,7 +5969,7 @@ mod usage_request_log_tests {
             .await
             .unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].1, 23);
+        assert_eq!(entries[0].1, Some(23));
         assert_eq!(
             key_usage_since(&pool, "usage-view-key", "2026-01-02T00:00:00Z")
                 .await

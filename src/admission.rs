@@ -225,8 +225,6 @@ struct ActiveReservation {
     at: Instant,
     tokens: u64,
     cost: Option<f64>,
-    day: NaiveDate,
-    month: (i32, u32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -264,11 +262,20 @@ impl AdmissionReservation {
     }
 
     /// Settle the request count and retain its conservative token estimate.
-    pub(crate) fn reconcile_incomplete(self) {
-        self.reconcile(&TokenUsage::default(), None);
+    pub(crate) fn reconcile_incomplete_at(self, now_wall: chrono::DateTime<Utc>) {
+        self.reconcile_at(&TokenUsage::default(), None, now_wall);
     }
 
-    pub fn reconcile(mut self, usage: &TokenUsage, actual_cost: Option<f64>) {
+    pub fn reconcile(self, usage: &TokenUsage, actual_cost: Option<f64>) {
+        self.reconcile_at(usage, actual_cost, Utc::now());
+    }
+
+    pub(crate) fn reconcile_at(
+        mut self,
+        usage: &TokenUsage,
+        actual_cost: Option<f64>,
+        now_wall: chrono::DateTime<Utc>,
+    ) {
         let actual_tokens = match (usage.input, usage.output) {
             (Some(input), Some(output)) => Some(input.saturating_add(output)),
             _ => None,
@@ -278,7 +285,7 @@ impl AdmissionReservation {
             self.id,
             actual_tokens,
             actual_cost,
-            Utc::now(),
+            now_wall,
             Instant::now(),
         );
         self.metrics
@@ -425,6 +432,18 @@ impl AdmissionController {
     }
 
     async fn ensure_initialized(&self, pool: &Pool, key_id: &str, entry: &Arc<KeyAdmission>) {
+        self.ensure_initialized_at(pool, key_id, entry, Utc::now(), Instant::now())
+            .await;
+    }
+
+    async fn ensure_initialized_at(
+        &self,
+        pool: &Pool,
+        key_id: &str,
+        entry: &Arc<KeyAdmission>,
+        wall_now: chrono::DateTime<Utc>,
+        instant_now: Instant,
+    ) {
         if entry.initialized.load(Ordering::Acquire) {
             return;
         }
@@ -434,11 +453,20 @@ impl AdmissionController {
             return;
         }
 
-        let wall_now = Utc::now();
-        let instant_now = Instant::now();
         let minute_since = (wall_now - chrono::Duration::seconds(60)).to_rfc3339();
-        let daily_since = crate::pool::window_start("daily", None);
-        let monthly_since = crate::pool::window_start("monthly", None);
+        let daily_since = wall_now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .map(|start| start.and_utc())
+            .unwrap_or(wall_now)
+            .to_rfc3339();
+        let monthly_since = wall_now
+            .date_naive()
+            .with_day(1)
+            .and_then(|first| first.and_hms_opt(0, 0, 0))
+            .map(|start| start.and_utc())
+            .unwrap_or(wall_now)
+            .to_rfc3339();
 
         let (minute, daily, monthly) = tokio::join!(
             db::key_usage_entries_since(pool, key_id, &minute_since),
@@ -568,9 +596,6 @@ impl KeyLedger {
     fn current(&mut self, now_wall: chrono::DateTime<Utc>, now: Instant) -> (u64, u64, f64, f64) {
         self.roll_periods(now_wall);
         self.prune(now);
-        let day = now_wall.date_naive();
-        let month = (now_wall.year(), now_wall.month());
-
         let mut requests = self.minute.len() as u64;
         let mut tokens = self.minute.iter().fold(0_u64, |total, entry| {
             entry
@@ -580,18 +605,16 @@ impl KeyLedger {
         let mut daily = self.daily_spend;
         let mut monthly = self.monthly_spend;
 
+        // Usage rows are timestamped at completion, so active reservations belong
+        // to the period currently being admitted, regardless of start time.
         for active in self.active.values() {
             if now.saturating_duration_since(active.at) < MINUTE_WINDOW {
                 requests = requests.saturating_add(1);
                 tokens = tokens.saturating_add(active.tokens);
             }
             if let Some(cost) = active.cost {
-                if active.day == day {
-                    daily += cost;
-                }
-                if active.month == month {
-                    monthly += cost;
-                }
+                daily += cost;
+                monthly += cost;
             }
         }
         (requests, tokens, daily, monthly)
@@ -604,8 +627,6 @@ impl KeyLedger {
     ) -> AdmissionBudgetSnapshot {
         self.roll_periods(now_wall);
         self.prune(now);
-        let day = now_wall.date_naive();
-        let month = (now_wall.year(), now_wall.month());
         let mut snapshot = AdmissionBudgetSnapshot {
             daily: AdmissionBudgetPeriodSnapshot {
                 settled_spend_usd: self.daily_spend,
@@ -617,17 +638,16 @@ impl KeyLedger {
             },
         };
 
+        // Match admission: any active reservation may settle into this period.
         for active in self.active.values() {
-            if active.day == day {
-                match active.cost {
-                    Some(cost) => snapshot.daily.active_reserved_usd += cost,
-                    None => snapshot.daily.has_unknown_active_cost = true,
+            match active.cost {
+                Some(cost) => {
+                    snapshot.daily.active_reserved_usd += cost;
+                    snapshot.monthly.active_reserved_usd += cost;
                 }
-            }
-            if active.month == month {
-                match active.cost {
-                    Some(cost) => snapshot.monthly.active_reserved_usd += cost,
-                    None => snapshot.monthly.has_unknown_active_cost = true,
+                None => {
+                    snapshot.daily.has_unknown_active_cost = true;
+                    snapshot.monthly.has_unknown_active_cost = true;
                 }
             }
         }
@@ -760,8 +780,6 @@ impl KeyLedger {
                 at: now,
                 tokens: estimate.tokens,
                 cost: estimate.cost,
-                day: now_wall.date_naive(),
-                month: (now_wall.year(), now_wall.month()),
             },
         );
         Ok(())
@@ -789,14 +807,11 @@ impl KeyLedger {
             });
         }
 
+        // roll_periods() selected the completion period, matching the usage row timestamp.
         let cost = actual_cost.or(active.cost);
         if let Some(cost) = cost {
-            if self.daily_day == Some(active.day) {
-                self.daily_spend += cost;
-            }
-            if self.monthly_key == Some(active.month) {
-                self.monthly_spend += cost;
-            }
+            self.daily_spend += cost;
+            self.monthly_spend += cost;
         }
     }
 
@@ -1107,6 +1122,141 @@ mod tests {
         assert_eq!(reservations.len(), 3);
     }
 
+    #[tokio::test]
+    async fn active_budget_reservations_follow_completion_period_across_utc_rollover() {
+        let before_midnight = chrono::DateTime::parse_from_rfc3339("2026-01-31T23:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let after_midnight = chrono::DateTime::parse_from_rfc3339("2026-02-01T00:00:02Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let before_instant = Instant::now();
+        let after_instant = before_instant + Duration::from_secs(3);
+        let estimate = AdmissionEstimate {
+            tokens: 1,
+            cost: Some(0.8),
+        };
+        let mut key = key();
+        key.daily_budget = Some(1.0);
+        key.monthly_budget = Some(1.0);
+
+        let mut ledger = KeyLedger::default();
+        assert!(ledger
+            .reserve(1, &key, estimate, before_midnight, before_instant)
+            .is_ok());
+
+        let active = ledger.budget_snapshot(after_midnight, after_instant);
+        assert_eq!(active.daily.active_reserved_usd, 0.8);
+        assert_eq!(active.monthly.active_reserved_usd, 0.8);
+        assert!(ledger
+            .reserve(
+                2,
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.8),
+                },
+                after_midnight,
+                after_instant,
+            )
+            .is_err());
+
+        ledger.reconcile(1, Some(1), Some(0.8), after_midnight, after_instant);
+        let settled = ledger.budget_snapshot(after_midnight, after_instant);
+        assert_eq!(settled.daily.settled_spend_usd, 0.8);
+        assert_eq!(settled.monthly.settled_spend_usd, 0.8);
+        assert!(ledger
+            .reserve(
+                3,
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.3),
+                },
+                after_midnight,
+                after_instant,
+            )
+            .is_err());
+
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-admission-rollover-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = db::connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+            .await
+            .unwrap();
+        db::migrate(&pool).await.unwrap();
+        let completion_ts = after_midnight.to_rfc3339();
+        sqlx::query(
+            "INSERT INTO usage_logs
+             (id, request_id, ts, key_id, client_format, requested_model, status, status_code,
+              input_tokens, output_tokens, cost_usd, cost_known)
+             VALUES ('rollover', 'rollover', ?, 'key', 'openai', 'model', 'success', 200, 1, 1, 0.8, 1)",
+        )
+        .bind(&completion_ts)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let day_start = "2026-02-01T00:00:00+00:00";
+        assert_eq!(
+            db::key_admission_budget_spend_since(&pool, "key", day_start)
+                .await
+                .unwrap(),
+            settled.daily.settled_spend_usd
+        );
+        let persisted_usage =
+            db::client_usage_summary(&pool, "key", day_start, "2026-02-02T00:00:00+00:00")
+                .await
+                .unwrap();
+        assert_eq!(
+            persisted_usage.known_cost_usd,
+            settled.daily.settled_spend_usd
+        );
+
+        let restarted = AdmissionController::default();
+        let restarted_entry = restarted.entry("key");
+        restarted
+            .ensure_initialized_at(
+                &pool,
+                "key",
+                &restarted_entry,
+                after_midnight,
+                after_instant,
+            )
+            .await;
+        let restored = restarted_entry
+            .ledger
+            .lock()
+            .budget_snapshot(after_midnight, after_instant);
+        assert_eq!(
+            restored.daily.settled_spend_usd,
+            settled.daily.settled_spend_usd
+        );
+        assert_eq!(
+            restored.monthly.settled_spend_usd,
+            settled.monthly.settled_spend_usd
+        );
+        assert!(restarted_entry
+            .ledger
+            .lock()
+            .reserve(
+                1,
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.3),
+                },
+                after_midnight,
+                after_instant,
+            )
+            .is_err());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn budget_snapshot_includes_active_reservations_without_exposing_them_individually() {
         let (controller, entry) = initialized_controller();
@@ -1232,7 +1382,7 @@ mod tests {
                 },
             )
             .unwrap();
-        reservation.reconcile_incomplete();
+        reservation.reconcile_incomplete_at(Utc::now());
         let second = controller.reserve_initialized(
             entry,
             &key,

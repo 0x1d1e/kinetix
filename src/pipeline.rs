@@ -189,18 +189,19 @@ impl Drop for RequestMeta {
                 .as_ref()
                 .is_some_and(crate::client_disconnect::ClientDisconnect::is_cancelled);
         if disconnected_after_dispatch {
-            self.record_cancelled_accounting();
+            let completion_time = chrono::Utc::now();
+            self.record_cancelled_accounting(completion_time);
             if let Some(admission) = self.admission.take() {
                 // The active dispatch may have incurred unreported usage. Earlier
                 // attempts cannot make this request's total exact.
-                admission.reconcile_incomplete();
+                admission.reconcile_incomplete_at(completion_time);
             }
         }
     }
 }
 
 impl RequestMeta {
-    fn record_cancelled_accounting(&mut self) {
+    fn record_cancelled_accounting(&mut self, completion_time: chrono::DateTime<chrono::Utc>) {
         if self.accounting_enqueued.load(Ordering::Acquire) {
             return;
         }
@@ -242,7 +243,7 @@ impl RequestMeta {
         let request_row = UsageLogRow {
             id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
             request_id: self.request_id.clone(),
-            ts: db::now_iso(),
+            ts: completion_time.to_rfc3339(),
             key_id: self.key_id.clone(),
             key_name: self.key_name.clone(),
             client_format: self.client_format.to_string(),
@@ -1971,7 +1972,7 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                 );
                                 let client_error = failure_to_error(&failure, target);
-                                record_precommit_request_log(
+                                let completion_time = record_precommit_request_log(
                                     state,
                                     &meta,
                                     &req,
@@ -1986,13 +1987,14 @@ pub(crate) async fn run_with_disconnect(
                                     attempts_done,
                                 );
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
-                                enqueue_precommit_failure(
+                                enqueue_precommit_failure_at(
                                     state,
                                     &req,
                                     &mut meta,
                                     started,
                                     attempts_done,
                                     &client_error,
+                                    completion_time,
                                 );
                                 return Err(client_error);
                             }
@@ -2314,7 +2316,7 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                     None,
                                 );
-                                record_precommit_request_log(
+                                let completion_time = record_precommit_request_log(
                                     state,
                                     &meta,
                                     &req,
@@ -2329,13 +2331,14 @@ pub(crate) async fn run_with_disconnect(
                                     attempts_done,
                                 );
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
-                                enqueue_precommit_failure(
+                                enqueue_precommit_failure_at(
                                     state,
                                     &req,
                                     &mut meta,
                                     started,
                                     attempts_done,
                                     &refresh_error,
+                                    completion_time,
                                 );
                                 return Err(refresh_error);
                             }
@@ -2374,7 +2377,7 @@ pub(crate) async fn run_with_disconnect(
                         None,
                         None,
                     );
-                    record_precommit_request_log(
+                    let completion_time = record_precommit_request_log(
                         state,
                         &meta,
                         &req,
@@ -2389,13 +2392,14 @@ pub(crate) async fn run_with_disconnect(
                         attempts_done,
                     );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
-                    enqueue_precommit_failure(
+                    enqueue_precommit_failure_at(
                         state,
                         &req,
                         &mut meta,
                         started,
                         attempts_done,
                         &client_error,
+                        completion_time,
                     );
                     return Err(client_error);
                 }
@@ -2481,7 +2485,7 @@ pub(crate) async fn run_with_disconnect(
                         None,
                         None,
                     );
-                    record_precommit_request_log(
+                    let completion_time = record_precommit_request_log(
                         state,
                         &meta,
                         &req,
@@ -2496,13 +2500,14 @@ pub(crate) async fn run_with_disconnect(
                         attempts_done,
                     );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
-                    enqueue_precommit_failure(
+                    enqueue_precommit_failure_at(
                         state,
                         &req,
                         &mut meta,
                         started,
                         attempts_done,
                         &client_error,
+                        completion_time,
                     );
                     return Err(client_error);
                 }
@@ -2527,7 +2532,7 @@ pub(crate) async fn run_with_disconnect(
         .unwrap_or_else(|| format!("all targets of {name} are currently unavailable"));
     trace.finish("all_targets_unavailable");
     if let Some(failure) = last_precommit_failure.as_ref() {
-        record_precommit_request_log(
+        let completion_time = record_precommit_request_log(
             state,
             &meta,
             &req,
@@ -2541,13 +2546,14 @@ pub(crate) async fn run_with_disconnect(
             started,
             failure.attempts_done,
         );
-        enqueue_precommit_failure(
+        enqueue_precommit_failure_at(
             state,
             &req,
             &mut meta,
             started,
             failure.attempts_done,
             &failure.client_error,
+            completion_time,
         );
     }
     state.live.finish(
@@ -2597,7 +2603,28 @@ fn enqueue_precommit_failure(
     attempts_done: usize,
     error: &ProxyError,
 ) {
+    enqueue_precommit_failure_at(
+        state,
+        req,
+        meta,
+        started,
+        attempts_done,
+        error,
+        chrono::Utc::now(),
+    );
+}
+
+fn enqueue_precommit_failure_at(
+    state: &AppState,
+    req: &InternalRequest,
+    meta: &mut RequestMeta,
+    started: Instant,
+    attempts_done: usize,
+    error: &ProxyError,
+    completion_time: chrono::DateTime<chrono::Utc>,
+) {
     let retries = attempts_done.saturating_sub(1) as i64;
+    let completion_ts = completion_time.to_rfc3339();
     let upstream_dispatched = meta.upstream_dispatched.load(Ordering::Acquire);
     let not_dispatched = !upstream_dispatched;
     let usage = TokenUsage {
@@ -2616,10 +2643,10 @@ fn enqueue_precommit_failure(
         })
         .flatten();
     if !meta.accounting_enqueued.swap(true, Ordering::AcqRel) {
-        state.log_queue.enqueue(db::UsageLogRow {
+        let row = db::UsageLogRow {
             id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
             request_id: meta.request_id.clone(),
-            ts: db::now_iso(),
+            ts: completion_ts,
             key_id: meta.key_id.clone(),
             key_name: meta.key_name.clone(),
             client_format: meta.client_format.to_string(),
@@ -2659,15 +2686,23 @@ fn enqueue_precommit_failure(
             route_trace_id: None,
             opaque_route_id: None,
             admission_cost_usd,
+        };
+        state.log_queue.enqueue_bundle(db::UsageAccountingBundle {
+            request: row,
+            attempts: meta
+                .partial_attempts
+                .iter()
+                .map(|attempt| attempt.row.clone())
+                .collect(),
         });
     }
     if let Some(admission) = meta.admission.take() {
         if upstream_dispatched {
             let (admission_usage, admission_cost) =
                 aggregate_admission_accounting(meta, None, None);
-            admission.reconcile(&admission_usage, admission_cost);
+            admission.reconcile_at(&admission_usage, admission_cost, completion_time);
         } else {
-            admission.reconcile(&usage, cost);
+            admission.reconcile_at(&usage, cost, completion_time);
         }
     }
 }
@@ -6873,7 +6908,9 @@ fn record_precommit_request_log(
     termination: StreamTermination,
     started: Instant,
     attempts_done: usize,
-) {
+) -> chrono::DateTime<chrono::Utc> {
+    let completion_time = chrono::Utc::now();
+    let completion_ts = completion_time.to_rfc3339();
     let (usage, cost) = aggregate_request_accounting(meta, None, None);
     let admission_cost_usd = if usage.input.is_some() && usage.output.is_some() && cost.is_some() {
         None
@@ -6895,7 +6932,7 @@ fn record_precommit_request_log(
     let row = UsageLogRow {
         id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
         request_id: meta.request_id.clone(),
-        ts: db::now_iso(),
+        ts: completion_ts,
         key_id: key.map(|key| key.id.clone()),
         key_name: key.map(|key| key.name.clone()),
         client_format: meta.client_format.to_string(),
@@ -6940,6 +6977,7 @@ fn record_precommit_request_log(
             .collect(),
     });
     meta.accounting_enqueued.store(true, Ordering::Release);
+    completion_time
 }
 
 /// Compute cost and enqueue the usage row (never blocks the request path),
@@ -7128,8 +7166,10 @@ async fn finalize_log(
             .as_ref()
             .and_then(|admission| admission.conservative_cost_estimate())
     };
+    let completion_time = chrono::Utc::now();
+    let completion_ts = completion_time.to_rfc3339();
     if let Some(admission) = meta.admission.take() {
-        admission.reconcile(&admission_usage, admission_cost);
+        admission.reconcile_at(&admission_usage, admission_cost, completion_time);
     }
 
     // Accounting truthfulness (FR-6.8): provider-reported vs unknown.
@@ -7183,7 +7223,7 @@ async fn finalize_log(
     let row = UsageLogRow {
         id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
         request_id: meta.request_id.clone(),
-        ts: db::now_iso(),
+        ts: completion_ts,
         key_id: key.as_ref().map(|k| k.id.clone()),
         key_name: key.as_ref().map(|k| k.name.clone()),
         client_format: meta.client_format.to_string(),

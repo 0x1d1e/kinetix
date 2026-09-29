@@ -49,7 +49,10 @@ Enforced before proxying:
 Inference admission is atomic per virtual key. Kinetix reserves one RPM slot,
 a conservative token allowance, and conservative priced spend before dispatch.
 Active reservations participate in later admission decisions immediately, so a
-concurrent burst cannot all observe the same stale counter. Complete provider
+concurrent burst cannot all observe the same stale counter. An active budget
+reservation applies to the current UTC day and month, even if the request began
+in an earlier period. Completion settles its cost into the completion period,
+matching usage-log timestamps and restart reconstruction. Complete provider
 usage reconciles the reservation after the request. If token usage is unknown,
 the live TPM ledger retains the conservative estimate. After a restart, a
 persisted unknown token total fails closed for the rest of that 60-second
