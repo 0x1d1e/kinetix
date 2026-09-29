@@ -10695,7 +10695,6 @@ pub async fn import_config(
                 None
             }
         };
-        let source_integration_installed = installed_ceilings.is_some();
         let (integration_features, integration_protocols) =
             if let Some(ceilings) = installed_ceilings {
                 ceilings
@@ -10728,29 +10727,38 @@ pub async fn import_config(
             };
         if let Some(protocols) = integration_protocols.as_ref() {
             if let Some(wire) = WireFormat::parse(p["wire_format"].as_str().unwrap_or("")) {
+                // Installed manifests stay authoritative; defer only live adapter checks
+                // until the bound plugin is enabled and its grants are approved.
                 let result = if protocols
                     .upstream
                     .iter()
                     .any(|protocol| protocol == "plugin-native")
                 {
-                    if source_integration_installed {
-                        match state.plugin_manager() {
-                            Some(manager) => {
-                                validate_integration_upstream_protocols(
-                                    manager,
-                                    Some(protocols),
-                                    wire.as_str(),
-                                    p["wire_plugin"].as_str().unwrap_or(""),
-                                )
-                                .await
-                            }
-                            None => Err("plugin-native requires the plugin host".to_string()),
+                    let wire_plugin = p["wire_plugin"].as_str().unwrap_or("");
+                    if let (Some(manager), Some(binding)) = (
+                        state.plugin_manager(),
+                        crate::plugins::PluginRef::parse(wire_plugin),
+                    ) {
+                        if manager.is_usable(&binding.plugin_id).await {
+                            validate_integration_upstream_protocols(
+                                manager,
+                                Some(protocols),
+                                wire.as_str(),
+                                wire_plugin,
+                            )
+                            .await
+                        } else {
+                            validate_imported_upstream_protocols_structurally(
+                                protocols,
+                                wire.as_str(),
+                                wire_plugin,
+                            )
                         }
                     } else {
                         validate_imported_upstream_protocols_structurally(
                             protocols,
                             wire.as_str(),
-                            p["wire_plugin"].as_str().unwrap_or(""),
+                            wire_plugin,
                         )
                     }
                 } else {
@@ -23235,7 +23243,7 @@ mod credential_enrollment_regression_tests {
             State(target.clone()),
             auth(),
             Json(ImportBody {
-                config: exported,
+                config: exported.clone(),
                 apply: true,
             }),
         )
@@ -23299,6 +23307,9 @@ base_url = "https://native.example/v1"
 wire_format = "plugin"
 auth_scheme = "bearer"
 
+[permissions]
+network_hosts = ["native.example"]
+
 [limits]
 memory = "128MiB"
 storage = "2MiB"
@@ -23323,6 +23334,47 @@ storage = "2MiB"
         let package = archive.into_inner().unwrap();
         let manager = target.plugin_manager().unwrap().clone();
         manager.install(&package, None, &[], false).await.unwrap();
+        assert!(!manager
+            .get("plugin.test")
+            .await
+            .unwrap()
+            .unwrap()
+            .status()
+            .is_enabled());
+
+        let imported_while_disabled = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(imported_while_disabled["ok"], true);
+        let disabled_provider = db::list_providers(&target.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "native-provider")
+            .unwrap();
+        assert!(
+            !disabled_provider
+                .integration_feature_ceiling()
+                .unwrap()
+                .unwrap()
+                .vision
+        );
+        let disabled_protocols = disabled_provider
+            .integration_protocol_ceiling()
+            .unwrap()
+            .unwrap();
+        assert_eq!(disabled_protocols.input, vec!["anthropic"]);
+        assert_eq!(disabled_protocols.upstream, vec!["plugin-native"]);
+        assert!(target.adapters.for_transport(&transport).is_err());
+
         manager.approve_permissions("plugin.test").await.unwrap();
         manager.enable("plugin.test").await.unwrap();
         register_enabled_plugin_capabilities(&target, "plugin.test").await;
