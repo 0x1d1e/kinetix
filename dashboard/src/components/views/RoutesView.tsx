@@ -240,6 +240,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
       portabilityPolicy: 'strip_with_warning',
       cacheAffinity: true,
       stickyRouting: sticky,
+      maxAttempts: null,
       maxConcurrentRequests: maxConcurrentRequests === '' ? null : Number(maxConcurrentRequests),
       totalHops: 0,
       status: 'active',

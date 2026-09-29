@@ -6098,38 +6098,150 @@ pub struct DryRunRequest {
 fn route_selection_is_stochastic(
     route: Option<&db::RouteRow>,
     candidates: &[ResolvedTarget],
+    selection_candidates: &[(usize, String, bool, bool, bool)],
+    affinity_candidate_id: Option<&str>,
+    quota_fallback_allowed: bool,
 ) -> bool {
-    let mut groups: std::collections::HashMap<String, Vec<&ResolvedTarget>> =
-        std::collections::HashMap::new();
-    for candidate in candidates {
-        let group = match route {
-            Some(_) => candidate
-                .route_target_id
-                .clone()
-                .unwrap_or_else(|| format!("account:{}", candidate.account.id)),
-            None => "direct-account-pool".to_string(),
-        };
-        groups.entry(group).or_default().push(candidate);
+    let state_by_id: std::collections::HashMap<_, _> = selection_candidates
+        .iter()
+        .map(|(rank, id, eligible, quota_check_reached, quota_reached)| {
+            (
+                id.as_str(),
+                (
+                    *rank,
+                    *eligible && !*quota_reached,
+                    *quota_check_reached && *quota_reached,
+                ),
+            )
+        })
+        .collect();
+    let dispatchable = |candidate: &ResolvedTarget| {
+        state_by_id
+            .get(adaptive_candidate_key(candidate).as_str())
+            .is_some_and(|(_, eligible, _)| *eligible)
+    };
+    let quota_stops = |candidate: &ResolvedTarget| {
+        !quota_fallback_allowed
+            && state_by_id
+                .get(adaptive_candidate_key(candidate).as_str())
+                .is_some_and(|(_, _, quota_reached)| *quota_reached)
+    };
+
+    // Runtime promotes the exact remembered candidate after strategy ordering.
+    // If it can pass the pre-dispatch gates, no randomized ordering can change
+    // the first attempt.
+    if let Some(affinity_id) = affinity_candidate_id {
+        if candidates.iter().any(|candidate| {
+            adaptive_candidate_key(candidate) == affinity_id
+                && (dispatchable(candidate) || quota_stops(candidate))
+        }) {
+            return false;
+        }
     }
 
-    if groups.values().any(|group| {
-        let Some(min_priority) = group
+    let account_frontier_is_stochastic = |group: &[&ResolvedTarget]| {
+        let active: Vec<_> = group
+            .iter()
+            .copied()
+            .filter(|candidate| dispatchable(candidate) || quota_stops(candidate))
+            .collect();
+        let Some(first_priority) = active
             .iter()
             .map(|candidate| candidate.account.priority)
             .min()
         else {
             return false;
         };
-        group
+        let first_tier: Vec<_> = active
+            .into_iter()
+            .filter(|candidate| candidate.account.priority == first_priority)
+            .collect();
+        let dispatch_count = first_tier
             .iter()
-            .filter(|candidate| candidate.account.priority == min_priority)
-            .count()
-            > 1
-    }) {
-        return true;
+            .filter(|candidate| dispatchable(candidate))
+            .count();
+        let quota_stop_count = first_tier
+            .iter()
+            .filter(|candidate| quota_stops(candidate))
+            .count();
+        dispatch_count > 1 || (dispatch_count > 0 && quota_stop_count > 0)
+    };
+
+    let Some(route) = route else {
+        let group: Vec<_> = candidates.iter().collect();
+        return account_frontier_is_stochastic(&group);
+    };
+
+    let mut groups: std::collections::HashMap<String, Vec<&ResolvedTarget>> =
+        std::collections::HashMap::new();
+    let mut group_order: Vec<(usize, String)> = Vec::new();
+    for (rank, id, _, _, _) in selection_candidates {
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| adaptive_candidate_key(candidate) == *id)
+        else {
+            continue;
+        };
+        let group_id = candidate
+            .route_target_id
+            .clone()
+            .unwrap_or_else(|| format!("account:{}", candidate.account.id));
+        if !groups.contains_key(&group_id) {
+            group_order.push((*rank, group_id.clone()));
+        }
+        groups.entry(group_id).or_default().push(candidate);
     }
 
-    route.is_some_and(|route| route.strategy == "weighted" && groups.len() > 1)
+    if route.strategy == "weighted" {
+        // Every positive-weight route target can be ordered first. Compare the
+        // possible outcomes at each target's first dispatchable account tier,
+        // after quota and other pre-dispatch gates have removed blocked rows.
+        let mut possible_dispatches = HashSet::new();
+        let mut possible_quota_stop = false;
+        for group in groups.values() {
+            if account_frontier_is_stochastic(group) {
+                return true;
+            }
+            let active: Vec<_> = group
+                .iter()
+                .copied()
+                .filter(|candidate| dispatchable(candidate) || quota_stops(candidate))
+                .collect();
+            let Some(first_priority) = active
+                .iter()
+                .map(|candidate| candidate.account.priority)
+                .min()
+            else {
+                continue;
+            };
+            for candidate in active
+                .into_iter()
+                .filter(|candidate| candidate.account.priority == first_priority)
+            {
+                if dispatchable(candidate) {
+                    possible_dispatches.insert(adaptive_candidate_key(candidate));
+                }
+                possible_quota_stop |= quota_stops(candidate);
+            }
+        }
+        return possible_dispatches.len() > 1
+            || (possible_quota_stop && !possible_dispatches.is_empty());
+    }
+
+    // Non-weighted Route strategies have a deterministic logical target order.
+    // Only its first reachable target group can dispatch first; account ties in
+    // that group's first reachable priority tier remain randomized.
+    group_order.sort_by_key(|(rank, _)| *rank);
+    group_order
+        .into_iter()
+        .find_map(|(_, group_id)| {
+            let group = groups.get(&group_id)?;
+            let active = group
+                .iter()
+                .any(|candidate| dispatchable(candidate) || quota_stops(candidate));
+            active.then(|| account_frontier_is_stochastic(group))
+        })
+        .unwrap_or(false)
 }
 
 pub async fn dry_run(
@@ -6226,8 +6338,8 @@ pub async fn dry_run(
         evaluations.insert(adaptive_candidate_key(target), (decision, protocol_ok));
     }
 
-    let stochastic_selection = route_selection_is_stochastic(route.as_ref(), &hard_eligible);
     let dry_run_traffic = adaptive_route.then(|| snapshot_traffic_targets(state, &hard_eligible));
+    let mut affinity_candidate_id = None;
     let route_rank = if let Some(route) = &route {
         let mut ordered =
             order_route_targets_for_simulation(state, route, hard_eligible, simulation_seed)
@@ -6255,6 +6367,7 @@ pub async fn dry_run(
                     .iter()
                     .position(|target| target_key(route, target) == sticky_key)
                 {
+                    affinity_candidate_id = Some(adaptive_candidate_key(&dispatchable[index]));
                     dispatchable.rotate_left(index);
                 }
             }
@@ -6322,8 +6435,7 @@ pub async fn dry_run(
         let rank = route_rank
             .as_ref()
             .and_then(|ranks| ranks.get(&candidate_id).copied());
-        let quota_check_reached =
-            request_eligible && account_eligible && route_capacity && quota_override_available;
+        let quota_check_reached = eligible_without_account_quota;
         if let Some(rank) = rank {
             selection_candidates.push((
                 rank,
@@ -6412,6 +6524,13 @@ pub async fn dry_run(
     let allow_fallback = descriptor.allow_fallback.unwrap_or(true);
     let quota_fallback_allowed =
         allow_fallback && route_allows_fallback(route.as_ref(), FailureKind::QuotaExhausted);
+    let stochastic_selection = route_selection_is_stochastic(
+        route.as_ref(),
+        &targets,
+        &selection_candidates,
+        affinity_candidate_id.as_deref(),
+        quota_fallback_allowed,
+    );
     let mut selected: Option<String> = None;
     let mut selected_identity: Option<String> = None;
     let mut quota_blocked: Option<(usize, String)> = None;
@@ -8137,6 +8256,114 @@ mod route_policy_tests {
     }
 
     #[tokio::test]
+    async fn dry_run_affinity_makes_weighted_target_selection_deterministic() {
+        let (state, root, _, model_id, account_ids) = adaptive_dry_run_state().await;
+        let route = state
+            .registry
+            .snapshot()
+            .routes
+            .values()
+            .find(|route| route.name == "adaptive-dry-run")
+            .unwrap()
+            .clone();
+        sqlx::query("UPDATE routes SET strategy='weighted', sticky_routing=1 WHERE id=?")
+            .bind(&route.id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        state.sticky_remember(
+            "weighted-sticky-session",
+            format!("{}|{}|{}", route.id, account_ids[1], model_id),
+        );
+
+        let result = dry_run(
+            &state,
+            "adaptive-dry-run",
+            &DryRunRequest {
+                session: Some("weighted-sticky-session".into()),
+                ..DryRunRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["selection_mode"], "deterministic");
+        assert_eq!(result["would_select"], "Adaptive Model @ fallback");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dry_run_marks_reachable_lower_priority_account_tier_stochastic() {
+        let (state, root, provider_id, _, account_ids) = adaptive_dry_run_state().await;
+        let exhausted_by_quota = &account_ids[0];
+        sqlx::query(
+            "UPDATE accounts SET priority=1, soft_quota_usd=0.5, quota_type='daily' WHERE id=?",
+        )
+        .bind(exhausted_by_quota)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE accounts SET priority=2 WHERE id=?")
+            .bind(&account_ids[1])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let third_account = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "third",
+            "",
+            "",
+            2,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-provider/adaptive-model', 'success', 200, 1.0, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(db::now_iso())
+        .bind(exhausted_by_quota)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+
+        let result = dry_run(
+            &state,
+            "adaptive-provider/adaptive-model",
+            &DryRunRequest::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["selection_mode"], "stochastic");
+        assert_eq!(result["outcome"], "stochastic");
+        assert!(result["would_select"].is_null());
+        let reachable: Vec<_> = result["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|candidate| {
+                candidate["account_id"] == account_ids[1]
+                    || candidate["account_id"] == third_account
+            })
+            .collect();
+        assert_eq!(reachable.len(), 2);
+        assert!(reachable
+            .iter()
+            .all(|candidate| candidate["eligible"] == true));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn dry_run_reports_no_selection_when_all_adaptive_targets_are_saturated() {
         let (state, root, provider_id, model_id, account_ids) = adaptive_dry_run_state().await;
         let mut permits = Vec::new();
@@ -8262,9 +8489,9 @@ mod route_policy_tests {
                     candidate["not_selected_reasons"]
                         .as_array()
                         .is_some_and(|reasons| {
-                            reasons
-                                .iter()
-                                .any(|reason| reason.as_str() == Some("capabilities"))
+                            reasons.iter().any(|reason| {
+                                reason.as_str() == Some("integration_feature_ceiling")
+                            })
                         })
                 }));
         }
@@ -8332,7 +8559,7 @@ mod route_policy_tests {
         assert!(
             errors.iter().all(|error| {
                 error.kind == crate::types::ErrorKind::Unsupported
-                    && error.message.contains("target capabilities do not satisfy")
+                    && error.message.contains("no configured target can satisfy")
             }),
             "requests must be rejected by capability eligibility, got: {errors:?}"
         );

@@ -225,6 +225,8 @@ export interface RouteTargetInput {
   model_id: string;
   priority: number;
   weight: number;
+  predicate?: Record<string, unknown> | null;
+  param_overrides?: Record<string, unknown> | null;
 }
 
 export interface RouteConfigInput {

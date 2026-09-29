@@ -59,12 +59,15 @@ function routeConfigInput(route: Route, routeId?: string): RouteConfigInput {
     portability_policy: route.portabilityPolicy,
     cache_affinity: route.cacheAffinity,
     sticky_routing: route.stickyRouting,
+    max_attempts: route.maxAttempts,
     max_concurrent_requests: route.maxConcurrentRequests,
     targets: route.targets.map((target) => ({
       account_id: target.accountId || null,
       model_id: target.modelId,
       priority: target.priority,
       weight: target.weight ?? 1,
+      predicate: target.predicate ?? null,
+      param_overrides: target.paramOverrides ?? null,
     })),
   };
 }

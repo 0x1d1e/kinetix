@@ -25451,6 +25451,51 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn config_import_rejects_structurally_invalid_routes_without_writes() {
+        let (state, root) = test_state("empty-route-import").await;
+        let config = json!({
+            "kinetix_config_version": 2,
+            "routes": [{"name": "empty-route", "targets": []}]
+        });
+
+        let dry_run = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: config.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], false);
+        assert!(dry_run["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|problem| problem
+                .as_str()
+                .is_some_and(|problem| problem.contains("has no targets"))));
+
+        let apply_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+        assert!(db::list_routes(&state.pool).await.unwrap().is_empty());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn config_import_rolls_back_every_resource_when_a_late_write_fails() {
         let (state, root) = test_state("config-import-transaction-rollback").await;
         sqlx::query(
@@ -25842,7 +25887,7 @@ mod credential_enrollment_regression_tests {
         assert!(feature_veto["candidates"][0]["not_selected_reasons"]
             .as_array()
             .unwrap()
-            .contains(&json!("capabilities")));
+            .contains(&json!("integration_feature_ceiling")));
 
         drop(source);
         drop(target);
@@ -26047,7 +26092,7 @@ mod credential_enrollment_regression_tests {
         assert!(feature_veto["candidates"][0]["not_selected_reasons"]
             .as_array()
             .unwrap()
-            .contains(&json!("capabilities")));
+            .contains(&json!("integration_feature_ceiling")));
 
         drop(source);
         drop(target);

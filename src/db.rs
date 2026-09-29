@@ -59,6 +59,14 @@ pub async fn connect(database_url: &str) -> Result<Pool> {
     Ok(pool)
 }
 
+/// Write a consistent SQLite snapshot to a new database file.
+pub async fn snapshot(pool: &Pool, destination: &std::path::Path) -> Result<()> {
+    sqlx::query(&vacuum_into_sql(destination))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn open_and_migrate(
     database_url: &str,
     data_dir: &std::path::Path,

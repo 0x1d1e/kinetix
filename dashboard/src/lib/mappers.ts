@@ -221,10 +221,19 @@ export function mapRoute(j: any): Route {
       modelDisplayName: str(x.model_display_name),
       priority: num(x.priority, idx + 1),
       weight: num(x.weight, 1),
+      predicate:
+        x.predicate && typeof x.predicate === 'object' && !Array.isArray(x.predicate)
+          ? { ...x.predicate }
+          : null,
+      paramOverrides:
+        x.param_overrides && typeof x.param_overrides === 'object' && !Array.isArray(x.param_overrides)
+          ? { ...x.param_overrides }
+          : null,
     })),
     portabilityPolicy: (j.portability_policy as Route['portabilityPolicy']) || 'strip_with_warning',
     cacheAffinity: !!j.cache_affinity,
     stickyRouting: !!j.sticky_routing,
+    maxAttempts: optionalNum(j.max_attempts),
     maxConcurrentRequests: optionalNum(j.max_concurrent_requests),
     totalHops: 0,
     status: allExhausted ? 'all_exhausted' : j.enabled === false ? 'degraded' : 'active',
