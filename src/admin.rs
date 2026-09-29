@@ -17076,7 +17076,7 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
-    async fn legacy_cached_discovery_imports_without_observed_at() {
+    async fn legacy_cached_discovery_import_uses_original_observation_time() {
         let (state, root) = test_state("legacy-discovery-import").await;
         let provider_id = "provider-legacy-discovery";
         sqlx::query(
@@ -17088,6 +17088,7 @@ mod credential_enrollment_regression_tests {
         .execute(&state.pool)
         .await
         .unwrap();
+        let discovery_observed_at = db::now_iso();
         persist_provider_discovery_observations(
             &state.pool,
             provider_id,
@@ -17097,7 +17098,14 @@ mod credential_enrollment_regression_tests {
                     "display_name": "Legacy Cache Model",
                     "context_window": 4096,
                     "capabilities": {"text": true},
-                    "execution_supported": true
+                    "execution_supported": true,
+                    "reconciliation": {
+                        "status": "unchanged",
+                        "checked_at": discovery_observed_at,
+                        "last_success_at": discovery_observed_at,
+                        "diff": [],
+                        "pinned_fields": []
+                    }
                 }],
                 "disappeared": []
             }),
@@ -17117,16 +17125,33 @@ mod credential_enrollment_regression_tests {
         .unwrap();
         let cached_model = &cached.0["models"][0];
         assert!(cached_model.get("observed_at").is_none());
+        assert_eq!(
+            cached_model["reconciliation"]["last_success_at"],
+            discovery_observed_at
+        );
         let mut discovery = json!({
             "context_window": cached_model["context_window"],
             "capabilities": cached_model["capabilities"],
             "execution_supported": cached_model["execution_supported"],
             "imported_from_discovery": true
         });
-        if let Some(observed_at) = cached_model.get("observed_at") {
+        let observed_at = cached_model
+            .get("observed_at")
+            .filter(|value| !value.is_null())
+            .or_else(|| {
+                cached_model
+                    .pointer("/reconciliation/last_success_at")
+                    .filter(|value| !value.is_null())
+            })
+            .or_else(|| {
+                cached_model
+                    .pointer("/reconciliation/checked_at")
+                    .filter(|value| !value.is_null())
+            });
+        if let Some(observed_at) = observed_at {
             discovery["observed_at"] = observed_at.clone();
         }
-        assert!(discovery.get("observed_at").is_none());
+        assert_eq!(discovery["observed_at"], discovery_observed_at);
         let result = create_model(
             State(state.clone()),
             AdminAuth {
@@ -17158,6 +17183,15 @@ mod credential_enrollment_regression_tests {
             .await
             .unwrap()
             .is_some());
+        let observations = db::list_model_observations(&state.pool, model_id, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        let expected_observed_at = chrono::DateTime::parse_from_rfc3339(&discovery_observed_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        assert_eq!(observations[0].observed_at, expected_observed_at);
 
         state.pool.close().await;
         let _ = std::fs::remove_dir_all(root);

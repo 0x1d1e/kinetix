@@ -621,6 +621,10 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     if (m.execution_supported === false) return;
     const discoveredThinking = m.thinking_map;
     const discoveredPrices = m.prices;
+    const observedAt =
+      m.observed_at ??
+      m.reconciliation?.last_success_at ??
+      m.reconciliation?.checked_at;
     const newModel: ModelConfig = {
       id: '',
       providerId: activeProvider.id,
@@ -661,7 +665,9 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
           }
         : { levels: {} },
       discovery: {
-        ...(m.observed_at === undefined ? {} : { observed_at: m.observed_at }),
+        ...(observedAt === undefined || observedAt === null
+          ? {}
+          : { observed_at: observedAt }),
         context_window: m.context_window ?? null,
         max_output_tokens: m.max_output_tokens ?? null,
         display_name: m.display_name ?? null,
