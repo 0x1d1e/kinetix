@@ -58,7 +58,35 @@ Exports omit `secret_envelope` and `encryption` by default. To include secrets, 
 }
 ```
 
-The descriptor is authenticated as AES-GCM additional data: the UTF-8 prefix `kinetix:credential-interchange:v1`, one NUL byte, then compact UTF-8 JSON for the descriptor. Object keys are recursively sorted lexicographically; array order is preserved. A changed descriptor, nonce, payload, salt, or passphrase fails decryption. Store secret-inclusive bundle files as sensitive material; Kinetix never exports their plaintext secrets.
+The descriptor is authenticated as AES-GCM additional data: the UTF-8 prefix `kinetix:credential-interchange:v1`, one NUL byte, then the descriptor serialized with RFC 8785 JSON Canonicalization Scheme (JCS). This standard defines key ordering, string escaping, and ECMAScript-compatible number rendering; array order is preserved. The golden vectors below are also covered by tests and can be used by other implementations. A changed descriptor, nonce, payload, salt, or passphrase fails decryption. Store secret-inclusive bundle files as sensitive material; Kinetix never exports their plaintext secrets.
+
+### JCS interoperability vectors
+
+RFC 8785's number/string example:
+
+Input:
+
+```json
+{"numbers":[333333333.33333329,1E30,4.50,2e-3,0.000000000000000000000000001],"string":"€$\u000f\nA'B\"\\\"/","literals":[null,true,false]}
+```
+
+Canonical UTF-8 output:
+
+```json
+{"literals":[null,true,false],"numbers":[333333333.3333333,1e+30,4.5,0.002,1e-27],"string":"€$\u000f\nA'B\"\\\"/"}
+```
+
+Credential descriptor input:
+
+```json
+{"schema":"llm-credential/v1","kind":"api_key","provider":"anthropic","label":"café/仕事","metadata":{"credential_mode":"manual","extensions":{"org.prightcord.kinetix":{"auth_scheme":"bearer"}}},"x-z":{"array":[3,2,1],"object":{"z":1e30,"é":"雪"}}}
+```
+
+Canonical UTF-8 output (the bytes appended after the NUL-terminated AAD prefix):
+
+```json
+{"kind":"api_key","label":"café/仕事","metadata":{"credential_mode":"manual","extensions":{"org.prightcord.kinetix":{"auth_scheme":"bearer"}}},"provider":"anthropic","schema":"llm-credential/v1","x-z":{"array":[3,2,1],"object":{"z":1e+30,"é":"雪"}}}
+```
 
 ## Admin API
 
@@ -86,6 +114,6 @@ Secret-inclusive export requires both explicit intent and a passphrase:
 
 Supply `passphrase` when the bundle contains secret envelopes. Dry-run returns `valid`, `plan`, `problems`, `conflicts`, `warnings`, and `missing_resources`. It writes nothing. Applying reruns the same validation inside one SQLite write transaction; any failed write rolls back the whole import. Imported secrets are decrypted only in memory and re-encrypted with the destination's local key.
 
-Kinetix resolves descriptors against existing providers by name and validates the explicit credential mode. Auth-flow imports also require matching Kinetix integration bindings; installed plugin manifests are authoritative. An unavailable plugin integration is reported in `missing_resources`; the credential can still be stored, but the plugin must be installed before it can be used. No plugin-private KV state is imported.
+Kinetix resolves descriptors against existing providers by name and validates the explicit credential mode. Auth-flow imports also require matching Kinetix integration bindings; installed plugin manifests are authoritative. An unavailable plugin integration is reported in `missing_resources`; the credential can still be stored, but the plugin must be installed before it can be used. No plugin-private KV state is imported. Secret-inclusive export currently rejects bundles containing auth-flow accounts because `accounts.secret_enc` may be stale relative to a plugin's rotated canonical credential. Import can create a new auth-flow account from an envelope as initial account-row state, but auth-flow replacement is rejected because updating only that row cannot safely replace plugin state or cached leases. Portable export and replacement need a versioned plugin snapshot/restore contract before they can be supported safely.
 
-A descriptor without an envelope is validation-only: it can be checked or used as a template, but does not create a credential. Existing provider/label matches with an envelope are reported as conflicts and left unchanged unless `replace_existing: true`; replacement changes only credential material. New accounts use local defaults. A `none` descriptor verifies a credential-free provider and makes no account changes.
+A descriptor without an envelope is validation-only: it can be checked or used as a template, but does not create a credential. Existing provider/label matches with an envelope are reported as conflicts and left unchanged unless `replace_existing: true`; auth-flow replacement is rejected even when explicitly requested. Manual replacement changes only credential material. New accounts use local defaults. A `none` descriptor verifies a credential-free provider and makes no account changes.

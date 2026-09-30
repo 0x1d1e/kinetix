@@ -101,8 +101,8 @@ Route creation, updates, and config imports apply the same semantic validation b
 
 | Method & path | Purpose |
 | --- | --- |
-| `POST /admin/api/credential-interchange/export` | Export versioned provider-neutral descriptors; secrets are omitted unless `include_secrets:true` and a passphrase are supplied. |
-| `POST /admin/api/credential-interchange/import` | Validate by default; `apply:true` writes credentials transactionally. `replace_existing:true` explicitly permits replacing matching account secrets. |
+| `POST /admin/api/credential-interchange/export` | Export versioned provider-neutral descriptors; secrets are omitted unless `include_secrets:true` and a passphrase are supplied. Secret-inclusive export rejects auth-flow accounts until plugins can snapshot authoritative credential state. |
+| `POST /admin/api/credential-interchange/import` | Validate by default; `apply:true` writes credentials transactionally. `replace_existing:true` permits manual replacement; auth-flow replacement is rejected until plugin state can be restored safely. |
 
 See [Credential interchange](Credential-Interchange) for the schema, encryption profile, dry-run results, and compatibility rules.
 

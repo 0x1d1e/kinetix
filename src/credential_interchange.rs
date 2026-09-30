@@ -351,30 +351,11 @@ fn decode_base64(value: &str, field: &str) -> Result<Vec<u8>, String> {
 }
 
 fn descriptor_aad(descriptor: &CredentialDescriptor) -> Result<Vec<u8>, String> {
-    let value = serde_json::to_value(descriptor)
-        .map_err(|_| "credential descriptor could not be serialized".to_string())?;
+    let canonical = serde_jcs::to_vec(descriptor)
+        .map_err(|_| "credential descriptor could not be serialized as RFC 8785 JCS".to_string())?;
     let mut bytes = b"kinetix:credential-interchange:v1\0".to_vec();
-    bytes.extend_from_slice(
-        &serde_json::to_vec(&canonicalize_json(value))
-            .map_err(|_| "credential descriptor could not be serialized".to_string())?,
-    );
+    bytes.extend_from_slice(&canonical);
     Ok(bytes)
-}
-
-fn canonicalize_json(value: Value) -> Value {
-    match value {
-        Value::Object(object) => {
-            let mut entries = object.into_iter().collect::<Vec<_>>();
-            entries.sort_by(|left, right| left.0.cmp(&right.0));
-            let mut canonical = Map::new();
-            for (key, value) in entries {
-                canonical.insert(key, canonicalize_json(value));
-            }
-            Value::Object(canonical)
-        }
-        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_json).collect()),
-        other => other,
-    }
 }
 
 #[cfg(test)]
@@ -416,6 +397,35 @@ mod tests {
             }],
             extensions: Map::new(),
         }
+    }
+
+    #[test]
+    fn jcs_matches_rfc_8785_canonicalization_vector() {
+        let value: Value = serde_json::from_str(
+            r#"{"numbers":[333333333.33333329,1E30,4.50,2e-3,0.000000000000000000000000001],"string":"€$\u000f\nA'B\"\\\"/","literals":[null,true,false]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_jcs::to_string(&value).unwrap(),
+            r#"{"literals":[null,true,false],"numbers":[333333333.3333333,1e+30,4.5,0.002,1e-27],"string":"€$\u000f\nA'B\"\\\"/"}"#,
+        );
+    }
+
+    #[test]
+    fn descriptor_aad_uses_jcs_for_nested_extensions_and_unicode() {
+        let mut descriptor = descriptor();
+        descriptor.label = "café/仕事".into();
+        descriptor.extensions.insert(
+            "x-z".into(),
+            json!({"array": [3, 2, 1], "object": {"z": 1e30, "é": "雪"}}),
+        );
+        let aad = descriptor_aad(&descriptor).unwrap();
+        let prefix = b"kinetix:credential-interchange:v1\0";
+        assert!(aad.starts_with(prefix));
+        assert_eq!(
+            std::str::from_utf8(&aad[prefix.len()..]).unwrap(),
+            r#"{"kind":"api_key","label":"café/仕事","metadata":{"credential_mode":"manual","extensions":{"org.prightcord.kinetix":{"auth_scheme":"bearer"}}},"provider":"anthropic","schema":"llm-credential/v1","x-z":{"array":[3,2,1],"object":{"z":1e+30,"é":"雪"}}}"#,
+        );
     }
 
     #[test]

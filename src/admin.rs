@@ -11118,6 +11118,11 @@ pub async fn export_credentials(
             "auth_flow" => crate::credential_interchange::CredentialKind::Custom,
             _ => return Err(ApiError::internal("account has an invalid credential mode")),
         };
+        if body.include_secrets && provider.credential_mode == "auth_flow" {
+            return Err(ApiError::bad(
+                "secret-inclusive export of auth-flow credentials is unavailable until the credential plugin supports authoritative snapshot and restore",
+            ));
+        }
         let descriptor = portable_credential_descriptor(provider, &account.label, kind);
         let secret = if body.include_secrets {
             Some(
@@ -11324,6 +11329,19 @@ async fn build_portable_credential_import_plan(
             }));
             continue;
         };
+
+        if mode == "auth_flow" && replace_existing && !matching_accounts.is_empty() {
+            conflicts.push(json!({
+                "kind": "credential",
+                "provider": provider_name,
+                "label": label,
+                "reason": "auth-flow replacement is unsupported until plugin credential state can be restored safely",
+            }));
+            problems.push(format!(
+                "auth-flow credential '{provider_name}/{label}' cannot be replaced safely"
+            ));
+            continue;
+        }
 
         let action = match matching_accounts.as_slice() {
             [] => {
@@ -27899,6 +27917,29 @@ storage = "2MiB"
                 1,
             )
             .await;
+            let rotated_oauth_secret = json!({
+                "access_token": "rotated-access-value",
+                "refresh_token": "rotated-refresh-value",
+            })
+            .to_string();
+            let now = db::now_iso();
+            sqlx::query(
+                "INSERT INTO plugins (id, version, plugin_api_major, package_sha256, enabled, signature, manifest_json, component, installed_at, updated_at) VALUES ('plugin.oauth', '0.0.0', 1, 'fixture', 1, 'unsigned', '{}', X'', ?, ?)",
+            )
+            .bind(&now)
+            .bind(&now)
+            .execute(&source.pool)
+            .await
+            .unwrap();
+            crate::plugins::store::kv_put(
+                &source.pool,
+                &source.crypto,
+                "plugin.oauth",
+                "cred:oauth-work",
+                rotated_oauth_secret.as_bytes(),
+            )
+            .await
+            .unwrap();
 
             let default_response = export_credentials(
                 State(source.clone()),
@@ -27925,6 +27966,26 @@ storage = "2MiB"
                 .iter()
                 .all(|record| record.get("secret_envelope").is_none()));
 
+            let oauth_export_error = export_credentials(
+                State(source.clone()),
+                auth(),
+                Json(CredentialExportBody {
+                    include_secrets: true,
+                    passphrase: Some(EXPORT_PASSPHRASE.into()),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(oauth_export_error.0, StatusCode::BAD_REQUEST);
+            assert!(oauth_export_error
+                .1
+                .contains("authoritative snapshot and restore"));
+
+            sqlx::query("DELETE FROM accounts WHERE provider_id=? AND label='oauth-work'")
+                .bind(&source_oauth)
+                .execute(&source.pool)
+                .await
+                .unwrap();
             let encrypted_bundle = response_json(
                 export_credentials(
                     State(source.clone()),
@@ -27941,6 +28002,8 @@ storage = "2MiB"
             let encrypted_text = encrypted_bundle.to_string();
             assert!(!encrypted_text.contains("fixture-manual-value"));
             assert!(!encrypted_text.contains("fixture-access-value"));
+            assert!(!encrypted_text.contains("rotated-access-value"));
+            assert!(!encrypted_text.contains("rotated-refresh-value"));
             assert!(encrypted_bundle["credentials"]
                 .as_array()
                 .unwrap()
@@ -27985,6 +28048,7 @@ storage = "2MiB"
             .await;
             assert_eq!(dry_run["valid"], true);
             assert_eq!(dry_run["applied"], Value::Null);
+            assert_eq!(dry_run["missing_resources"][0]["kind"], "integration");
             assert!(dry_run["plan"]
                 .as_array()
                 .unwrap()
@@ -28009,8 +28073,7 @@ storage = "2MiB"
             .await;
             assert_eq!(applied["valid"], true);
             assert_eq!(applied["applied"], true);
-            assert_eq!(applied["plan"].as_array().unwrap().len(), 3);
-            assert_eq!(applied["missing_resources"][0]["kind"], "integration");
+            assert_eq!(applied["plan"].as_array().unwrap().len(), 2);
             let manual = db::list_accounts_for_provider(&target.pool, &target_manual)
                 .await
                 .unwrap();
@@ -28023,12 +28086,7 @@ storage = "2MiB"
             let oauth = db::list_accounts_for_provider(&target.pool, &target_oauth)
                 .await
                 .unwrap();
-            assert_eq!(oauth.len(), 1);
-            assert!(target
-                .crypto
-                .decrypt(&oauth[0].secret_enc)
-                .is_ok_and(|value| value == oauth_secret));
-            assert_eq!(oauth[0].key_mask, "oauth:****");
+            assert!(oauth.is_empty());
 
             drop(source);
             drop(target);
@@ -28165,6 +28223,98 @@ storage = "2MiB"
             drop(source);
             drop(target);
             let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn auth_flow_replacement_is_rejected_until_plugin_state_can_be_restored() {
+            let (target, target_root) = test_state("portable-oauth-replace").await;
+            let provider_id = insert_provider(
+                &target,
+                "oauth-replacement-provider",
+                crate::plugins::CredentialMode::AuthFlow,
+                Some("plugin.oauth"),
+                Some("oauth"),
+            )
+            .await;
+            let old_secret =
+                json!({"access_token": "old", "refresh_token": "old-refresh"}).to_string();
+            add_account(&target, &provider_id, "work", &old_secret, "oauth:****", 1).await;
+            let provider = db::get_provider(&target.pool, &provider_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let descriptor = portable_credential_descriptor(
+                &provider,
+                "work",
+                crate::credential_interchange::CredentialKind::OAuth,
+            );
+            let new_secret =
+                json!({"access_token": "new", "refresh_token": "new-refresh"}).to_string();
+            let (encryption, mut envelopes) = crate::credential_interchange::encrypt_secrets(
+                EXPORT_PASSPHRASE,
+                std::slice::from_ref(&descriptor),
+                &[Some(new_secret)],
+            )
+            .unwrap();
+            let bundle = serde_json::to_value(crate::credential_interchange::CredentialBundle {
+                schema: crate::credential_interchange::BUNDLE_SCHEMA.into(),
+                encryption: Some(encryption),
+                credentials: vec![crate::credential_interchange::CredentialRecord {
+                    descriptor,
+                    secret_envelope: envelopes.pop().unwrap(),
+                    extensions: serde_json::Map::new(),
+                }],
+                extensions: serde_json::Map::new(),
+            })
+            .unwrap();
+            let plan = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(CredentialImportBody {
+                        bundle: bundle.clone(),
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                        apply: false,
+                        replace_existing: true,
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(plan["valid"], false);
+            assert!(plan["problems"][0]
+                .as_str()
+                .unwrap()
+                .contains("cannot be replaced safely"));
+            assert!(plan["conflicts"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("plugin credential state can be restored safely"));
+            let apply_error = import_credentials(
+                State(target.clone()),
+                auth(),
+                Json(CredentialImportBody {
+                    bundle,
+                    passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    apply: true,
+                    replace_existing: true,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+            let account = db::list_accounts_for_provider(&target.pool, &provider_id)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                target.crypto.decrypt(&account.secret_enc).unwrap(),
+                old_secret
+            );
+
+            drop(target);
             let _ = std::fs::remove_dir_all(target_root);
         }
 
