@@ -491,8 +491,8 @@ impl AdmissionController {
 
         let (minute, daily, monthly) = tokio::try_join!(
             db::key_usage_entries_since(pool, key_id, &minute_since),
-            db::key_admission_budget_spend_since(pool, key_id, &daily_since),
-            db::key_admission_budget_spend_since(pool, key_id, &monthly_since),
+            db::key_admission_budget_seed_since(pool, key_id, &daily_since),
+            db::key_admission_budget_seed_since(pool, key_id, &monthly_since),
         )?;
 
         let mut ledger = entry.ledger.lock();
@@ -512,8 +512,10 @@ impl AdmissionController {
                 tokens: tokens.map(|tokens| tokens.max(0) as u64),
             });
         }
-        ledger.daily_spend = daily.max(0.0);
-        ledger.monthly_spend = monthly.max(0.0);
+        ledger.daily_spend = daily.spend_usd.max(0.0);
+        ledger.daily_has_unknown_settled_cost = daily.has_unknown_cost;
+        ledger.monthly_spend = monthly.spend_usd.max(0.0);
+        ledger.monthly_has_unknown_settled_cost = monthly.has_unknown_cost;
         ledger.prune(instant_now);
         entry.initialized.store(true, Ordering::Release);
         Ok(())
@@ -1279,9 +1281,10 @@ mod tests {
 
         let day_start = "2026-02-01T00:00:00+00:00";
         assert_eq!(
-            db::key_admission_budget_spend_since(&pool, "key", day_start)
+            db::key_admission_budget_seed_since(&pool, "key", day_start)
                 .await
-                .unwrap(),
+                .unwrap()
+                .spend_usd,
             settled.daily.settled_spend_usd
         );
         let persisted_usage =
@@ -1595,7 +1598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_unknown_cost_retains_budget_reservation_after_restart() {
+    async fn persisted_unknown_cost_retains_budget_and_unknown_marker_after_restart() {
         let root = std::env::temp_dir().join(format!(
             "kinetix-admission-unknown-cost-{}",
             uuid::Uuid::new_v4().simple()
@@ -1619,6 +1622,19 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs
+             (id, request_id, ts, key_id, client_format, requested_model, status, status_code,
+              cost_usd, cost_known)
+             VALUES (?, ?, ?, ?, 'openai', 'model', 'upstream_error', 502, NULL, 0)",
+        )
+        .bind("unpriced-request")
+        .bind("unpriced-request")
+        .bind(db::now_iso())
+        .bind("unpriced-key")
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let daily_since = crate::pool::window_start("daily", None);
         assert_eq!(
@@ -1628,18 +1644,33 @@ mod tests {
             0.0
         );
         assert_eq!(
-            db::key_admission_budget_spend_since(&pool, "key", &daily_since)
+            db::key_admission_budget_seed_since(&pool, "key", &daily_since)
                 .await
-                .unwrap(),
+                .unwrap()
+                .spend_usd,
             0.8
         );
 
         let controller = AdmissionController::default();
-        let entry = controller.entry("key");
-        controller
-            .ensure_initialized(&pool, "key", &entry)
+        let budget_at = controller
+            .budget_snapshot_current(&pool, "key")
             .await
             .unwrap();
+        assert_eq!(budget_at.snapshot.daily.settled_spend_usd, 0.8);
+        assert_eq!(budget_at.snapshot.monthly.settled_spend_usd, 0.8);
+        assert!(budget_at.snapshot.daily.has_unknown_settled_cost);
+        assert!(budget_at.snapshot.monthly.has_unknown_settled_cost);
+
+        let unpriced = controller
+            .budget_snapshot_current(&pool, "unpriced-key")
+            .await
+            .unwrap();
+        assert_eq!(unpriced.snapshot.daily.settled_spend_usd, 0.0);
+        assert_eq!(unpriced.snapshot.monthly.settled_spend_usd, 0.0);
+        assert!(unpriced.snapshot.daily.has_unknown_settled_cost);
+        assert!(unpriced.snapshot.monthly.has_unknown_settled_cost);
+
+        let entry = controller.entry("key");
         let mut key = key();
         key.daily_budget = Some(1.0);
         let next = controller.reserve_initialized(

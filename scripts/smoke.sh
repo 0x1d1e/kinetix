@@ -265,7 +265,7 @@ curl -s -N --max-time 30 -X POST "$BASE/v1/chat/completions" \
 ACTIVE_UNKNOWN_BUDGET_STREAM_PID=$!
 for _ in $(seq 1 100); do
   ACTIVE_UNKNOWN_BUDGET_USAGE="$(curl -s "$BASE/v1/usage" -H "authorization: Bearer $ACTIVE_UNKNOWN_BUDGET_KEY")"
-  if python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["admission"]["in_flight"] == 1 else 1)' <<<"$ACTIVE_UNKNOWN_BUDGET_USAGE"; then
+  if python3 -c 'import json,sys; body=json.load(sys.stdin); budget=body["admission"]["budget"]["daily"]; sys.exit(0 if body["admission"]["in_flight"] == 1 and budget["unknown_active_cost"] and body["remaining"]["daily_budget_usd"] is None else 1)' <<<"$ACTIVE_UNKNOWN_BUDGET_USAGE"; then
     break
   fi
   sleep 0.05

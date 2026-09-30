@@ -4075,22 +4075,33 @@ pub async fn key_spend_since(pool: &Pool, key_id: &str, since_iso: &str) -> Resu
     Ok(row.get::<f64, _>("total"))
 }
 
-/// Spend used to rebuild key budget admission after restart. Unknown actual
-/// costs use their persisted conservative reservation; known costs use actuals.
-pub async fn key_admission_budget_spend_since(
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyAdmissionBudgetSeed {
+    pub spend_usd: f64,
+    pub has_unknown_cost: bool,
+}
+
+/// Rebuild budget admission after restart. Unknown actual costs use their
+/// persisted conservative reservation and remain marked as unknown.
+pub async fn key_admission_budget_seed_since(
     pool: &Pool,
     key_id: &str,
     since_iso: &str,
-) -> Result<f64> {
+) -> Result<KeyAdmissionBudgetSeed> {
     let row = sqlx::query(
-        "SELECT COALESCE(SUM(COALESCE(admission_cost_usd, cost_usd)),0.0) as total
+        "SELECT COALESCE(SUM(COALESCE(admission_cost_usd, cost_usd)),0.0) as total,
+                COALESCE(MAX(CASE WHEN cost_known = 0 OR cost_usd IS NULL THEN 1 ELSE 0 END),0)
+                    as has_unknown_cost
          FROM usage_logs WHERE key_id = ? AND ts >= ?",
     )
     .bind(key_id)
     .bind(since_iso)
     .fetch_one(pool)
     .await?;
-    Ok(row.get::<f64, _>("total"))
+    Ok(KeyAdmissionBudgetSeed {
+        spend_usd: row.get::<f64, _>("total"),
+        has_unknown_cost: row.get::<i64, _>("has_unknown_cost") != 0,
+    })
 }
 
 /// Sum of cost for an account within a time window (for soft quotas).
