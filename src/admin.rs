@@ -8465,6 +8465,13 @@ fn validate_model_transport_override(
     };
     let parsed = crate::adapters::TargetTransport::parse(transport)
         .ok_or_else(|| ApiError::bad(format!("unsupported model transport '{transport}'")))?;
+    if matches!(&parsed, crate::adapters::TargetTransport::Plugin(_))
+        && provider.wire_plugin_ref().is_none()
+    {
+        return Err(ApiError::bad(
+            "plugin model transport requires an explicit provider adapter binding",
+        ));
+    }
     if let Some(reference) = provider.wire_plugin_ref() {
         let bound = crate::adapters::TargetTransport::Plugin(reference.to_string_ref());
         if parsed != bound {
@@ -11037,6 +11044,10 @@ fn portable_credential_delivery_metadata(
     metadata.insert("wire_format".into(), json!(provider.wire_format));
     metadata.insert("wire_plugin".into(), json!(provider.wire_plugin));
     metadata.insert("allow_insecure_tls".into(), json!(provider.insecure_tls()));
+    metadata.insert(
+        "effective_allow_insecure_tls".into(),
+        json!(provider.insecure_tls()),
+    );
     metadata.insert("credential_hosts".into(), json!(credential_hosts));
     metadata.insert(
         "follow_redirects".into(),
@@ -11051,6 +11062,25 @@ fn portable_credential_delivery_metadata(
         json!(provider.custom_param_name),
     );
     metadata
+}
+
+fn portable_credential_descriptor_for_state(
+    state: &AppState,
+    provider: &db::ProviderRow,
+    label: &str,
+    kind: crate::credential_interchange::CredentialKind,
+) -> Result<crate::credential_interchange::CredentialDescriptor, String> {
+    let mut descriptor = portable_credential_descriptor(provider, label, kind)?;
+    let extension = descriptor
+        .metadata
+        .pointer_mut("/extensions/org.prightcord.kinetix")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "missing Kinetix credential provider metadata".to_string())?;
+    extension.insert(
+        "effective_allow_insecure_tls".into(),
+        json!(state.config.allow_insecure_tls || provider.insecure_tls()),
+    );
+    Ok(descriptor)
 }
 
 fn portable_credential_descriptor(
@@ -11128,7 +11158,8 @@ pub async fn export_credentials(
     for provider in &snapshot.providers {
         if provider.credential_mode == "none" {
             records.push(crate::credential_interchange::CredentialRecord {
-                descriptor: portable_credential_descriptor(
+                descriptor: portable_credential_descriptor_for_state(
+                    &state,
                     provider,
                     "default",
                     crate::credential_interchange::CredentialKind::None,
@@ -11167,8 +11198,9 @@ pub async fn export_credentials(
                 "secret-inclusive export of auth-flow credentials is unavailable until the credential plugin supports authoritative snapshot and restore",
             ));
         }
-        let descriptor = portable_credential_descriptor(provider, &account.label, kind)
-            .map_err(ApiError::internal)?;
+        let descriptor =
+            portable_credential_descriptor_for_state(&state, provider, &account.label, kind)
+                .map_err(ApiError::internal)?;
         let secret = if body.include_secrets {
             Some(
                 state
@@ -11282,6 +11314,7 @@ async fn build_portable_credential_import_plan(
     let mut plan = Vec::<Value>::new();
     let mut writes = Vec::<PortableCredentialWrite>::new();
     let mut seen = std::collections::HashSet::<(String, String)>::new();
+    let mut checked_model_transports = std::collections::HashSet::<String>::new();
 
     for (index, record) in bundle.credentials.iter().enumerate() {
         let descriptor = &record.descriptor;
@@ -11352,6 +11385,13 @@ async fn build_portable_credential_import_plan(
             Ok(None) => {}
             Err(problem) => {
                 problems.push(problem);
+                continue;
+            }
+        }
+        if secret.is_some() && checked_model_transports.insert(provider.id.clone()) {
+            if let Err(problem) = validate_portable_credential_target_transports(tx, provider).await
+            {
+                problems.push(format!("credential '{provider_name}/{label}' {problem}"));
                 continue;
             }
         }
@@ -11493,6 +11533,26 @@ async fn build_portable_credential_import_plan(
     })
 }
 
+async fn validate_portable_credential_target_transports(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    provider: &db::ProviderRow,
+) -> Result<(), String> {
+    let models = sqlx::query_as::<_, db::ModelRow>("SELECT * FROM models WHERE provider_id = ?")
+        .bind(&provider.id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| format!("could not inspect target model transports: {error}"))?;
+    for model in models {
+        crate::adapters::resolve_model_transport(provider, &model).map_err(|error| {
+            format!(
+                "target model '{}' has an incompatible transport: {}",
+                model.display_name, error.message
+            )
+        })?;
+    }
+    Ok(())
+}
+
 async fn validate_portable_credential_provider(
     state: &AppState,
     provider: &db::ProviderRow,
@@ -11575,7 +11635,26 @@ async fn validate_portable_credential_provider(
                 descriptor.provider, descriptor.label
             ));
         }
-        for (field, expected) in portable_credential_delivery_metadata(provider) {
+        let source_allows_insecure_tls = extension
+            .get("effective_allow_insecure_tls")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                format!(
+                    "credential '{} / {}' is missing effective TLS delivery identity",
+                    descriptor.provider, descriptor.label
+                )
+            })?;
+        if !source_allows_insecure_tls
+            && (state.config.allow_insecure_tls || provider.insecure_tls())
+        {
+            return Err(format!(
+                "credential '{} / {}' effective_allow_insecure_tls target weakens the exported TLS policy",
+                descriptor.provider, descriptor.label
+            ));
+        }
+        let mut expected_delivery = portable_credential_delivery_metadata(provider);
+        expected_delivery.remove("effective_allow_insecure_tls");
+        for (field, expected) in expected_delivery {
             if extension.get(&field) != Some(&expected) {
                 return Err(format!(
                     "credential '{} / {}' delivery identity field '{}' does not match the configured provider",
@@ -13171,7 +13250,16 @@ async fn import_config_apply(
                         .map(|candidate| candidate.wire_plugin.as_str())
                 })
                 .unwrap_or("");
-            if let Some(reference) = crate::plugins::PluginRef::parse(configured_binding) {
+            let provider_plugin = crate::plugins::PluginRef::parse(configured_binding);
+            if matches!(
+                crate::adapters::TargetTransport::parse(transport),
+                Some(crate::adapters::TargetTransport::Plugin(_))
+            ) && provider_plugin.is_none()
+            {
+                problems.push(format!(
+                    "model '{model_key}' plugin transport requires an explicit provider adapter binding"
+                ));
+            } else if let Some(reference) = provider_plugin {
                 let expected = crate::adapters::TargetTransport::Plugin(reference.to_string_ref());
                 if crate::adapters::TargetTransport::parse(transport) != Some(expected) {
                     problems.push(format!(
@@ -28047,6 +28135,35 @@ storage = "2MiB"
             .unwrap();
         }
 
+        async fn add_model_transport_override(
+            state: &AppState,
+            provider_id: &str,
+            transport: &str,
+        ) {
+            let model_id = db::insert_model(
+                &state.pool,
+                &db::NewModel {
+                    provider_id,
+                    upstream_id: "delivery-boundary-model",
+                    display_name: "Delivery Boundary Model",
+                    enabled: true,
+                    context_window: None,
+                    max_output_tokens: None,
+                    capabilities: json!({}),
+                    prices: json!({}),
+                    parameters: json!({}),
+                    thinking_map: json!({}),
+                    extra_request: json!({}),
+                    discovery: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+            db::set_model_transport_override(&state.pool, &model_id, Some(transport))
+                .await
+                .unwrap();
+        }
+
         fn encrypted_import_bundle(
             entries: Vec<(crate::credential_interchange::CredentialDescriptor, String)>,
         ) -> Value {
@@ -28940,6 +29057,193 @@ storage = "2MiB"
                 .iter()
                 .filter_map(Value::as_str)
                 .any(|problem| problem.contains("custom_param_name")));
+            assert!(
+                db::list_accounts_for_provider(&target.pool, &target_provider_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn rejects_import_when_a_target_model_selects_an_unbound_plugin_transport() {
+            let (source, source_root) =
+                test_state_with_allow_insecure_tls("portable-model-transport-source", false).await;
+            let (target, target_root) =
+                test_state_with_allow_insecure_tls("portable-model-transport-target", false).await;
+            let source_provider_id = insert_provider(
+                &source,
+                "model-transport-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_provider_id = insert_provider(
+                &target,
+                "model-transport-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            for (state, provider_id) in [
+                (&source, &source_provider_id),
+                (&target, &target_provider_id),
+            ] {
+                set_provider_delivery_profile(
+                    state,
+                    provider_id,
+                    "openai",
+                    "",
+                    "bearer",
+                    None,
+                    None,
+                    false,
+                    "",
+                    false,
+                )
+                .await;
+            }
+            add_account(
+                &source,
+                &source_provider_id,
+                "work",
+                "source-credential",
+                &crypto::mask_secret("source-credential"),
+                1,
+            )
+            .await;
+            add_model_transport_override(&target, &target_provider_id, "plugin:other/adapter")
+                .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            let dry_run = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(bundle, false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], false);
+            assert!(dry_run["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|problem| problem
+                    .contains("plugin transport requires a valid provider adapter binding")));
+            assert!(
+                db::list_accounts_for_provider(&target.pool, &target_provider_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn rejects_import_when_global_tls_policy_weakens_verification() {
+            let (source, source_root) =
+                test_state_with_allow_insecure_tls("portable-global-tls-source", false).await;
+            let (target, target_root) =
+                test_state_with_allow_insecure_tls("portable-global-tls-target", true).await;
+            let source_provider_id = insert_provider(
+                &source,
+                "global-tls-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_provider_id = insert_provider(
+                &target,
+                "global-tls-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            for (state, provider_id) in [
+                (&source, &source_provider_id),
+                (&target, &target_provider_id),
+            ] {
+                set_provider_delivery_profile(
+                    state,
+                    provider_id,
+                    "openai",
+                    "",
+                    "bearer",
+                    None,
+                    None,
+                    false,
+                    "",
+                    false,
+                )
+                .await;
+            }
+            add_account(
+                &source,
+                &source_provider_id,
+                "work",
+                "source-credential",
+                &crypto::mask_secret("source-credential"),
+                1,
+            )
+            .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            let dry_run = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(bundle, false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], false);
+            assert!(dry_run["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|problem| problem.contains("effective_allow_insecure_tls")));
             assert!(
                 db::list_accounts_for_provider(&target.pool, &target_provider_id)
                     .await

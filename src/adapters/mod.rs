@@ -180,25 +180,20 @@ fn fresh_probe_status<'a>(
     }
 }
 
-/// Resolve model transport, reasoning, parameters, and capabilities without an
-/// account-bound probe scope. Scoped probe evidence is intentionally ignored.
-pub fn resolve_execution_profile(
+/// Resolve the model's effective outbound transport.
+pub fn resolve_model_transport(
     provider: &crate::db::ProviderRow,
     model: &crate::db::ModelRow,
-) -> Result<ResolvedExecutionProfile, ProxyError> {
-    resolve_execution_profile_for_target(provider, model, None)
-}
-
-/// Resolve the execution profile for one concrete account target. Fresh probe
-/// evidence is consumed only when provider, account, model, and transport all
-/// match the active execution target.
-pub fn resolve_execution_profile_for_target(
-    provider: &crate::db::ProviderRow,
-    model: &crate::db::ModelRow,
-    account_id: Option<&str>,
-) -> Result<ResolvedExecutionProfile, ProxyError> {
+) -> Result<TargetTransport, ProxyError> {
     let discovery = serde_json::from_str::<serde_json::Value>(&model.discovery)
         .unwrap_or_else(|_| serde_json::json!({}));
+    resolve_model_transport_from_discovery(provider, &discovery)
+}
+
+fn resolve_model_transport_from_discovery(
+    provider: &crate::db::ProviderRow,
+    discovery: &serde_json::Value,
+) -> Result<TargetTransport, ProxyError> {
     let provider_wire = WireFormat::parse(&provider.wire_format).ok_or_else(|| {
         ProxyError::unsupported(format!(
             "unsupported provider wire format '{}'",
@@ -211,7 +206,7 @@ pub fn resolve_execution_profile_for_target(
             ProxyError::unsupported("configured model transport must be a string")
         })?),
     };
-    let observed = discovered_transport(&discovery)?;
+    let observed = discovered_transport(discovery)?;
     let provider_plugin = provider.wire_plugin_ref();
 
     let transport = if let Some(reference) = &provider_plugin {
@@ -243,11 +238,36 @@ pub fn resolve_execution_profile_for_target(
         TargetTransport::default_for_provider(provider)?
     };
 
-    if provider_plugin.is_none() && provider_wire == WireFormat::Plugin {
+    if provider_plugin.is_none()
+        && (provider_wire == WireFormat::Plugin || matches!(&transport, TargetTransport::Plugin(_)))
+    {
         return Err(ProxyError::unsupported(
             "plugin transport requires a valid provider adapter binding",
         ));
     }
+    Ok(transport)
+}
+
+/// Resolve model transport, reasoning, parameters, and capabilities without an
+/// account-bound probe scope. Scoped probe evidence is intentionally ignored.
+pub fn resolve_execution_profile(
+    provider: &crate::db::ProviderRow,
+    model: &crate::db::ModelRow,
+) -> Result<ResolvedExecutionProfile, ProxyError> {
+    resolve_execution_profile_for_target(provider, model, None)
+}
+
+/// Resolve the execution profile for one concrete account target. Fresh probe
+/// evidence is consumed only when provider, account, model, and transport all
+/// match the active execution target.
+pub fn resolve_execution_profile_for_target(
+    provider: &crate::db::ProviderRow,
+    model: &crate::db::ModelRow,
+    account_id: Option<&str>,
+) -> Result<ResolvedExecutionProfile, ProxyError> {
+    let discovery = serde_json::from_str::<serde_json::Value>(&model.discovery)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let transport = resolve_model_transport_from_discovery(provider, &discovery)?;
 
     let reasoning_ownership = discovery.get("operator_reasoning_overrides");
     let operator_reasoning_overrides = reasoning_ownership.and_then(serde_json::Value::as_object);
@@ -2386,6 +2406,42 @@ mod execution_profile_tests {
                 .unwrap()
                 .transport,
             TargetTransport::OpenAiChat
+        );
+    }
+
+    #[test]
+    fn model_plugin_transport_requires_a_provider_adapter_binding() {
+        let provider = provider();
+        let mut model = model();
+        model.discovery = serde_json::json!({
+            "configured_transport": "plugin:other/adapter"
+        })
+        .to_string();
+        let error = resolve_execution_profile(&provider, &model).unwrap_err();
+        assert!(error
+            .message
+            .contains("plugin transport requires a valid provider adapter binding"));
+
+        model.discovery = serde_json::json!({
+            "transport": {"format": "plugin:other/adapter"}
+        })
+        .to_string();
+        let error = resolve_execution_profile(&provider, &model).unwrap_err();
+        assert!(error
+            .message
+            .contains("plugin transport requires a valid provider adapter binding"));
+
+        let mut bound_provider = provider;
+        bound_provider.wire_plugin = "plugin:trusted/adapter".into();
+        model.discovery = serde_json::json!({
+            "configured_transport": "plugin:trusted/adapter"
+        })
+        .to_string();
+        assert_eq!(
+            resolve_execution_profile(&bound_provider, &model)
+                .unwrap()
+                .transport,
+            TargetTransport::Plugin("plugin:trusted/adapter".into())
         );
     }
 
