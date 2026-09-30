@@ -11210,6 +11210,7 @@ pub async fn export_credentials(
     let mut records = Vec::new();
     let mut descriptors = Vec::new();
     let mut secrets = Vec::new();
+    let mut checked_transport_providers = std::collections::HashSet::new();
 
     for provider in &snapshot.providers {
         if provider.credential_mode == "none" {
@@ -11253,6 +11254,19 @@ pub async fn export_credentials(
             return Err(ApiError::bad(
                 "secret-inclusive export of auth-flow credentials is unavailable until the credential plugin supports authoritative snapshot and restore",
             ));
+        }
+        if body.include_secrets
+            && provider.credential_mode == "manual"
+            && checked_transport_providers.insert(provider.id.clone())
+        {
+            validate_portable_credential_model_transports(
+                provider,
+                snapshot
+                    .models
+                    .iter()
+                    .filter(|model| model.provider_id == provider.id),
+            )
+            .map_err(ApiError::bad)?;
         }
         let descriptor =
             portable_credential_descriptor_for_state(&state, provider, &account.label, kind)
@@ -11589,18 +11603,13 @@ async fn build_portable_credential_import_plan(
     })
 }
 
-async fn validate_portable_credential_target_transports(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+fn validate_portable_credential_model_transports<'a>(
     provider: &db::ProviderRow,
+    models: impl IntoIterator<Item = &'a db::ModelRow>,
 ) -> Result<(), String> {
-    let models = sqlx::query_as::<_, db::ModelRow>("SELECT * FROM models WHERE provider_id = ?")
-        .bind(&provider.id)
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|error| format!("could not inspect target model transports: {error}"))?;
     for model in models {
         let transport =
-            crate::adapters::resolve_model_transport(provider, &model).map_err(|error| {
+            crate::adapters::resolve_model_transport(provider, model).map_err(|error| {
                 format!(
                     "target model '{}' has an incompatible transport: {}",
                     model.display_name, error.message
@@ -11619,6 +11628,18 @@ async fn validate_portable_credential_target_transports(
         }
     }
     Ok(())
+}
+
+async fn validate_portable_credential_target_transports(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    provider: &db::ProviderRow,
+) -> Result<(), String> {
+    let models = sqlx::query_as::<_, db::ModelRow>("SELECT * FROM models WHERE provider_id = ?")
+        .bind(&provider.id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| format!("could not inspect target model transports: {error}"))?;
+    validate_portable_credential_model_transports(provider, models.iter())
 }
 
 async fn validate_portable_credential_provider(
@@ -12839,6 +12860,20 @@ async fn import_config_apply(
     let models = cfg["models"].as_array().unwrap_or(&empty);
     let routes = cfg["routes"].as_array().unwrap_or(&empty);
     let aliases = cfg["aliases"].as_array().unwrap_or(&empty);
+    // Match Apply's wire_plugin semantics: imported entries use their supplied string or "",
+    // while providers absent from the import retain the current persisted binding.
+    let mut effective_provider_wire_plugins = existing_providers
+        .iter()
+        .map(|provider| (provider.name.clone(), provider.wire_plugin.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    for provider in providers {
+        if let Some(name) = provider["name"].as_str() {
+            effective_provider_wire_plugins.insert(
+                name.to_string(),
+                provider["wire_plugin"].as_str().unwrap_or("").to_string(),
+            );
+        }
+    }
     for key in ["providers", "accounts", "models", "routes", "aliases"] {
         if cfg.get(key).is_some_and(|value| !value.is_array()) {
             problems.push(format!("config field '{key}' must be an array"));
@@ -12987,7 +13022,10 @@ async fn import_config_apply(
                 };
                 (features, protocols)
             };
-        let wire_plugin = p["wire_plugin"].as_str().unwrap_or("");
+        let wire_plugin = effective_provider_wire_plugins
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or("");
         let credential_plugin = p["credential_plugin"].as_str().unwrap_or("");
         let model_source_plugin = p["model_source_plugin"].as_str().unwrap_or("");
         let source_bindings_valid = if let Some(plugin_id) = source_plugin_id {
@@ -13311,16 +13349,9 @@ async fn import_config_apply(
             .map(str::trim)
             .filter(|transport| !transport.is_empty())
         {
-            let configured_binding = providers
-                .iter()
-                .find(|candidate| candidate["name"].as_str() == Some(provider))
-                .and_then(|candidate| candidate["wire_plugin"].as_str())
-                .or_else(|| {
-                    existing_providers
-                        .iter()
-                        .find(|candidate| candidate.name == provider)
-                        .map(|candidate| candidate.wire_plugin.as_str())
-                })
+            let configured_binding = effective_provider_wire_plugins
+                .get(provider)
+                .map(String::as_str)
                 .unwrap_or("");
             let provider_plugin = crate::plugins::PluginRef::parse(configured_binding);
             if let Some(reference) = provider_plugin {
@@ -13916,7 +13947,10 @@ async fn import_config_apply(
                 follow_redirects,
                 credential_hosts,
                 allow_insecure_tls,
-                wire_plugin: p["wire_plugin"].as_str().unwrap_or(""),
+                wire_plugin: effective_provider_wire_plugins
+                    .get(name)
+                    .map(String::as_str)
+                    .unwrap_or(""),
                 credential_plugin: p["credential_plugin"].as_str().unwrap_or(""),
                 model_source_plugin: p["model_source_plugin"].as_str().unwrap_or(""),
                 credential_mode: credential_mode.as_str(),
@@ -13973,7 +14007,10 @@ async fn import_config_apply(
                 follow_redirects,
                 credential_hosts,
                 allow_insecure_tls,
-                wire_plugin: p["wire_plugin"].as_str().unwrap_or(""),
+                wire_plugin: effective_provider_wire_plugins
+                    .get(name)
+                    .map(String::as_str)
+                    .unwrap_or(""),
                 credential_plugin: p["credential_plugin"].as_str().unwrap_or(""),
                 model_source_plugin: p["model_source_plugin"].as_str().unwrap_or(""),
                 credential_mode: credential_mode.as_str(),
@@ -25806,6 +25843,111 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn config_import_uses_proposed_wire_plugin_for_validation_and_apply() {
+        let (source, source_root) = test_state("config-clear-plugin-binding-source").await;
+        let source_provider_id = insert_provider(
+            &source,
+            "clear-plugin-binding",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let source_model_id = db::insert_model(
+            &source.pool,
+            &db::NewModel {
+                provider_id: &source_provider_id,
+                upstream_id: "explicit-transport",
+                display_name: "Explicit Transport",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        db::set_model_transport_override(&source.pool, &source_model_id, Some("openai"))
+            .await
+            .unwrap();
+        let mut exported = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        exported["providers"][0]["wire_plugin"] = Value::Null;
+
+        let (target, target_root) = test_state("config-clear-plugin-binding-target").await;
+        let target_provider_id = insert_provider(
+            &target,
+            "clear-plugin-binding",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        sqlx::query("UPDATE providers SET wire_plugin = ? WHERE id = ?")
+            .bind("plugin:test/adapter")
+            .bind(&target_provider_id)
+            .execute(&target.pool)
+            .await
+            .unwrap();
+
+        let dry_run = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true, "problems: {}", dry_run["problems"]);
+
+        let _ = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let imported_provider = db::get_provider(&target.pool, &target_provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(imported_provider.wire_plugin.is_empty());
+        let imported_model =
+            db::find_model_by_upstream(&target.pool, &target_provider_id, "explicit-transport")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            discovery_object(&imported_model)["configured_transport"],
+            "openai"
+        );
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
     async fn config_export_import_preserves_pinned_disabled_account_for_fresh_install() {
         let (source, source_root) = test_state("pinned-account-export-source").await;
         let provider_id = db::insert_provider(
@@ -28563,6 +28705,47 @@ storage = "2MiB"
                 extensions: serde_json::Map::new(),
             })
             .unwrap()
+        }
+
+        #[tokio::test]
+        async fn secret_export_rejects_unbound_plugin_model_transport() {
+            let (source, source_root) = test_state("portable-export-unbound-transport").await;
+            let provider_id = insert_provider(
+                &source,
+                "native-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &source,
+                &provider_id,
+                "work",
+                "manual-secret",
+                &crypto::mask_secret("manual-secret"),
+                1,
+            )
+            .await;
+            add_model_transport_override(&source, &provider_id, "plugin:test/adapter").await;
+
+            let error = export_credentials(
+                State(source.clone()),
+                auth(),
+                Json(CredentialExportBody {
+                    include_secrets: true,
+                    passphrase: Some(EXPORT_PASSPHRASE.into()),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error
+                .1
+                .contains("without matching provider wire_plugin binding"));
+
+            drop(source);
+            let _ = std::fs::remove_dir_all(source_root);
         }
 
         #[tokio::test]
