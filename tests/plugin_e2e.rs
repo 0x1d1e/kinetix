@@ -13,16 +13,33 @@
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 
-use kinetix::adapters::{Adapter, AdapterRegistry, UpstreamContext};
-use kinetix::crypto::Crypto;
-use kinetix::db::{self, Pool};
+use axum::{
+    extract::State,
+    http::{header::AUTHORIZATION, StatusCode},
+    response::IntoResponse,
+    routing::any,
+    Json, Router,
+};
 use kinetix::plugins::{
-    adapter::{register_declared_adapters, PluginAdapter},
+    adapter::{register_declared_adapters, request_to_json, PluginAdapter},
     Capability, HostPolicy, PluginManager,
 };
-use kinetix::types::{
-    InternalRequest, Message, Part, Role, SamplingParams, ThinkingLevel, WireFormat,
+use kinetix::{
+    adapters::{Adapter, AdapterRegistry, UpstreamContext},
+    app::AppState,
+    config::Config,
+    crypto::{self, Crypto},
+    db::{self, NewProvider, Pool},
+    logqueue::UsageLogQueue,
+    paths::Paths,
+    registry::Registry,
+    types::{
+        AuthScheme, FailureKind, FinishReason, InternalRequest, Message, Part, ProxyError, Role,
+        SamplingParams, StreamEvent, ThinkingLevel, UpstreamFailure, WireFormat,
+    },
 };
+use serde_json::{json, Value};
+use tokio::sync::Mutex;
 
 /// These tests exercise the host/guest boundary, not publisher trust; local
 /// builds may be signed with a development key unknown to the test manager.
@@ -36,8 +53,19 @@ fn package_path() -> Option<std::path::PathBuf> {
 
 /// Build an unsigned package containing one of the checked-in ABI fixtures.
 fn fixture_package(id: &str, name: &str, api_major: u8, component: &[u8]) -> Vec<u8> {
+    fixture_package_with_adapter(id, name, api_major, "session-echo", false, component)
+}
+
+fn fixture_package_with_adapter(
+    id: &str,
+    name: &str,
+    api_major: u8,
+    adapter: &str,
+    thinking_translation: bool,
+    component: &[u8],
+) -> Vec<u8> {
     let manifest = format!(
-        "manifest_version = 1\nid = {id:?}\nname = {name:?}\nversion = \"0.1.0\"\nplugin_api = \"{api_major}\"\n\n[provides]\nprovider_adapters = [\"session-echo\"]\n"
+        "manifest_version = 1\nid = {id:?}\nname = {name:?}\nversion = \"0.1.0\"\nplugin_api = \"{api_major}\"\n\n[provides]\nprovider_adapters = [{adapter:?}]\nthinking_translation = {thinking_translation}\n"
     );
     let mut builder = tar::Builder::new(Vec::new());
     for (path, data) in [
@@ -113,6 +141,363 @@ async fn manager() -> (PluginManager, Pool) {
     )
     .unwrap();
     (manager, pool)
+}
+
+#[derive(Clone, Default)]
+struct AnthropicPluginMock(Arc<Mutex<Vec<Value>>>);
+
+async fn anthropic_plugin_upstream(
+    State(mock): State<AnthropicPluginMock>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    mock.0.lock().await.push(body);
+    Json(json!({
+        "schema": "kinetix.plugin.response",
+        "schema_version": 2,
+        "events": [
+            {"type": "text_delta", "text": "plugin accepted the continuation"},
+            {"type": "finish", "reason": "stop"}
+        ]
+    }))
+}
+
+struct AnthropicTranslationPluginAdapter;
+
+impl Adapter for AnthropicTranslationPluginAdapter {
+    fn wire_format(&self) -> &'static str {
+        "anthropic-translation-plugin-fixture"
+    }
+
+    fn handles_thinking_translation(&self) -> bool {
+        true
+    }
+
+    fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
+        Ok(ctx.provider.base_url.clone())
+    }
+
+    fn apply_auth(
+        &self,
+        ctx: &UpstreamContext<'_>,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
+        Ok(request.bearer_auth(&ctx.credential))
+    }
+
+    fn build_body(
+        &self,
+        _ctx: &UpstreamContext<'_>,
+        request: &InternalRequest,
+    ) -> Result<Value, UpstreamFailure> {
+        serde_json::from_str(&request_to_json(request)).map_err(|error| UpstreamFailure {
+            kind: FailureKind::PluginFailure,
+            status: None,
+            retry_after_secs: None,
+            message: format!("invalid plugin request contract JSON: {error}"),
+            quota_reset_at: None,
+        })
+    }
+
+    fn classify_error(
+        &self,
+        status: u16,
+        _body: &str,
+        _headers: &reqwest::header::HeaderMap,
+    ) -> UpstreamFailure {
+        UpstreamFailure {
+            kind: FailureKind::ServerError,
+            status: Some(status),
+            retry_after_secs: None,
+            message: "synthetic plugin upstream error".into(),
+            quota_reset_at: None,
+        }
+    }
+
+    fn parse_stream_chunk(&self, _data: &str) -> Result<Vec<StreamEvent>, UpstreamFailure> {
+        Ok(Vec::new())
+    }
+
+    fn parse_full_response(&self, body: &Value) -> Result<Vec<StreamEvent>, UpstreamFailure> {
+        let text = body["events"]
+            .as_array()
+            .and_then(|events| {
+                events.iter().find_map(|event| {
+                    (event["type"] == "text_delta")
+                        .then(|| event["text"].as_str())
+                        .flatten()
+                })
+            })
+            .ok_or_else(|| UpstreamFailure {
+                kind: FailureKind::MalformedUpstream,
+                status: None,
+                retry_after_secs: None,
+                message: "plugin response omitted text_delta".into(),
+                quota_reset_at: None,
+            })?;
+        Ok(vec![
+            StreamEvent::TextDelta(text.to_owned()),
+            StreamEvent::Finish(FinishReason::Stop),
+        ])
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_messages_frontend_passes_thinking_and_tool_continuation_to_plugin() {
+    const CLIENT_KEY: &str = "sk-kinetix-anthropic-plugin-test";
+    const PLUGIN_ID: &str = "dev.kinetix.anthropic-echo-fixture";
+    let mock = AnthropicPluginMock::default();
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let upstream_mock = mock.clone();
+    let upstream_server = tokio::spawn(async move {
+        axum::serve(
+            upstream_listener,
+            Router::new()
+                .fallback(any(anthropic_plugin_upstream))
+                .with_state(upstream_mock),
+        )
+        .await
+        .unwrap();
+    });
+
+    let root = std::env::temp_dir().join(format!(
+        "kinetix-anthropic-plugin-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let paths = Paths {
+        config_dir: root.join("config"),
+        data_dir: root.join("data"),
+        state_dir: root.join("state"),
+    };
+    paths.ensure_dirs().unwrap();
+    let database_url = paths.database_url();
+    let pool = db::connect(&database_url).await.unwrap();
+    db::migrate(&pool).await.unwrap();
+    let crypto = Arc::new(Crypto::new(&[37u8; 32]));
+    let base_url = format!("http://{upstream_addr}");
+    let wire_plugin = format!("plugin:{PLUGIN_ID}/anthropic-echo");
+    let provider_id = db::insert_provider(
+        &pool,
+        &NewProvider {
+            name: "anthropic-plugin-fixture",
+            base_url: &base_url,
+            wire_format: WireFormat::Plugin,
+            auth_scheme: AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: json!({}),
+            timeout_ms: 2_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: true,
+            wire_plugin: &wire_plugin,
+            credential_plugin: "",
+            model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let secret = crypto.encrypt("plugin-test-key").unwrap();
+    let _account_id = db::insert_account(
+        &pool,
+        &provider_id,
+        "anthropic-plugin-account",
+        &secret,
+        "plugin-test-key",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+    let model_id = db::insert_model(
+        &pool,
+        &db::NewModel {
+            provider_id: &provider_id,
+            upstream_id: "fixture-anthropic-model",
+            display_name: "Anthropic plugin fixture",
+            enabled: true,
+            context_window: Some(8_192),
+            max_output_tokens: Some(1_024),
+            capabilities: json!({"text": true, "reasoning": true, "tools": true}),
+            prices: json!({}),
+            parameters: json!({}),
+            thinking_map: json!({}),
+            extra_request: json!({}),
+            discovery: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let route_id = db::insert_route(
+        &pool,
+        &db::NewRoute {
+            name: "anthropic-plugin-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+            max_concurrent_requests: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(&pool, &route_id, None, &model_id, 1, 1, "{}", "{}")
+        .await
+        .unwrap();
+    db::insert_virtual_key(
+        &pool,
+        &db::VirtualKeyRow {
+            id: "anthropic-plugin-test-key".into(),
+            key_hash: crypto::hash_virtual_key(CLIENT_KEY),
+            name: "Anthropic plugin test".into(),
+            owner: "test".into(),
+            tag: String::new(),
+            allowed_models: json!(["*"]).to_string(),
+            allowed_providers: json!([]).to_string(),
+            rpm_limit: None,
+            tpm_limit: None,
+            max_concurrent_requests: None,
+            daily_budget: None,
+            monthly_budget: None,
+            expires_at: None,
+            status: "active".into(),
+            allowed_ips: json!([]).to_string(),
+            body_logging: 0,
+            created_at: db::now_iso(),
+            revoked_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let registry = Arc::new(Registry::new());
+    registry.reload(&pool).await.unwrap();
+    let state = AppState::new(
+        Arc::new(Config {
+            bind: "127.0.0.1:0".into(),
+            public_base_url: "http://127.0.0.1".into(),
+            database_url,
+            master_key: [37u8; 32],
+            admin_token: "test-admin".into(),
+            cf_access_aud: None,
+            cf_access_team_domain: None,
+            log_json: false,
+            bootstrap_file: None,
+            allow_private_upstreams: true,
+            max_inflight_inferences: 4,
+            allow_insecure_tls: true,
+            data_dir: paths.data_dir.clone(),
+            shutdown_grace_secs: 1,
+            alert_webhook_url: None,
+            alert_fallback_rate: 1.0,
+            alert_error_rate: 1.0,
+            alert_min_requests: 1,
+            alert_interval_secs: 60,
+            alert_p95_latency_ms: 1_000,
+            ip_rate_limit_per_min: 0,
+            session_ttl_minutes: 60,
+            export_retention_days: 1,
+            paths,
+            generated_admin_password: None,
+        }),
+        pool.clone(),
+        registry,
+        crypto,
+        reqwest::Client::new(),
+        UsageLogQueue::new(pool, 16),
+        0,
+    );
+    state.register_plugin_adapter(wire_plugin, Arc::new(AnthropicTranslationPluginAdapter));
+
+    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_addr = gateway_listener.local_addr().unwrap();
+    let gateway = kinetix::router::build(state);
+    let gateway_server = tokio::spawn(async move {
+        axum::serve(
+            kinetix::server::DisconnectAwareListener::new(gateway_listener),
+            gateway.into_make_service_with_connect_info::<kinetix::server::ClientConnectionInfo>(),
+        )
+        .await
+        .unwrap();
+    });
+    let request = json!({
+        "model": "anthropic-plugin-route",
+        "max_tokens": 128,
+        "stream": false,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "tools": [{
+            "name": "lookup",
+            "description": "Look up a city",
+            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+        }],
+        "messages": [
+            {"role": "user", "content": "continue the tool turn"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_prior", "name": "lookup", "input": {"city": "Paris"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_prior", "content": "sunny"},
+                {"type": "text", "text": "continue"}
+            ]}
+        ]
+    });
+    let response = reqwest::Client::new()
+        .post(format!("http://{gateway_addr}/v1/messages"))
+        .header(AUTHORIZATION, format!("Bearer {CLIENT_KEY}"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let response_body = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{response_body}");
+    let response_json: Value = serde_json::from_str(&response_body).unwrap();
+    assert_eq!(
+        response_json["content"],
+        json!([{"type": "text", "text": "plugin accepted the continuation"}])
+    );
+
+    let received = mock.0.lock().await;
+    assert_eq!(received.len(), 1);
+    let canonical = &received[0];
+    assert_eq!(canonical["schema"], "kinetix.plugin.request");
+    assert_eq!(canonical["thinking"], json!({"level": "low"}));
+    assert_eq!(canonical["stream"], false);
+    let assistant_parts = canonical["messages"][1]["parts"].as_array().unwrap();
+    assert!(
+        assistant_parts.contains(&json!({
+            "type": "tool_call",
+            "id": "toolu_prior",
+            "name": "lookup",
+            "arguments": "{\"city\":\"Paris\"}",
+            "signature": null
+        })),
+        "canonical request: {canonical}"
+    );
+    let user_parts = canonical["messages"][2]["parts"].as_array().unwrap();
+    assert!(user_parts.contains(&json!({
+        "type": "tool_result",
+        "tool_call_id": "toolu_prior",
+        "name": "lookup",
+        "content": "sunny",
+        "is_error": false
+    })));
+    assert_eq!(canonical["tools"][0]["name"], "lookup");
+
+    gateway_server.abort();
+    upstream_server.abort();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]

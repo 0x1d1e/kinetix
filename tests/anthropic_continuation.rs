@@ -771,18 +771,68 @@ async fn native_anthropic_sse_preserves_payload_and_normalizes_crlf_framing() {
         .await
         .unwrap();
     let body = String::from_utf8(bytes.to_vec()).unwrap();
-    assert!(body.contains(
-        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"foo→🙂\"},\"vendor_extension\":{\"opaque\":true}}\n\n"
-    ));
-    assert!(body.contains(
-        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"bar\"}}\n\n"
-    ));
-    assert!(body.contains(
-        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig\"}}\n\n"
-    ));
-    assert!(body.contains("opaque-redacted-state"));
-    assert!(body.contains("toolu_mock"));
     assert!(!body.contains('\r'), "SSE framing is normalized to LF");
+    let events: Vec<(String, Value)> = body
+        .split("\n\n")
+        .filter(|frame| frame.lines().any(|line| line.starts_with("data:")))
+        .map(|frame| {
+            let event_name = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("event: "))
+                .unwrap_or_else(|| panic!("Anthropic SSE frame missing event name: {frame:?}"))
+                .to_owned();
+            let data = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("each Anthropic SSE frame has data");
+            (event_name, serde_json::from_str(data).unwrap())
+        })
+        .collect();
+    let ordered_types: Vec<&str> = events
+        .iter()
+        .map(|(_, payload)| payload["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ordered_types,
+        [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ]
+    );
+    for (event_name, payload) in &events {
+        assert_eq!(payload["type"], event_name.as_str());
+    }
+    assert_eq!(events[0].1["message"]["usage"]["input_tokens"], 1);
+    assert_eq!(events[0].1["message"]["usage"]["output_tokens"], 0);
+    assert_eq!(events[1].1["index"], 0);
+    assert_eq!(events[1].1["content_block"]["type"], "thinking");
+    assert_eq!(events[2].1["delta"]["thinking"], "foo→🙂");
+    assert_eq!(events[2].1["vendor_extension"]["opaque"], true);
+    assert_eq!(events[3].1["delta"]["thinking"], "bar");
+    assert_eq!(events[4].1["delta"]["signature"], "sig");
+    assert_eq!(events[6].1["index"], 1);
+    assert_eq!(events[6].1["content_block"]["type"], "redacted_thinking");
+    assert_eq!(
+        events[6].1["content_block"]["data"],
+        "opaque-redacted-state"
+    );
+    assert_eq!(events[8].1["index"], 2);
+    assert_eq!(events[8].1["content_block"]["type"], "tool_use");
+    assert_eq!(events[8].1["content_block"]["id"], "toolu_mock");
+    assert_eq!(events[9].1["delta"]["partial_json"], "{\"city\":\"Paris\"}");
+    assert_eq!(events[11].1["usage"]["output_tokens"], 1);
+    assert_eq!(events[12].1["type"], "message_stop");
     cleanup(harness).await;
 }
 

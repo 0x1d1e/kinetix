@@ -35,7 +35,8 @@ use tokio::sync::Mutex;
 const CLIENT_KEY: &str = "sk-kinetix-streaming-stress-test";
 const ROUTE: &str = "streaming-stress-route";
 const FALLBACK_ROUTE: &str = "streaming-reset-route";
-const BACKPRESSURE_EVENTS: usize = 10_000;
+const BACKPRESSURE_EVENTS: usize = 1_024;
+const BACKPRESSURE_EVENT_BYTES: usize = 32 * 1024;
 const LARGE_FRAME_BYTES: usize = 256 * 1024;
 
 #[derive(Default)]
@@ -377,10 +378,10 @@ async fn upstream(
             let body = Body::from_stream(async_stream::stream! {
                 let _drop_counter = StreamDropCounter(probe.clone());
                 probe.streams_started.fetch_add(1, Ordering::Relaxed);
-                let text = "b".repeat(2048);
+                let frame = event(&"b".repeat(BACKPRESSURE_EVENT_BYTES));
                 for _ in 0..BACKPRESSURE_EVENTS {
                     probe.chunks_generated.fetch_add(1, Ordering::Relaxed);
-                    yield Ok::<_, io::Error>(event(&text));
+                    yield Ok::<_, io::Error>(frame.clone());
                 }
                 yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
             });
@@ -527,7 +528,7 @@ async fn setup() -> Harness {
             allowed_providers: json!([]).to_string(),
             rpm_limit: None,
             tpm_limit: None,
-            max_concurrent_requests: None,
+            max_concurrent_requests: Some(1),
             daily_budget: None,
             monthly_budget: None,
             expires_at: None,
@@ -555,7 +556,7 @@ async fn setup() -> Harness {
             log_json: false,
             bootstrap_file: None,
             allow_private_upstreams: true,
-            max_inflight_inferences: kinetix::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
+            max_inflight_inferences: 1,
             allow_insecure_tls: true,
             data_dir: paths.data_dir.clone(),
             shutdown_grace_secs: 1,
@@ -632,6 +633,26 @@ impl Harness {
             .send()
             .await
             .unwrap()
+    }
+
+    async fn provider_failures(&self) -> i64 {
+        sqlx::query_scalar("SELECT consecutive_failures FROM accounts WHERE id = ?")
+            .bind(&self.account_id)
+            .fetch_one(&self.state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn assert_admission_released(&self, expected_failures: i64) {
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            let response = self.send("fragmented", None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            response.bytes().await.unwrap()
+        })
+        .await
+        .expect("a follow-up request must acquire all released admission permits");
+        assert!(!response.is_empty());
+        assert_eq!(self.provider_failures().await, expected_failures);
     }
 
     async fn trace(&self, request_id: &str) -> (Option<String>, String, Option<i64>) {
@@ -760,7 +781,11 @@ async fn streaming_transport_and_lifecycle_stress_regressions() {
         ("oversized_frame", "protocol_violation", "not_committed"),
     ] {
         let request_count_before = harness.probe.requests.lock().await.len();
-        let response = harness.send(case, None).await;
+        let response = if case == "upstream_error" {
+            harness.send_to_route(FALLBACK_ROUTE, case, None).await
+        } else {
+            harness.send(case, None).await
+        };
         let request_id = response.headers()["x-request-id"]
             .to_str()
             .unwrap()
@@ -776,7 +801,7 @@ async fn streaming_transport_and_lifecycle_stress_regressions() {
             assert_eq!(
                 harness.probe.requests.lock().await.len(),
                 request_count_before + 1,
-                "post-commit failure must not replay on the eligible fallback target"
+                "post-commit SSE error must not replay on the eligible fallback target"
             );
         }
     }
@@ -792,6 +817,7 @@ async fn streaming_transport_and_lifecycle_stress_regressions() {
     assert_eq!(outcome.as_deref(), Some("timeout"));
     assert_eq!(commit, "not_committed");
 
+    let failures_before_pre_commit_cancel = harness.provider_failures().await;
     let baseline_started = harness.probe.streams_started.load(Ordering::Relaxed);
     let baseline_dropped = harness.probe.streams_dropped.load(Ordering::Relaxed);
     let before = tokio::spawn({
@@ -832,14 +858,17 @@ async fn streaming_transport_and_lifecycle_stress_regressions() {
     })
     .await
     .expect("pre-commit client cancellation was not recorded");
+    assert_eq!(
+        harness.provider_failures().await,
+        failures_before_pre_commit_cancel,
+        "pre-commit cancellation must not mutate provider failure state"
+    );
+    harness
+        .assert_admission_released(failures_before_pre_commit_cancel)
+        .await;
 
     let baseline_dropped = harness.probe.streams_dropped.load(Ordering::Relaxed);
-    let baseline_failures: i64 =
-        sqlx::query_scalar("SELECT consecutive_failures FROM accounts WHERE id = ?")
-            .bind(&harness.account_id)
-            .fetch_one(&harness.state.pool)
-            .await
-            .unwrap();
+    let failures_before_post_commit_cancel = harness.provider_failures().await;
     let response = harness.send("disconnect_after_commit", None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let request_id = response.headers()["x-request-id"]
@@ -863,9 +892,12 @@ async fn streaming_transport_and_lifecycle_stress_regressions() {
             .await
             .unwrap();
     assert_eq!(
-        failures_after, baseline_failures,
+        failures_after, failures_before_post_commit_cancel,
         "cancellation is not provider failure"
     );
+    harness
+        .assert_admission_released(failures_before_post_commit_cancel)
+        .await;
 
     harness.probe.chunks_generated.store(0, Ordering::Relaxed);
     let response = harness.send("backpressure", None).await;
@@ -877,18 +909,20 @@ async fn streaming_transport_and_lifecycle_stress_regressions() {
     harness
         .wait_for_counter(&harness.probe.chunks_generated, 0)
         .await;
+    // TCP and HTTP buffering make upstream chunk counts nondeterministic. The
+    // exact response-channel capacity and producer stall/resume are proven by
+    // stream_response_channel_tests; this end-to-end case stresses a slow reader.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let buffered = harness.probe.chunks_generated.load(Ordering::Relaxed);
-    assert!(
-        buffered < BACKPRESSURE_EVENTS / 2,
-        "producer ran to completion before the slow reader resumed: {buffered}"
-    );
     let mut stream = response.bytes_stream();
     let mut bytes_received = 0usize;
     while let Some(chunk) = stream.next().await {
         bytes_received += chunk.unwrap().len();
     }
-    assert!(bytes_received > 10 * 1024 * 1024);
+    assert!(
+        bytes_received >= BACKPRESSURE_EVENTS * BACKPRESSURE_EVENT_BYTES,
+        "received {bytes_received} bytes; generated {} of {BACKPRESSURE_EVENTS} events",
+        harness.probe.chunks_generated.load(Ordering::Relaxed)
+    );
     assert_eq!(
         harness.probe.chunks_generated.load(Ordering::Relaxed),
         BACKPRESSURE_EVENTS

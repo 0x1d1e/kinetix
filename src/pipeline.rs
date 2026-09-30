@@ -5428,6 +5428,15 @@ fn check_param_policy(
 
 /// Build the client response: streaming or aggregated non-streaming.
 #[allow(clippy::too_many_arguments)]
+const STREAM_RESPONSE_CHANNEL_CAPACITY: usize = 64;
+
+fn stream_response_channel() -> (
+    mpsc::Sender<Result<Bytes, std::io::Error>>,
+    mpsc::Receiver<Result<Bytes, std::io::Error>>,
+) {
+    mpsc::channel(STREAM_RESPONSE_CHANNEL_CAPACITY)
+}
+
 async fn stream_response(
     state: &AppState,
     snap: Arc<crate::registry::Snapshot>,
@@ -5442,7 +5451,7 @@ async fn stream_response(
 ) -> Response {
     let stream = req.stream;
     let state = state.clone();
-    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let (tx, rx) = stream_response_channel();
 
     let model_display = attempt.target.model.display_name.clone();
     let request_id = meta.request_id.clone();
@@ -11593,5 +11602,73 @@ mod route_policy_tests {
             native,
         );
         assert_eq!(classified.kind, FailureKind::RateLimit);
+    }
+}
+
+#[cfg(test)]
+mod stream_response_channel_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn bounded_response_queue_stalls_and_resumes_at_its_capacity() {
+        assert_eq!(STREAM_RESPONSE_CHANNEL_CAPACITY, 64);
+        let (tx, mut rx) = stream_response_channel();
+        assert_eq!(rx.capacity(), STREAM_RESPONSE_CHANNEL_CAPACITY);
+
+        let event_count = STREAM_RESPONSE_CHANNEL_CAPACITY * 2 + 1;
+        let sent = Arc::new(AtomicUsize::new(0));
+        let producer_sent = sent.clone();
+        let producer = tokio::spawn(async move {
+            for index in 0..event_count {
+                tx.send(Ok(Bytes::copy_from_slice(&index.to_le_bytes())))
+                    .await
+                    .expect("test consumer remains connected");
+                producer_sent.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sent.load(Ordering::SeqCst) < STREAM_RESPONSE_CHANNEL_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("producer should fill the response queue");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            STREAM_RESPONSE_CHANNEL_CAPACITY
+        );
+        assert_eq!(rx.len(), STREAM_RESPONSE_CHANNEL_CAPACITY);
+        assert_eq!(rx.capacity(), 0);
+        assert!(!producer.is_finished(), "producer must wait for the reader");
+
+        let mut received = vec![rx.recv().await.unwrap().unwrap()];
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sent.load(Ordering::SeqCst) <= STREAM_RESPONSE_CHANNEL_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("producer should resume when the reader frees one slot");
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            STREAM_RESPONSE_CHANNEL_CAPACITY + 1
+        );
+        assert_eq!(rx.len(), STREAM_RESPONSE_CHANNEL_CAPACITY);
+        assert!(
+            !producer.is_finished(),
+            "producer should block again at capacity"
+        );
+
+        while let Some(frame) = rx.recv().await {
+            received.push(frame.unwrap());
+        }
+        producer.await.unwrap();
+        assert_eq!(received.len(), event_count);
+        for (index, frame) in received.into_iter().enumerate() {
+            assert_eq!(frame.as_ref(), index.to_le_bytes());
+        }
     }
 }
