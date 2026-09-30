@@ -33,7 +33,7 @@ pub(crate) struct RegistryPublication<'a> {
     _guard: tokio::sync::MutexGuard<'a, ()>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Snapshot {
     pub providers: HashMap<String, ProviderRow>,
     pub provider_order: Vec<String>,
@@ -225,6 +225,44 @@ impl Registry {
     /// throughout, so it is unaffected by concurrent configuration changes.
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.inner.read().clone()
+    }
+
+    /// Whether an account still belongs to a provider in the active runtime
+    /// snapshot. Credential resolution uses this to reject stale request
+    /// snapshots after account/provider deletion without retaining tombstones.
+    pub fn contains_provider_account(&self, provider_id: &str, account_id: &str) -> bool {
+        let snapshot = self.snapshot();
+        snapshot.providers.contains_key(provider_id)
+            && snapshot.accounts.get(account_id).is_some_and(|account| {
+                account.provider_id == provider_id && account.status != "disabled"
+            })
+    }
+
+    /// Remove a deleted account from the active snapshot immediately. The next
+    /// database-backed reload will publish the complete canonical snapshot.
+    pub fn forget_account(&self, account_id: &str) {
+        let mut current = self.inner.write();
+        let mut snapshot = (**current).clone();
+        snapshot.accounts.remove(account_id);
+        *current = Arc::new(snapshot);
+    }
+
+    /// Remove a deleted provider and its runtime-owned children immediately.
+    pub fn forget_provider(&self, provider_id: &str) {
+        let mut current = self.inner.write();
+        let mut snapshot = (**current).clone();
+        snapshot.providers.remove(provider_id);
+        snapshot.provider_order.retain(|id| id != provider_id);
+        snapshot
+            .accounts
+            .retain(|_, account| account.provider_id != provider_id);
+        snapshot
+            .models
+            .retain(|_, model| model.provider_id != provider_id);
+        snapshot
+            .model_by_upstream
+            .retain(|(id, _), _| id != provider_id);
+        *current = Arc::new(snapshot);
     }
 
     /// The number of providers currently in the active snapshot.

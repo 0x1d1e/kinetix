@@ -404,6 +404,13 @@ async fn run_model_lifecycle_lane(
     provider_id: &str,
     lane: ModelLifecycleLane,
 ) -> Result<Value, ApiError> {
+    if db::get_provider(&state.pool, provider_id)
+        .await
+        .map_err(ApiError::internal)?
+        .is_none()
+    {
+        return Err(ApiError::not_found("provider not found"));
+    }
     let state = state.clone();
     let provider_id = provider_id.to_string();
     let class = match lane {
@@ -764,6 +771,14 @@ async fn run_scheduled_model_lifecycle_for_provider(
     provider: db::ProviderRow,
     settings: ModelLifecycleSettings,
 ) {
+    match db::get_provider(&state.pool, &provider.id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(error) => {
+            tracing::debug!(provider = %provider.id, %error, "could not revalidate scheduled lifecycle provider");
+            return;
+        }
+    }
     let reconcile_key = lifecycle_setting_key("reconciliation", "last_attempt", &provider.id);
     let pricing_key = lifecycle_setting_key("pricing_sync", "last_attempt", &provider.id);
     let reconcile_due = scheduled_due(
@@ -18874,6 +18889,204 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn stale_credential_snapshot_after_account_deletion_does_not_recreate_state() {
+        let (state, root) = test_state("stale-credential-after-delete").await;
+        let spy = Arc::new(CredentialEvictionSpy::default());
+        state.register_plugin_credential_strategy("test-eviction", spy);
+        let provider_id = insert_provider(
+            &state,
+            "stale-credential-provider",
+            crate::plugins::CredentialMode::AuthFlow,
+            Some("test-eviction"),
+            Some("integration"),
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("account-secret").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "stale-account",
+            &encrypted,
+            "test-key",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let stale_provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_account = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let _ = delete_account(
+            axum::extract::State(state.clone()),
+            auth(),
+            Path(account_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!state
+            .registry
+            .contains_provider_account(&provider_id, &account_id));
+        let scheduled_before = state.provider_work.metrics_snapshot().scheduled;
+
+        let error = state
+            .credential_for(&stale_provider, &stale_account)
+            .await
+            .expect_err("stale account snapshot must be rejected after deletion");
+        assert_eq!(error.code, "credential_state_evicted");
+        assert_eq!(
+            state.provider_work.metrics_snapshot().scheduled,
+            scheduled_before,
+            "stale credential resolution must not enter provider-work coordination"
+        );
+        assert!(state
+            .credential_refresh
+            .next_attempt_at(&provider_id, &account_id)
+            .is_none());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stale_credential_snapshot_after_provider_deletion_does_not_recreate_state() {
+        let (state, root) = test_state("stale-credential-after-provider-delete").await;
+        state.register_plugin_credential_strategy(
+            "test-eviction",
+            Arc::new(CredentialEvictionSpy::default()),
+        );
+        let provider_id = insert_provider(
+            &state,
+            "stale-credential-provider-delete",
+            crate::plugins::CredentialMode::AuthFlow,
+            Some("test-eviction"),
+            Some("integration"),
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("account-secret").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "stale-account",
+            &encrypted,
+            "test-key",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let stale_provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_account = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let _ = delete_provider(
+            axum::extract::State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+        )
+        .await
+        .unwrap();
+        let scheduled_before = state.provider_work.metrics_snapshot().scheduled;
+
+        let error = state
+            .credential_for(&stale_provider, &stale_account)
+            .await
+            .expect_err("stale provider/account snapshot must be rejected after deletion");
+        assert_eq!(error.code, "credential_state_evicted");
+        assert_eq!(
+            state.provider_work.metrics_snapshot().scheduled,
+            scheduled_before,
+            "stale credential resolution must not enter provider-work coordination"
+        );
+        assert!(state
+            .credential_refresh
+            .next_attempt_at(&provider_id, &account_id)
+            .is_none());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stale_scheduled_provider_snapshot_after_deletion_does_not_recreate_gate() {
+        let (state, root) = test_state("stale-scheduled-provider-after-delete").await;
+        let provider_id = insert_provider(
+            &state,
+            "stale-scheduled-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        state.registry.reload(&state.pool).await.unwrap();
+        let stale_provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let _ = delete_provider(
+            axum::extract::State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state.registry.provider(&provider_id).is_none());
+        let scheduled_before = state.provider_work.metrics_snapshot().scheduled;
+        run_scheduled_model_lifecycle_for_provider(
+            &state,
+            stale_provider,
+            ModelLifecycleSettings {
+                reconciliation_interval_secs: 300,
+                pricing_sync_interval_secs: 0,
+                jitter_secs: 0,
+                probe_freshness_secs: 3600,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            state.provider_work.metrics_snapshot().scheduled,
+            scheduled_before,
+            "stale scheduled work must be rejected before entering provider-work coordination"
+        );
+        assert!(db::get_setting(
+            &state.pool,
+            &lifecycle_setting_key("reconciliation", "last_attempt", &provider_id)
+        )
+        .await
+        .unwrap()
+        .is_none());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn account_and_provider_deletion_evict_control_plane_state() {
         let (state, root) = test_state("delete-control-plane-state").await;
         let spy = Arc::new(CredentialEvictionSpy::default());
@@ -21808,6 +22021,7 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
         let provider = db::get_provider(&state.pool, &provider_id)
             .await
             .unwrap()
@@ -22390,6 +22604,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
         state.register_plugin_credential_strategy("plugin.test", Arc::new(ExpiredCredential));
+        state.registry.reload(&state.pool).await.unwrap();
         let provider = db::get_provider(&state.pool, &provider_id)
             .await
             .unwrap()

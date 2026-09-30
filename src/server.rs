@@ -745,6 +745,14 @@ async fn run_plugin_health_probes_for_provider(
     manager: &Arc<PluginManager>,
     provider: db::ProviderRow,
 ) {
+    if !state
+        .registry
+        .snapshot()
+        .providers
+        .contains_key(&provider.id)
+    {
+        return;
+    }
     let Some(pref) = provider.credential_plugin_ref() else {
         return;
     };
@@ -764,7 +772,11 @@ async fn run_plugin_health_probes_for_provider(
         Err(_) => return,
     };
     for account in accounts {
-        if account.status == "disabled" {
+        if account.status == "disabled"
+            || !state
+                .registry
+                .contains_provider_account(&provider.id, &account.id)
+        {
             continue;
         }
         let probe_plugin = pref.plugin_id.clone();

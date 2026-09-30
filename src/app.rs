@@ -285,6 +285,7 @@ impl AppState {
 
     /// Release account-scoped credential cache and refresh state after deletion.
     pub fn forget_deleted_account(&self, provider_id: &str, account_id: &str) {
+        self.registry.forget_account(account_id);
         self.credential_refresh.forget(provider_id, account_id);
         for strategy in self.plugin_credentials.iter() {
             strategy.value().forget_account(provider_id, account_id);
@@ -293,11 +294,26 @@ impl AppState {
 
     /// Release provider-scoped work and credential state after deletion.
     pub fn forget_deleted_provider(&self, provider_id: &str) {
+        self.registry.forget_provider(provider_id);
         self.provider_work.forget_provider(provider_id);
         self.credential_refresh.forget_provider(provider_id);
         for strategy in self.plugin_credentials.iter() {
             strategy.value().forget_provider(provider_id);
         }
+    }
+
+    fn credential_identity_is_current(&self, provider_id: &str, account_id: &str) -> bool {
+        self.registry
+            .contains_provider_account(provider_id, account_id)
+    }
+
+    fn credential_state_evicted_error() -> CredentialRotationError {
+        CredentialRotationError::new(
+            "credential_state_evicted",
+            "account or provider was deleted before credential work started",
+            false,
+            None,
+        )
     }
 
     /// Resolve the credential for an account, honouring a provider's plugin
@@ -308,6 +324,9 @@ impl AppState {
         account: &crate::db::AccountRow,
     ) -> std::result::Result<crate::credentials::ResolvedCredential, CredentialRotationError> {
         if let Some(r) = provider.credential_plugin_ref() {
+            if !self.credential_identity_is_current(&provider.id, &account.id) {
+                return Err(Self::credential_state_evicted_error());
+            }
             let Some(strategy) = self.plugin_credentials.get(&r.plugin_id) else {
                 return Err(CredentialRotationError::new(
                     "plugin_internal",
@@ -379,8 +398,7 @@ impl AppState {
         if !disabled {
             return Ok(false);
         }
-        self.credential_refresh
-            .forget(&account.provider_id, &account.id);
+        self.forget_deleted_account(&account.provider_id, &account.id);
         self.registry.reload(&self.pool).await.with_context(|| {
             format!(
                 "account {} was disabled but registry reload failed",
@@ -408,6 +426,9 @@ impl AppState {
         let Some(r) = provider.credential_plugin_ref() else {
             return Ok(false);
         };
+        if !self.credential_identity_is_current(&provider.id, &account.id) {
+            return Err(Self::credential_state_evicted_error());
+        }
         let strategy = self
             .plugin_credentials
             .get(&r.plugin_id)
@@ -579,6 +600,11 @@ impl AppState {
                 return;
             }
         };
+        if !self.credential_identity_is_current(&provider.id, &account.id) {
+            self.credential_refresh
+                .forget(&key.provider_id, &key.account_id);
+            return;
+        }
         let Some(reference) = provider.credential_plugin_ref() else {
             self.credential_refresh
                 .forget(&key.provider_id, &key.account_id);
