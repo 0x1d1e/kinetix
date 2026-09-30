@@ -77,6 +77,19 @@ if [ -z "$KEY" ]; then
   exit 1
 fi
 
+KEY_READY=false
+for _ in $(seq 1 20); do
+  if curl -fsS -H "Authorization: Bearer $KEY" "http://$BIND/v1/models" >/dev/null; then
+    KEY_READY=true
+    break
+  fi
+  sleep 0.25
+done
+if [ "$KEY_READY" != true ]; then
+  echo "Bootstrap virtual key failed authentication"
+  exit 1
+fi
+
 echo "==> Running compatibility matrix suite"
 KINETIX_BASE="http://$BIND" KINETIX_KEY="$KEY" python3 scripts/compat-matrix.py
 

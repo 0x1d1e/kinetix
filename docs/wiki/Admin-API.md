@@ -95,8 +95,8 @@ Account responses include `status_reason`, `status_changed_at`, and `retry_at`. 
 
 | Method & path | Purpose |
 | --- | --- |
-| `GET /admin/api/config/export` | Export portable config (secret-free; `?include_secrets=true` adds encrypted blobs). |
-| `POST /admin/api/config/import` | Two-phase: `apply:false` = Validate/Dry Run (no writes); `apply:true` = upsert by name. Model `transport_override` values round-trip through export/import. |
+| `GET /admin/api/config/export` | Export version 2 config (secret-free; `?include_secrets=true` adds encrypted blobs and opaque account references). |
+| `POST /admin/api/config/import` | Accepts version 1 and 2; unversioned configs are treated as version 1. `apply:false` validates without writes and reports problems, conflicts, warnings, and missing resources. `apply:true` applies all upserts in one transaction and rolls back on failure. Imported secrets do not replace existing credentials; changing a provider to `credential_mode: none` may remove its credential accounts. |
 
 ## Usage, requests, traces
 

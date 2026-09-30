@@ -10,6 +10,7 @@ use axum::Json;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::Row;
 
 use crate::adapters::{
     normalize_plugin_reasoning_capability, normalize_plugin_reasoning_capability_v1,
@@ -9855,33 +9856,31 @@ pub async fn export_config(
     _auth: AdminAuth,
     Query(q): Query<ExportQuery>,
 ) -> ApiResult {
-    let providers = db::list_providers(&state.pool)
+    export_config_with_pause(state, q.include_secrets, || async {}).await
+}
+
+async fn export_config_with_pause<F, Fut>(
+    state: AppState,
+    include_secrets: bool,
+    after_resources_read: F,
+) -> ApiResult
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let snapshot = db::config_export_snapshot_with_hook(&state.pool, after_resources_read)
         .await
         .map_err(ApiError::internal)?;
-    let mut accounts = Vec::new();
-    let mut models = Vec::new();
-    for p in &providers {
-        for a in db::accounts_for_provider(&state.pool, &p.id)
-            .await
-            .map_err(ApiError::internal)?
-        {
-            if a.label != "__kinetix_noauth__" {
-                accounts.push(a);
-            }
-        }
-        for m in db::models_for_provider(&state.pool, &p.id)
-            .await
-            .map_err(ApiError::internal)?
-        {
-            models.push(m);
-        }
-    }
-    let routes = db::list_routes(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-    let aliases = db::list_aliases(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+    let providers = snapshot.providers;
+    let accounts: Vec<_> = snapshot
+        .accounts
+        .into_iter()
+        .filter(|account| account.label != "__kinetix_noauth__")
+        .collect();
+    let models = snapshot.models;
+    let routes = snapshot.routes;
+    let aliases = snapshot.aliases;
+    let route_targets_by_route = snapshot.route_targets;
 
     let provider_name = |id: &str| -> String {
         providers
@@ -9928,20 +9927,29 @@ pub async fn export_config(
         })
         .collect();
 
+    let portable_account_refs: std::collections::HashMap<String, String> = accounts
+        .iter()
+        .enumerate()
+        .map(|(index, account)| (account.id.clone(), format!("account-{}", index + 1)))
+        .collect();
     let accounts_json: Vec<Value> = accounts
         .iter()
-        .map(|a| {
+        .enumerate()
+        .map(|(index, a)| {
             let mut v = json!({
+                "ref": format!("account-{}", index + 1),
                 "provider": provider_name(&a.provider_id),
                 "label": a.label,
                 "key_mask": a.key_mask,
                 "status": a.status,
+                "enabled": account_export_enabled(&a.status, &a.status_reason),
                 "quota_type": a.quota_type,
+                "quota_window_s": a.quota_window_s,
                 "soft_quota_usd": a.soft_quota_usd,
                 "priority": a.priority,
                 "weight": a.weight,
             });
-            if q.include_secrets {
+            if include_secrets {
                 v["secret_enc"] = json!(a.secret_enc);
             }
             v
@@ -9988,15 +9996,18 @@ pub async fn export_config(
 
     let mut routes_json = Vec::new();
     for r in &routes {
-        let targets = db::route_targets(&state.pool, &r.id)
-            .await
-            .map_err(ApiError::internal)?;
+        let targets = route_targets_by_route
+            .get(&r.id)
+            .cloned()
+            .unwrap_or_default();
         let targets_json: Vec<Value> = targets
             .iter()
             .map(|t| {
                 json!({
                     "model": model_label(&t.model_id),
-                    "account_id": t.account_id,
+                    "account_ref": t.account_id.as_ref().and_then(|id| {
+                        portable_account_refs.get(id).cloned()
+                    }),
                     "priority": t.priority,
                     "weight": t.weight,
                     "predicate": serde_json::from_str::<Value>(&t.predicate).unwrap_or(json!({})),
@@ -10036,9 +10047,9 @@ pub async fn export_config(
         .collect();
 
     Ok(Json(json!({
-        "kinetix_config_version": 1,
+        "kinetix_config_version": 2,
         "exported_at": db::now_iso(),
-        "secrets_included": q.include_secrets,
+        "secrets_included": include_secrets,
         "providers": providers_json,
         "accounts": accounts_json,
         "models": models_json,
@@ -10190,6 +10201,173 @@ async fn resolve_imported_provider_pricing_scope(
     }
 }
 
+fn imported_provider_mode<'a>(
+    provider_name: &str,
+    imported_providers: &'a [Value],
+    existing_providers: &'a [db::ProviderRow],
+) -> Option<&'a str> {
+    imported_providers
+        .iter()
+        .find(|provider| provider["name"].as_str() == Some(provider_name))
+        .and_then(|provider| provider["credential_mode"].as_str())
+        .or_else(|| {
+            existing_providers
+                .iter()
+                .find(|provider| provider.name == provider_name)
+                .map(|provider| provider.credential_mode.as_str())
+        })
+}
+
+async fn write_route_targets_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    route_id: &str,
+    targets: &[RouteTargetBody],
+) -> Result<(), ApiError> {
+    for target in targets {
+        sqlx::query(
+            "INSERT INTO route_targets (id, route_id, account_id, model_id, priority, weight, param_overrides, predicate) VALUES (?,?,?,?,?,?,?,?)",
+        )
+        .bind(format!("tgt_{}", uuid::Uuid::new_v4().simple()))
+        .bind(route_id)
+        .bind(target.account_id.as_deref())
+        .bind(&target.model_id)
+        .bind(target.priority)
+        .bind(target.weight)
+        .bind(target.param_overrides.to_string())
+        .bind(target.predicate.to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+    Ok(())
+}
+
+fn account_export_enabled(status: &str, status_reason: &str) -> Option<bool> {
+    if !matches!(status, "healthy" | "cooldown" | "exhausted" | "disabled") {
+        return None;
+    }
+    match status_reason {
+        "operator_disabled" => Some(false),
+        "existing_disabled" | "unknown" if status == "disabled" => None,
+        _ => Some(true),
+    }
+}
+
+fn imported_account_enabled(account: &Value, source_version: u64) -> Result<bool, String> {
+    let status_enabled = match account.get("status") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(status)) => match status.as_str() {
+            "disabled" => Some(false),
+            "healthy" | "cooldown" | "exhausted" => Some(true),
+            _ => {
+                return Err(
+                    "account status must be healthy, cooldown, exhausted, or disabled".into(),
+                )
+            }
+        },
+        Some(_) => {
+            return Err("account status must be a string".into());
+        }
+    };
+    if let Some(value) = account.get("enabled") {
+        if value.is_null() {
+            if source_version == 2 {
+                return Err("account enabled must be a boolean in config version 2".into());
+            }
+        } else {
+            let enabled = value
+                .as_bool()
+                .ok_or_else(|| "account enabled must be a boolean".to_string())?;
+            if source_version == 1
+                && status_enabled.is_some_and(|status_enabled| status_enabled != enabled)
+            {
+                return Err("account enabled conflicts with status".into());
+            }
+            return Ok(enabled);
+        }
+    }
+    if source_version == 2 {
+        return Err("account enabled is required in config version 2".into());
+    }
+    Ok(status_enabled.unwrap_or(true))
+}
+
+fn normalize_import_config(mut config: Value) -> Result<(Value, u64, Vec<String>), ApiError> {
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| ApiError::bad("config must be a JSON object"))?;
+    let version = match object.get("kinetix_config_version") {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| ApiError::bad("kinetix_config_version must be an integer"))?,
+        None => 1,
+    };
+    if !matches!(version, 1 | 2) {
+        return Err(ApiError::bad(format!(
+            "unsupported kinetix_config_version {version}; supported versions are 1 and 2"
+        )));
+    }
+
+    let mut warnings = Vec::new();
+    if version == 1 {
+        let account_refs: Vec<(String, String)> = object
+            .get("accounts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(index, account)| {
+                let provider = account.get("provider")?.as_str()?.to_string();
+                let reference = account
+                    .get("ref")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("account-{}", index + 1));
+                Some((provider, reference))
+            })
+            .collect();
+        if let Some(accounts) = object.get_mut("accounts").and_then(Value::as_array_mut) {
+            for (index, account) in accounts.iter_mut().enumerate() {
+                if let Some(account) = account.as_object_mut() {
+                    account
+                        .entry("ref".to_string())
+                        .or_insert_with(|| json!(format!("account-{}", index + 1)));
+                }
+            }
+        }
+        if let Some(routes) = object.get_mut("routes").and_then(Value::as_array_mut) {
+            for route in routes {
+                let Some(targets) = route.get_mut("targets").and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                for target in targets {
+                    if target.get("account_id").and_then(Value::as_str).is_none() {
+                        continue;
+                    }
+                    let provider = target
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .and_then(|model| model.split_once('/'))
+                        .map(|(provider, _)| provider);
+                    let matching_refs: Vec<&str> = account_refs
+                        .iter()
+                        .filter(|(account_provider, _)| provider == Some(account_provider.as_str()))
+                        .map(|(_, reference)| reference.as_str())
+                        .collect();
+                    if let [reference] = matching_refs.as_slice() {
+                        target["account_ref"] = json!(reference);
+                        target.as_object_mut().unwrap().remove("account_id");
+                    }
+                }
+            }
+        }
+        warnings.push(
+            "configuration version 1 was migrated; ambiguous account bindings require manual review".into(),
+        );
+    }
+    Ok((config, version, warnings))
+}
+
 #[derive(Deserialize)]
 pub struct ImportBody {
     pub config: Value,
@@ -10203,17 +10381,39 @@ pub async fn import_config(
     _auth: AdminAuth,
     Json(body): Json<ImportBody>,
 ) -> ApiResult {
-    let cfg = &body.config;
+    let (config, source_version, compatibility_warnings) = normalize_import_config(body.config)?;
+    let cfg = &config;
     let mut plan: Vec<Value> = Vec::new();
     let mut problems: Vec<String> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings = compatibility_warnings;
+    let mut conflicts: Vec<Value> = Vec::new();
+    let mut missing_resources: Vec<Value> = Vec::new();
+    let _import_guard = if body.apply {
+        Some(state.registry.config_import_lock().await)
+    } else {
+        None
+    };
+    let existing_providers = db::list_providers(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let existing_provider_ids: std::collections::HashMap<String, String> = existing_providers
+        .iter()
+        .map(|provider| (provider.name.clone(), provider.id.clone()))
+        .collect();
     let mut effective_provider_scopes: std::collections::HashMap<String, String> =
-        db::list_providers(&state.pool)
-            .await
-            .map_err(ApiError::internal)?
-            .into_iter()
-            .map(|provider| (provider.name, provider.pricing_scope))
+        existing_providers
+            .iter()
+            .map(|provider| (provider.name.clone(), provider.pricing_scope.clone()))
             .collect();
+    let existing_models = db::list_models(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let existing_accounts = db::list_accounts(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let existing_routes = db::list_routes(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
 
     let empty = Vec::new();
     let providers = cfg["providers"].as_array().unwrap_or(&empty);
@@ -10221,20 +10421,68 @@ pub async fn import_config(
     let models = cfg["models"].as_array().unwrap_or(&empty);
     let routes = cfg["routes"].as_array().unwrap_or(&empty);
     let aliases = cfg["aliases"].as_array().unwrap_or(&empty);
+    for key in ["providers", "accounts", "models", "routes", "aliases"] {
+        if cfg.get(key).is_some_and(|value| !value.is_array()) {
+            problems.push(format!("config field '{key}' must be an array"));
+        }
+    }
 
-    if providers.is_empty() && models.is_empty() && routes.is_empty() {
+    if providers.is_empty()
+        && accounts.is_empty()
+        && models.is_empty()
+        && routes.is_empty()
+        && aliases.is_empty()
+    {
         return Err(ApiError::bad(
             "config has no providers, models, or routes to import",
         ));
     }
 
     // ---- Validate phase (FR-8.6): schema + outbound security, no writes ----
+    let mut seen_provider_names = std::collections::HashSet::new();
     for p in providers {
         let name = p["name"].as_str().unwrap_or("");
         let base_url = p["base_url"].as_str().unwrap_or("");
         if name.is_empty() || base_url.is_empty() {
             problems.push("a provider entry is missing name or base_url".into());
             continue;
+        }
+        if !seen_provider_names.insert(name.to_string()) {
+            conflicts
+                .push(json!({ "kind": "provider", "name": name, "reason": "duplicate entry" }));
+            problems.push(format!("provider '{name}' appears more than once"));
+        }
+        for problem in crate::validate::validate_provider_schema(
+            name,
+            base_url,
+            p["wire_format"].as_str().unwrap_or(""),
+            p["auth_scheme"].as_str().unwrap_or("bearer"),
+            p["custom_header_name"].as_str(),
+            p["custom_param_name"].as_str(),
+        ) {
+            problems.push(format!("provider '{name}': {problem}"));
+        }
+        if p.get("timeout_ms").is_some_and(|value| !value.is_null())
+            && !p["timeout_ms"].as_i64().is_some_and(|timeout| timeout > 0)
+        {
+            problems.push(format!(
+                "provider '{name}': timeout_ms must be a positive integer"
+            ));
+        }
+        if p.get("enabled").is_some_and(|value| !value.is_null()) && !p["enabled"].is_boolean() {
+            problems.push(format!("provider '{name}': enabled must be a boolean"));
+        }
+        if !p.get("extra_headers").is_none_or(Value::is_null) && !p["extra_headers"].is_object() {
+            problems.push(format!(
+                "provider '{name}': extra_headers must be an object"
+            ));
+        }
+        if !p.get("rate_limit_rules").is_none_or(Value::is_null)
+            && !p["rate_limit_rules"].is_object()
+        {
+            problems.push(format!(
+                "provider '{name}': rate_limit_rules must be an object"
+            ));
         }
         if let Err(e) = validate_outbound_url(&state, base_url) {
             problems.push(format!("provider '{name}': {}", e.1));
@@ -10256,10 +10504,8 @@ pub async fn import_config(
                 "provider '{name}': pricing_scope must be 'direct_api' or 'integration'"
             ));
         }
-        let existing_provider = db::list_providers(&state.pool)
-            .await
-            .map_err(ApiError::internal)?
-            .into_iter()
+        let existing_provider = existing_providers
+            .iter()
             .find(|provider| provider.name == name);
         let explicit_mode = match p.get("credential_mode").filter(|mode| !mode.is_null()) {
             Some(mode) => match mode
@@ -10352,11 +10598,143 @@ pub async fn import_config(
             "effective_pricing_scope": effective_pricing_scope,
         }));
     }
+
+    let mut known_provider_names: std::collections::HashSet<String> = existing_providers
+        .iter()
+        .map(|provider| provider.name.clone())
+        .collect();
+    known_provider_names.extend(
+        providers
+            .iter()
+            .filter_map(|provider| provider["name"].as_str().map(str::to_string)),
+    );
+    let mut referenced_plugins = std::collections::BTreeSet::new();
+    for provider in providers {
+        for field in ["wire_plugin", "credential_plugin", "model_source_plugin"] {
+            if let Some(binding) = provider[field]
+                .as_str()
+                .filter(|binding| !binding.is_empty())
+            {
+                match crate::plugins::PluginRef::parse(binding) {
+                    Some(reference) => {
+                        referenced_plugins.insert(reference.plugin_id);
+                    }
+                    None => problems.push(format!(
+                        "provider '{}': {field} must be a valid plugin binding",
+                        provider["name"].as_str().unwrap_or("")
+                    )),
+                }
+            }
+        }
+        if let Some(plugin_id) = provider["source_plugin_id"]
+            .as_str()
+            .filter(|plugin_id| !plugin_id.trim().is_empty())
+        {
+            referenced_plugins.insert(plugin_id.to_string());
+        }
+    }
+    if let Some(required) = cfg.get("required_plugins") {
+        if let Some(required) = required.as_array() {
+            for plugin in required {
+                match plugin.as_str().filter(|id| !id.trim().is_empty()) {
+                    Some(plugin) => {
+                        referenced_plugins.insert(plugin.to_string());
+                    }
+                    None => {
+                        problems.push("required_plugins entries must be non-empty strings".into())
+                    }
+                }
+            }
+        } else {
+            problems.push("required_plugins must be an array".into());
+        }
+    }
+    for plugin_id in referenced_plugins {
+        let available = match state.plugin_manager() {
+            Some(manager) => manager
+                .get(&plugin_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|plugin| plugin.enabled != 0),
+            None => false,
+        };
+        if !available {
+            missing_resources.push(json!({ "kind": "plugin", "id": plugin_id }));
+            warnings.push(format!(
+                "required plugin '{plugin_id}' is not installed and enabled"
+            ));
+        }
+    }
+
+    let mut seen_model_keys = std::collections::HashSet::new();
     for m in models {
         let provider = m["provider"].as_str().unwrap_or("");
         let upstream = m["upstream_id"].as_str().unwrap_or("");
         if provider.is_empty() || upstream.is_empty() {
             problems.push("a model entry is missing provider or upstream_id".into());
+        }
+        let model_key = format!("{provider}/{upstream}");
+        if !seen_model_keys.insert(model_key.clone()) {
+            conflicts
+                .push(json!({ "kind": "model", "name": model_key, "reason": "duplicate entry" }));
+            problems.push(format!("model '{model_key}' appears more than once"));
+        }
+        if !known_provider_names.contains(provider) {
+            missing_resources.push(json!({ "kind": "provider", "name": provider }));
+            problems.push(format!(
+                "model '{model_key}' references missing provider '{provider}'"
+            ));
+        }
+        for (field, value) in [
+            ("capabilities", &m["capabilities"]),
+            ("prices", &m["prices"]),
+            ("parameters", &m["parameters"]),
+            ("extra_request", &m["extra_request"]),
+        ] {
+            if !value.is_null() && !value.is_object() {
+                problems.push(format!("model '{model_key}': {field} must be an object"));
+            }
+        }
+        if let Err(error) = serde_json::from_value::<Prices>(m["prices"].clone()) {
+            problems.push(format!("model '{model_key}' has invalid prices: {error}"));
+        }
+        if let Err(error) = validate_continuation_families(&m["capabilities"]) {
+            problems.push(format!("model '{model_key}': {}", error.1));
+        }
+        let validation = crate::validate::validate_model(
+            upstream,
+            m["context_window"].as_i64(),
+            m["max_output_tokens"].as_i64(),
+            &m["capabilities"],
+            &m["prices"],
+            &m["parameters"],
+        );
+        problems.extend(
+            validation["problems"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p.as_str().map(|p| format!("model '{model_key}': {p}"))),
+        );
+        warnings.extend(
+            validation["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|w| w.as_str().map(|w| format!("model '{model_key}': {w}"))),
+        );
+        match serde_json::from_value::<ThinkingMap>(
+            m.get("thinking_map").cloned().unwrap_or_else(|| json!({})),
+        ) {
+            Ok(thinking) => {
+                if let Err(error) = validate_thinking_map(&thinking) {
+                    problems.push(format!("model '{model_key}': {}", error.1));
+                }
+            }
+            Err(error) => problems.push(format!(
+                "model '{model_key}' has invalid thinking_map: {error}"
+            )),
         }
         if let Some(value) = m.get("transport_override").filter(|value| !value.is_null()) {
             match value.as_str() {
@@ -10369,6 +10747,27 @@ pub async fn import_config(
                 None => problems.push(format!(
                     "model '{provider}/{upstream}' transport_override must be a string or null"
                 )),
+            }
+        }
+        if let Some(transport) = m["transport_override"].as_str() {
+            let configured_binding = providers
+                .iter()
+                .find(|candidate| candidate["name"].as_str() == Some(provider))
+                .and_then(|candidate| candidate["wire_plugin"].as_str())
+                .or_else(|| {
+                    existing_providers
+                        .iter()
+                        .find(|candidate| candidate.name == provider)
+                        .map(|candidate| candidate.wire_plugin.as_str())
+                })
+                .unwrap_or("");
+            if let Some(reference) = crate::plugins::PluginRef::parse(configured_binding) {
+                let expected = crate::adapters::TargetTransport::Plugin(reference.to_string_ref());
+                if crate::adapters::TargetTransport::parse(transport) != Some(expected) {
+                    problems.push(format!(
+                        "model '{model_key}' transport override conflicts with the provider's explicit plugin adapter"
+                    ));
+                }
             }
         }
         let mut suppressed_external_price_fields = Vec::new();
@@ -10402,33 +10801,379 @@ pub async fn import_config(
             "suppressed_external_price_fields": suppressed_external_price_fields,
         }));
     }
+
+    let provider_names_by_id: std::collections::HashMap<&str, &str> = existing_providers
+        .iter()
+        .map(|provider| (provider.id.as_str(), provider.name.as_str()))
+        .collect();
+    let mut effective_provider_modes: std::collections::HashMap<String, String> =
+        existing_providers
+            .iter()
+            .map(|provider| (provider.name.clone(), provider.credential_mode.clone()))
+            .collect();
+    for provider in providers {
+        if let Some(name) = provider["name"].as_str() {
+            effective_provider_modes.insert(
+                name.to_string(),
+                imported_provider_mode(name, providers, &existing_providers)
+                    .unwrap_or("manual")
+                    .to_string(),
+            );
+        }
+    }
+    let mut existing_accounts_by_key =
+        std::collections::HashMap::<(String, String), Vec<String>>::new();
+    let mut effective_existing_account_ids =
+        std::collections::HashMap::<&str, (String, String)>::new();
+    for account in &existing_accounts {
+        let Some(provider_name) = provider_names_by_id.get(account.provider_id.as_str()) else {
+            continue;
+        };
+        let mode = effective_provider_modes
+            .get(*provider_name)
+            .map(String::as_str)
+            .unwrap_or("manual");
+        if mode == "none" || account.label == "__kinetix_noauth__" {
+            continue;
+        }
+        let key = ((*provider_name).to_string(), account.label.clone());
+        existing_accounts_by_key
+            .entry(key.clone())
+            .or_default()
+            .push(account.id.clone());
+        effective_existing_account_ids.insert(account.id.as_str(), key);
+    }
+    let mut imported_account_label_counts =
+        std::collections::HashMap::<(String, String), usize>::new();
+    for account in accounts {
+        if let (Some(provider), Some(label)) =
+            (account["provider"].as_str(), account["label"].as_str())
+        {
+            *imported_account_label_counts
+                .entry((provider.to_string(), label.to_string()))
+                .or_default() += 1;
+        }
+    }
+    let mut imported_accounts_by_ref =
+        std::collections::HashMap::<String, (String, String, bool, bool)>::new();
+    let mut reported_ambiguous_account_keys = std::collections::HashSet::new();
+    for account in accounts {
+        let provider = account["provider"].as_str().unwrap_or("");
+        let label = account["label"].as_str().unwrap_or("");
+        let reference = account["ref"].as_str().unwrap_or("");
+        if provider.is_empty() || label.trim().is_empty() {
+            problems.push("an account entry is missing provider or label".into());
+        }
+        if !known_provider_names.contains(provider) {
+            missing_resources.push(json!({ "kind": "provider", "name": provider }));
+            problems.push(format!(
+                "account '{label}' references missing provider '{provider}'"
+            ));
+        }
+        if reference.trim().is_empty() {
+            problems.push(format!(
+                "account '{provider}/{label}' is missing a portable ref"
+            ));
+        } else {
+            let has_secret = account["secret_enc"].as_str().is_some();
+            let mode = effective_provider_modes
+                .get(provider)
+                .map(String::as_str)
+                .unwrap_or("manual");
+            let key = (provider.to_string(), label.to_string());
+            let matches = existing_accounts_by_key
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let imported_label_count = imported_account_label_counts
+                .get(&key)
+                .copied()
+                .unwrap_or(1);
+            let existing_account_id = match matches {
+                [account_id] if imported_label_count == 1 => Some(account_id.clone()),
+                [] => None,
+                _ => {
+                    if reported_ambiguous_account_keys.insert(key) {
+                        conflicts.push(json!({
+                            "kind": "account",
+                            "provider": provider,
+                            "label": label,
+                            "reason": "ambiguous existing account label",
+                            "existing_matches": matches.len(),
+                            "imported_refs": imported_label_count,
+                        }));
+                        problems.push(format!(
+                            "account '{provider}/{label}' cannot be matched unambiguously to existing account labels; resolve the duplicates before importing"
+                        ));
+                    }
+                    None
+                }
+            };
+            if existing_account_id.is_some() && has_secret {
+                conflicts.push(json!({
+                    "kind": "account",
+                    "provider": provider,
+                    "label": label,
+                    "reason": "existing credentials are kept",
+                }));
+            }
+            let will_exist = mode != "none"
+                && label != "__kinetix_noauth__"
+                && (existing_account_id.is_some() || (matches.is_empty() && has_secret));
+            if imported_accounts_by_ref
+                .insert(
+                    reference.to_string(),
+                    (
+                        provider.to_string(),
+                        label.to_string(),
+                        has_secret,
+                        will_exist,
+                    ),
+                )
+                .is_some()
+            {
+                conflicts.push(
+                    json!({ "kind": "account", "ref": reference, "reason": "duplicate reference" }),
+                );
+                problems.push(format!(
+                    "account reference '{reference}' appears more than once"
+                ));
+            }
+        }
+        if let Some(secret_enc) = account.get("secret_enc") {
+            match secret_enc.as_str() {
+                Some(secret_enc) if state.crypto.decrypt(secret_enc).is_ok() => {}
+                Some(_) => problems.push(format!(
+                    "account '{provider}/{label}' has an unreadable encrypted secret"
+                )),
+                None => problems.push(format!(
+                    "account '{provider}/{label}' secret_enc must be a string"
+                )),
+            }
+        }
+        if let Err(problem) = imported_account_enabled(account, source_version) {
+            problems.push(format!("account '{provider}/{label}' {problem}"));
+        }
+        if account
+            .get("quota_window_s")
+            .is_some_and(|value| !value.is_null())
+            && !account["quota_window_s"]
+                .as_i64()
+                .is_some_and(|value| value > 0)
+        {
+            problems.push(format!(
+                "account '{provider}/{label}' quota_window_s must be a positive integer"
+            ));
+        }
+        let quota_type = account["quota_type"].as_str().unwrap_or("none");
+        if !matches!(quota_type, "none" | "daily" | "monthly" | "rolling") {
+            problems.push(format!(
+                "account '{provider}/{label}' has invalid quota_type '{quota_type}'"
+            ));
+        }
+        for field in ["priority", "weight"] {
+            if account.get(field).is_some_and(|value| !value.is_null())
+                && !account[field].as_i64().is_some_and(|value| value > 0)
+            {
+                problems.push(format!(
+                    "account '{provider}/{label}' {field} must be a positive integer"
+                ));
+            }
+        }
+    }
+
+    let mut known_model_keys: std::collections::HashSet<String> = existing_models
+        .iter()
+        .filter_map(|model| {
+            Some(format!(
+                "{}/{}",
+                provider_names_by_id.get(model.provider_id.as_str())?,
+                model.upstream_id
+            ))
+        })
+        .collect();
+    known_model_keys.extend(models.iter().filter_map(|model| {
+        Some(format!(
+            "{}/{}",
+            model["provider"].as_str()?,
+            model["upstream_id"].as_str()?
+        ))
+    }));
+    let mut known_route_names: std::collections::HashSet<String> = existing_routes
+        .iter()
+        .map(|route| route.name.clone())
+        .collect();
+    known_route_names.extend(
+        routes
+            .iter()
+            .filter_map(|route| route["name"].as_str().map(str::to_string)),
+    );
+    let mut seen_route_names = std::collections::HashSet::new();
     for r in routes {
         let name = r["name"].as_str().unwrap_or("");
         if name.is_empty() {
             problems.push("a route entry is missing a name".into());
         }
-        let targets = r["targets"].as_array().map(|a| a.len()).unwrap_or(0);
+        if !seen_route_names.insert(name.to_string()) {
+            conflicts.push(json!({ "kind": "route", "name": name, "reason": "duplicate entry" }));
+            problems.push(format!("route '{name}' appears more than once"));
+        }
+        let target_values = r["targets"].as_array().unwrap_or(&empty);
+        let targets = target_values.len();
         if targets == 0 {
             problems.push(format!("route '{name}' has no targets"));
         }
-        if let Some(value) = r
-            .get("max_concurrent_requests")
-            .filter(|value| !value.is_null())
+        let legacy_reject = r["continuity_policy"].as_str() == Some("error");
+        let target_bodies: Vec<RouteTargetBody> = target_values
+            .iter()
+            .map(|target| RouteTargetBody {
+                account_id: None,
+                model_id: target["model"].as_str().unwrap_or("").to_string(),
+                priority: target["priority"].as_i64().unwrap_or(1),
+                weight: target["weight"].as_i64().unwrap_or(1),
+                predicate: target["predicate"].clone(),
+                param_overrides: target["param_overrides"].clone(),
+            })
+            .collect();
+        let route_body = RouteBody {
+            name: name.to_string(),
+            description: r["description"].as_str().unwrap_or("").to_string(),
+            strategy: r["strategy"].as_str().unwrap_or("priority").to_string(),
+            fallback_triggers: r["fallback_triggers"].clone(),
+            portability_policy: r["portability_policy"]
+                .as_str()
+                .unwrap_or(if legacy_reject {
+                    "reject"
+                } else {
+                    "strip_with_warning"
+                })
+                .to_string(),
+            sticky_routing: r["sticky_routing"].as_bool().unwrap_or(false),
+            cache_affinity: r["cache_affinity"].as_bool().unwrap_or(false),
+            max_attempts: r["max_attempts"].as_i64(),
+            max_concurrent_requests: r["max_concurrent_requests"].as_i64(),
+            targets: target_bodies,
+        };
+        if let Err(error) = validate_route_body(&route_body) {
+            problems.push(format!("route '{name}': {}", error.1));
+        }
+        if r.get("enabled").is_some_and(|value| !value.is_null()) && !r["enabled"].is_boolean() {
+            problems.push(format!("route '{name}': enabled must be a boolean"));
+        }
+        if r.get("max_attempts").is_some_and(|value| !value.is_null())
+            && !r["max_attempts"].as_i64().is_some_and(|limit| limit > 0)
         {
-            if !value.as_i64().is_some_and(|limit| limit >= 0) {
-                problems.push(format!(
-                    "route '{name}': max_concurrent_requests must be positive or zero for unlimited"
-                ));
+            problems.push(format!(
+                "route '{name}': max_attempts must be a positive integer"
+            ));
+        }
+        if r.get("max_concurrent_requests")
+            .is_some_and(|value| !value.is_null())
+            && !r["max_concurrent_requests"]
+                .as_i64()
+                .is_some_and(|limit| limit >= 0)
+        {
+            problems.push(format!(
+                "route '{name}': max_concurrent_requests must be positive or zero for unlimited"
+            ));
+        }
+        for target in target_values {
+            let model = target["model"].as_str().unwrap_or("");
+            let Some((model_provider, _)) = model.split_once('/') else {
+                missing_resources.push(json!({ "kind": "model", "name": model }));
+                problems.push(format!("route '{name}' references missing model '{model}'"));
+                continue;
+            };
+            if !known_model_keys.contains(model) {
+                missing_resources.push(json!({ "kind": "model", "name": model }));
+                problems.push(format!("route '{name}' references missing model '{model}'"));
+            }
+            if let Some(account_ref) = target.get("account_ref") {
+                if !account_ref.is_null() {
+                    let Some(account_ref) = account_ref.as_str() else {
+                        problems.push(format!(
+                            "route '{name}' account_ref must be a string or null"
+                        ));
+                        continue;
+                    };
+                    match imported_accounts_by_ref.get(account_ref) {
+                        Some((account_provider, _, _, will_exist)) => {
+                            if account_provider != model_provider {
+                                problems.push(format!(
+                                    "route '{name}' account reference does not belong to model provider '{model_provider}'"
+                                ));
+                            } else if !will_exist {
+                                missing_resources
+                                    .push(json!({ "kind": "account", "ref": account_ref }));
+                                problems.push(format!(
+                                    "route '{name}' references account '{account_ref}' that will not exist after provider-mode reconciliation"
+                                ));
+                            }
+                        }
+                        None => {
+                            missing_resources
+                                .push(json!({ "kind": "account", "ref": account_ref }));
+                            problems.push(format!(
+                                "route '{name}' references missing account '{account_ref}'"
+                            ));
+                        }
+                    }
+                }
+            } else if let Some(account_id) = target.get("account_id").and_then(Value::as_str) {
+                match effective_existing_account_ids.get(account_id) {
+                    Some((account_provider, _)) if account_provider == model_provider => {}
+                    _ => {
+                        missing_resources
+                            .push(json!({ "kind": "account", "legacy_id": account_id }));
+                        problems.push(format!(
+                            "route '{name}' references an unavailable legacy account"
+                        ));
+                    }
+                }
             }
         }
         plan.push(json!({"kind": "route", "name": name, "action": "upsert", "targets": targets}));
     }
 
+    let mut seen_aliases = std::collections::HashSet::new();
+    for alias in aliases {
+        let name = alias["alias"].as_str().unwrap_or("");
+        let target_type = alias["target_type"].as_str().unwrap_or("model");
+        let target = alias["target"].as_str().unwrap_or("");
+        if name.trim().is_empty() {
+            problems.push("an alias entry is missing alias".into());
+        }
+        if !seen_aliases.insert(name.to_string()) {
+            conflicts.push(json!({ "kind": "alias", "name": name, "reason": "duplicate entry" }));
+            problems.push(format!("alias '{name}' appears more than once"));
+        }
+        let exists = match target_type {
+            "route" => known_route_names.contains(target),
+            "model" => known_model_keys.contains(target),
+            _ => {
+                problems.push(format!(
+                    "alias '{name}' has invalid target_type '{target_type}'"
+                ));
+                false
+            }
+        };
+        if !exists {
+            missing_resources.push(json!({ "kind": target_type, "name": target }));
+            problems.push(format!(
+                "alias '{name}' references missing {target_type} '{target}'"
+            ));
+        }
+    }
+
     if !body.apply {
         return Ok(Json(json!({
             "valid": problems.is_empty(),
+            "source_version": source_version,
+            "config_version": 2,
             "problems": problems,
             "warnings": warnings,
+            "conflicts": conflicts,
+            "missing_resources": missing_resources,
             "plan": plan,
             "note": "dry run: no changes were applied",
         })));
@@ -10440,14 +11185,38 @@ pub async fn import_config(
         )));
     }
 
-    // ---- Apply phase ----
-    let mut provider_ids: std::collections::HashMap<String, String> = Default::default();
-    for p in &db::list_providers(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-    {
-        provider_ids.insert(p.name.clone(), p.id.clone());
+    // ---- Apply phase: one SQLite transaction for the complete import ----
+    let mut provider_lock_ids: Vec<String> = providers
+        .iter()
+        .chain(models.iter())
+        .filter_map(|resource| {
+            let name = if resource.get("name").is_some() {
+                resource["name"].as_str()?
+            } else {
+                resource["provider"].as_str()?
+            };
+            existing_provider_ids.get(name).cloned()
+        })
+        .collect();
+    provider_lock_ids.sort();
+    provider_lock_ids.dedup();
+    let mut _provider_guards = Vec::with_capacity(provider_lock_ids.len());
+    for id in &provider_lock_ids {
+        _provider_guards.push(model_reconciliation_lock(id).lock_owned().await);
     }
+    let model_price_ids: Vec<String> = existing_models
+        .iter()
+        .filter(|model| provider_lock_ids.contains(&model.provider_id))
+        .map(|model| model.id.clone())
+        .collect();
+    let _model_price_guards = db::lock_model_price_versions(&model_price_ids).await;
+    let publication = state.registry.publication().await;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let mut provider_ids = existing_provider_ids.clone();
+    let mut provider_modes: std::collections::HashMap<String, String> = existing_providers
+        .iter()
+        .map(|provider| (provider.name.clone(), provider.credential_mode.clone()))
+        .collect();
 
     for p in providers {
         let name = p["name"].as_str().unwrap_or("");
@@ -10471,11 +11240,9 @@ pub async fn import_config(
             .and_then(crate::plugins::CredentialMode::parse);
 
         if let Some(existing_id) = provider_ids.get(name).cloned() {
-            let lock = model_reconciliation_lock(&existing_id);
-            let _guard = lock.lock().await;
-            let existing = db::get_provider(&state.pool, &existing_id)
-                .await
-                .map_err(ApiError::internal)?
+            let existing = existing_providers
+                .iter()
+                .find(|provider| provider.id == existing_id)
                 .ok_or_else(|| ApiError::not_found("provider not found"))?;
             let credential_mode = explicit_mode
                 .or_else(|| crate::plugins::CredentialMode::parse(&existing.credential_mode))
@@ -10513,131 +11280,168 @@ pub async fn import_config(
                 source_plugin_id: source_plugin_id.as_deref(),
                 source_integration_id: source_integration_id.as_deref(),
             };
-            let pricing_scope = resolve_imported_provider_pricing_scope(
-                &state,
-                name,
-                base_url,
-                p["pricing_scope"].as_str(),
-                credential_mode,
-                source_plugin_id.as_deref(),
-                source_integration_id.as_deref(),
-                p["wire_plugin"].as_str().unwrap_or(""),
-                p["credential_plugin"].as_str().unwrap_or(""),
-                p["model_source_plugin"].as_str().unwrap_or(""),
-            )
-            .await
-            .map_err(ApiError::bad)?;
-            db::update_provider(&state.pool, &existing_id, &provider, Some(&pricing_scope))
+            let pricing_scope = effective_provider_scopes
+                .get(name)
+                .map(String::as_str)
+                .unwrap_or("integration");
+            db::update_provider_in_transaction(&mut tx, &existing_id, &provider, pricing_scope)
                 .await
                 .map_err(ApiError::internal)?;
-            reconcile_provider_account_mode(&state, &existing_id, credential_mode).await?;
+            reconcile_provider_account_mode_in_transaction(
+                &state,
+                &mut tx,
+                &existing_id,
+                credential_mode.as_str(),
+            )
+            .await?;
+            provider_modes.insert(name.to_string(), credential_mode.as_str().to_string());
         } else {
             let credential_mode = explicit_mode.unwrap_or(crate::plugins::CredentialMode::Manual);
-            let pricing_scope = resolve_imported_provider_pricing_scope(
-                &state,
+            let pricing_scope = effective_provider_scopes
+                .get(name)
+                .map(String::as_str)
+                .unwrap_or("integration");
+            let provider = db::NewProvider {
                 name,
                 base_url,
-                p["pricing_scope"].as_str(),
-                credential_mode,
-                p["source_plugin_id"].as_str(),
-                p["source_integration_id"].as_str(),
-                p["wire_plugin"].as_str().unwrap_or(""),
-                p["credential_plugin"].as_str().unwrap_or(""),
-                p["model_source_plugin"].as_str().unwrap_or(""),
-            )
-            .await
-            .map_err(ApiError::bad)?;
-            let id = db::insert_provider(
-                &state.pool,
-                &db::NewProvider {
-                    name,
-                    base_url,
-                    wire_format: wire,
-                    auth_scheme: auth,
-                    custom_header_name: custom_header,
-                    custom_param_name: custom_param,
-                    extra_headers,
-                    timeout_ms,
-                    capability_mode,
-                    models_path,
-                    rate_limit_rules,
-                    follow_redirects,
-                    credential_hosts,
-                    allow_insecure_tls,
-                    wire_plugin: p["wire_plugin"].as_str().unwrap_or(""),
-                    credential_plugin: p["credential_plugin"].as_str().unwrap_or(""),
-                    model_source_plugin: p["model_source_plugin"].as_str().unwrap_or(""),
-                    credential_mode: credential_mode.as_str(),
-                    source_plugin_id: p["source_plugin_id"].as_str(),
-                    source_integration_id: p["source_integration_id"].as_str(),
-                },
-            )
-            .await
-            .map_err(ApiError::internal)?;
-            db::update_provider_pricing_scope(&state.pool, &id, &pricing_scope)
+                wire_format: wire,
+                auth_scheme: auth,
+                custom_header_name: custom_header,
+                custom_param_name: custom_param,
+                extra_headers,
+                timeout_ms,
+                capability_mode,
+                models_path,
+                rate_limit_rules,
+                follow_redirects,
+                credential_hosts,
+                allow_insecure_tls,
+                wire_plugin: p["wire_plugin"].as_str().unwrap_or(""),
+                credential_plugin: p["credential_plugin"].as_str().unwrap_or(""),
+                model_source_plugin: p["model_source_plugin"].as_str().unwrap_or(""),
+                credential_mode: credential_mode.as_str(),
+                source_plugin_id: p["source_plugin_id"].as_str(),
+                source_integration_id: p["source_integration_id"].as_str(),
+            };
+            let id = db::insert_provider_in_transaction(&mut tx, &provider, pricing_scope)
                 .await
                 .map_err(ApiError::internal)?;
-            reconcile_provider_account_mode(&state, &id, credential_mode).await?;
+            reconcile_provider_account_mode_in_transaction(
+                &state,
+                &mut tx,
+                &id,
+                credential_mode.as_str(),
+            )
+            .await?;
             provider_ids.insert(name.to_string(), id);
+            provider_modes.insert(name.to_string(), credential_mode.as_str().to_string());
+        }
+        if let Some(enabled) = p["enabled"].as_bool() {
+            let provider_id = provider_ids
+                .get(name)
+                .expect("provider was just created or resolved");
+            sqlx::query("UPDATE providers SET enabled=? WHERE id=?")
+                .bind(enabled as i64)
+                .bind(provider_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(ApiError::internal)?;
         }
     }
 
-    // Accounts: only restored when the provider mode permits credentials and
-    // the export carries an encrypted secret blob. Internal no-auth accounts
-    // are always synthesized by reconciliation, never imported as user state.
-    for a in accounts {
-        let provider = a["provider"].as_str().unwrap_or("");
-        let Some(pid) = provider_ids.get(provider) else {
+    // Resolve against pre-existing accounts before creating imported rows so
+    // duplicate labels in the import remain distinct portable identities.
+    let mut account_ids_by_ref = std::collections::HashMap::new();
+    let mut accounts_to_create = Vec::new();
+    for account in accounts {
+        let provider = account["provider"].as_str().unwrap_or("");
+        let Some(provider_id) = provider_ids.get(provider) else {
             continue;
         };
-        let provider_row = db::get_provider(&state.pool, pid)
-            .await
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::not_found("provider not found"))?;
-        let label = a["label"].as_str().unwrap_or("Default key");
-        if provider_row.credential_mode == "none" || label == "__kinetix_noauth__" {
+        let label = account["label"].as_str().unwrap_or("Default key");
+        if provider_modes
+            .get(provider)
+            .is_some_and(|mode| mode == "none")
+            || label == "__kinetix_noauth__"
+        {
             continue;
         }
-        let Some(secret_enc) = a["secret_enc"].as_str() else {
-            continue;
-        };
-        let exists = db::accounts_for_provider(&state.pool, pid)
-            .await
-            .map_err(ApiError::internal)?
-            .into_iter()
-            .any(|x| x.label == label);
-        if exists {
-            continue; // never overwrite an existing credential
+        let reference = account["ref"].as_str().unwrap_or("");
+        let existing_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM accounts WHERE provider_id=? AND label=? ORDER BY created_at, id",
+        )
+        .bind(provider_id)
+        .bind(label)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+        match existing_ids.as_slice() {
+            [account_id] => {
+                let enabled =
+                    imported_account_enabled(account, source_version).map_err(ApiError::bad)?;
+                db::update_account_policy_in_transaction(
+                    &mut tx,
+                    account_id,
+                    enabled,
+                    account["priority"].as_i64().unwrap_or(1),
+                    account["weight"].as_i64().unwrap_or(1),
+                    account["soft_quota_usd"].as_f64(),
+                    account["quota_type"].as_str().unwrap_or("none"),
+                    account["quota_window_s"].as_i64(),
+                )
+                .await
+                .map_err(ApiError::internal)?;
+                account_ids_by_ref.insert(reference.to_string(), account_id.clone());
+            }
+            [] => {
+                if account["secret_enc"].as_str().is_some() {
+                    accounts_to_create.push((account, reference.to_string(), provider_id.clone()));
+                }
+            }
+            _ => {
+                return Err(ApiError::bad(format!(
+                    "account '{provider}/{label}' matches multiple existing accounts; resolve the duplicate labels before importing"
+                )));
+            }
         }
-        db::insert_account(
-            &state.pool,
-            pid,
+    }
+    for (account, reference, provider_id) in accounts_to_create {
+        let label = account["label"].as_str().unwrap_or("Default key");
+        let secret_enc = account["secret_enc"]
+            .as_str()
+            .expect("validated encrypted secret");
+        let enabled = imported_account_enabled(account, source_version).map_err(ApiError::bad)?;
+        let account_id = db::insert_account_in_transaction(
+            &mut tx,
+            &provider_id,
             label,
             secret_enc,
-            a["key_mask"].as_str().unwrap_or("••••"),
-            a["priority"].as_i64().unwrap_or(1),
-            a["weight"].as_i64().unwrap_or(1),
-            a["soft_quota_usd"].as_f64(),
-            a["quota_type"].as_str().unwrap_or("none"),
+            account["key_mask"].as_str().unwrap_or("••••"),
+            account["priority"].as_i64().unwrap_or(1),
+            account["weight"].as_i64().unwrap_or(1),
+            account["soft_quota_usd"].as_f64(),
+            account["quota_type"].as_str().unwrap_or("none"),
+            account["quota_window_s"].as_i64(),
+            enabled,
         )
         .await
         .map_err(ApiError::internal)?;
+        account_ids_by_ref.insert(reference, account_id);
     }
 
-    let mut model_ids: std::collections::HashMap<String, String> = Default::default();
-    for m in &db::list_models(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-    {
-        let pname = db::list_providers(&state.pool)
-            .await
-            .map_err(ApiError::internal)?
-            .into_iter()
-            .find(|p| p.id == m.provider_id)
-            .map(|p| p.name)
-            .unwrap_or_default();
-        model_ids.insert(format!("{}/{}", pname, m.upstream_id), m.id.clone());
-    }
+    let mut model_ids: std::collections::HashMap<String, String> = existing_models
+        .iter()
+        .filter_map(|model| {
+            Some((
+                format!(
+                    "{}/{}",
+                    provider_names_by_id.get(model.provider_id.as_str())?,
+                    model.upstream_id
+                ),
+                model.id.clone(),
+            ))
+        })
+        .collect();
 
     for m in models {
         let provider = m["provider"].as_str().unwrap_or("");
@@ -10666,12 +11470,13 @@ pub async fn import_config(
         let max_output_tokens = m["max_output_tokens"].as_i64();
         let requested_transport = m["transport_override"].as_str();
 
-        let lock = model_reconciliation_lock(pid);
-        let _guard = lock.lock().await;
-        let provider_row = db::get_provider(&state.pool, pid)
-            .await
-            .map_err(ApiError::internal)?
-            .ok_or_else(|| ApiError::not_found("provider not found"))?;
+        let provider_row =
+            sqlx::query_as::<_, db::ProviderRow>("SELECT * FROM providers WHERE id=?")
+                .bind(pid)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(ApiError::internal)?
+                .ok_or_else(|| ApiError::not_found("provider not found"))?;
         let transport_override =
             validate_model_transport_override(&provider_row, requested_transport)?;
 
@@ -10688,13 +11493,13 @@ pub async fn import_config(
         } else {
             (prices, None)
         };
-        let existing = db::find_model_by_upstream(&state.pool, pid, upstream)
-            .await
-            .map_err(ApiError::internal)?;
+        let existing = existing_models
+            .iter()
+            .find(|model| model.provider_id == *pid && model.upstream_id == upstream);
         if let Some(existing) = existing {
             let existing_id = existing.id.clone();
             model_ids.insert(model_key.clone(), existing_id.clone());
-            let existing_discovery = discovery_object(&existing);
+            let existing_discovery = discovery_object(existing);
             let previous_prices = existing.prices();
             let (price_source, price_metadata, discovery_patch) = if let Some(ownership) =
                 imported_ownership.as_ref()
@@ -10760,8 +11565,8 @@ pub async fn import_config(
                 (price_source, price_metadata, Value::Object(discovery_patch))
             };
 
-            db::commit_model_operator_mutation(
-                &state.pool,
+            db::commit_model_operator_mutation_in_transaction(
+                &mut tx,
                 &db::ModelOperatorMutation {
                     id: &existing_id,
                     display_name: display,
@@ -10825,8 +11630,8 @@ pub async fn import_config(
                         source,
                         metadata,
                     });
-            let (id, _) = db::commit_model_creation(
-                &state.pool,
+            let (id, _) = db::commit_model_creation_in_transaction(
+                &mut tx,
                 &db::ModelCreation {
                     model: db::NewModel {
                         provider_id: pid,
@@ -10855,6 +11660,10 @@ pub async fn import_config(
     }
 
     // Routes (upsert by name) + targets.
+    let mut route_ids: std::collections::HashMap<String, String> = existing_routes
+        .iter()
+        .map(|route| (route.name.clone(), route.id.clone()))
+        .collect();
     for r in routes {
         let name = r["name"].as_str().unwrap_or("");
         let legacy_reject = r["continuity_policy"].as_str() == Some("error");
@@ -10884,8 +11693,21 @@ pub async fn import_config(
             let Some(mid) = model_ids.get(model_key) else {
                 continue;
             };
+            let account_id = match t.get("account_ref").filter(|value| !value.is_null()) {
+                Some(value) => {
+                    let reference = value.as_str().ok_or_else(|| {
+                        ApiError::bad("route target account_ref must be a string or null")
+                    })?;
+                    Some(account_ids_by_ref.get(reference).cloned().ok_or_else(|| {
+                        ApiError::bad(format!(
+                            "route target account reference '{reference}' could not be resolved"
+                        ))
+                    })?)
+                }
+                None => t["account_id"].as_str().map(str::to_string),
+            };
             target_bodies.push(RouteTargetBody {
-                account_id: t["account_id"].as_str().map(|s| s.to_string()),
+                account_id,
                 model_id: mid.clone(),
                 priority: t["priority"].as_i64().unwrap_or(1),
                 weight: t["weight"].as_i64().unwrap_or(1),
@@ -10893,59 +11715,71 @@ pub async fn import_config(
                 param_overrides: t["param_overrides"].clone(),
             });
         }
-        let existing = db::get_route_by_name(&state.pool, name)
-            .await
-            .map_err(ApiError::internal)?;
-        let rid = match existing {
-            Some(route) => {
-                let mut body = body;
-                body.targets = target_bodies;
-                db::update_route(
-                    &state.pool,
-                    &route.id,
-                    &body.description,
-                    &body.strategy,
-                    body.fallback_triggers.clone(),
-                    &body.portability_policy,
-                    body.sticky_routing,
-                    body.cache_affinity,
-                    body.max_attempts,
-                    body.max_concurrent_requests.filter(|limit| *limit > 0),
+        let mut body = body;
+        body.targets = target_bodies;
+        validate_route_body(&body)?;
+        let rid = match route_ids.get(name).cloned() {
+            Some(route_id) => {
+                sqlx::query(
+                    "UPDATE routes SET description=?, strategy=?, fallback_triggers=?, continuity_policy='strip', portability_policy=?, sticky_routing=?, cache_affinity=?, max_attempts=?, max_concurrent_requests=? WHERE id=?",
                 )
+                .bind(&body.description)
+                .bind(&body.strategy)
+                .bind(body.fallback_triggers.to_string())
+                .bind(&body.portability_policy)
+                .bind(body.sticky_routing as i64)
+                .bind(body.cache_affinity as i64)
+                .bind(body.max_attempts)
+                .bind(body.max_concurrent_requests.filter(|limit| *limit > 0))
+                .bind(&route_id)
+                .execute(&mut *tx)
                 .await
                 .map_err(ApiError::internal)?;
-                db::clear_route_targets(&state.pool, &route.id)
+                sqlx::query("DELETE FROM route_targets WHERE route_id=?")
+                    .bind(&route_id)
+                    .execute(&mut *tx)
                     .await
                     .map_err(ApiError::internal)?;
-                write_route_targets(&state.pool, &route.id, &body.targets).await?;
-                route.id
+                write_route_targets_in_transaction(&mut tx, &route_id, &body.targets).await?;
+                route_id
             }
             None => {
-                let id = db::insert_route(
-                    &state.pool,
-                    &db::NewRoute {
-                        name,
-                        description: &body.description,
-                        strategy: &body.strategy,
-                        fallback_triggers: if body.fallback_triggers.is_null() {
-                            json!({"on429": true, "onQuota": true, "on5xx": true, "onTimeout": true})
-                        } else {
-                            body.fallback_triggers.clone()
-                        },
-                        portability_policy: &body.portability_policy,
-                        sticky_routing: body.sticky_routing,
-                        cache_affinity: body.cache_affinity,
-                        max_attempts: body.max_attempts,
-                        max_concurrent_requests: body.max_concurrent_requests.filter(|limit| *limit > 0),
-                    },
+                let id = format!("route_{}", uuid::Uuid::new_v4().simple());
+                let fallback_triggers = if body.fallback_triggers.is_null() {
+                    json!({"on429": true, "onQuota": true, "on5xx": true, "onTimeout": true})
+                } else {
+                    body.fallback_triggers.clone()
+                };
+                sqlx::query(
+                    "INSERT INTO routes (id, name, description, strategy, fallback_triggers, continuity_policy, portability_policy, sticky_routing, cache_affinity, max_attempts, max_concurrent_requests, enabled, created_at) VALUES (?,?,?,?,?,'strip',?,?,?,?,?,1,?)",
                 )
+                .bind(&id)
+                .bind(name)
+                .bind(&body.description)
+                .bind(&body.strategy)
+                .bind(fallback_triggers.to_string())
+                .bind(&body.portability_policy)
+                .bind(body.sticky_routing as i64)
+                .bind(body.cache_affinity as i64)
+                .bind(body.max_attempts)
+                .bind(body.max_concurrent_requests.filter(|limit| *limit > 0))
+                .bind(db::now_iso())
+                .execute(&mut *tx)
                 .await
                 .map_err(ApiError::internal)?;
-                write_route_targets(&state.pool, &id, &target_bodies).await?;
+                write_route_targets_in_transaction(&mut tx, &id, &body.targets).await?;
                 id
             }
         };
-        let _ = rid;
+        route_ids.insert(name.to_string(), rid.clone());
+        if let Some(enabled) = r["enabled"].as_bool() {
+            sqlx::query("UPDATE routes SET enabled=? WHERE id=?")
+                .bind(enabled as i64)
+                .bind(&rid)
+                .execute(&mut *tx)
+                .await
+                .map_err(ApiError::internal)?;
+        }
     }
 
     // Aliases (upsert by alias name).
@@ -10957,25 +11791,47 @@ pub async fn import_config(
         let ttype = a["target_type"].as_str().unwrap_or("model");
         let target = a["target"].as_str().unwrap_or("");
         let tid = if ttype == "route" {
-            db::get_route_by_name(&state.pool, target)
-                .await
-                .map_err(ApiError::internal)?
-                .map(|r| r.id)
+            route_ids.get(target).cloned()
         } else {
             model_ids.get(target).cloned()
         };
         let Some(tid) = tid else { continue };
-        db::upsert_alias(
-            &state.pool,
-            alias,
-            ttype,
-            &tid,
-            a["description"].as_str().unwrap_or(""),
-        )
-        .await
-        .map_err(ApiError::internal)?;
+        let description = a["description"].as_str().unwrap_or("");
+        if let Some(id) = sqlx::query_scalar::<_, String>("SELECT id FROM aliases WHERE alias=?")
+            .bind(alias)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?
+        {
+            sqlx::query("UPDATE aliases SET target_type=?, target_id=?, description=? WHERE id=?")
+                .bind(ttype)
+                .bind(&tid)
+                .bind(description)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(ApiError::internal)?;
+        } else {
+            sqlx::query(
+                "INSERT INTO aliases (id, alias, target_type, target_id, description, created_at) VALUES (?,?,?,?,?,?)",
+            )
+            .bind(format!("alias_{}", uuid::Uuid::new_v4().simple()))
+            .bind(alias)
+            .bind(ttype)
+            .bind(&tid)
+            .bind(description)
+            .bind(db::now_iso())
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+        }
     }
 
+    let next_registry = crate::registry::Registry::build_snapshot_in_transaction(&mut tx)
+        .await
+        .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    publication.activate(next_registry);
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -10992,12 +11848,15 @@ pub async fn import_config(
         ),
     )
     .await;
-    state
-        .registry
-        .reload(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(json!({ "ok": true, "applied": plan })))
+    Ok(Json(json!({
+        "ok": true,
+        "source_version": source_version,
+        "config_version": 2,
+        "warnings": warnings,
+        "conflicts": conflicts,
+        "missing_resources": missing_resources,
+        "applied": plan,
+    })))
 }
 
 // ===========================================================================
@@ -11189,6 +12048,109 @@ async fn reconcile_provider_account_mode(
         }
     }
 
+    Ok(())
+}
+
+async fn reconcile_provider_account_mode_in_transaction(
+    state: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    provider_id: &str,
+    credential_mode: &str,
+) -> Result<(), ApiError> {
+    let legacy_public_mask = crate::crypto::mask_secret("public");
+    match credential_mode {
+        "none" => {
+            let accounts = sqlx::query(
+                "SELECT id, label, key_mask FROM accounts WHERE provider_id=? ORDER BY created_at",
+            )
+            .bind(provider_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(ApiError::internal)?;
+            let empty_secret = state.crypto.encrypt("").map_err(ApiError::internal)?;
+            if accounts.len() == 1 {
+                let id: String = accounts[0].try_get("id").map_err(ApiError::internal)?;
+                let label: String = accounts[0].try_get("label").map_err(ApiError::internal)?;
+                let key_mask: String = accounts[0]
+                    .try_get("key_mask")
+                    .map_err(ApiError::internal)?;
+                if label == "__kinetix_noauth__"
+                    || (label == "public" && key_mask == legacy_public_mask)
+                {
+                    sqlx::query(
+                        "UPDATE accounts
+                         SET label='__kinetix_noauth__', secret_enc=?, key_mask='',
+                             status='healthy', cooldown_until=NULL, quota_reset_at=NULL,
+                             quota_type='none', quota_window_s=NULL, soft_quota_usd=NULL,
+                             priority=1, weight=1, last_error=NULL, last_probe_at=NULL,
+                             circuit_open_until=NULL, consecutive_failures=0,
+                             account_state_version=account_state_version + 1
+                         WHERE id=?",
+                    )
+                    .bind(&empty_secret)
+                    .bind(id)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(ApiError::internal)?;
+                    return Ok(());
+                }
+            }
+            sqlx::query(
+                "UPDATE route_targets SET account_id=NULL
+                 WHERE account_id IN (SELECT id FROM accounts WHERE provider_id=?)",
+            )
+            .bind(provider_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(ApiError::internal)?;
+            sqlx::query("DELETE FROM accounts WHERE provider_id=?")
+                .bind(provider_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(ApiError::internal)?;
+            db::insert_account_in_transaction(
+                tx,
+                provider_id,
+                "__kinetix_noauth__",
+                &empty_secret,
+                "",
+                1,
+                1,
+                None,
+                "none",
+                None,
+                true,
+            )
+            .await
+            .map_err(ApiError::internal)?;
+        }
+        "manual" | "auth_flow" => {
+            sqlx::query(
+                "UPDATE route_targets SET account_id=NULL
+                 WHERE account_id IN (
+                     SELECT id FROM accounts
+                     WHERE provider_id=?
+                       AND (label='__kinetix_noauth__' OR (label='public' AND key_mask=?))
+                 )",
+            )
+            .bind(provider_id)
+            .bind(&legacy_public_mask)
+            .execute(&mut **tx)
+            .await
+            .map_err(ApiError::internal)?;
+            sqlx::query(
+                "DELETE FROM accounts
+                 WHERE provider_id=?
+                   AND (label='__kinetix_noauth__' OR (label='public' AND key_mask=?))",
+            )
+            .bind(provider_id)
+            .bind(&legacy_public_mask)
+            .execute(&mut **tx)
+            .await
+            .map_err(ApiError::internal)?;
+        }
+        _ => return Err(ApiError::bad("invalid provider credential mode")),
+    }
     Ok(())
 }
 
@@ -19674,6 +20636,12 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
+        let noauth_account = db::list_accounts_for_provider(&source.pool, &noauth_provider)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|account| account.label == "__kinetix_noauth__")
+            .unwrap();
         let route_id = db::insert_route(
             &source.pool,
             &db::NewRoute {
@@ -19693,7 +20661,7 @@ mod credential_enrollment_regression_tests {
         db::insert_route_target(
             &source.pool,
             &route_id,
-            None,
+            Some(&noauth_account.id),
             &source_model_id,
             1,
             1,
@@ -19741,11 +20709,27 @@ mod credential_enrollment_regression_tests {
             .iter()
             .all(|account| account["label"] != "__kinetix_noauth__"));
         assert_eq!(
+            exported["routes"][0]["targets"][0]["account_ref"],
+            Value::Null
+        );
+        assert_eq!(
             exported["models"][0]["transport_override"],
             "openai-responses"
         );
 
         let (target, target_root) = test_state("export-target").await;
+        let dry_run = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true);
         let _ = import_config(
             State(target.clone()),
             auth(),
@@ -19802,6 +20786,18 @@ mod credential_enrollment_regression_tests {
             .unwrap()
             .unwrap();
         assert_eq!(imported_route.max_concurrent_requests, Some(4));
+        let imported_route_targets = db::route_targets(&target.pool, &imported_route.id)
+            .await
+            .unwrap();
+        assert_eq!(imported_route_targets.len(), 1);
+        assert_eq!(imported_route_targets[0].account_id, None);
+        match target.registry.resolve("limited-route").unwrap() {
+            crate::registry::Resolved::Route { targets, .. } => {
+                assert_eq!(targets.len(), 1);
+                assert_eq!(targets[0].account.label, "__kinetix_noauth__");
+            }
+            _ => panic!("expected an imported route"),
+        }
 
         let public_accounts = db::accounts_for_provider(&target.pool, &public.id)
             .await
@@ -19818,6 +20814,1140 @@ mod credential_enrollment_regression_tests {
 
         let _ = std::fs::remove_dir_all(source_root);
         let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn config_export_uses_one_snapshot_across_concurrent_control_plane_commit() {
+        let (state, root) = test_state("config-export-snapshot").await;
+        let provider_name = "snapshot-provider";
+        let provider_id = insert_provider(
+            &state,
+            provider_name,
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let old_secret = state.crypto.encrypt("old-secret").unwrap();
+        let old_account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "old-account",
+            &old_secret,
+            "old:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let old_model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "old-model",
+                display_name: "Old Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let route_id = db::insert_route(
+            &state.pool,
+            &db::NewRoute {
+                name: "snapshot-route",
+                description: "snapshot consistency test",
+                strategy: "priority",
+                fallback_triggers: json!({}),
+                portability_policy: "strip_with_warning",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: Some(1),
+                max_concurrent_requests: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::insert_route_target(
+            &state.pool,
+            &route_id,
+            Some(&old_account_id),
+            &old_model_id,
+            1,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .unwrap();
+        db::upsert_alias(
+            &state.pool,
+            "snapshot-model-alias",
+            "model",
+            &old_model_id,
+            "snapshot test",
+        )
+        .await
+        .unwrap();
+
+        let (read_started_tx, read_started_rx) = tokio::sync::oneshot::channel();
+        let (resume_export_tx, resume_export_rx) = tokio::sync::oneshot::channel();
+        let export_state = state.clone();
+        let export = tokio::spawn(async move {
+            export_config_with_pause(export_state, true, move || async move {
+                read_started_tx.send(()).unwrap();
+                resume_export_rx.await.unwrap();
+            })
+            .await
+        });
+        read_started_rx.await.unwrap();
+
+        let new_secret = state.crypto.encrypt("new-secret").unwrap();
+        let mut write_tx = state.pool.begin().await.unwrap();
+        let new_account_id = db::insert_account_in_transaction(
+            &mut write_tx,
+            &provider_id,
+            "new-account",
+            &new_secret,
+            "new:****",
+            2,
+            1,
+            None,
+            "none",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let new_model_id = format!("model_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO models
+             (id, provider_id, upstream_id, display_name, enabled, context_window, max_output_tokens,
+              capabilities, prices, parameters, thinking_map, extra_request, discovery, created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&new_model_id)
+        .bind(&provider_id)
+        .bind("new-model")
+        .bind("New Model")
+        .bind(1_i64)
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind("{}")
+        .bind("{}")
+        .bind("{}")
+        .bind("{}")
+        .bind("{}")
+        .bind("{}")
+        .bind(db::now_iso())
+        .execute(&mut *write_tx)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE route_targets SET model_id=?, account_id=? WHERE route_id=?")
+            .bind(&new_model_id)
+            .bind(&new_account_id)
+            .bind(&route_id)
+            .execute(&mut *write_tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE aliases SET target_id=? WHERE alias=?")
+            .bind(&new_model_id)
+            .bind("snapshot-model-alias")
+            .execute(&mut *write_tx)
+            .await
+            .unwrap();
+        write_tx.commit().await.unwrap();
+        resume_export_tx.send(()).unwrap();
+
+        let exported = export.await.unwrap().unwrap().0;
+        let models = exported["models"].as_array().unwrap();
+        let model_names: std::collections::HashSet<String> = models
+            .iter()
+            .map(|model| {
+                format!(
+                    "{}/{}",
+                    model["provider"].as_str().unwrap(),
+                    model["upstream_id"].as_str().unwrap()
+                )
+            })
+            .collect();
+        let target = &exported["routes"][0]["targets"][0];
+        let target_model = target["model"].as_str().unwrap();
+        assert!(model_names.contains(target_model));
+        let account_ref = target["account_ref"].as_str().unwrap();
+        let target_account = exported["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|account| account["ref"] == account_ref)
+            .unwrap();
+        let target_account_label = target_account["label"].as_str().unwrap();
+        let alias_target = exported["aliases"][0]["target"].as_str().unwrap();
+
+        if target_model == format!("{provider_name}/old-model") {
+            assert_eq!(target_account_label, "old-account");
+            assert_eq!(alias_target, target_model);
+            assert!(!model_names.contains(&format!("{provider_name}/new-model")));
+            assert_eq!(exported["accounts"].as_array().unwrap().len(), 1);
+        } else {
+            assert_eq!(target_model, format!("{provider_name}/new-model"));
+            assert_eq!(target_account_label, "new-account");
+            assert_eq!(alias_target, target_model);
+            assert!(model_names.contains(&format!("{provider_name}/old-model")));
+            assert_eq!(exported["accounts"].as_array().unwrap().len(), 2);
+        }
+
+        let dry_run = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true, "{dry_run}");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_export_import_preserves_duplicate_label_account_bindings() {
+        let (source, source_root) = test_state("duplicate-account-label-source").await;
+        let provider_id = insert_provider(
+            &source,
+            "duplicate-label-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let account_ids = ["first-secret", "second-secret"]
+            .into_iter()
+            .map(|secret| secret.to_string())
+            .collect::<Vec<_>>();
+        let mut source_account_ids = Vec::new();
+        for secret in &account_ids {
+            source_account_ids.push(
+                db::insert_account(
+                    &source.pool,
+                    &provider_id,
+                    "Primary",
+                    &source.crypto.encrypt(secret).unwrap(),
+                    &crate::crypto::mask_secret(secret),
+                    1,
+                    1,
+                    None,
+                    "none",
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let model_id = db::insert_model(
+            &source.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "duplicate-label-model",
+                display_name: "Duplicate Label Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let route_id = db::insert_route(
+            &source.pool,
+            &db::NewRoute {
+                name: "duplicate-label-route",
+                description: "",
+                strategy: "priority",
+                fallback_triggers: json!({}),
+                portability_policy: "strip_with_warning",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: None,
+                max_concurrent_requests: None,
+            },
+        )
+        .await
+        .unwrap();
+        for account_id in &source_account_ids {
+            db::insert_route_target(
+                &source.pool,
+                &route_id,
+                Some(account_id),
+                &model_id,
+                1,
+                1,
+                "{}",
+                "{}",
+            )
+            .await
+            .unwrap();
+        }
+
+        let exported = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let exported_accounts = exported["accounts"].as_array().unwrap();
+        assert_eq!(exported_accounts.len(), 2);
+        assert_ne!(exported_accounts[0]["ref"], exported_accounts[1]["ref"]);
+        assert_eq!(exported_accounts[0]["label"], exported_accounts[1]["label"]);
+        let target_refs = exported["routes"][0]["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|target| target["account_ref"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(target_refs.len(), 2);
+        let duplicate_label_import = exported.clone();
+
+        let (target, target_root) = test_state("duplicate-account-label-target").await;
+        let _ = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let provider = db::list_providers(&target.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "duplicate-label-provider")
+            .unwrap();
+        let imported_accounts = db::list_accounts_for_provider(&target.pool, &provider.id)
+            .await
+            .unwrap();
+        assert_eq!(imported_accounts.len(), 2);
+        assert!(imported_accounts
+            .iter()
+            .all(|account| account.label == "Primary"));
+        let restored_secrets = imported_accounts
+            .iter()
+            .map(|account| target.crypto.decrypt(&account.secret_enc).unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(restored_secrets, account_ids.into_iter().collect());
+
+        let imported_route = db::get_route_by_name(&target.pool, "duplicate-label-route")
+            .await
+            .unwrap()
+            .unwrap();
+        let imported_targets = db::route_targets(&target.pool, &imported_route.id)
+            .await
+            .unwrap();
+        let bound_accounts = imported_targets
+            .iter()
+            .map(|target| target.account_id.as_deref().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(bound_accounts.len(), 2);
+        assert!(bound_accounts
+            .iter()
+            .all(|id| imported_accounts.iter().any(|account| account.id == **id)));
+        assert_eq!(
+            target
+                .registry
+                .snapshot()
+                .route_targets
+                .get(&imported_route.id)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let (existing_target, existing_target_root) =
+            test_state("duplicate-account-label-existing-target").await;
+        let existing_provider = insert_provider(
+            &existing_target,
+            "duplicate-label-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        db::insert_account(
+            &existing_target.pool,
+            &existing_provider,
+            "Primary",
+            &existing_target.crypto.encrypt("existing-secret").unwrap(),
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let conflict = import_config(
+            State(existing_target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: duplicate_label_import,
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(conflict["valid"], false);
+        assert!(conflict["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["reason"] == "ambiguous existing account label" }));
+        assert_eq!(
+            db::list_accounts_for_provider(&existing_target.pool, &existing_provider)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        drop(existing_target);
+        let _ = std::fs::remove_dir_all(existing_target_root);
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn config_import_reports_ambiguous_existing_account_labels_as_conflicts() {
+        let (source, source_root) = test_state("ambiguous-account-label-source").await;
+        let source_provider = insert_provider(
+            &source,
+            "ambiguous-label-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        db::insert_account(
+            &source.pool,
+            &source_provider,
+            "Primary",
+            &source.crypto.encrypt("source-secret").unwrap(),
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let config = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let (target, target_root) = test_state("ambiguous-account-label-target").await;
+        let target_provider = insert_provider(
+            &target,
+            "ambiguous-label-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        for secret in ["first-target-secret", "second-target-secret"] {
+            db::insert_account(
+                &target.pool,
+                &target_provider,
+                "Primary",
+                &target.crypto.encrypt(secret).unwrap(),
+                "test:****",
+                1,
+                1,
+                None,
+                "none",
+            )
+            .await
+            .unwrap();
+        }
+
+        let dry_run = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: config.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], false);
+        assert!(dry_run["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|conflict| { conflict["reason"] == "ambiguous existing account label" }));
+        assert!(dry_run["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|problem| problem
+                .as_str()
+                .is_some_and(|problem| problem.contains("cannot be matched unambiguously"))));
+        let error = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            db::list_accounts_for_provider(&target.pool, &target_provider)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn staged_import_snapshot_cannot_overwrite_later_account_update() {
+        let (state, root) = test_state("staged-snapshot-account-update").await;
+        let provider_id = insert_provider(
+            &state,
+            "staged-snapshot-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "Primary",
+            &state.crypto.encrypt("secret").unwrap(),
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        // Hold the same publication lock as config import while staging an
+        // older snapshot, then queue a newer account-state reload.
+        let publication = state.registry.publication().await;
+        let stale_snapshot = crate::registry::Registry::build_snapshot(&state.pool)
+            .await
+            .unwrap();
+
+        db::update_account(
+            &state.pool,
+            &account_id,
+            "Primary",
+            None,
+            10,
+            7,
+            None,
+            "none",
+            None,
+        )
+        .await
+        .unwrap();
+        let reload_registry = state.registry.clone();
+        let reload_pool = state.pool.clone();
+        let (reload_started, reload_start_rx) = tokio::sync::oneshot::channel();
+        let (reload_acquired, mut reload_acquired_rx) = tokio::sync::oneshot::channel();
+        let reload = tokio::spawn(async move {
+            let _ = reload_started.send(());
+            let publication = reload_registry.publication().await;
+            let _ = reload_acquired.send(());
+            publication.reload(&reload_pool).await.unwrap();
+        });
+        reload_start_rx.await.unwrap();
+        assert!(matches!(
+            reload_acquired_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        publication.activate(stale_snapshot);
+        reload.await.unwrap();
+        reload_acquired_rx.await.unwrap();
+        assert_eq!(state.registry.account(&account_id).unwrap().priority, 10);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn concurrent_config_imports_replan_after_the_first_commit() {
+        let (state, root) = test_state("concurrent-config-imports").await;
+        let config = json!({
+            "kinetix_config_version": 2,
+            "providers": [{
+                "name": "shared-import-provider",
+                "base_url": "https://shared-import.example/v1",
+                "wire_format": "openai",
+                "auth_scheme": "bearer",
+                "extra_headers": {},
+                "rate_limit_rules": {},
+                "credential_mode": "manual",
+                "enabled": true
+            }],
+            "models": [{
+                "provider": "shared-import-provider",
+                "upstream_id": "shared-model",
+                "display_name": "Shared Model",
+                "capabilities": {},
+                "prices": {},
+                "parameters": {},
+                "thinking_map": {},
+                "extra_request": {}
+            }]
+        });
+        let start = Arc::new(Barrier::new(3));
+        let first_state = state.clone();
+        let first_start = start.clone();
+        let first_config = config.clone();
+        let first = tokio::spawn(async move {
+            first_start.wait().await;
+            import_config(
+                State(first_state),
+                auth(),
+                Json(ImportBody {
+                    config: first_config,
+                    apply: true,
+                }),
+            )
+            .await
+        });
+        let second_state = state.clone();
+        let second_start = start.clone();
+        let second = tokio::spawn(async move {
+            second_start.wait().await;
+            import_config(
+                State(second_state),
+                auth(),
+                Json(ImportBody {
+                    config,
+                    apply: true,
+                }),
+            )
+            .await
+        });
+        start.wait().await;
+
+        let first_response = first.await.unwrap().expect("first import succeeds").0;
+        let second_response = second
+            .await
+            .unwrap()
+            .expect("second import re-plans and succeeds")
+            .0;
+        assert_eq!(first_response["ok"], true);
+        assert_eq!(second_response["ok"], true);
+
+        let providers = db::list_providers(&state.pool).await.unwrap();
+        let matching_providers: Vec<_> = providers
+            .iter()
+            .filter(|provider| provider.name == "shared-import-provider")
+            .collect();
+        assert_eq!(matching_providers.len(), 1);
+        let models = db::list_models(&state.pool).await.unwrap();
+        let matching_models: Vec<_> = models
+            .iter()
+            .filter(|model| {
+                model.provider_id == matching_providers[0].id && model.upstream_id == "shared-model"
+            })
+            .collect();
+        assert_eq!(matching_models.len(), 1);
+        assert!(state.registry.model(&matching_models[0].id).is_some());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_import_applies_account_policy_to_existing_credentials() {
+        let (source, source_root) = test_state("existing-account-policy-source").await;
+        let source_provider = insert_provider(
+            &source,
+            "existing-account-policy-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let source_account = db::insert_account(
+            &source.pool,
+            &source_provider,
+            "Primary",
+            &source.crypto.encrypt("source-secret").unwrap(),
+            "source:****",
+            10,
+            20,
+            Some(35.5),
+            "rolling",
+        )
+        .await
+        .unwrap();
+        db::update_account(
+            &source.pool,
+            &source_account,
+            "Primary",
+            Some("disabled"),
+            10,
+            20,
+            Some(35.5),
+            "rolling",
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE accounts SET quota_window_s=3600 WHERE id=?")
+            .bind(&source_account)
+            .execute(&source.pool)
+            .await
+            .unwrap();
+        let config = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let (target, target_root) = test_state("existing-account-policy-target").await;
+        let target_provider = insert_provider(
+            &target,
+            "existing-account-policy-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let target_account = db::insert_account(
+            &target.pool,
+            &target_provider,
+            "Primary",
+            &target.crypto.encrypt("target-secret").unwrap(),
+            "target:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+
+        let dry_run = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: config.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true);
+        let _ = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let restored = db::get_account(&target.pool, &target_account)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            target.crypto.decrypt(&restored.secret_enc).unwrap(),
+            "target-secret"
+        );
+        assert_eq!(restored.status, "disabled");
+        assert_eq!(restored.status_reason, "operator_disabled");
+        assert_eq!(restored.priority, 10);
+        assert_eq!(restored.weight, 20);
+        assert_eq!(restored.quota_type, "rolling");
+        assert_eq!(restored.quota_window_s, Some(3600));
+        assert_eq!(restored.soft_quota_usd, Some(35.5));
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn config_export_import_preserves_account_policy_not_runtime_health() {
+        let (source, source_root) = test_state("account-policy-source").await;
+        let provider_id = insert_provider(
+            &source,
+            "account-policy-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let disabled_id = db::insert_account(
+            &source.pool,
+            &provider_id,
+            "disabled-rolling",
+            &source.crypto.encrypt("disabled-secret").unwrap(),
+            "test:****",
+            4,
+            3,
+            Some(12.5),
+            "rolling",
+        )
+        .await
+        .unwrap();
+        db::update_account(
+            &source.pool,
+            &disabled_id,
+            "disabled-rolling",
+            Some("disabled"),
+            4,
+            3,
+            Some(12.5),
+            "rolling",
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE accounts SET quota_window_s=3600 WHERE id=?")
+            .bind(&disabled_id)
+            .execute(&source.pool)
+            .await
+            .unwrap();
+        let cooling_id = db::insert_account(
+            &source.pool,
+            &provider_id,
+            "temporarily-cooling",
+            &source.crypto.encrypt("cooling-secret").unwrap(),
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE accounts SET status='cooldown', status_reason='rate_limited', cooldown_until='2999-01-01T00:00:00Z', circuit_open_until='2999-01-01T00:00:00Z' WHERE id=?",
+        )
+        .bind(&cooling_id)
+        .execute(&source.pool)
+        .await
+        .unwrap();
+        let rejected_id = db::insert_account(
+            &source.pool,
+            &provider_id,
+            "runtime-disabled-credential",
+            &source.crypto.encrypt("rejected-secret").unwrap(),
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE accounts SET status='disabled', status_reason='credential_rejected' WHERE id=?",
+        )
+        .bind(&rejected_id)
+        .execute(&source.pool)
+        .await
+        .unwrap();
+
+        let exported = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let exported_accounts = exported["accounts"].as_array().unwrap();
+        let disabled = exported_accounts
+            .iter()
+            .find(|account| account["label"] == "disabled-rolling")
+            .unwrap();
+        assert_eq!(disabled["enabled"], false);
+        assert_eq!(disabled["quota_type"], "rolling");
+        assert_eq!(disabled["quota_window_s"], 3600);
+        assert_eq!(disabled["status"], "disabled");
+        let cooling = exported_accounts
+            .iter()
+            .find(|account| account["label"] == "temporarily-cooling")
+            .unwrap();
+        assert_eq!(cooling["enabled"], true);
+        assert_eq!(cooling["status"], "cooldown");
+        let rejected = exported_accounts
+            .iter()
+            .find(|account| account["label"] == "runtime-disabled-credential")
+            .unwrap();
+        assert_eq!(rejected["status"], "disabled");
+        assert_eq!(rejected["enabled"], true);
+
+        let (target, target_root) = test_state("account-policy-target").await;
+        let dry_run = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true);
+        let _ = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let provider = db::list_providers(&target.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "account-policy-provider")
+            .unwrap();
+        let restored = db::list_accounts_for_provider(&target.pool, &provider.id)
+            .await
+            .unwrap();
+        let disabled = restored
+            .iter()
+            .find(|account| account.label == "disabled-rolling")
+            .unwrap();
+        assert_eq!(disabled.status, "disabled");
+        assert_eq!(disabled.status_reason, "operator_disabled");
+        assert_eq!(disabled.quota_type, "rolling");
+        assert_eq!(disabled.quota_window_s, Some(3600));
+        assert_eq!(disabled.priority, 4);
+        assert_eq!(disabled.weight, 3);
+        assert_eq!(disabled.soft_quota_usd, Some(12.5));
+        let cooling = restored
+            .iter()
+            .find(|account| account.label == "temporarily-cooling")
+            .unwrap();
+        assert_eq!(cooling.status, "healthy");
+        assert_eq!(cooling.cooldown_until, None);
+        assert_eq!(cooling.circuit_open_until, None);
+        let rejected = restored
+            .iter()
+            .find(|account| account.label == "runtime-disabled-credential")
+            .unwrap();
+        assert_eq!(rejected.status, "healthy");
+        assert_eq!(rejected.status_reason, "account_created");
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn config_import_dry_run_accounts_for_provider_mode_reconciliation() {
+        let (state, root) = test_state("import-account-mode-reconciliation").await;
+        let provider_id = insert_provider(
+            &state,
+            "mode-reconciliation-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "existing-account",
+            &state.crypto.encrypt("existing-secret").unwrap(),
+            "test:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "mode-reconciliation-model",
+                display_name: "Mode Reconciliation Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let route_id = db::insert_route(
+            &state.pool,
+            &db::NewRoute {
+                name: "mode-reconciliation-route",
+                description: "",
+                strategy: "priority",
+                fallback_triggers: json!({}),
+                portability_policy: "strip_with_warning",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: None,
+                max_concurrent_requests: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::insert_route_target(
+            &state.pool,
+            &route_id,
+            Some(&account_id),
+            &model_id,
+            1,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        let mut portable = export_config(
+            State(state.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        portable["providers"][0]["credential_mode"] = json!("none");
+        let mut legacy_id_binding = portable.clone();
+        legacy_id_binding["routes"][0]["targets"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("account_ref");
+        legacy_id_binding["routes"][0]["targets"][0]["account_id"] = json!(account_id);
+
+        for config in [portable, legacy_id_binding] {
+            let dry_run = import_config(
+                State(state.clone()),
+                auth(),
+                Json(ImportBody {
+                    config: config.clone(),
+                    apply: false,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(dry_run["valid"], false);
+            assert!(dry_run["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|problem| problem
+                    .as_str()
+                    .is_some_and(|problem| problem.contains("account"))));
+            let apply_error = import_config(
+                State(state.clone()),
+                auth(),
+                Json(ImportBody {
+                    config,
+                    apply: true,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                db::get_provider(&state.pool, &provider_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .credential_mode,
+                "manual"
+            );
+            assert!(db::get_account(&state.pool, &account_id)
+                .await
+                .unwrap()
+                .is_some());
+            assert_eq!(
+                db::route_targets(&state.pool, &route_id).await.unwrap()[0]
+                    .account_id
+                    .as_deref(),
+                Some(account_id.as_str())
+            );
+        }
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -19862,10 +21992,221 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap_err();
         assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+        let dry_run_problems = dry_run["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            apply_error.1,
+            format!("config validation failed: {}", dry_run_problems.join("; "))
+        );
         assert!(db::list_routes(&state.pool).await.unwrap().is_empty());
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_import_rolls_back_every_resource_when_a_late_write_fails() {
+        let (state, root) = test_state("config-import-transaction-rollback").await;
+        sqlx::query(
+            "CREATE TRIGGER fail_config_import_alias BEFORE INSERT ON aliases BEGIN SELECT RAISE(ABORT, 'forced import failure'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let config = json!({
+            "kinetix_config_version": 2,
+            "providers": [{
+                "name": "rollback-provider",
+                "base_url": "https://provider-a.example/v1",
+                "wire_format": "openai",
+                "auth_scheme": "bearer",
+                "extra_headers": {},
+                "rate_limit_rules": {},
+                "credential_mode": "manual",
+                "enabled": true
+            }],
+            "models": [{
+                "provider": "rollback-provider",
+                "upstream_id": "rollback-model",
+                "display_name": "Rollback Model",
+                "capabilities": {},
+                "prices": {},
+                "parameters": {},
+                "thinking_map": {},
+                "extra_request": {}
+            }],
+            "routes": [{
+                "name": "rollback-route",
+                "targets": [{"model": "rollback-provider/rollback-model"}]
+            }],
+            "aliases": [{
+                "alias": "rollback-alias",
+                "target_type": "route",
+                "target": "rollback-route"
+            }]
+        });
+
+        let result = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config,
+                apply: true,
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
+        assert!(db::list_models(&state.pool).await.unwrap().is_empty());
+        assert!(db::list_routes(&state.pool).await.unwrap().is_empty());
+        assert!(db::list_aliases(&state.pool).await.unwrap().is_empty());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn registry_snapshot_build_failure_leaves_database_and_active_snapshot_unchanged() {
+        let (state, root) = test_state("registry-snapshot-staging-failure").await;
+        let provider_id = insert_provider(
+            &state,
+            "snapshot-staging-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        db::insert_route(
+            &state.pool,
+            &db::NewRoute {
+                name: "snapshot-staging-route",
+                description: "",
+                strategy: "priority",
+                fallback_triggers: json!({}),
+                portability_policy: "strip_with_warning",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: None,
+                max_concurrent_requests: None,
+            },
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+
+        sqlx::query("DROP TABLE route_targets")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let result = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: json!({
+                    "providers": [{
+                        "name": "uncommitted-provider",
+                        "base_url": "https://provider.example/v1",
+                        "wire_format": "openai",
+                        "auth_scheme": "bearer",
+                        "extra_headers": {},
+                        "rate_limit_rules": {},
+                        "credential_mode": "manual"
+                    }]
+                }),
+                apply: true,
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+
+        assert_eq!(
+            db::list_providers(&state.pool).await.unwrap().len(),
+            1,
+            "staged snapshot failure must roll back imported providers"
+        );
+        assert_eq!(
+            db::get_provider(&state.pool, &provider_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name,
+            "snapshot-staging-provider"
+        );
+        assert!(state
+            .registry
+            .snapshot()
+            .providers
+            .contains_key(&provider_id));
+        assert!(!state
+            .registry
+            .snapshot()
+            .providers
+            .values()
+            .any(|provider| provider.name == "uncommitted-provider"));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_import_migrates_legacy_account_targets_and_rejects_unknown_versions() {
+        let legacy = json!({
+            "kinetix_config_version": 1,
+            "accounts": [{"provider": "p", "label": "only-account"}],
+            "routes": [{"targets": [{"model": "p/model", "account_id": "old-db-id"}]}]
+        });
+        let (migrated, source_version, warnings) = normalize_import_config(legacy).unwrap();
+        assert_eq!(source_version, 1);
+        assert_eq!(migrated["accounts"][0]["ref"], "account-1");
+        assert_eq!(
+            migrated["routes"][0]["targets"][0]["account_ref"],
+            "account-1"
+        );
+        assert!(migrated["routes"][0]["targets"][0]
+            .get("account_id")
+            .is_none());
+        assert_eq!(warnings.len(), 1);
+
+        let error = normalize_import_config(json!({"kinetix_config_version": 99})).unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn config_v2_enabled_is_operator_authoritative_and_unknown_intent_stays_unknown() {
+        assert_eq!(
+            imported_account_enabled(&json!({"status": "disabled", "enabled": true}), 2),
+            Ok(true)
+        );
+        assert!(imported_account_enabled(&json!({"status": "disabled"}), 2).is_err());
+        assert_eq!(
+            imported_account_enabled(&json!({"status": "disabled"}), 1),
+            Ok(false)
+        );
+        assert_eq!(
+            account_export_enabled("disabled", "credential_rejected"),
+            Some(true)
+        );
+        assert_eq!(
+            account_export_enabled("disabled", "operator_disabled"),
+            Some(false)
+        );
+        assert_eq!(
+            account_export_enabled("disabled", "existing_disabled"),
+            None
+        );
+        assert_eq!(
+            account_export_enabled("cooldown", "cooldown_cleared"),
+            Some(true)
+        );
+        assert_eq!(
+            account_export_enabled("disabled", "future_runtime_reason"),
+            Some(true)
+        );
+        assert_eq!(account_export_enabled("healthy", "unknown"), Some(true));
     }
 
     #[tokio::test]

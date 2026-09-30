@@ -22,6 +22,15 @@ use crate::db::{
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<RwLock<Arc<Snapshot>>>,
+    publication: Arc<tokio::sync::Mutex<()>>,
+    config_imports: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Holds the registry publication lock across a control-plane database update.
+/// Publish the matching snapshot before dropping the guard.
+pub(crate) struct RegistryPublication<'a> {
+    registry: &'a Registry,
+    _guard: tokio::sync::MutexGuard<'a, ()>,
 }
 
 #[derive(Default)]
@@ -73,53 +82,141 @@ impl Registry {
     pub fn new() -> Self {
         Registry {
             inner: Arc::new(RwLock::new(Arc::new(Snapshot::default()))),
+            publication: Arc::new(tokio::sync::Mutex::new(())),
+            config_imports: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    /// Serialize apply imports before they read control-plane state to plan.
+    pub(crate) async fn config_import_lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.config_imports.clone().lock_owned().await
+    }
+
+    pub(crate) async fn publication(&self) -> RegistryPublication<'_> {
+        RegistryPublication {
+            registry: self,
+            _guard: self.publication.lock().await,
         }
     }
 
     pub async fn reload(&self, pool: &Pool) -> Result<()> {
+        self.publication().await.reload(pool).await
+    }
+
+    /// Build a registry snapshot without making it active.
+    pub async fn build_snapshot(pool: &Pool) -> Result<Snapshot> {
         let providers = db::list_providers(pool).await?;
         let accounts = db::list_accounts(pool).await?;
         let models = db::list_models(pool).await?;
         let aliases = db::list_aliases(pool).await?;
         let routes = db::list_routes(pool).await?;
+        let mut route_targets = HashMap::new();
+        for route in &routes {
+            route_targets.insert(route.id.clone(), db::route_targets(pool, &route.id).await?);
+        }
+        Ok(Self::snapshot_from_rows(
+            providers,
+            accounts,
+            models,
+            aliases,
+            routes,
+            route_targets,
+        ))
+    }
 
+    /// Build a snapshot from uncommitted configuration for atomic activation
+    /// after the transaction commits.
+    pub async fn build_snapshot_in_transaction(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ) -> Result<Snapshot> {
+        let providers =
+            sqlx::query_as::<_, ProviderRow>("SELECT * FROM providers ORDER BY created_at")
+                .fetch_all(&mut **tx)
+                .await?;
+        let accounts =
+            sqlx::query_as::<_, AccountRow>("SELECT * FROM accounts ORDER BY priority, created_at")
+                .fetch_all(&mut **tx)
+                .await?;
+        let models = sqlx::query_as::<_, ModelRow>("SELECT * FROM models ORDER BY created_at")
+            .fetch_all(&mut **tx)
+            .await?;
+        let aliases = sqlx::query_as::<_, AliasRow>("SELECT * FROM aliases ORDER BY alias")
+            .fetch_all(&mut **tx)
+            .await?;
+        let routes = sqlx::query_as::<_, RouteRow>("SELECT * FROM routes ORDER BY created_at")
+            .fetch_all(&mut **tx)
+            .await?;
+        let mut route_targets = HashMap::new();
+        for route in &routes {
+            let targets = sqlx::query_as::<_, RouteTargetRow>(
+                "SELECT * FROM route_targets WHERE route_id = ? ORDER BY priority, weight DESC",
+            )
+            .bind(&route.id)
+            .fetch_all(&mut **tx)
+            .await?;
+            route_targets.insert(route.id.clone(), targets);
+        }
+        Ok(Self::snapshot_from_rows(
+            providers,
+            accounts,
+            models,
+            aliases,
+            routes,
+            route_targets,
+        ))
+    }
+
+    /// Atomically activate a fully built immutable snapshot while publication
+    /// is serialized by `RegistryPublication`.
+    fn activate(&self, snapshot: Snapshot) {
+        *self.inner.write() = Arc::new(snapshot);
+    }
+
+    fn snapshot_from_rows(
+        providers: Vec<ProviderRow>,
+        accounts: Vec<AccountRow>,
+        models: Vec<ModelRow>,
+        aliases: Vec<AliasRow>,
+        routes: Vec<RouteRow>,
+        route_targets: HashMap<String, Vec<RouteTargetRow>>,
+    ) -> Snapshot {
         let mut snap = Snapshot::default();
-        for p in providers {
-            if p.enabled == 0 {
+        for provider in providers {
+            if provider.enabled == 0 {
                 continue;
             }
-            snap.provider_order.push(p.id.clone());
-            snap.providers.insert(p.id.clone(), p);
+            snap.provider_order.push(provider.id.clone());
+            snap.providers.insert(provider.id.clone(), provider);
         }
-        for a in accounts {
+        for account in accounts {
             let allowed = snap
                 .providers
-                .get(&a.provider_id)
+                .get(&account.provider_id)
                 .is_some_and(|provider| match provider.credential_mode.as_str() {
-                    "none" => a.label == "__kinetix_noauth__",
-                    _ => a.label != "__kinetix_noauth__",
+                    "none" => account.label == "__kinetix_noauth__",
+                    _ => account.label != "__kinetix_noauth__",
                 });
             if allowed {
-                snap.accounts.insert(a.id.clone(), a);
+                snap.accounts.insert(account.id.clone(), account);
             }
         }
-        for m in models {
-            snap.model_by_upstream
-                .insert((m.provider_id.clone(), m.upstream_id.clone()), m.id.clone());
-            snap.models.insert(m.id.clone(), m);
+        for model in models {
+            snap.model_by_upstream.insert(
+                (model.provider_id.clone(), model.upstream_id.clone()),
+                model.id.clone(),
+            );
+            snap.models.insert(model.id.clone(), model);
         }
-        for a in aliases {
-            snap.aliases.insert(a.alias.clone(), a);
+        for alias in aliases {
+            snap.aliases.insert(alias.alias.clone(), alias);
         }
-        for c in routes {
-            let targets = db::route_targets(pool, &c.id).await?;
-            snap.route_targets.insert(c.id.clone(), targets);
-            snap.routes.insert(c.id.clone(), c);
+        for route in routes {
+            if let Some(targets) = route_targets.get(&route.id) {
+                snap.route_targets.insert(route.id.clone(), targets.clone());
+            }
+            snap.routes.insert(route.id.clone(), route);
         }
-
-        // Atomically activate the new immutable snapshot (NFR-2.10).
-        *self.inner.write() = Arc::new(snap);
-        Ok(())
+        snap
     }
 
     /// Take a reference to the current immutable snapshot.
@@ -312,6 +409,21 @@ impl Registry {
             })
             .map(|r| r.name.clone())
             .collect()
+    }
+}
+
+impl RegistryPublication<'_> {
+    /// Build and publish a fresh snapshot while holding the publication lock.
+    pub(crate) async fn reload(self, pool: &Pool) -> Result<()> {
+        let snapshot = Registry::build_snapshot(pool).await?;
+        self.activate(snapshot);
+        Ok(())
+    }
+
+    /// Publish a snapshot staged from a transaction after that transaction has
+    /// committed. The lock excludes concurrent reloads until activation.
+    pub(crate) fn activate(self, snapshot: Snapshot) {
+        self.registry.activate(snapshot);
     }
 }
 
