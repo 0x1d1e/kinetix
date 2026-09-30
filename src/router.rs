@@ -3,7 +3,7 @@
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Request};
 use axum::middleware::Next;
 use axum::response::Response;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -57,7 +57,49 @@ pub fn build(state: AppState) -> Router {
         .route("/v1/usage", get(api::client_usage))
         .layer(axum::middleware::from_fn(attach_client_disconnect));
 
-    let admin_api = Router::new()
+    let admin_api = admin_routes()
+        .finish()
+        .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
+        // Preserve fail-closed mutations while the control-plane store is degraded.
+        // Reads remain available; only the Admin API error representation changes.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admin::require_control_plane,
+        ))
+        .layer(axum::middleware::from_fn(crate::admin_contract::boundary));
+
+    let unknown_admin_api = axum::routing::any(|| async {
+        crate::admin_contract::error_response(
+            axum::http::StatusCode::NOT_FOUND,
+            "endpoint not found",
+            vec![],
+        )
+    })
+    .layer(axum::middleware::from_fn(crate::admin_contract::boundary));
+
+    let dashboard = Router::new()
+        .route("/", get(assets::serve))
+        .route("/admin", get(assets::serve))
+        .route("/admin/", get(assets::serve))
+        .route("/admin/{*path}", get(assets::serve));
+
+    Router::new()
+        .merge(public)
+        .nest("/admin/api", admin_api)
+        // The dashboard wildcard must not turn unknown API paths into HTML 200s.
+        .route("/admin/api", unknown_admin_api.clone())
+        .route("/admin/api/", unknown_admin_api.clone())
+        .route("/admin/api/{*path}", unknown_admin_api)
+        .merge(dashboard)
+        .layer(cors)
+        .layer(TraceLayer::new_for_http())
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .with_state(state)
+}
+
+pub(crate) fn admin_routes() -> crate::admin_contract::reference::AdminRouter {
+    use crate::admin_contract::reference::{delete, get, post, put, AdminRouter};
+    AdminRouter::new()
         .route("/login", post(admin::login))
         .route("/logout", post(admin::logout))
         .route("/me", get(admin::me))
@@ -249,25 +291,4 @@ pub fn build(state: AppState) -> Router {
         )
         .route("/plugins/{id}/audit", get(admin::plugin_audit))
         .route("/plugins/{id}/metrics", get(admin::plugin_metrics))
-        // Admin mutations fail closed while the control-plane store is degraded
-        // (NFR-2.7). Reads stay available.
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            admin::require_control_plane,
-        ));
-
-    let dashboard = Router::new()
-        .route("/", get(assets::serve))
-        .route("/admin", get(assets::serve))
-        .route("/admin/", get(assets::serve))
-        .route("/admin/{*path}", get(assets::serve));
-
-    Router::new()
-        .merge(public)
-        .nest("/admin/api", admin_api)
-        .merge(dashboard)
-        .layer(cors)
-        .layer(TraceLayer::new_for_http())
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
-        .with_state(state)
 }

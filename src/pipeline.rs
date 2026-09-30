@@ -7371,7 +7371,7 @@ async fn finalize_log(
 /// claiming an exact target. Never mutates production state or calls upstream.
 ///
 /// `descriptor` mirrors the fields a representative request would carry.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct DryRunRequest {
     #[serde(default)]
     pub frontend: Option<String>,

@@ -2021,7 +2021,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
             token: "test-admin-token".into(),
         },
         axum::extract::Path(stale_account_id.clone()),
-        Json(rotated_body),
+        kinetix::admin_contract::Json(rotated_body),
     )
     .await
     .expect("manual credential rotation should succeed");

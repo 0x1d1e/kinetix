@@ -204,7 +204,7 @@ impl ThinkingLevel {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingMode {
     ManualBudget,
@@ -212,7 +212,7 @@ pub enum ThinkingMode {
     Adaptive,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ThinkingMap {
     /// Canonical level -> upstream request field value (opaque JSON).

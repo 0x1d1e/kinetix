@@ -60,14 +60,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin, onLoginSucces
       <div className="absolute top-8 left-8 hidden md:block rotate-[-4deg]">
         <div className="p-3 bg-[var(--postit)] border-2 border-[var(--ink)] sketch-shadow-sm rounded-lg max-w-[200px] text-xs font-mono">
           <span className="font-heading font-bold text-sm block mb-1">⚡ Gateway Rule #1</span>
-          All upstream keys remain masked & stored securely in container memory.
+          Ordinary API reads mask credentials. Explicit secret exports need careful handling.
         </div>
       </div>
 
       <div className="absolute bottom-8 right-8 hidden md:block rotate-[3deg]">
         <div className="p-3 bg-[var(--tint-green)] border-2 border-[var(--ink)] sketch-shadow-sm rounded-lg max-w-[220px] text-xs font-mono">
-          <span className="font-heading font-bold text-sm text-[var(--success-text)] block mb-1">🛡️ RBAC & Audit</span>
-          Every key mutation, route edit, and provider ping is cryptographically stamped.
+          <span className="font-heading font-bold text-sm text-[var(--success-text)] block mb-1">🛡️ Administrator Access</span>
+          Use virtual keys for clients. Keep administrator credentials private.
         </div>
       </div>
 
@@ -103,7 +103,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin, onLoginSucces
               Sign in to Gateway
             </h2>
             <p className="text-sm font-body text-[var(--ink)]/80 mt-0.5">
-              Enter your credentials to manage routing routes, key pools, and upstream providers.
+              Sign in to manage Routes, Accounts, and Providers.
             </p>
           </div>
 
@@ -176,10 +176,10 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin, onLoginSucces
                 📌 Authentication Note:
               </span>
               <div>
-                Sessions are signed server-side and stored in an httpOnly cookie.
+                Sessions are validated server-side using an httpOnly cookie.
               </div>
               <div className="mt-1 text-[11px] text-[var(--ink)]/60">
-                🔒 All audit logs record actions under the authenticated admin session.
+                🔒 Protect credential exports and generated client profiles.
               </div>
             </div>
           </div>
@@ -188,7 +188,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin, onLoginSucces
 
       <div className="text-xs font-mono text-[var(--ink)]/60 text-center relative z-10 flex items-center gap-1.5">
         <ShieldCheck className="w-4 h-4 text-[var(--pen-green)]" />
-        Kinetix LLM Gateway v0.1 • End-to-end Local Encryption
+        Kinetix LLM Gateway • Administrator Access
       </div>
     </div>
   );

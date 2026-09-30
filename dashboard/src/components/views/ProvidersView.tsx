@@ -823,6 +823,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     };
 
     setIsSaving(true);
+    setValidation(null);
     try {
       if (editingProviderId) {
         // api_key is omitted unless a new one was typed (rotating the pool key).
@@ -841,6 +842,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
       }
       setShowAddProviderModal(false);
       resetProviderForm();
+    } catch (error) {
+      setValidation({ valid: false, problems: [error instanceof Error ? error.message : String(error)], warnings: [] });
     } finally {
       setIsSaving(false);
     }
@@ -2259,6 +2262,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
 
                 {validation && (
                   <div
+                    role={validation.valid ? 'status' : 'alert'}
                     className="p-3 text-sm font-mono"
                     style={{
                       borderRadius: DESIGN_TOKENS.radii.wobbly,
@@ -2267,7 +2271,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     }}
                   >
                     <div className="font-bold mb-1">
-                      {validation.valid ? 'Validate: passed' : 'Validate: problems found'}
+                      {validation.valid ? 'Validate: passed' : 'Provider errors'}
                     </div>
                     {validation.problems.map((p, i) => (
                       <div key={i} style={{ color: 'var(--danger-text)' }}>
