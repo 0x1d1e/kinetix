@@ -236,12 +236,12 @@ async fn upstream(
                 "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n"
             )))
             .unwrap(),
-        "terminal_http_503" => Response::builder()
+        "terminal_http_503" | "local_skip_http_503" => Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header("content-type", "application/json")
             .body(Body::from(r#"{"error":{"message":"temporarily unavailable"}}"#))
             .unwrap(),
-        "terminal_http_429" => Response::builder()
+        "terminal_http_429" | "local_skip_http_429" => Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
             .header("content-type", "application/json")
             .body(Body::from(
@@ -1007,6 +1007,122 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
         .unwrap();
     }
 
+    let skipped_provider_id = db::insert_provider(
+        &pool,
+        &db::NewProvider {
+            name: "mock-provider-circuit-skipped",
+            base_url: &base_url,
+            wire_format: WireFormat::Openai,
+            auth_scheme: AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: json!({}),
+            timeout_ms: 2_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: true,
+            wire_plugin: "",
+            credential_plugin: "",
+            model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let skipped_account_id = db::insert_account(
+        &pool,
+        &skipped_provider_id,
+        "locally-skipped-account",
+        &crypto.encrypt("locally-skipped-key").unwrap(),
+        "locally-skipped-key",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+    let skipped_model_id = db::insert_model(
+        &pool,
+        &db::NewModel {
+            provider_id: &skipped_provider_id,
+            upstream_id: UPSTREAM_MODEL,
+            display_name: "Circuit-skipped model",
+            enabled: true,
+            context_window: None,
+            max_output_tokens: Some(1024),
+            capabilities: json!({"text": true}),
+            prices: json!({}),
+            parameters: json!({}),
+            thinking_map: json!({}),
+            extra_request: json!({}),
+            discovery: json!({"configured_transport": "openai-responses"}),
+        },
+    )
+    .await
+    .unwrap();
+    for test_case in ["local_skip_http_429", "local_skip_http_503"] {
+        let primary_account_id = db::insert_account(
+            &pool,
+            &terminal_provider_id,
+            &format!("{test_case}-primary-account"),
+            &crypto.encrypt(&format!("{test_case}-key")).unwrap(),
+            &format!("{test_case}-key"),
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let route_name = format!("responses-{test_case}-route");
+        let route_id = db::insert_route(
+            &pool,
+            &db::NewRoute {
+                name: &route_name,
+                description: "",
+                strategy: "priority",
+                fallback_triggers: json!({}),
+                portability_policy: "reject",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: Some(2),
+                max_concurrent_requests: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::insert_route_target(
+            &pool,
+            &route_id,
+            Some(&primary_account_id),
+            &terminal_model_id,
+            1,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .unwrap();
+        db::insert_route_target(
+            &pool,
+            &route_id,
+            Some(&skipped_account_id),
+            &skipped_model_id,
+            2,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .unwrap();
+    }
+
     db::insert_virtual_key(
         &pool,
         &db::VirtualKeyRow {
@@ -1101,6 +1217,25 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
         0,
     );
 
+    for index in 0..2 {
+        let attempt = state
+            .provider_circuits
+            .begin_attempt(
+                &skipped_provider_id,
+                &format!("seed-account-{index}"),
+                &format!("seed-target-{index}"),
+            )
+            .unwrap();
+        attempt.finish_failure(kinetix::types::FailureKind::ServerError, Some(503));
+    }
+    assert_eq!(
+        state.provider_circuits.snapshot(&skipped_provider_id).state,
+        kinetix::provider_circuit::ProviderCircuitState::Open
+    );
+    let skipped_circuit_rejects_before = state
+        .provider_circuits
+        .snapshot(&skipped_provider_id)
+        .rejects;
     let (status, streamed_refusal) = call_responses(
         &state,
         "responses-route",
@@ -1472,6 +1607,60 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
         assert_eq!(attempts[0].1, "stream_error");
         assert_eq!(attempts[0].6, "pre_commit");
     }
+
+    // Run after terminal-provider cases to avoid sharing their circuit history.
+    // The outbound transport retries HTTP 503 once before route fallback.
+    for (test_case, expected_response, expected_status, expected_code) in [
+        (
+            "local_skip_http_429",
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            429,
+        ),
+        (
+            "local_skip_http_503",
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            502,
+        ),
+    ] {
+        let route_name = format!("responses-{test_case}-route");
+        let (request_id, response_status, body) =
+            call_responses_with_id(&state, &route_name, test_case).await;
+        assert_eq!(response_status, expected_response, "{test_case}: {body}");
+        let rows = wait_for_usage_rows(&state, &request_id, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1),
+            (expected_status, expected_code),
+            "{test_case} must account for the dispatched upstream failure, not the local skip"
+        );
+        assert_eq!(
+            usage_attempt_rows_for_request(&state, &request_id)
+                .await
+                .len(),
+            1,
+            "the locally skipped target must not create an attempt row"
+        );
+        let trace_steps: String =
+            sqlx::query_scalar("SELECT steps FROM route_traces WHERE request_id = ?")
+                .bind(&request_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(
+            trace_steps.contains("provider_circuit_open"),
+            "{test_case} should record the local circuit rejection: {trace_steps}"
+        );
+    }
+    assert_eq!(
+        state
+            .provider_circuits
+            .snapshot(&skipped_provider_id)
+            .rejects,
+        skipped_circuit_rejects_before + 2,
+        "the fallback candidate should be rejected locally by the open provider circuit"
+    );
 
     let before_unknown_attempt = state.admission.metrics_snapshot();
     let (request_id, status, unknown_fallback) = call_responses_with_id_stream(

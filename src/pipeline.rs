@@ -89,6 +89,15 @@ struct PartialAttemptUsage {
     row: db::UsageAttemptRow,
 }
 
+struct LastPrecommitFailure {
+    target: ResolvedTarget,
+    upstream_request_id: Option<String>,
+    failure: UpstreamFailure,
+    termination: StreamTermination,
+    attempts_done: usize,
+    client_error: ProxyError,
+}
+
 struct ActivePrecommitAttempt {
     target: ResolvedTarget,
     attempt_number: usize,
@@ -1171,7 +1180,7 @@ pub(crate) async fn run_with_disconnect(
     let mut skip_logical_target: Option<String> = None;
     let deadline = started + MAX_PRE_COMMIT_DEADLINE;
     let mut auth_retried_accounts = std::collections::HashSet::new();
-    let mut last_precommit_failure = None;
+    let mut last_precommit_failure: Option<LastPrecommitFailure> = None;
 
     while let Some(target_owned) = pending_targets.pop_front() {
         let target = &target_owned;
@@ -1975,17 +1984,19 @@ pub(crate) async fn run_with_disconnect(
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
                                 return Err(client_error);
                             }
-                            last_precommit_failure = Some((
-                                (*target).clone(),
-                                upstream_request_id.clone(),
-                                failure.clone(),
+                            let client_error = failure_to_error(&failure, target);
+                            last_precommit_failure = Some(LastPrecommitFailure {
+                                target: (*target).clone(),
+                                upstream_request_id: upstream_request_id.clone(),
+                                failure: failure.clone(),
                                 termination,
                                 attempts_done,
-                            ));
+                                client_error: client_error.clone(),
+                            });
                             if failure.kind == FailureKind::TargetError {
                                 skip_logical_target = target.route_target_id.clone();
                             }
-                            last_error = Some(failure_to_error(&failure, target));
+                            last_error = Some(client_error);
                             continue;
                         }
                     };
@@ -2104,6 +2115,15 @@ pub(crate) async fn run_with_disconnect(
                     Some(failure.kind),
                     failure.status,
                 );
+                let client_error = preserve_anthropic_error(
+                    failure_to_error(&failure, target),
+                    format,
+                    adapter.as_ref(),
+                    &failure,
+                    status,
+                    &headers,
+                    upstream_error_body.as_deref(),
+                );
                 record_precommit_attempt_usage(
                     state,
                     &mut meta,
@@ -2116,13 +2136,14 @@ pub(crate) async fn run_with_disconnect(
                     termination,
                 )
                 .await;
-                last_precommit_failure = Some((
-                    (*target).clone(),
-                    upstream_request_id.clone(),
-                    failure.clone(),
+                last_precommit_failure = Some(LastPrecommitFailure {
+                    target: (*target).clone(),
+                    upstream_request_id: upstream_request_id.clone(),
+                    failure: failure.clone(),
                     termination,
                     attempts_done,
-                ));
+                    client_error: client_error.clone(),
+                });
                 if let Some(permit) = traffic_permit.as_ref() {
                     permit.finish(traffic_outcome_for_failure(failure.kind));
                 }
@@ -2303,15 +2324,6 @@ pub(crate) async fn run_with_disconnect(
                 }
 
                 handle_key_failure(state, target, &failure, &mut meta, &mut trace).await;
-                let client_error = preserve_anthropic_error(
-                    failure_to_error(&failure, target),
-                    format,
-                    adapter.as_ref(),
-                    &failure,
-                    status,
-                    &headers,
-                    upstream_error_body.as_deref(),
-                );
                 let can_fallback =
                     allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
                 trace.stream_termination(termination, Some(can_fallback));
@@ -2371,6 +2383,7 @@ pub(crate) async fn run_with_disconnect(
                     Some(failure.kind),
                     failure.status,
                 );
+                let client_error = failure_to_error(&failure, target);
                 record_precommit_attempt_usage(
                     state,
                     &mut meta,
@@ -2383,13 +2396,14 @@ pub(crate) async fn run_with_disconnect(
                     termination,
                 )
                 .await;
-                last_precommit_failure = Some((
-                    (*target).clone(),
-                    None,
-                    failure.clone(),
+                last_precommit_failure = Some(LastPrecommitFailure {
+                    target: (*target).clone(),
+                    upstream_request_id: None,
+                    failure: failure.clone(),
                     termination,
                     attempts_done,
-                ));
+                    client_error: client_error.clone(),
+                });
                 if let Some(permit) = traffic_permit.as_ref() {
                     permit.finish(traffic_outcome_for_failure(failure.kind));
                 }
@@ -2439,7 +2453,6 @@ pub(crate) async fn run_with_disconnect(
                         None,
                     );
                     reconcile_partial_attempts(&mut meta);
-                    let client_error = failure_to_error(&failure, target);
                     record_precommit_request_log(
                         state,
                         &meta,
@@ -2457,7 +2470,7 @@ pub(crate) async fn run_with_disconnect(
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
                     return Err(client_error);
                 }
-                last_error = Some(failure_to_error(&failure, target));
+                last_error = Some(client_error);
                 continue;
             }
         }
@@ -2472,31 +2485,26 @@ pub(crate) async fn run_with_disconnect(
         .as_ref()
         .map(|c| format!("route '{}'", c.name))
         .unwrap_or_else(|| req.requested_model.clone());
-    let msg = last_error
+    let msg = last_precommit_failure
         .as_ref()
-        .map(|e| e.message.clone())
+        .map(|failure| failure.client_error.message.clone())
+        .or_else(|| last_error.as_ref().map(|error| error.message.clone()))
         .unwrap_or_else(|| format!("all targets of {name} are currently unavailable"));
     trace.finish("all_targets_unavailable");
-    if let Some((target, upstream_request_id, failure, termination, attempts_done)) =
-        last_precommit_failure
-    {
-        let request_error = last_error
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| failure_to_error(&failure, &target));
+    if let Some(failure) = last_precommit_failure.as_ref() {
         record_precommit_request_log(
             state,
             &meta,
             &req,
-            &target,
+            &failure.target,
             key.as_ref(),
             &trace,
-            upstream_request_id.as_deref(),
-            &failure,
-            &request_error,
-            termination,
+            failure.upstream_request_id.as_deref(),
+            &failure.failure,
+            &failure.client_error,
+            failure.termination,
             started,
-            attempts_done,
+            failure.attempts_done,
         );
     }
     state.live.finish(
@@ -2507,8 +2515,11 @@ pub(crate) async fn run_with_disconnect(
         None,
     );
     let _ = db::insert_route_trace(&state.pool, &trace).await;
-    // Preserve the actual upstream failure when we attempted a target. Routing
-    // exhaustion must not turn a useful 429/401/5xx into a generic 503.
+    // Preserve the actual dispatched failure and its client error together.
+    // Routing exhaustion must not turn a useful 429/401/5xx into a generic 503.
+    if let Some(failure) = last_precommit_failure {
+        return Err(failure.client_error);
+    }
     if let Some(error) = last_error {
         return Err(error);
     }
