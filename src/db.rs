@@ -439,9 +439,11 @@ async fn atomic_rename_noreplace(
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
             let destination = std::ffi::CString::new(destination_path.as_os_str().as_bytes())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-            // SAFETY: both paths are live NUL-terminated C strings and the call does not retain pointers.
+            // SAFETY: both paths are live NUL-terminated C strings; the syscall does not retain pointers.
+            // Calling the syscall avoids requiring glibc 2.28's renameat2 symbol at link time.
             let result = unsafe {
-                libc::renameat2(
+                libc::syscall(
+                    libc::SYS_renameat2,
                     libc::AT_FDCWD,
                     source.as_ptr(),
                     libc::AT_FDCWD,
