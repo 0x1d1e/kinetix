@@ -221,7 +221,7 @@ fn model_entries_in(
 
     entries.retain(|entry| {
         crate::db::VirtualKeyRow::model_is_allowed(key_allowed, &entry.name)
-            && provider_policy_allows(&snap, &entry.name, key_allowed_providers)
+            && provider_policy_allows(snap, &entry.name, key_allowed_providers)
     });
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
@@ -352,6 +352,54 @@ fn declared_caps(m: &ModelRow) -> Option<Value> {
         None
     } else {
         Some(Value::Object(out))
+    }
+}
+
+/// Encode an error body in the calling frontend's format (FR-2.8, NFR-6.2).
+pub fn error_body(format: FrontendFormat, err: &ProxyError) -> Value {
+    match format {
+        FrontendFormat::OpenAi | FrontendFormat::OpenAiResponses => {
+            let etype = match err.kind {
+                ErrorKind::BadRequest | ErrorKind::Unsupported => "invalid_request_error",
+                ErrorKind::Unauthorized => "authentication_error",
+                ErrorKind::Forbidden => "permission_error",
+                ErrorKind::NotFound => "invalid_request_error",
+                ErrorKind::RateLimited => "rate_limit_error",
+                ErrorKind::BudgetExceeded => "budget_exceeded",
+                ErrorKind::AllTargetsUnavailable => "upstream_unavailable",
+                ErrorKind::Upstream => "upstream_error",
+                ErrorKind::Internal => "internal_error",
+                ErrorKind::ServiceUnavailable => "service_unavailable",
+                ErrorKind::ClientCancelled => "server_error",
+            };
+            json!({
+                "error": {
+                    "message": err.message,
+                    "type": etype,
+                    "param": null,
+                    "code": etype
+                }
+            })
+        }
+        FrontendFormat::Anthropic => {
+            let etype = match err.kind {
+                ErrorKind::BadRequest | ErrorKind::Unsupported => "invalid_request_error",
+                ErrorKind::Unauthorized => "authentication_error",
+                ErrorKind::Forbidden => "permission_error",
+                ErrorKind::NotFound => "not_found_error",
+                ErrorKind::RateLimited => "rate_limit_error",
+                ErrorKind::BudgetExceeded => "rate_limit_error",
+                ErrorKind::AllTargetsUnavailable => "overloaded_error",
+                ErrorKind::Upstream => "api_error",
+                ErrorKind::Internal => "api_error",
+                ErrorKind::ServiceUnavailable => "overloaded_error",
+                ErrorKind::ClientCancelled => "api_error",
+            };
+            json!({
+                "type": "error",
+                "error": { "type": etype, "message": err.message }
+            })
+        }
     }
 }
 
@@ -704,53 +752,5 @@ mod tests {
             &["provider-c".into()]
         ));
         assert!(provider_ids_allowed(["provider-a"], &[]));
-    }
-}
-
-/// Encode an error body in the calling frontend's format (FR-2.8, NFR-6.2).
-pub fn error_body(format: FrontendFormat, err: &ProxyError) -> Value {
-    match format {
-        FrontendFormat::OpenAi | FrontendFormat::OpenAiResponses => {
-            let etype = match err.kind {
-                ErrorKind::BadRequest | ErrorKind::Unsupported => "invalid_request_error",
-                ErrorKind::Unauthorized => "authentication_error",
-                ErrorKind::Forbidden => "permission_error",
-                ErrorKind::NotFound => "invalid_request_error",
-                ErrorKind::RateLimited => "rate_limit_error",
-                ErrorKind::BudgetExceeded => "budget_exceeded",
-                ErrorKind::AllTargetsUnavailable => "upstream_unavailable",
-                ErrorKind::Upstream => "upstream_error",
-                ErrorKind::Internal => "internal_error",
-                ErrorKind::ServiceUnavailable => "service_unavailable",
-                ErrorKind::ClientCancelled => "server_error",
-            };
-            json!({
-                "error": {
-                    "message": err.message,
-                    "type": etype,
-                    "param": null,
-                    "code": etype
-                }
-            })
-        }
-        FrontendFormat::Anthropic => {
-            let etype = match err.kind {
-                ErrorKind::BadRequest | ErrorKind::Unsupported => "invalid_request_error",
-                ErrorKind::Unauthorized => "authentication_error",
-                ErrorKind::Forbidden => "permission_error",
-                ErrorKind::NotFound => "not_found_error",
-                ErrorKind::RateLimited => "rate_limit_error",
-                ErrorKind::BudgetExceeded => "rate_limit_error",
-                ErrorKind::AllTargetsUnavailable => "overloaded_error",
-                ErrorKind::Upstream => "api_error",
-                ErrorKind::Internal => "api_error",
-                ErrorKind::ServiceUnavailable => "overloaded_error",
-                ErrorKind::ClientCancelled => "api_error",
-            };
-            json!({
-                "type": "error",
-                "error": { "type": etype, "message": err.message }
-            })
-        }
     }
 }

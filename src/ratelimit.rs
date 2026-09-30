@@ -109,7 +109,7 @@ mod tests {
             assert!(l.check(Some("1.2.3.4".parse().unwrap())).is_ok());
         }
         let err = l.check(Some("1.2.3.4".parse().unwrap())).unwrap_err();
-        assert!(err >= 1 && err <= 60);
+        assert!((1..=60).contains(&err));
         // A different IP is unaffected.
         assert!(l.check(Some("5.6.7.8".parse().unwrap())).is_ok());
         assert_eq!(l.limited_total(), 1);

@@ -70,7 +70,7 @@ pub struct QuotaHeaderObservation {
 impl QuotaHeaderObservation {
     pub fn retry_after_secs(self, now: DateTime<Utc>) -> Option<u64> {
         let millis = (self.reset_at? - now).num_milliseconds();
-        (millis > 0).then(|| (millis as u64 + 999) / 1000)
+        (millis > 0).then(|| (millis as u64).div_ceil(1000))
     }
 }
 

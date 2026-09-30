@@ -2351,7 +2351,7 @@ pub async fn claim_half_open_probe_at(
     now: DateTime<Utc>,
     min_gap_secs: i64,
 ) -> Result<bool> {
-    let probe_after = (now.clone() - chrono::Duration::seconds(min_gap_secs.max(0))).to_rfc3339();
+    let probe_after = (now - chrono::Duration::seconds(min_gap_secs.max(0))).to_rfc3339();
     let now = now.to_rfc3339();
     let result = sqlx::query(
         "UPDATE accounts SET last_probe_at=? \
@@ -2410,6 +2410,26 @@ pub struct ModelRow {
     /// validated discovery descriptor, not by the plugin package version.
     #[serde(default)]
     pub opaque_state_plugin: String,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ModelObservationRow {
+    pub id: String,
+    pub model_id: String,
+    pub kind: String,
+    pub source: String,
+    pub observed_at: String,
+    pub scope_json: String,
+    pub value_json: String,
+}
+
+/// A source observation to append alongside a current discovery/evidence update.
+pub struct ModelObservationDraft<'a> {
+    pub kind: &'a str,
+    pub source: &'a str,
+    pub observed_at: &'a str,
+    pub scope: &'a Value,
+    pub value: &'a Value,
 }
 
 impl ModelRow {
@@ -2486,6 +2506,69 @@ pub async fn find_model_by_upstream(
     .await?)
 }
 
+async fn insert_model_observation_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    model_id: &str,
+    observation: &ModelObservationDraft<'_>,
+) -> Result<()> {
+    let id = format!("observation_{}", uuid::Uuid::new_v4().simple());
+    let observed_at = DateTime::parse_from_rfc3339(observation.observed_at)
+        .context("model observation timestamp must be RFC3339")?
+        .with_timezone(&Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    sqlx::query(
+        "INSERT INTO model_observations
+         (id, model_id, kind, source, observed_at, scope_json, value_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(model_id)
+    .bind(observation.kind)
+    .bind(observation.source)
+    .bind(observed_at)
+    .bind(observation.scope.to_string())
+    .bind(observation.value.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_model_observations(
+    pool: &Pool,
+    model_id: &str,
+    limit: i64,
+    cursor: Option<(&str, &str)>,
+) -> Result<Vec<ModelObservationRow>> {
+    let rows = if let Some((observed_at, id)) = cursor {
+        sqlx::query_as::<_, ModelObservationRow>(
+            "SELECT id, model_id, kind, source, observed_at, scope_json, value_json
+             FROM model_observations
+             WHERE model_id = ? AND (observed_at, id) < (?, ?)
+             ORDER BY observed_at DESC, id DESC
+             LIMIT ?",
+        )
+        .bind(model_id)
+        .bind(observed_at)
+        .bind(id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, ModelObservationRow>(
+            "SELECT id, model_id, kind, source, observed_at, scope_json, value_json
+             FROM model_observations
+             WHERE model_id = ?
+             ORDER BY observed_at DESC, id DESC
+             LIMIT ?",
+        )
+        .bind(model_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows)
+}
+
 pub struct NewModel<'a> {
     pub provider_id: &'a str,
     pub upstream_id: &'a str,
@@ -2535,6 +2618,7 @@ pub struct ModelCreation<'a> {
     pub discovery_patch: &'a Value,
     pub opaque_state_plugin: Option<&'a str>,
     pub pricing: Option<ModelPricingMutation<'a>>,
+    pub initial_observation: Option<ModelObservationDraft<'a>>,
 }
 
 async fn insert_model_in_transaction(
@@ -2810,6 +2894,21 @@ async fn merge_model_discovery_in_transaction(
     Ok(())
 }
 
+/// Update the latest discovery/evidence view and append its immutable source
+/// observation atomically.
+pub async fn merge_model_discovery_with_observation(
+    pool: &Pool,
+    id: &str,
+    fresh: &Value,
+    observation: &ModelObservationDraft<'_>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    merge_model_discovery_in_transaction(&mut tx, id, fresh).await?;
+    insert_model_observation_in_transaction(&mut tx, id, observation).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Create one complete runtime-visible model state as a single database
 /// transaction. A registry reload can only observe the model after transport,
 /// ownership metadata, opaque-state binding, and immutable pricing are complete.
@@ -2822,6 +2921,9 @@ pub async fn commit_model_creation(
 
     set_model_transport_override_in_transaction(&mut tx, &id, creation.transport).await?;
     merge_model_discovery_in_transaction(&mut tx, &id, creation.discovery_patch).await?;
+    if let Some(observation) = creation.initial_observation.as_ref() {
+        insert_model_observation_in_transaction(&mut tx, &id, observation).await?;
+    }
     if let Some(plugin_id) = creation.opaque_state_plugin {
         set_model_opaque_state_plugin_in_transaction(&mut tx, &id, plugin_id).await?;
     }

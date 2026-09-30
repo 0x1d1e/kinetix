@@ -1178,8 +1178,7 @@ async fn responses_passthrough_policy_refusal_and_incomplete_aggregation_inner()
         .lock()
         .await
         .iter()
-        .filter(|request| request.body["input"] == "case:stale_auth")
-        .last()
+        .rfind(|request| request.body["input"] == "case:stale_auth")
         .cloned()
         .expect("replacement credential request should be captured");
     assert_eq!(

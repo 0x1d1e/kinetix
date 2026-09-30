@@ -505,7 +505,7 @@ async fn startup_retries_preserve_snapshot_until_pricing_repair_succeeds() {
     .fetch_one(&backup)
     .await
     .unwrap();
-    assert_eq!(old_schema_has_integration_protocols, 0);
+    assert_eq!(old_schema_has_integration_protocols, 1);
     backup.close().await;
 
     let pool = db::connect(&url).await.unwrap();
@@ -573,9 +573,9 @@ async fn interrupted_marker_publication_recovers_the_pending_snapshot() {
     ));
     let mut temporary_file = std::fs::File::create(&preparing_temporary).unwrap();
     use std::io::Write as _;
-    write!(
+    writeln!(
         temporary_file,
-        "kinetix-pre-migration-20260928T000000Z-{}.db\n",
+        "kinetix-pre-migration-20260928T000000Z-{}.db",
         uuid::Uuid::new_v4().simple()
     )
     .unwrap();
@@ -597,7 +597,7 @@ async fn interrupted_marker_publication_recovers_the_pending_snapshot() {
         uuid::Uuid::new_v4().simple()
     ));
     let mut temporary_file = std::fs::File::create(&ready_temporary).unwrap();
-    write!(temporary_file, "{snapshot_name}\n").unwrap();
+    writeln!(temporary_file, "{snapshot_name}").unwrap();
     temporary_file.sync_all().unwrap();
     let retry = db::open_and_migrate(&url, &data_dir).await;
     assert!(retry

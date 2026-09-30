@@ -453,7 +453,7 @@ fn schedule_from_credential(
         secret_fingerprint: Sha256::digest(credential.secret.as_bytes()).into(),
     };
 
-    let requested = lease_identity.refresh_after.clone().or_else(|| {
+    let requested = lease_identity.refresh_after.or_else(|| {
         lease_identity.expires_at.as_ref().map(|expires| {
             // Keep half of a short lease available before refreshing. Applying
             // the fixed five-minute lead to a lease shorter than five minutes
