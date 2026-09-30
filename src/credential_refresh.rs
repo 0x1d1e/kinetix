@@ -83,7 +83,17 @@ impl RefreshCoordinator {
     /// proactive renewal. Explicit plugin-provided `refresh_after` wins;
     /// otherwise core derives a provider-neutral five-minute lead from expiry.
     pub fn observe(&self, provider_id: &str, account_id: &str, credential: &ResolvedCredential) {
-        self.store_schedule(provider_id, account_id, credential, false, Utc::now(), None);
+        let key = CredentialKey::new(provider_id, account_id);
+        let gate = self.gate(&key);
+        self.store_schedule(
+            provider_id,
+            account_id,
+            credential,
+            false,
+            Utc::now(),
+            None,
+            &gate,
+        );
     }
 
     /// Read a cached credential under the account-scoped gate so it cannot
@@ -97,9 +107,19 @@ impl RefreshCoordinator {
         let key = CredentialKey::new(provider_id, &account.id);
         let gate = self.gate(&key);
         let _guard = gate.lock.lock().await;
+        self.ensure_current_gate(&key, &gate)?;
         let current = strategy.resolve_cached(account).await?;
+        self.ensure_current_gate(&key, &gate)?;
         if let Some(current) = &current {
-            self.observe(provider_id, &account.id, current);
+            self.store_schedule(
+                provider_id,
+                &account.id,
+                current,
+                false,
+                Utc::now(),
+                None,
+                &gate,
+            );
         }
         Ok(current)
     }
@@ -116,13 +136,25 @@ impl RefreshCoordinator {
         let key = CredentialKey::new(provider_id, &account.id);
         let gate = self.gate(&key);
         let _guard = gate.lock.lock().await;
+        self.ensure_current_gate(&key, &gate)?;
 
         if let Some(current) = strategy.resolve_cached(account).await? {
-            self.observe(provider_id, &account.id, &current);
+            self.ensure_current_gate(&key, &gate)?;
+            self.store_schedule(
+                provider_id,
+                &account.id,
+                &current,
+                false,
+                Utc::now(),
+                None,
+                &gate,
+            );
             return Ok(current);
         }
 
-        match strategy.resolve(account).await {
+        let resolved = strategy.resolve(account).await;
+        self.ensure_current_gate(&key, &gate)?;
+        match resolved {
             Ok(current) => {
                 if current.rotated {
                     self.observe_successful_rotation(
@@ -130,9 +162,18 @@ impl RefreshCoordinator {
                         &account.id,
                         &current,
                         Utc::now(),
+                        &gate,
                     );
                 } else {
-                    self.observe(provider_id, &account.id, &current);
+                    self.store_schedule(
+                        provider_id,
+                        &account.id,
+                        &current,
+                        false,
+                        Utc::now(),
+                        None,
+                        &gate,
+                    );
                 }
                 Ok(current)
             }
@@ -145,8 +186,17 @@ impl RefreshCoordinator {
         provider_id: &str,
         account_id: &str,
         credential: &ResolvedCredential,
+        gate: &Arc<RotationGate>,
     ) {
-        self.store_schedule(provider_id, account_id, credential, true, Utc::now(), None);
+        self.store_schedule(
+            provider_id,
+            account_id,
+            credential,
+            true,
+            Utc::now(),
+            None,
+            gate,
+        );
     }
 
     fn observe_successful_rotation(
@@ -155,6 +205,7 @@ impl RefreshCoordinator {
         account_id: &str,
         credential: &ResolvedCredential,
         now: DateTime<Utc>,
+        gate: &Arc<RotationGate>,
     ) {
         let not_before =
             now.to_owned() + ChronoDuration::seconds(MIN_SUCCESSFUL_REFRESH_INTERVAL_SECS);
@@ -165,6 +216,7 @@ impl RefreshCoordinator {
             true,
             now,
             Some(not_before),
+            gate,
         );
     }
 
@@ -176,8 +228,15 @@ impl RefreshCoordinator {
         reset_failures: bool,
         now: DateTime<Utc>,
         not_before: Option<DateTime<Utc>>,
+        gate: &Arc<RotationGate>,
     ) {
         let key = CredentialKey::new(provider_id, account_id);
+        let _gate_entry = match self.gates.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) if Arc::ptr_eq(entry.get(), gate) => {
+                entry
+            }
+            _ => return,
+        };
         let Some(mut schedule) = schedule_from_credential(credential, now) else {
             self.schedules.remove(&key);
             return;
@@ -248,15 +307,15 @@ impl RefreshCoordinator {
     /// removed, disabled, or a refresh token is confirmed invalid.
     pub fn forget(&self, provider_id: &str, account_id: &str) {
         let key = CredentialKey::new(provider_id, account_id);
-        self.schedules.remove(&key);
         self.gates.remove(&key);
+        self.schedules.remove(&key);
     }
 
     /// Forget all proactive refresh state for a deleted provider.
     pub fn forget_provider(&self, provider_id: &str) {
+        self.gates.retain(|key, _| key.provider_id != provider_id);
         self.schedules
             .retain(|key, _| key.provider_id != provider_id);
-        self.gates.retain(|key, _| key.provider_id != provider_id);
     }
 
     /// Atomically claim every lease whose refresh deadline has arrived.
@@ -294,6 +353,7 @@ impl RefreshCoordinator {
         let gate = self.gate(&key);
         let observed_generation = gate.generation.load(Ordering::Acquire);
         let _guard = gate.lock.lock().await;
+        self.ensure_current_gate(&key, &gate)?;
 
         if gate.generation.load(Ordering::Acquire) != observed_generation {
             if let Some(result) = gate.last_auth_result.lock().clone() {
@@ -301,39 +361,57 @@ impl RefreshCoordinator {
             }
         }
 
-        let result = match strategy.resolve(account).await {
+        let resolved = strategy.resolve(account).await;
+        self.ensure_current_gate(&key, &gate)?;
+        let result = match resolved {
             Ok(current) if current.secret != failed_secret => {
-                self.observe_successful_rotation(provider_id, &account.id, &current, Utc::now());
+                self.observe_successful_rotation(
+                    provider_id,
+                    &account.id,
+                    &current,
+                    Utc::now(),
+                    &gate,
+                );
                 Ok(true)
             }
             Err(error) if error.invalid_credential() => Err(error),
-            Ok(_) | Err(_) => match strategy.rotate(account).await {
-                Ok(()) => match strategy.resolve(account).await {
-                    Ok(current) => {
-                        self.observe_successful_rotation(
-                            provider_id,
-                            &account.id,
-                            &current,
-                            Utc::now(),
-                        );
-                        Ok(true)
+            Ok(_) | Err(_) => {
+                let rotated = strategy.rotate(account).await;
+                self.ensure_current_gate(&key, &gate)?;
+                match rotated {
+                    Ok(()) => {
+                        let resolved = strategy.resolve(account).await;
+                        self.ensure_current_gate(&key, &gate)?;
+                        match resolved {
+                            Ok(current) => {
+                                self.observe_successful_rotation(
+                                    provider_id,
+                                    &account.id,
+                                    &current,
+                                    Utc::now(),
+                                    &gate,
+                                );
+                                Ok(true)
+                            }
+                            Err(error) => {
+                                if !error.invalid_credential() {
+                                    self.record_failure_for_gate(&key, &gate, &error);
+                                }
+                                Err(error)
+                            }
+                        }
                     }
                     Err(error) => {
                         if !error.invalid_credential() {
-                            self.record_failure(&key, &error);
+                            self.record_failure_for_gate(&key, &gate, &error);
                         }
                         Err(error)
                     }
-                },
-                Err(error) => {
-                    if !error.invalid_credential() {
-                        self.record_failure(&key, &error);
-                    }
-                    Err(error)
                 }
-            },
+            }
         };
 
+        self.ensure_current_gate(&key, &gate)?;
         *gate.last_auth_result.lock() = Some(result.clone());
         gate.generation.fetch_add(1, Ordering::Release);
         result
@@ -362,23 +440,26 @@ impl RefreshCoordinator {
         let key = CredentialKey::new(provider_id, &account.id);
         let gate = self.gate(&key);
         let _guard = gate.lock.lock().await;
+        self.ensure_current_gate(&key, &gate)?;
 
-        let current = match strategy.resolve(account).await {
+        let resolved = strategy.resolve(account).await;
+        self.ensure_current_gate(&key, &gate)?;
+        let current = match resolved {
             Ok(current) => current,
             Err(error) => {
                 if !error.invalid_credential() {
-                    self.record_failure(&key, &error);
+                    self.record_failure_for_gate(&key, &gate, &error);
                 }
                 return Err(error);
             }
         };
 
         let Some(current_schedule) = schedule_from_credential(&current, now.to_owned()) else {
-            self.schedules.remove(&key);
+            self.remove_schedule_for_gate(&key, &gate);
             return Ok(false);
         };
         let Some(stored_schedule) = self.schedules.get(&key).map(|entry| entry.clone()) else {
-            self.observe_refreshed(provider_id, &account.id, &current);
+            self.observe_refreshed(provider_id, &account.id, &current, &gate);
             return Ok(false);
         };
         if current.rotated || stored_schedule.lease_identity != current_schedule.lease_identity {
@@ -390,6 +471,7 @@ impl RefreshCoordinator {
                 &account.id,
                 &current,
                 Utc::now().max(now),
+                &gate,
             );
             return Ok(false);
         }
@@ -397,13 +479,17 @@ impl RefreshCoordinator {
             return Ok(false);
         }
 
-        match strategy.rotate(account).await {
+        let rotated = strategy.rotate(account).await;
+        self.ensure_current_gate(&key, &gate)?;
+        match rotated {
             Ok(()) => {
-                let current = match strategy.resolve(account).await {
+                let resolved = strategy.resolve(account).await;
+                self.ensure_current_gate(&key, &gate)?;
+                let current = match resolved {
                     Ok(current) => current,
                     Err(error) => {
                         if !error.invalid_credential() {
-                            self.record_failure(&key, &error);
+                            self.record_failure_for_gate(&key, &gate, &error);
                         }
                         return Err(error);
                     }
@@ -413,6 +499,7 @@ impl RefreshCoordinator {
                     &account.id,
                     &current,
                     Utc::now().max(now),
+                    &gate,
                 );
                 // A scheduled rotation changed the generation, but it did not
                 // produce a reactive auth result. Clear any older auth result
@@ -424,7 +511,7 @@ impl RefreshCoordinator {
             }
             Err(error) => {
                 if !error.invalid_credential() {
-                    self.record_failure(&key, &error);
+                    self.record_failure_for_gate(&key, &gate, &error);
                 }
                 Err(error)
             }
@@ -445,7 +532,44 @@ impl RefreshCoordinator {
             .clone()
     }
 
+    fn ensure_current_gate(
+        &self,
+        key: &CredentialKey,
+        gate: &Arc<RotationGate>,
+    ) -> std::result::Result<(), CredentialRotationError> {
+        if self
+            .gates
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current.value(), gate))
+        {
+            Ok(())
+        } else {
+            Err(CredentialRotationError::new(
+                "credential_state_evicted",
+                "account was deleted during credential resolution",
+                false,
+                None,
+            ))
+        }
+    }
+
     fn record_failure(&self, key: &CredentialKey, error: &CredentialRotationError) {
+        let gate = self.gate(key);
+        self.record_failure_for_gate(key, &gate, error);
+    }
+
+    fn record_failure_for_gate(
+        &self,
+        key: &CredentialKey,
+        gate: &Arc<RotationGate>,
+        error: &CredentialRotationError,
+    ) {
+        let _gate_entry = match self.gates.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) if Arc::ptr_eq(entry.get(), gate) => {
+                entry
+            }
+            _ => return,
+        };
         let now = Utc::now();
         let mut schedule = self.schedules.entry(key.clone()).or_insert(LeaseSchedule {
             next_attempt_at: now.to_owned(),
@@ -463,6 +587,16 @@ impl RefreshCoordinator {
             .unwrap_or_else(|| exponential_backoff_secs(schedule.failures));
         schedule.next_attempt_at = now + ChronoDuration::seconds(retry.min(MAX_RETRY_SECS) as i64);
         schedule.claim_until = None;
+    }
+
+    fn remove_schedule_for_gate(&self, key: &CredentialKey, gate: &Arc<RotationGate>) {
+        let _gate_entry = match self.gates.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) if Arc::ptr_eq(entry.get(), gate) => {
+                entry
+            }
+            _ => return,
+        };
+        self.schedules.remove(key);
     }
 }
 
@@ -676,6 +810,37 @@ mod tests {
         rotations: AtomicUsize,
     }
 
+    struct BlockingResolveStrategy {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl CredentialStrategy for BlockingResolveStrategy {
+        fn name(&self) -> &'static str {
+            "test_blocking_resolve"
+        }
+
+        async fn resolve(
+            &self,
+            _account: &AccountRow,
+        ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
+            self.started.notify_one();
+            self.release
+                .acquire()
+                .await
+                .expect("test semaphore remains open")
+                .forget();
+            let now = Utc::now();
+            Ok(ResolvedCredential {
+                secret: "resolved-after-deletion".into(),
+                expires_at: Some((now + ChronoDuration::hours(1)).to_rfc3339()),
+                refresh_after: Some((now + ChronoDuration::minutes(30)).to_rfc3339()),
+                rotated: false,
+            })
+        }
+    }
+
     #[async_trait]
     impl CredentialStrategy for FixedShortLeaseStrategy {
         fn name(&self) -> &'static str {
@@ -835,6 +1000,58 @@ mod tests {
             retry_at,
             "ordinary credential resolution must not erase refresh backoff"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_deletion_during_resolution_does_not_restore_refresh_state() {
+        let coordinator = RefreshCoordinator::default();
+        let account = account();
+        let strategy = Arc::new(BlockingResolveStrategy {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let task_coordinator = coordinator.clone();
+        let task_strategy = strategy.clone();
+        let task_account = account.clone();
+        let task = tokio::spawn(async move {
+            task_coordinator
+                .resolve("p1", task_strategy, &task_account)
+                .await
+        });
+
+        strategy.started.notified().await;
+        coordinator.forget_provider("p1");
+        strategy.release.add_permits(1);
+        assert!(task.await.unwrap().is_err());
+
+        assert!(coordinator.schedules.is_empty());
+        assert!(coordinator.gates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_deletion_during_resolution_does_not_restore_refresh_state() {
+        let coordinator = RefreshCoordinator::default();
+        let account = account();
+        let strategy = Arc::new(BlockingResolveStrategy {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let task_coordinator = coordinator.clone();
+        let task_strategy = strategy.clone();
+        let task_account = account.clone();
+        let task = tokio::spawn(async move {
+            task_coordinator
+                .resolve("p1", task_strategy, &task_account)
+                .await
+        });
+
+        strategy.started.notified().await;
+        coordinator.forget("p1", &account.id);
+        strategy.release.add_permits(1);
+        assert!(task.await.unwrap().is_err());
+
+        assert!(coordinator.schedules.is_empty());
+        assert!(coordinator.gates.is_empty());
     }
 
     #[tokio::test]

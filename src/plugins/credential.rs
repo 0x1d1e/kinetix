@@ -124,6 +124,7 @@ pub struct PluginCredentialStrategy {
     crypto: Arc<Crypto>,
     plugin_id: String,
     leases: DashMap<(String, String), PluginCredentialLease>,
+    lease_generations: DashMap<(String, String), Arc<()>>,
 }
 
 impl PluginCredentialStrategy {
@@ -148,6 +149,7 @@ impl PluginCredentialStrategy {
             crypto,
             plugin_id: plugin_id.into(),
             leases: DashMap::new(),
+            lease_generations: DashMap::new(),
         }
     }
 
@@ -159,6 +161,29 @@ impl PluginCredentialStrategy {
     ) {
         let key = (provider_id.to_owned(), account_id.to_owned());
         self.leases.remove_if(&key, |_, cached| cached == lease);
+    }
+
+    fn lease_generation(&self, key: &(String, String)) -> Arc<()> {
+        self.lease_generations
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(()))
+            .clone()
+    }
+
+    fn cache_lease_if_current(
+        &self,
+        key: &(String, String),
+        generation: &Arc<()>,
+        lease: PluginCredentialLease,
+    ) -> bool {
+        let Some(current) = self.lease_generations.get(key) else {
+            return false;
+        };
+        if !Arc::ptr_eq(current.value(), generation) {
+            return false;
+        }
+        self.leases.insert(key.clone(), lease);
+        true
     }
 
     async fn lease_secret(
@@ -244,6 +269,8 @@ impl CredentialStrategy for PluginCredentialStrategy {
         &self,
         account: &AccountRow,
     ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
+        let key = (account.provider_id.clone(), account.id.clone());
+        let generation = self.lease_generation(&key);
         let lease = self
             .manager
             .resolve_lease(
@@ -255,10 +282,14 @@ impl CredentialStrategy for PluginCredentialStrategy {
             .await
             .map_err(credential_error)?;
         let secret = self.lease_secret(&lease.handle).await?;
-        self.leases.insert(
-            (account.provider_id.clone(), account.id.clone()),
-            lease.clone(),
-        );
+        if !self.cache_lease_if_current(&key, &generation, lease.clone()) {
+            return Err(CredentialRotationError::new(
+                "credential_state_evicted",
+                "account was deleted during credential resolution",
+                false,
+                None,
+            ));
+        }
         Ok(ResolvedCredential {
             secret,
             expires_at: lease.expires_at,
@@ -271,11 +302,14 @@ impl CredentialStrategy for PluginCredentialStrategy {
     }
 
     fn forget_account(&self, provider_id: &str, account_id: &str) {
-        self.leases
-            .remove(&(provider_id.to_owned(), account_id.to_owned()));
+        let key = (provider_id.to_owned(), account_id.to_owned());
+        self.lease_generations.remove(&key);
+        self.leases.remove(&key);
     }
 
     fn forget_provider(&self, provider_id: &str) {
+        self.lease_generations
+            .retain(|(cached_provider, _), _| cached_provider != provider_id);
         self.leases
             .retain(|(cached_provider, _), _| cached_provider != provider_id);
     }
@@ -608,6 +642,111 @@ mod tests {
                 reset_at: None,
             })
         }
+    }
+
+    struct BlockingLeaseHost {
+        pool: Pool,
+        crypto: Arc<Crypto>,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl CredentialPluginHost for BlockingLeaseHost {
+        async fn resolve_lease(
+            &self,
+            plugin_id: &str,
+            _provider_id: &str,
+            _account_id: &str,
+            _account_label: &str,
+        ) -> Result<PluginCredentialLease, PluginFault> {
+            self.started.notify_one();
+            self.release
+                .acquire()
+                .await
+                .expect("test semaphore remains open")
+                .forget();
+            crate::plugins::store::kv_put(
+                &self.pool,
+                &self.crypto,
+                plugin_id,
+                &format!("{LEASE_PREFIX}blocked-resolution"),
+                b"resolved-after-deletion",
+            )
+            .await
+            .map_err(|error| PluginFault::Internal(error.to_string()))?;
+            let now = chrono::Utc::now();
+            Ok(PluginCredentialLease {
+                handle: "blocked-resolution".into(),
+                expires_at: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
+                refresh_after: Some((now + chrono::Duration::minutes(30)).to_rfc3339()),
+            })
+        }
+
+        async fn rotate_lease(
+            &self,
+            _plugin_id: &str,
+            _provider_id: &str,
+            _account_id: &str,
+        ) -> Result<(), PluginFault> {
+            Ok(())
+        }
+
+        async fn health_state(
+            &self,
+            _plugin_id: &str,
+            _provider_id: &str,
+            _account_id: &str,
+        ) -> Result<PluginHealthObservation, PluginFault> {
+            Ok(PluginHealthObservation {
+                state: "healthy".into(),
+                reset_at: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn account_or_provider_deletion_during_resolution_does_not_restore_cached_lease() {
+        let (root, pool, crypto) = test_store("delete-during-resolution").await;
+        let host = Arc::new(BlockingLeaseHost {
+            pool: pool.clone(),
+            crypto: crypto.clone(),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let strategy = Arc::new(PluginCredentialStrategy::with_host(
+            host.clone(),
+            pool.clone(),
+            crypto,
+            "test.plugin",
+        ));
+
+        let account = test_account("blocked-account", "provider-a");
+        let task_strategy = strategy.clone();
+        let task_account = account.clone();
+        let task = tokio::spawn(async move { task_strategy.resolve(&task_account).await });
+        host.started.notified().await;
+        strategy.forget_account(&account.provider_id, &account.id);
+        host.release.add_permits(1);
+        assert!(task.await.unwrap().is_err());
+        let key = (account.provider_id, account.id);
+        assert!(!strategy.leases.contains_key(&key));
+        assert!(!strategy.lease_generations.contains_key(&key));
+
+        let account = test_account("blocked-provider-account", "provider-b");
+        let task_strategy = strategy.clone();
+        let task_account = account.clone();
+        let task = tokio::spawn(async move { task_strategy.resolve(&task_account).await });
+        host.started.notified().await;
+        strategy.forget_provider("provider-b");
+        host.release.add_permits(1);
+        assert!(task.await.unwrap().is_err());
+        let key = (account.provider_id, account.id);
+        assert!(!strategy.leases.contains_key(&key));
+        assert!(!strategy.lease_generations.contains_key(&key));
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

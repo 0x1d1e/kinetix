@@ -139,6 +139,17 @@ struct ProviderGate {
     rate: tokio::sync::Mutex<RateState>,
 }
 
+tokio::task_local! {
+    static PROVIDER_WORK_SCOPE: ProviderWorkScope;
+}
+
+#[derive(Clone)]
+struct ProviderWorkScope {
+    coordinator: Arc<()>,
+    provider_id: String,
+    gate: Arc<ProviderGate>,
+}
+
 impl Default for ProviderGate {
     fn default() -> Self {
         Self {
@@ -205,18 +216,33 @@ pub enum ProviderWorkError<E> {
 pub struct ProviderWorkCoordinator {
     providers: Arc<DashMap<String, Arc<ProviderGate>>>,
     flights: Arc<DashMap<FlightKey, Arc<dyn Any + Send + Sync>>>,
+    flight_registration: Arc<parking_lot::Mutex<()>>,
+    identity: Arc<()>,
     metrics: Arc<WorkMetrics>,
 }
 
 impl ProviderWorkCoordinator {
     fn gate(&self, provider_id: &str) -> Arc<ProviderGate> {
+        if let Some(gate) = PROVIDER_WORK_SCOPE
+            .try_with(|scope| {
+                (scope.provider_id == provider_id
+                    && Arc::ptr_eq(&scope.coordinator, &self.identity))
+                .then(|| scope.gate.clone())
+            })
+            .ok()
+            .flatten()
+        {
+            return gate;
+        }
         self.providers
             .entry(provider_id.to_string())
             .or_insert_with(|| Arc::new(ProviderGate::default()))
             .clone()
     }
 
-    /// Release provider-scoped budget state after provider deletion.
+    /// Release provider-scoped budget state after provider deletion. Work that
+    /// already captured the gate may finish against it, but cannot recreate the
+    /// entry after eviction.
     pub fn forget_provider(&self, provider_id: &str) {
         self.providers.remove(provider_id);
     }
@@ -261,16 +287,24 @@ impl ProviderWorkCoordinator {
     {
         self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
         let provider_id = provider_id.into();
+        let gate = self.gate(&provider_id);
         if let Some(key) = singleflight_key {
             let coordinator = self.clone();
-            self.singleflight(provider_id.clone(), class, key, move || async move {
+            let flight_gate = gate.clone();
+            self.singleflight(provider_id.clone(), class, key, gate, move || async move {
                 coordinator
-                    .execute(provider_id, class, work, classify_failure)
+                    .execute(class, flight_gate, work, classify_failure)
                     .await
             })
             .await
         } else {
-            self.execute(provider_id, class, work, classify_failure)
+            let scope = ProviderWorkScope {
+                coordinator: self.identity.clone(),
+                provider_id,
+                gate: gate.clone(),
+            };
+            PROVIDER_WORK_SCOPE
+                .scope(scope, self.execute(class, gate, work, classify_failure))
                 .await
         }
     }
@@ -292,14 +326,15 @@ impl ProviderWorkCoordinator {
         Fut: Future<Output = Result<T, E>> + Send + 'static,
     {
         self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
+        let provider_id = provider_id.into();
+        let gate = self.gate(&provider_id);
         let work = move || async move {
             work()
                 .await
                 .map(Arc::new)
                 .map_err(|error| Arc::new(ProviderWorkError::Operation(error)))
         };
-        self.singleflight(provider_id.into(), class, key, work)
-            .await
+        self.singleflight(provider_id, class, key, gate, work).await
     }
 
     async fn singleflight<T, E, F, Fut>(
@@ -307,6 +342,7 @@ impl ProviderWorkCoordinator {
         provider_id: String,
         class: ProviderWorkClass,
         key: String,
+        gate: Arc<ProviderGate>,
         work: F,
     ) -> WorkResult<T, E>
     where
@@ -315,21 +351,22 @@ impl ProviderWorkCoordinator {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = WorkResult<T, E>> + Send + 'static,
     {
-        // Bound the coordination table. The caller still applies operation
-        // budgets inside the work closure if coalescing is unavailable.
-        if self.flights.len() >= MAX_SINGLEFLIGHTS {
-            return work().await;
-        }
-
         let flight_key = FlightKey {
             provider_id,
             class,
             key,
             result_types: TypeId::of::<(T, E)>(),
         };
-        let (flight_any, created) = match self.flights.entry(flight_key.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(entry) => (entry.get().clone(), false),
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
+        let mut work = Some(work);
+        // Serialize only registration. Existing keys are joined before the cap
+        // is considered, and concurrent unique insertions cannot exceed it.
+        let registration = {
+            let _registration = self.flight_registration.lock();
+            if let Some(existing) = self.flights.get(&flight_key) {
+                Some((existing.value().clone(), false))
+            } else if self.flights.len() >= MAX_SINGLEFLIGHTS {
+                None
+            } else {
                 let (tx, mut rx) = tokio::sync::watch::channel(None::<WorkResult<T, E>>);
                 let result = async move {
                     loop {
@@ -347,18 +384,37 @@ impl ProviderWorkCoordinator {
                     result: tokio::sync::Mutex::new(result),
                 });
                 let erased: Arc<dyn Any + Send + Sync> = flight.clone();
-                entry.insert(erased.clone());
+                self.flights.insert(flight_key.clone(), erased.clone());
 
                 let coordinator = self.clone();
                 let cleanup_key = flight_key.clone();
                 let cleanup_flight = erased.clone();
+                let work = work.take().expect("singleflight work is consumed once");
+                let scope = ProviderWorkScope {
+                    coordinator: self.identity.clone(),
+                    provider_id: flight_key.provider_id.clone(),
+                    gate: gate.clone(),
+                };
                 tokio::spawn(async move {
-                    let output = work().await;
+                    let output = PROVIDER_WORK_SCOPE.scope(scope, work()).await;
                     let _ = tx.send(Some(output));
                     coordinator.remove_flight(&cleanup_key, &cleanup_flight);
                 });
-                (erased, true)
+                Some((erased, true))
             }
+        };
+        let Some((flight_any, created)) = registration else {
+            let scope = ProviderWorkScope {
+                coordinator: self.identity.clone(),
+                provider_id: flight_key.provider_id.clone(),
+                gate,
+            };
+            return PROVIDER_WORK_SCOPE
+                .scope(
+                    scope,
+                    work.take().expect("fallback work is consumed once")(),
+                )
+                .await;
         };
 
         let Some(flight) = flight_any.clone().downcast::<Flight<T, E>>().ok() else {
@@ -378,8 +434,8 @@ impl ProviderWorkCoordinator {
 
     async fn execute<T, E, F, Fut, C>(
         &self,
-        provider_id: String,
         class: ProviderWorkClass,
+        gate: Arc<ProviderGate>,
         work: F,
         classify_failure: C,
     ) -> WorkResult<T, E>
@@ -390,7 +446,7 @@ impl ProviderWorkCoordinator {
         Fut: Future<Output = Result<T, E>> + Send + 'static,
         C: Fn(&E) -> Option<ProviderBackoffEvidence> + Send + Sync + 'static,
     {
-        let permit = match self.acquire_inner(&provider_id, class, false).await {
+        let permit = match self.acquire_with_gate(gate, class, false).await {
             Ok(permit) => permit,
             Err(wait) => return Err(Arc::new(ProviderWorkError::BackedOff(wait))),
         };
@@ -423,10 +479,19 @@ impl ProviderWorkCoordinator {
         class: ProviderWorkClass,
         count_scheduled: bool,
     ) -> Result<ProviderWorkPermit, Duration> {
+        let gate = self.gate(provider_id);
+        self.acquire_with_gate(gate, class, count_scheduled).await
+    }
+
+    async fn acquire_with_gate(
+        &self,
+        gate: Arc<ProviderGate>,
+        class: ProviderWorkClass,
+        count_scheduled: bool,
+    ) -> Result<ProviderWorkPermit, Duration> {
         if count_scheduled {
             self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
         }
-        let gate = self.gate(provider_id);
         loop {
             let slot = gate
                 .slots
@@ -1071,6 +1136,111 @@ mod tests {
             remaining > Duration::from_secs(9),
             "second sequential failure should back off for about 10s, got {remaining:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_provider_during_pending_singleflight_does_not_recreate_gate() {
+        let coordinator = ProviderWorkCoordinator::default();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let task_coordinator = coordinator.clone();
+        let task_started = started.clone();
+        let task_release = release.clone();
+        let task = tokio::spawn(async move {
+            let nested_coordinator = task_coordinator.clone();
+            task_coordinator
+                .run(
+                    "deleted-provider",
+                    ProviderWorkClass::HealthProbe,
+                    Some("pending-probe".into()),
+                    move || async move {
+                        task_started.notify_one();
+                        task_release
+                            .acquire()
+                            .await
+                            .expect("test semaphore remains open")
+                            .forget();
+                        let permit = nested_coordinator
+                            .acquire("deleted-provider", ProviderWorkClass::CredentialRefresh)
+                            .await
+                            .map_err(|wait| format!("unexpected backoff: {wait:?}"))?;
+                        permit.finish_success().await;
+                        Ok::<_, String>(())
+                    },
+                    |_| None,
+                )
+                .await
+        });
+
+        started.notified().await;
+        coordinator.forget_provider("deleted-provider");
+        release.add_permits(1);
+        task.await.unwrap().unwrap();
+
+        assert!(!coordinator.providers.contains_key("deleted-provider"));
+    }
+
+    #[tokio::test]
+    async fn full_singleflight_table_still_joins_existing_flights() {
+        use futures::FutureExt;
+        use tokio::sync::Semaphore;
+
+        let coordinator = ProviderWorkCoordinator::default();
+        let release = Arc::new(Semaphore::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::with_capacity(MAX_SINGLEFLIGHTS);
+
+        for index in 0..MAX_SINGLEFLIGHTS {
+            let release = release.clone();
+            let started = started.clone();
+            let coordinator = coordinator.clone();
+            tasks.push(tokio::spawn(async move {
+                coordinator
+                    .coalesce(
+                        "provider-a",
+                        ProviderWorkClass::HealthProbe,
+                        format!("flight-{index}"),
+                        move || async move {
+                            started.fetch_add(1, Ordering::Relaxed);
+                            release.acquire().await.unwrap().forget();
+                            Ok::<_, String>(())
+                        },
+                    )
+                    .await
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while started.load(Ordering::Relaxed) < MAX_SINGLEFLIGHTS {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("all unique flights should start");
+        assert_eq!(coordinator.flights.len(), MAX_SINGLEFLIGHTS);
+
+        let duplicate_executions = Arc::new(AtomicUsize::new(0));
+        let duplicate_count = duplicate_executions.clone();
+        let mut duplicate = Box::pin(coordinator.coalesce(
+            "provider-a",
+            ProviderWorkClass::HealthProbe,
+            "flight-0".into(),
+            move || async move {
+                duplicate_count.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, String>(())
+            },
+        ));
+        assert!(duplicate.as_mut().now_or_never().is_none());
+        assert_eq!(duplicate_executions.load(Ordering::Relaxed), 0);
+        assert_eq!(coordinator.metrics_snapshot().coalesced, 1);
+
+        release.add_permits(MAX_SINGLEFLIGHTS);
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        duplicate.await.unwrap();
+        assert_eq!(duplicate_executions.load(Ordering::Relaxed), 0);
+        assert!(coordinator.flights.is_empty());
     }
 
     #[test]
