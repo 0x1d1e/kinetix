@@ -320,12 +320,14 @@ impl ProviderWorkCoordinator {
     /// gate after this transition.
     pub fn forget_provider_with(&self, provider_id: &str, invalidate: impl FnOnce()) {
         let _lifecycle = self.lifecycle.lock();
+        let _registration = self.flight_registration.lock();
         invalidate();
         if let Some((_, entry)) = self.providers.remove(provider_id) {
             entry
                 .generation
                 .store(false, std::sync::atomic::Ordering::Release);
         }
+        self.flights.retain(|key, _| key.provider_id != provider_id);
     }
 
     /// Release provider-scoped budget state after provider deletion.

@@ -277,13 +277,16 @@ impl AppState {
         self.adapters.register_plugin(reference, adapter);
     }
 
-    /// Drop every capability a plugin registered (credential strategy and
-    /// adapters). Called when a plugin is disabled, removed, rolled back, or
-    /// has a permission revoked, so a disabled plugin cannot keep resolving
-    /// credentials or serving adapters.
+    /// Drop every capability and routing-fact work scope a plugin registered.
+    /// Called when a plugin is disabled, removed, rolled back, or has a
+    /// permission revoked, so a disabled plugin cannot keep resolving
+    /// credentials, serving adapters, or retaining provider-work state.
     pub fn unregister_plugin_capabilities(&self, plugin_id: &str) {
-        self.plugin_credentials.remove(plugin_id);
-        self.adapters.unregister_plugin(plugin_id);
+        let work_scope = format!("plugin:{plugin_id}");
+        self.provider_work.forget_provider_with(&work_scope, || {
+            self.plugin_credentials.remove(plugin_id);
+            self.adapters.unregister_plugin(plugin_id);
+        });
     }
 
     /// Release account-scoped credential cache and refresh state after deletion.

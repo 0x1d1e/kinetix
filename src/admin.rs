@@ -17970,6 +17970,136 @@ mod credential_enrollment_regression_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn unregistering_plugin_resets_routing_work_state_and_flights() {
+        use tokio::sync::{Notify, Semaphore};
+
+        let (state, root) = test_state("plugin-routing-work-unregister").await;
+        let plugin_id = "routing-plugin";
+        let scope = format!("plugin:{plugin_id}");
+        let old_identity = state.provider_work.auxiliary_identity(&scope);
+        let old_started = Arc::new(Notify::new());
+        let release_old = Arc::new(Semaphore::new(0));
+        let old_coordinator = state.provider_work.clone();
+        let old_flight_identity = old_identity.clone();
+        let old_started_task = old_started.clone();
+        let release_old_task = release_old.clone();
+        let old_flight = tokio::spawn(async move {
+            old_coordinator
+                .coalesce(
+                    old_flight_identity,
+                    crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+                    "cached_snapshot".into(),
+                    move || async move {
+                        old_started_task.notify_one();
+                        release_old_task.acquire_owned().await.unwrap().forget();
+                        Ok::<_, String>("old-generation".to_owned())
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), old_started.notified())
+            .await
+            .expect("routing refresh should be in flight");
+
+        state
+            .provider_work
+            .acquire(
+                old_identity.clone(),
+                crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+            )
+            .await
+            .unwrap()
+            .finish_failure(Some(
+                crate::provider_work::ProviderBackoffEvidence::Transient {
+                    retry_after_secs: Some(30),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            state
+                .provider_work
+                .acquire(
+                    old_identity.clone(),
+                    crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+                )
+                .await,
+            Err(crate::provider_work::ProviderWorkAcquireError::BackedOff(_))
+        ));
+
+        state.unregister_plugin_capabilities(plugin_id);
+        let state_after_unregister = state.provider_work.state_counts();
+        let old_generation_invalidated = !old_identity.is_current();
+        let new_identity = state.provider_work.auxiliary_identity(&scope);
+        let generation_changed = !Arc::ptr_eq(
+            &old_identity.provider_generation,
+            &new_identity.provider_generation,
+        );
+        let fresh_admission = state
+            .provider_work
+            .acquire(
+                new_identity.clone(),
+                crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+            )
+            .await;
+        let fresh_gate = fresh_admission.is_ok();
+        if let Ok(permit) = fresh_admission {
+            permit.finish_success().await;
+        }
+
+        let new_runs = Arc::new(AtomicUsize::new(0));
+        let new_runs_task = new_runs.clone();
+        let new_coordinator = state.provider_work.clone();
+        let new_flight = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            new_coordinator.coalesce(
+                new_identity,
+                crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+                "cached_snapshot".into(),
+                move || async move {
+                    new_runs_task.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, String>("new-generation".to_owned())
+                },
+            ),
+        )
+        .await;
+
+        release_old.add_permits(1);
+        let old_result = tokio::time::timeout(std::time::Duration::from_secs(1), old_flight)
+            .await
+            .expect("old routing refresh should finish after release")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*old_result, "old-generation");
+        assert_eq!(
+            state_after_unregister,
+            (0, 0),
+            "unregistering capabilities must evict the synthetic provider gate and flight"
+        );
+        assert!(
+            old_generation_invalidated,
+            "unregistration invalidates work holding the previous generation"
+        );
+        assert!(
+            generation_changed,
+            "re-enabled plugin gets a fresh generation"
+        );
+        assert!(
+            fresh_gate,
+            "new generation must not inherit provider backoff"
+        );
+        let new_result = new_flight
+            .expect("new generation must not join the old flight")
+            .expect("new generation routing refresh should succeed");
+        assert_eq!(&*new_result, "new-generation");
+        assert_eq!(new_runs.load(Ordering::Relaxed), 1);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     async fn test_state_with_plugins(tag: &str) -> (AppState, std::path::PathBuf) {
         let (state, root) = test_state(tag).await;
         let manager = crate::plugins::PluginManager::new(
