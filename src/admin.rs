@@ -12778,37 +12778,14 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                 continue;
             }
 
-            let credential_hosts = template.credential_hosts.join(",");
-            let extra_headers = serde_json::to_value(&template.extra_headers).unwrap_or(json!({}));
-            let rate_limit_rules =
-                serde_json::from_str(&provider.rate_limit_rules).unwrap_or_else(|_| json!({}));
-            let updated_provider = db::NewProvider {
-                name: &integration.name,
-                base_url: &template.base_url,
-                wire_format: wire,
-                auth_scheme: auth,
-                custom_header_name: template.custom_header_name.as_deref(),
-                custom_param_name: template.custom_param_name.as_deref(),
-                extra_headers,
-                timeout_ms: template.timeout_ms as i64,
-                capability_mode: &template.capability_mode,
-                models_path: template.models_path.as_deref(),
-                rate_limit_rules,
-                follow_redirects: template.follow_redirects,
-                credential_hosts: &credential_hosts,
-                allow_insecure_tls: provider.allow_insecure_tls != 0,
-                wire_plugin: &wire_plugin,
-                credential_plugin: &credential_plugin,
-                model_source_plugin: &model_source_plugin,
-                credential_mode: credential_mode.as_str(),
-                source_plugin_id: Some(id),
-                source_integration_id: Some(&integration.id),
-            };
-            if let Err(error) = db::update_provider(
+            // Keep operator configuration intact; only reconcile the integration-owned bindings here.
+            if let Err(error) = db::update_provider_integration_bindings(
                 &state.pool,
                 &provider.id,
-                &updated_provider,
-                Some(template.pricing_scope.as_str()),
+                wire,
+                &wire_plugin,
+                &credential_plugin,
+                &model_source_plugin,
             )
             .await
             {
@@ -12817,7 +12794,7 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                     plugin = %id,
                     integration = %integration.id,
                     %error,
-                    "failed to update provider from current integration template"
+                    "failed to update provider integration bindings"
                 );
                 continue;
             }
@@ -20874,7 +20851,7 @@ mod credential_enrollment_regression_tests {
             .into_iter()
             .find(|provider| provider.id == restored_provider_id)
             .unwrap();
-        assert_eq!(provider.base_url, manifest_base_url);
+        assert_eq!(provider.base_url, restored_base_url);
         assert_eq!(provider.pricing_scope, "direct_api");
 
         drop(state);
@@ -23645,10 +23622,41 @@ storage = "2MiB"
             .unwrap();
         assert_eq!(disabled_protocols.input, vec!["openai-chat"]);
         assert_eq!(disabled_protocols.upstream, vec!["plugin-native"]);
+        db::update_provider(
+            &target.pool,
+            &restored_provider_id,
+            &db::NewProvider {
+                name: "Operator Edited Provider",
+                base_url: "https://operator.example/v2",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::CustomHeader,
+                custom_header_name: Some("x-operator-auth"),
+                custom_param_name: None,
+                extra_headers: json!({"x-operator-setting": "keep-me"}),
+                timeout_ms: 4_321,
+                capability_mode: "strict",
+                models_path: Some("/operator/models"),
+                rate_limit_rules: json!({"429": {"cooldown_seconds": 17}}),
+                follow_redirects: true,
+                credential_hosts: "operator.example",
+                allow_insecure_tls: disabled_provider.insecure_tls(),
+                wire_plugin: &disabled_provider.wire_plugin,
+                credential_plugin: &disabled_provider.credential_plugin,
+                model_source_plugin: &disabled_provider.model_source_plugin,
+                credential_mode: &disabled_provider.credential_mode,
+                source_plugin_id: disabled_provider.source_plugin_id.as_deref(),
+                source_integration_id: disabled_provider.source_integration_id.as_deref(),
+            },
+            Some(&disabled_provider.pricing_scope),
+        )
+        .await
+        .unwrap();
         assert!(target.adapters.for_transport(&transport).is_err());
 
         manager.approve_permissions("plugin.test").await.unwrap();
         manager.enable("plugin.test").await.unwrap();
+        register_enabled_plugin_capabilities(&target, "plugin.test").await;
+        // Simulate a later startup registration after the renamed adapter is active.
         register_enabled_plugin_capabilities(&target, "plugin.test").await;
 
         assert!(target.adapters.for_transport(&transport).is_ok());
@@ -23662,9 +23670,33 @@ storage = "2MiB"
             .into_iter()
             .find(|provider| provider.id == restored_provider_id)
             .unwrap();
+        assert_eq!(reconciled.wire_format, "plugin");
         assert_eq!(reconciled.wire_plugin, "plugin:plugin.test/new-adapter");
-        assert_eq!(reconciled.name, "Native Provider v2");
-        assert_eq!(reconciled.timeout_ms, 2_000);
+        assert_eq!(reconciled.source_plugin_id.as_deref(), Some("plugin.test"));
+        assert_eq!(reconciled.source_integration_id.as_deref(), Some("native"));
+        assert_eq!(reconciled.credential_mode, "manual");
+        assert_eq!(reconciled.pricing_scope, "integration");
+        assert_eq!(reconciled.name, "Operator Edited Provider");
+        assert_eq!(reconciled.base_url, "https://operator.example/v2");
+        assert_eq!(reconciled.auth_scheme, "custom_header");
+        assert_eq!(
+            reconciled.custom_header_name.as_deref(),
+            Some("x-operator-auth")
+        );
+        assert_eq!(reconciled.custom_param_name, None);
+        assert_eq!(
+            reconciled.extra_headers_map().get("x-operator-setting"),
+            Some(&"keep-me".to_string())
+        );
+        assert_eq!(reconciled.timeout_ms, 4_321);
+        assert_eq!(reconciled.capability_mode, "strict");
+        assert_eq!(reconciled.models_path.as_deref(), Some("/operator/models"));
+        assert_eq!(
+            reconciled.rate_limit_rules,
+            json!({"429": {"cooldown_seconds": 17}}).to_string()
+        );
+        assert!(reconciled.follows_redirects());
+        assert_eq!(reconciled.credential_hosts, "operator.example");
         assert!(
             !reconciled
                 .integration_feature_ceiling()

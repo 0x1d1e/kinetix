@@ -1469,6 +1469,45 @@ pub(crate) async fn update_provider_in_transaction(
     if pricing_scope == "integration" || catalog_identity_changed {
         revoke_external_catalog_effective_pricing_in_transaction(tx, id).await?;
     }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn update_provider_integration_bindings(
+    pool: &Pool,
+    id: &str,
+    wire_format: WireFormat,
+    wire_plugin: &str,
+    credential_plugin: &str,
+    model_source_plugin: &str,
+) -> Result<()> {
+    let existing = get_provider(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?;
+    let bindings_changed = existing.wire_format != wire_format.as_str()
+        || existing.wire_plugin != wire_plugin
+        || existing.credential_plugin != credential_plugin
+        || existing.model_source_plugin != model_source_plugin;
+    if !bindings_changed {
+        return Ok(());
+    }
+
+    let _guards = provider_price_guards(pool, id).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE providers
+         SET wire_format=?, wire_plugin=?, credential_plugin=?, model_source_plugin=?
+         WHERE id=?",
+    )
+    .bind(wire_format.as_str())
+    .bind(wire_plugin)
+    .bind(credential_plugin)
+    .bind(model_source_plugin)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    revoke_external_catalog_effective_pricing_in_transaction(&mut tx, id).await?;
+    tx.commit().await?;
     Ok(())
 }
 
