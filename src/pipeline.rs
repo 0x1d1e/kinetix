@@ -2276,6 +2276,9 @@ pub(crate) async fn run_with_disconnect(
                                 "credential refresh temporarily unavailable",
                                 Some(cooldown),
                             );
+                            if let Some(last_failure) = last_precommit_failure.as_mut() {
+                                last_failure.client_error = refresh_error.clone();
+                            }
                             let can_fallback = allow_fallback
                                 && route_allows_fallback(route.as_ref(), FailureKind::AuthError);
                             trace.stream_termination(termination, Some(can_fallback));

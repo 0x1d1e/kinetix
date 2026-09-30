@@ -12,6 +12,7 @@ use axum::{
     Json, Router,
 };
 use kinetix::{
+    api,
     app::AppState,
     config::Config,
     credentials::{
@@ -743,6 +744,62 @@ async fn retryable_rotation_failure_cools_down_and_falls_back_without_disabling(
         ]
     );
 
+    cleanup(harness).await;
+}
+
+#[tokio::test]
+async fn retryable_rotation_failure_remains_terminal_when_attempt_budget_is_exhausted() {
+    let strategy = Arc::new(TestCredential::new(RotationMode::RetryableFailure));
+    let harness = setup(strategy.clone(), None, 1).await;
+    let request_id = "req_plugin_auth_retryable_rotation_exhausted";
+
+    let error = match pipeline::run(
+        &harness.state,
+        FrontendFormat::OpenAi,
+        None,
+        harness.request.clone(),
+        request_id.into(),
+        true,
+        None,
+        vec![],
+    )
+    .await
+    {
+        Ok(response) => {
+            consume(response).await;
+            panic!("exhausted route should return the credential refresh error");
+        }
+        Err(error) => error,
+    };
+    let response = api::error_response(FrontendFormat::OpenAi, request_id, error);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers().get("retry-after").unwrap(), "5");
+    assert_eq!(
+        harness.upstream.attempts.lock().await.as_slice(),
+        ["Bearer stale-token"]
+    );
+
+    let usage_row = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let row = sqlx::query_as::<_, (String, i64)>(
+                "SELECT status, status_code FROM usage_logs WHERE request_id = ?",
+            )
+            .bind(request_id)
+            .fetch_optional(&harness.pool)
+            .await
+            .unwrap();
+            if row.is_some() {
+                break row.unwrap();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal request accounting should be persisted");
+    assert_eq!(usage_row.0, "upstream_error");
+    assert_eq!(usage_row.1, StatusCode::SERVICE_UNAVAILABLE.as_u16() as i64);
+
+    assert_eq!(strategy.rotations.load(Ordering::Relaxed), 1);
     cleanup(harness).await;
 }
 
