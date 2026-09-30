@@ -81,12 +81,53 @@ pub struct QuotaPluginObservation {
     pub exhausted: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "model_id")]
+pub enum PluginQuotaScope {
+    Account,
+    Model(String),
+    Unknown,
+}
+
+/// A validated quota bucket reported by an optional plugin health-v2 probe.
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginQuotaSnapshot {
+    pub scope: PluginQuotaScope,
+    pub group: Option<String>,
+    pub bucket_id: Option<String>,
+    pub remaining_fraction: Option<f64>,
+    pub remaining: Option<f64>,
+    pub limit: Option<f64>,
+    pub unit: Option<String>,
+    pub window: Option<String>,
+    pub reset_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginQuotaEvidence {
+    pub snapshots: Vec<PluginQuotaSnapshot>,
+    pub observed_at: DateTime<Utc>,
+    pub max_age_secs: u64,
+}
+
+impl PluginQuotaEvidence {
+    pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
+        now.signed_duration_since(self.observed_at)
+            .to_std()
+            .map(|age| age <= Duration::from_secs(self.max_age_secs))
+            .unwrap_or(true)
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct QuotaRegistry {
     /// Latest evidence from any source, retained for operator diagnostics.
     inner: Arc<DashMap<(String, String), QuotaSnapshot>>,
     /// Only explicitly account-global evidence may influence adaptive routing.
     account_global: Arc<DashMap<(String, String), QuotaSnapshot>>,
+    /// Structured plugin buckets, including model/group-scoped evidence that
+    /// must not be flattened into account-global routing signals.
+    plugin_evidence: Arc<DashMap<(String, String), PluginQuotaEvidence>>,
 }
 
 impl QuotaRegistry {
@@ -189,6 +230,81 @@ impl QuotaRegistry {
         } else {
             None
         }
+    }
+
+    /// Retain all structured plugin buckets for diagnostics. Only one explicit
+    /// account-scoped bucket may project into the scalar adaptive-routing registry;
+    /// model, unknown, and ambiguous multi-window evidence stays non-routing.
+    pub fn observe_plugin_snapshots(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        snapshots: Vec<PluginQuotaSnapshot>,
+    ) -> Option<QuotaPluginObservation> {
+        let snapshots = snapshots
+            .into_iter()
+            .map(validate_plugin_snapshot)
+            .collect::<Vec<_>>();
+        let evidence = PluginQuotaEvidence {
+            snapshots,
+            observed_at: Utc::now(),
+            max_age_secs: 45,
+        };
+        self.plugin_evidence.insert(
+            (provider_id.to_string(), account_id.to_string()),
+            evidence.clone(),
+        );
+
+        let mut account_snapshots = evidence
+            .snapshots
+            .iter()
+            .filter(|snapshot| matches!(snapshot.scope, PluginQuotaScope::Account));
+        let snapshot = account_snapshots.next()?;
+        if account_snapshots.next().is_some() {
+            return None;
+        }
+        let reset_at = snapshot.reset_at.as_deref().and_then(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .ok()
+                .map(|value| value.with_timezone(&Utc))
+        });
+        let remaining_fraction = snapshot
+            .remaining_fraction
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value));
+        if remaining_fraction.is_none() && reset_at.is_none() {
+            return None;
+        }
+
+        self.observe_account_global(
+            provider_id,
+            account_id,
+            remaining_fraction,
+            reset_at,
+            "plugin_health_probe_v2",
+            Duration::from_secs(evidence.max_age_secs),
+        );
+        Some(QuotaPluginObservation {
+            remaining_fraction,
+            reset_at,
+            exhausted: remaining_fraction.is_some_and(|remaining| remaining <= 0.0),
+        })
+    }
+
+    /// Current structured evidence for operator-facing diagnostics.
+    pub fn plugin_observations(&self) -> Vec<(String, String, PluginQuotaEvidence, bool)> {
+        let now = Utc::now();
+        self.plugin_evidence
+            .iter()
+            .map(|entry| {
+                let evidence = entry.value().clone();
+                (
+                    entry.key().0.clone(),
+                    entry.key().1.clone(),
+                    evidence.clone(),
+                    evidence.is_fresh(now),
+                )
+            })
+            .collect()
     }
 
     pub fn observe_headers(
@@ -299,6 +415,29 @@ impl QuotaRegistry {
             })
             .collect()
     }
+}
+
+fn validate_plugin_snapshot(mut snapshot: PluginQuotaSnapshot) -> PluginQuotaSnapshot {
+    if matches!(&snapshot.scope, PluginQuotaScope::Model(model) if model.trim().is_empty()) {
+        snapshot.scope = PluginQuotaScope::Unknown;
+    }
+    snapshot.remaining_fraction = snapshot
+        .remaining_fraction
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value));
+    snapshot.remaining = snapshot
+        .remaining
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    snapshot.limit = snapshot
+        .limit
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    if snapshot
+        .reset_at
+        .as_deref()
+        .is_some_and(|value| DateTime::parse_from_rfc3339(value).is_err())
+    {
+        snapshot.reset_at = None;
+    }
+    snapshot
 }
 
 fn parse_quota_state(value: &str) -> Option<f64> {
@@ -479,6 +618,112 @@ mod tests {
 
         assert!(!snapshot.is_fresh(now));
         assert_eq!(snapshot.preference(now), 0.0);
+    }
+
+    #[test]
+    fn structured_plugin_scopes_are_preserved_without_account_routing_projection() {
+        let registry = QuotaRegistry::default();
+        let observation = registry.observe_plugin_snapshots(
+            "p",
+            "a",
+            vec![
+                PluginQuotaSnapshot {
+                    scope: PluginQuotaScope::Unknown,
+                    group: Some("Gemini Models".into()),
+                    bucket_id: Some("gemini-5h".into()),
+                    remaining_fraction: Some(0.6),
+                    remaining: Some(600.0),
+                    limit: Some(1_000.0),
+                    unit: Some("requests".into()),
+                    window: Some("5h".into()),
+                    reset_at: Some("2030-01-01T00:00:00Z".into()),
+                },
+                PluginQuotaSnapshot {
+                    scope: PluginQuotaScope::Model("gemini-2.5-pro".into()),
+                    group: None,
+                    bucket_id: None,
+                    remaining_fraction: Some(0.2),
+                    remaining: None,
+                    limit: None,
+                    unit: Some("tokens".into()),
+                    window: Some("weekly".into()),
+                    reset_at: None,
+                },
+            ],
+        );
+
+        assert!(observation.is_none());
+        assert!(registry.adaptive_snapshot("p", "a").is_none());
+        let observations = registry.plugin_observations();
+        assert_eq!(observations.len(), 1);
+        let evidence = &observations[0].2;
+        assert!(observations[0].3);
+        assert_eq!(evidence.snapshots.len(), 2);
+        assert!(matches!(
+            &evidence.snapshots[0].scope,
+            PluginQuotaScope::Unknown
+        ));
+        assert_eq!(
+            evidence.snapshots[0].group.as_deref(),
+            Some("Gemini Models")
+        );
+        assert_eq!(evidence.snapshots[0].window.as_deref(), Some("5h"));
+        assert!(matches!(
+            &evidence.snapshots[1].scope,
+            PluginQuotaScope::Model(model) if model == "gemini-2.5-pro"
+        ));
+    }
+
+    #[test]
+    fn structured_plugin_account_windows_are_not_collapsed() {
+        let registry = QuotaRegistry::default();
+        let snapshots = ["5h", "weekly"]
+            .into_iter()
+            .map(|window| PluginQuotaSnapshot {
+                scope: PluginQuotaScope::Account,
+                group: None,
+                bucket_id: None,
+                remaining_fraction: Some(0.5),
+                remaining: None,
+                limit: None,
+                unit: Some("requests".into()),
+                window: Some(window.into()),
+                reset_at: None,
+            })
+            .collect();
+
+        assert!(registry
+            .observe_plugin_snapshots("p", "a", snapshots)
+            .is_none());
+        assert!(registry.adaptive_snapshot("p", "a").is_none());
+        assert_eq!(registry.plugin_observations()[0].2.snapshots.len(), 2);
+    }
+
+    #[test]
+    fn one_explicit_plugin_account_snapshot_can_update_routing_quota() {
+        let registry = QuotaRegistry::default();
+        let observation = registry
+            .observe_plugin_snapshots(
+                "p",
+                "a",
+                vec![PluginQuotaSnapshot {
+                    scope: PluginQuotaScope::Account,
+                    group: None,
+                    bucket_id: Some("account-5h".into()),
+                    remaining_fraction: Some(0.0),
+                    remaining: Some(0.0),
+                    limit: Some(100.0),
+                    unit: Some("requests".into()),
+                    window: Some("5h".into()),
+                    reset_at: Some("2030-01-01T00:00:00Z".into()),
+                }],
+            )
+            .unwrap();
+
+        assert!(observation.exhausted);
+        let routing = registry.adaptive_snapshot("p", "a").unwrap();
+        assert_eq!(routing.remaining_fraction, Some(0.0));
+        assert_eq!(routing.source, "plugin_health_probe_v2");
     }
 
     #[test]

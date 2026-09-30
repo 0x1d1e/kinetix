@@ -920,11 +920,34 @@ pub async fn runtime_health(
             .then_with(|| a["account_id"].as_str().cmp(&b["account_id"].as_str()))
     });
 
+    let mut plugin_quota_snapshots = state
+        .quota
+        .plugin_observations()
+        .into_iter()
+        .map(|(provider_id, account_id, evidence, fresh)| {
+            json!({
+                "provider_id": provider_id,
+                "account_id": account_id,
+                "snapshots": evidence.snapshots,
+                "observed_at": evidence.observed_at,
+                "max_age_secs": evidence.max_age_secs,
+                "freshness": if fresh { "fresh" } else { "stale" },
+            })
+        })
+        .collect::<Vec<_>>();
+    plugin_quota_snapshots.sort_by(|a, b| {
+        a["provider_id"]
+            .as_str()
+            .cmp(&b["provider_id"].as_str())
+            .then_with(|| a["account_id"].as_str().cmp(&b["account_id"].as_str()))
+    });
+
     Ok(Json(json!({
         "window": query.window.unwrap_or_else(|| "1h".into()),
         "telemetry": telemetry,
         "provider_circuits": provider_circuits,
         "quota": quota,
+        "plugin_quota_snapshots": plugin_quota_snapshots,
         "dropped": {
             "queue": state.target_telemetry.dropped_queue(),
             "persistence": state.target_telemetry.dropped_persistence(),
@@ -19862,6 +19885,21 @@ mod credential_enrollment_regression_tests {
             .quota
             .observe_headers("provider-test", "account-test", &headers)
             .unwrap();
+        state.quota.observe_plugin_snapshots(
+            "provider-test",
+            "account-test",
+            vec![crate::quota::PluginQuotaSnapshot {
+                scope: crate::quota::PluginQuotaScope::Unknown,
+                group: Some("Gemini Models".into()),
+                bucket_id: Some("gemini-weekly".into()),
+                remaining_fraction: Some(0.4),
+                remaining: None,
+                limit: None,
+                unit: Some("requests".into()),
+                window: Some("weekly".into()),
+                reset_at: Some("2030-01-01T00:00:00Z".into()),
+            }],
+        );
 
         let response = runtime_health(
             State(state.clone()),
@@ -19883,6 +19921,14 @@ mod credential_enrollment_regression_tests {
         assert_eq!(quota["routing"]["remaining_fraction"], 0.75);
         assert_eq!(quota["routing"]["source"], "plugin_health_probe");
         assert_eq!(quota["routing"]["routing_eligible"], true);
+        assert_eq!(
+            response["plugin_quota_snapshots"].as_array().unwrap().len(),
+            1
+        );
+        let plugin_snapshot = &response["plugin_quota_snapshots"][0];
+        assert_eq!(plugin_snapshot["snapshots"][0]["scope"]["kind"], "unknown");
+        assert_eq!(plugin_snapshot["snapshots"][0]["group"], "Gemini Models");
+        assert_eq!(plugin_snapshot["snapshots"][0]["window"], "weekly");
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);

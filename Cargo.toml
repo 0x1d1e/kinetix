@@ -63,10 +63,13 @@ dotenvy = "0.15"
 clap = { version = "4", features = ["derive", "env"] }
 csv = "1"
 libc = "0.2"
-wasmtime = { version = "48.0.2", features = ["component-model", "async", "cranelift", "pooling-allocator", "runtime"] }
+wasmtime = { version = "48.0.3", features = ["component-model", "async", "cranelift", "pooling-allocator", "runtime"] }
 tar = "0.4.46"
 ed25519-dalek = "3.0.0"
 semver = "1.0"
+
+[dev-dependencies]
+wat = "1"
 
 [features]
 # NFR-1.8: opt-in allocation accounting for the benchmark harness.

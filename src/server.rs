@@ -620,6 +620,72 @@ fn plugin_quota_reset_at(
     })
 }
 
+async fn apply_plugin_health_status(
+    pool: &db::Pool,
+    account_id: &str,
+    observed_state_version: i64,
+    current_status: &str,
+    state: &str,
+    reset_at: Option<&str>,
+    retry_after: Option<u64>,
+) {
+    match state {
+        "healthy" => {
+            if current_status != "healthy" {
+                let _ = db::set_account_status_if_version(
+                    pool,
+                    account_id,
+                    observed_state_version,
+                    "healthy",
+                    "probe_healthy",
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            }
+        }
+        "degraded" => {
+            // Advisory only: surface the reset hint in last_error without
+            // taking the account out of rotation.
+            let note = reset_at.unwrap_or("plugin reports degraded");
+            let _ = db::set_account_status_if_version(
+                pool,
+                account_id,
+                observed_state_version,
+                "healthy",
+                "probe_degraded",
+                None,
+                None,
+                Some(note),
+            )
+            .await;
+        }
+        "unavailable" => {
+            // Core owns the cooldown window; the plugin only says the
+            // account is not usable right now.
+            let until = reset_at.map(str::to_owned).or_else(|| {
+                retry_after.map(|seconds| {
+                    (chrono::Utc::now() + chrono::Duration::seconds(seconds as i64)).to_rfc3339()
+                })
+            });
+            let _ = db::set_account_status_if_version(
+                pool,
+                account_id,
+                observed_state_version,
+                "cooldown",
+                "probe_unavailable",
+                until.as_deref(),
+                None,
+                Some("plugin health probe: unavailable"),
+            )
+            .await;
+        }
+        // "unknown" and anything else: leave the account as-is.
+        _ => {}
+    }
+}
+
 async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>) {
     let providers = match db::list_providers(&state.pool).await {
         Ok(p) => p,
@@ -648,23 +714,54 @@ async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>
             if account.status == "disabled" {
                 continue;
             }
-            let obs = match manager
-                .health_probe(&pref.plugin_id, &provider.id, &account.id)
+            let probe = match manager
+                .health_probe_with_snapshots(&pref.plugin_id, &provider.id, &account.id)
                 .await
             {
-                Ok(o) => o,
+                Ok(observation) => observation,
                 Err(e) => {
                     tracing::debug!(plugin = %pref.plugin_id, account = %account.id,
                         error = %e.message(), "plugin health probe failed");
                     continue;
                 }
             };
-            let quota_observation = state.quota.observe_plugin(
-                &provider.id,
-                &account.id,
-                obs.quota_state.as_deref(),
-                obs.reset_at.as_deref(),
-            );
+            let quota_observation = match probe.quota_snapshots {
+                Some(snapshots) => state.quota.observe_plugin_snapshots(
+                    &provider.id,
+                    &account.id,
+                    snapshots
+                        .into_iter()
+                        .map(|snapshot| crate::quota::PluginQuotaSnapshot {
+                            scope: match snapshot.scope {
+                                crate::plugins::runtime::health_v2_wit::types::QuotaScopeV1::Account => {
+                                    crate::quota::PluginQuotaScope::Account
+                                }
+                                crate::plugins::runtime::health_v2_wit::types::QuotaScopeV1::Model(model) => {
+                                    crate::quota::PluginQuotaScope::Model(model)
+                                }
+                                crate::plugins::runtime::health_v2_wit::types::QuotaScopeV1::Unknown => {
+                                    crate::quota::PluginQuotaScope::Unknown
+                                }
+                            },
+                            group: snapshot.group,
+                            bucket_id: snapshot.bucket_id,
+                            remaining_fraction: snapshot.remaining_fraction,
+                            remaining: snapshot.remaining,
+                            limit: snapshot.limit,
+                            unit: snapshot.unit,
+                            window: snapshot.window,
+                            reset_at: snapshot.reset_at,
+                        })
+                        .collect(),
+                ),
+                None => state.quota.observe_plugin(
+                    &provider.id,
+                    &account.id,
+                    probe.observation.quota_state.as_deref(),
+                    probe.observation.reset_at.as_deref(),
+                ),
+            };
+            let obs = probe.observation;
             if let Some(observation) = quota_observation.filter(|observation| observation.exhausted)
             {
                 let now = chrono::Utc::now();
@@ -689,64 +786,16 @@ async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>
                 }
                 continue;
             }
-            match obs.state.as_str() {
-                "healthy" => {
-                    if account.status != "healthy" {
-                        let _ = db::set_account_status_if_version(
-                            &state.pool,
-                            &account.id,
-                            account.account_state_version,
-                            "healthy",
-                            "probe_healthy",
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
-                    }
-                }
-                "degraded" => {
-                    // Advisory only: surface the reset hint in last_error without
-                    // taking the account out of rotation.
-                    let note = obs
-                        .reset_at
-                        .clone()
-                        .unwrap_or_else(|| "plugin reports degraded".into());
-                    let _ = db::set_account_status_if_version(
-                        &state.pool,
-                        &account.id,
-                        account.account_state_version,
-                        "healthy",
-                        "probe_degraded",
-                        None,
-                        None,
-                        Some(&note),
-                    )
-                    .await;
-                }
-                "unavailable" => {
-                    // Core owns the cooldown window; the plugin only says the
-                    // account is not usable right now.
-                    let until = obs.reset_at.clone().or_else(|| {
-                        obs.retry_after.map(|s| {
-                            (chrono::Utc::now() + chrono::Duration::seconds(s as i64)).to_rfc3339()
-                        })
-                    });
-                    let _ = db::set_account_status_if_version(
-                        &state.pool,
-                        &account.id,
-                        account.account_state_version,
-                        "cooldown",
-                        "probe_unavailable",
-                        until.as_deref(),
-                        None,
-                        Some("plugin health probe: unavailable"),
-                    )
-                    .await;
-                }
-                // "unknown" and anything else: leave the account as-is.
-                _ => {}
-            }
+            apply_plugin_health_status(
+                &state.pool,
+                &account.id,
+                account.account_state_version,
+                &account.status,
+                &obs.state,
+                obs.reset_at.as_deref(),
+                obs.retry_after,
+            )
+            .await;
         }
     }
 }
@@ -807,6 +856,210 @@ mod tests {
             Some(explicit)
         );
         assert_eq!(plugin_quota_reset_at(None, Some(u64::MAX), now), None);
+    }
+
+    #[tokio::test]
+    async fn plugin_health_status_preserves_runtime_state_and_rejects_stale_updates() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-server-health-probe-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", root.join("k.db").display());
+        let pool = crate::db::connect(&url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let provider_id = crate::db::insert_provider(
+            &pool,
+            &crate::db::NewProvider {
+                name: "health-probe-test",
+                base_url: "https://example.test",
+                wire_format: crate::types::WireFormat::Plugin,
+                auth_scheme: crate::types::AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: serde_json::json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: serde_json::json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: true,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let quota = crate::quota::QuotaRegistry::default();
+        assert!(quota
+            .observe_plugin_snapshots(
+                &provider_id,
+                "account",
+                vec![
+                    crate::quota::PluginQuotaSnapshot {
+                        scope: crate::quota::PluginQuotaScope::Unknown,
+                        group: Some("Gemini Models".into()),
+                        bucket_id: Some("gemini-5h".into()),
+                        remaining_fraction: Some(0.6),
+                        remaining: None,
+                        limit: None,
+                        unit: Some("requests".into()),
+                        window: Some("5h".into()),
+                        reset_at: None,
+                    },
+                    crate::quota::PluginQuotaSnapshot {
+                        scope: crate::quota::PluginQuotaScope::Model("gemini-2.5-pro".into()),
+                        group: Some("Gemini Models".into()),
+                        bucket_id: Some("gemini-pro".into()),
+                        remaining_fraction: Some(0.4),
+                        remaining: None,
+                        limit: None,
+                        unit: Some("requests".into()),
+                        window: Some("weekly".into()),
+                        reset_at: None,
+                    },
+                ],
+            )
+            .is_none());
+        assert!(quota.adaptive_snapshot(&provider_id, "account").is_none());
+        for status in ["cooldown", "exhausted"] {
+            let account_id = crate::db::insert_account(
+                &pool,
+                &provider_id,
+                status,
+                "encrypted",
+                "masked",
+                1,
+                1,
+                None,
+                "none",
+            )
+            .await
+            .unwrap();
+            let reset_at = "2026-04-01T00:00:00Z";
+            crate::db::set_account_status(
+                &pool,
+                &account_id,
+                status,
+                if status == "cooldown" {
+                    "rate_limited"
+                } else {
+                    "account_quota_exhausted"
+                },
+                (status == "cooldown").then_some(reset_at),
+                (status == "exhausted").then_some(reset_at),
+                Some("runtime-owned failure"),
+            )
+            .await
+            .unwrap();
+            let before = crate::db::get_account(&pool, &account_id)
+                .await
+                .unwrap()
+                .unwrap();
+
+            // A quota-only Antigravity observation without account-wide fields
+            // reports unknown; core must not treat it as recovery.
+            apply_plugin_health_status(
+                &pool,
+                &account_id,
+                before.account_state_version,
+                &before.status,
+                "unknown",
+                None,
+                None,
+            )
+            .await;
+
+            let after = crate::db::get_account(&pool, &account_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.status, status);
+            assert_eq!(after.cooldown_until, before.cooldown_until);
+            assert_eq!(after.quota_reset_at, before.quota_reset_at);
+            assert_eq!(after.last_error, before.last_error);
+        }
+
+        let account_id = crate::db::insert_account(
+            &pool,
+            &provider_id,
+            "cooldown",
+            "encrypted",
+            "masked",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let observed = crate::db::get_account(&pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let reset_at = "2026-04-01T00:00:00Z";
+        assert!(crate::db::set_account_status_if_version(
+            &pool,
+            &account_id,
+            observed.account_state_version,
+            "exhausted",
+            "runtime_rate_limited",
+            None,
+            Some(reset_at),
+            Some("newer runtime failure"),
+        )
+        .await
+        .unwrap());
+        let newer = crate::db::get_account(&pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A probe started before the runtime failure must not undo any of the
+        // four account-state transitions, including quota exhaustion.
+        for state in ["healthy", "degraded", "unavailable"] {
+            apply_plugin_health_status(
+                &pool,
+                &account_id,
+                observed.account_state_version,
+                &observed.status,
+                state,
+                Some("2026-04-01T01:00:00Z"),
+                Some(120),
+            )
+            .await;
+        }
+        assert!(!crate::db::set_account_status_if_version(
+            &pool,
+            &account_id,
+            observed.account_state_version,
+            "exhausted",
+            "account_quota_exhausted",
+            None,
+            Some("2026-04-01T02:00:00Z"),
+            Some("plugin health probe: quota exhausted"),
+        )
+        .await
+        .unwrap());
+
+        let after = crate::db::get_account(&pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, newer.status);
+        assert_eq!(after.status_reason, newer.status_reason);
+        assert_eq!(after.account_state_version, newer.account_state_version);
+        assert_eq!(after.cooldown_until, newer.cooldown_until);
+        assert_eq!(after.quota_reset_at, newer.quota_reset_at);
+        assert_eq!(after.last_error, newer.last_error);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A real temp-file-backed opaque-state store, so the shutdown-flush
