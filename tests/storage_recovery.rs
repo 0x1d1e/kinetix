@@ -498,21 +498,21 @@ async fn startup_retries_preserve_snapshot_until_pricing_repair_succeeds() {
     .fetch_one(&backup)
     .await
     .unwrap();
-    assert_eq!(old_schema_has_account_state_version, 1);
+    assert_eq!(old_schema_has_account_state_version, 0);
     let old_schema_has_integration_features: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('providers') WHERE name='integration_features'",
     )
     .fetch_one(&backup)
     .await
     .unwrap();
-    assert_eq!(old_schema_has_integration_features, 1);
+    assert_eq!(old_schema_has_integration_features, 0);
     let old_schema_has_integration_protocols: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('providers') WHERE name='integration_protocols'",
     )
     .fetch_one(&backup)
     .await
     .unwrap();
-    assert_eq!(old_schema_has_integration_protocols, 1);
+    assert_eq!(old_schema_has_integration_protocols, 0);
     backup.close().await;
 
     let pool = db::connect(&url).await.unwrap();

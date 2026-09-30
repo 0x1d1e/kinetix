@@ -3932,9 +3932,9 @@ pub struct UsageAccountingBundle {
 pub async fn insert_usage_bundle(pool: &Pool, bundle: &UsageAccountingBundle) -> Result<()> {
     let mut tx = pool.begin().await?;
     for attempt in &bundle.attempts {
-        insert_usage_attempt_on(&mut *tx, attempt).await?;
+        insert_usage_attempt_on(&mut tx, attempt).await?;
     }
-    insert_usage_log_on(&mut *tx, &bundle.request).await?;
+    insert_usage_log_on(&mut tx, &bundle.request).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -5934,6 +5934,12 @@ mod usage_request_log_tests {
         .unwrap();
         sqlx::raw_sql(include_str!(
             "../migrations/20260930130000_usage_attempt_accounting.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/20260930150000_usage_request_log_admission_cost.sql"
         ))
         .execute(&pool)
         .await

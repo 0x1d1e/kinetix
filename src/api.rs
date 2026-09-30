@@ -1206,6 +1206,12 @@ mod client_usage_tests {
             ..Default::default()
         });
 
+        // Drop the request view while simulating a missing storage column;
+        // otherwise SQLite rejects the rename because the view references it.
+        sqlx::query("DROP VIEW usage_request_logs")
+            .execute(&state.pool)
+            .await
+            .unwrap();
         sqlx::query(
             "ALTER TABLE usage_logs RENAME COLUMN admission_cost_usd TO broken_admission_cost_usd",
         )
@@ -1229,6 +1235,12 @@ mod client_usage_tests {
         sqlx::query(
             "ALTER TABLE usage_logs RENAME COLUMN broken_admission_cost_usd TO admission_cost_usd",
         )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/20260930150000_usage_request_log_admission_cost.sql"
+        ))
         .execute(&state.pool)
         .await
         .unwrap();
@@ -1287,9 +1299,10 @@ mod client_usage_tests {
         .execute(&state.pool)
         .await
         .unwrap();
-        state
-            .log_queue
-            .enqueue(usage_row(&key.id, Some(10), Some(20), None));
+        state.log_queue.enqueue_bundle(db::UsageAccountingBundle {
+            request: usage_row(&key.id, Some(10), Some(20), None),
+            attempts: Vec::new(),
+        });
         for _ in 0..100 {
             if state.log_queue.dropped() > 0 {
                 break;

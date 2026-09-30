@@ -594,13 +594,13 @@ impl AdmissionController {
 impl KeyLedger {
     fn roll_periods(&mut self, now: chrono::DateTime<Utc>) {
         let day = now.date_naive();
-        if self.daily_day.map_or(true, |current| day > current) {
+        if self.daily_day.is_none_or(|current| day > current) {
             self.daily_day = Some(day);
             self.daily_spend = 0.0;
             self.daily_has_unknown_settled_cost = false;
         }
         let month = (now.year(), now.month());
-        if self.monthly_key.map_or(true, |current| month > current) {
+        if self.monthly_key.is_none_or(|current| month > current) {
             self.monthly_key = Some(month);
             self.monthly_spend = 0.0;
             self.monthly_has_unknown_settled_cost = false;
@@ -1019,13 +1019,14 @@ mod tests {
             .budget_snapshot_current(&pool, "key")
             .await
             .unwrap();
-        let ledger = entry.ledger.lock();
-        assert_eq!(ledger.daily_day, Some(budget_at.captured_at.date_naive()));
-        assert_eq!(
-            ledger.monthly_key,
-            Some((budget_at.captured_at.year(), budget_at.captured_at.month()))
-        );
-        drop(ledger);
+        {
+            let ledger = entry.ledger.lock();
+            assert_eq!(ledger.daily_day, Some(budget_at.captured_at.date_naive()));
+            assert_eq!(
+                ledger.monthly_key,
+                Some((budget_at.captured_at.year(), budget_at.captured_at.month()))
+            );
+        }
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);
     }
