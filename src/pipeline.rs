@@ -1569,11 +1569,12 @@ pub(crate) async fn run_with_disconnect(
         let mut execution_model = target.model.clone();
         execution_model.thinking_map = serde_json::to_string(&profile.thinking_map)
             .expect("ThinkingMap serialization is infallible");
+        let session_context = meta.session.clone();
         let ctx = UpstreamContext {
             provider: &target.provider,
             model: &execution_model,
             account_id: Some(target.account.id.as_str()),
-            session_context: meta.session.as_deref(),
+            session_context: session_context.as_deref(),
             credential,
         };
 
@@ -9166,7 +9167,7 @@ mod route_policy_tests {
         .await
         .expect("primary upstream attempt should start");
         sqlx::query(
-            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, ?)",
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, cost_known, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, 1, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(uuid::Uuid::new_v4().to_string())
@@ -9219,7 +9220,7 @@ mod route_policy_tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, ?)",
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, cost_known, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, 1, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(uuid::Uuid::new_v4().to_string())
@@ -9276,7 +9277,7 @@ mod route_policy_tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, ?)",
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, cost_known, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, 1, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(uuid::Uuid::new_v4().to_string())
@@ -9465,7 +9466,7 @@ mod route_policy_tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, ?)",
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, cost_known, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, 1, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(uuid::Uuid::new_v4().to_string())
@@ -9704,7 +9705,7 @@ mod route_policy_tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-provider/adaptive-model', 'success', 200, 1.0, ?)",
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, cost_known, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-provider/adaptive-model', 'success', 200, 1.0, 1, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(uuid::Uuid::new_v4().to_string())

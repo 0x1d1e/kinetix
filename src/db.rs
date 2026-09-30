@@ -5841,7 +5841,7 @@ mod usage_request_log_tests {
         .await
         .unwrap();
         sqlx::raw_sql(include_str!(
-            "../migrations/20260929120000_usage_attempt_accounting.sql"
+            "../migrations/20260930130000_usage_attempt_accounting.sql"
         ))
         .execute(&pool)
         .await
