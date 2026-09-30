@@ -199,7 +199,7 @@ pub enum ProviderAction {
         /// openai | anthropic | gemini
         #[arg(long, default_value = "openai")]
         wire_format: String,
-        /// bearer | custom_header | query_param
+        /// none | bearer | custom_header | query_param
         #[arg(long, default_value = "bearer")]
         auth_scheme: String,
         #[arg(long)]
@@ -215,6 +215,9 @@ pub enum ProviderAction {
         api_key: Option<String>,
         #[arg(long)]
         account_label: Option<String>,
+        /// JSON file containing declarations, values and network_hosts (non-secret).
+        #[arg(long)]
+        connection_parameters: Option<PathBuf>,
     },
     Remove {
         id: String,
@@ -916,14 +919,45 @@ async fn cmd_provider(cli: &Cli, args: ProviderArgs) -> Result<()> {
             timeout_ms,
             api_key,
             account_label,
+            connection_parameters,
         } => {
+            let problems = crate::validate::validate_provider_schema(
+                &name,
+                &base_url,
+                &wire_format,
+                &auth_scheme,
+                custom_header_name.as_deref(),
+                custom_param_name.as_deref(),
+            );
+            anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
+            let anonymous = auth_scheme == "none";
+            anyhow::ensure!(
+                !anonymous
+                    || (api_key.is_none()
+                        && custom_header_name.is_none()
+                        && custom_param_name.is_none()),
+                "no-auth providers must not configure auth fields"
+            );
+            let parameters: Option<crate::provider_connection::ConnectionParameters> =
+                match connection_parameters {
+                    Some(path) => Some(serde_json::from_str(
+                        &tokio::fs::read_to_string(path).await?,
+                    )?),
+                    None => None,
+                };
+            crate::provider_connection::resolve_endpoint(
+                &base_url,
+                models_path.as_deref(),
+                parameters.as_ref(),
+            )
+            .map_err(anyhow::Error::msg)?;
             let id = format!("prov_{}", uuid::Uuid::new_v4().simple());
             sqlx::query(
                 "INSERT INTO providers
                  (id, name, base_url, wire_format, auth_scheme, custom_header_name, custom_param_name,
                   extra_headers, timeout_ms, capability_mode, models_path, rate_limit_rules, enabled,
-                  follow_redirects, credential_hosts, allow_insecure_tls, created_at)
-                 VALUES (?,?,?,?,?,?,?,'{}',?,'permissive',?,'{}',1,0,'',0,?)",
+                  follow_redirects, credential_hosts, allow_insecure_tls, created_at, credential_mode, connection_parameters)
+                 VALUES (?,?,?,?,?,?,?,'{}',?,'permissive',?,'{}',1,0,'',0,?,?,?)",
             )
             .bind(&id)
             .bind(&name)
@@ -935,9 +969,15 @@ async fn cmd_provider(cli: &Cli, args: ProviderArgs) -> Result<()> {
             .bind(timeout_ms)
             .bind(&models_path)
             .bind(db::now_iso())
+            .bind(if anonymous { "none" } else { "manual" })
+            .bind(parameters.map(|parameters| serde_json::to_string(&parameters)).transpose()?)
             .execute(&pool)
             .await?;
             println!("provider created: {id}");
+            if anonymous {
+                db::insert_account(&pool, &id, "__kinetix_noauth__", "", "", 1, 1, None, "none")
+                    .await?;
+            }
             if let Some(key) = api_key {
                 let label = account_label.unwrap_or_else(|| "Primary key".to_string());
                 let acc_id =
@@ -1070,6 +1110,13 @@ async fn cmd_account(cli: &Cli, args: AccountArgs) -> Result<()> {
             quota_type,
         } => {
             let provider_id = resolve_provider(&pool, &provider).await?;
+            let row = db::get_provider(&pool, &provider_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("provider not found"))?;
+            anyhow::ensure!(
+                row.credential_mode == "manual",
+                "provider does not use manual credential enrollment"
+            );
             let id = insert_account_row(
                 &pool,
                 &crypto,

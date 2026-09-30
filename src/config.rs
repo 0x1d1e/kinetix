@@ -502,10 +502,14 @@ fn default_wildcard() -> Vec<String> {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BootstrapProvider {
     pub name: String,
+    #[serde(default)]
+    pub connection_parameters: Option<crate::provider_connection::ConnectionParameters>,
+    #[serde(default)]
+    pub credential_mode: Option<crate::plugins::CredentialMode>,
     pub base_url: String,
     /// `openai` | `anthropic` | `gemini` | `plugin`
     pub wire_format: String,
-    /// `bearer` | `custom_header` | `query_param`
+    /// `none` | `bearer` | `custom_header` | `query_param`
     #[serde(default = "default_bearer")]
     pub auth_scheme: String,
     #[serde(default)]

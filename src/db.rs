@@ -1017,9 +1017,36 @@ pub struct ProviderRow {
     pub integration_features: Option<String>,
     #[serde(default)]
     pub integration_protocols: Option<String>,
+    #[serde(default)]
+    pub connection_parameters: Option<String>,
 }
 
 impl ProviderRow {
+    pub fn connection(
+        &self,
+    ) -> Result<Option<crate::provider_connection::ConnectionParameters>, String> {
+        self.connection_parameters
+            .as_deref()
+            .map(|raw| {
+                serde_json::from_str(raw).map_err(|_| "invalid connection parameters".into())
+            })
+            .transpose()
+    }
+
+    pub fn resolved_endpoint(&self) -> Result<(String, Option<String>), String> {
+        crate::provider_connection::resolve_endpoint(
+            &self.base_url,
+            self.models_path.as_deref(),
+            self.connection()?.as_ref(),
+        )
+    }
+
+    pub fn resolved_base_url(&self) -> Result<String, crate::types::ProxyError> {
+        self.resolved_endpoint()
+            .map(|(base, _)| base)
+            .map_err(crate::types::ProxyError::bad_request)
+    }
+
     pub fn wire(&self) -> WireFormat {
         WireFormat::parse(&self.wire_format).unwrap_or(WireFormat::Openai)
     }
@@ -1180,6 +1207,41 @@ pub fn conservative_provider_pricing_scope(
     }
 }
 
+pub async fn set_provider_connection_parameters(
+    pool: &Pool,
+    id: &str,
+    parameters: Option<&crate::provider_connection::ConnectionParameters>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    set_provider_connection_parameters_in_transaction(&mut tx, id, parameters).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn set_provider_connection_parameters_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    parameters: Option<&crate::provider_connection::ConnectionParameters>,
+) -> Result<()> {
+    let provider = sqlx::query_as::<_, ProviderRow>("SELECT * FROM providers WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await?;
+    crate::provider_connection::resolve_endpoint(
+        &provider.base_url,
+        provider.models_path.as_deref(),
+        parameters,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let serialized = parameters.map(serde_json::to_string).transpose()?;
+    sqlx::query("UPDATE providers SET connection_parameters=? WHERE id=?")
+        .bind(serialized)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 pub async fn set_provider_integration_features(
     pool: &Pool,
     id: &str,
@@ -1248,7 +1310,25 @@ pub(crate) async fn set_provider_integration_protocols_in_transaction(
     Ok(())
 }
 
+fn validate_provider_auth(p: &NewProvider<'_>) -> Result<()> {
+    if p.auth_scheme == AuthScheme::None
+        && (p.credential_mode != "none"
+            || !p.credential_plugin.is_empty()
+            || p.custom_header_name.is_some()
+            || p.custom_param_name.is_some()
+            || p.extra_headers.as_object().is_some_and(|headers| {
+                headers
+                    .keys()
+                    .any(|name| crate::validate::is_auth_header(name))
+            }))
+    {
+        anyhow::bail!("no-auth providers require credential_mode 'none' without auth fields");
+    }
+    Ok(())
+}
+
 pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String> {
+    validate_provider_auth(p)?;
     let id = format!("prov_{}", uuid::Uuid::new_v4().simple());
     let pricing_scope = conservative_provider_pricing_scope(
         p.credential_mode,
@@ -1300,6 +1380,7 @@ pub(crate) async fn insert_provider_in_transaction(
     p: &NewProvider<'_>,
     pricing_scope: &str,
 ) -> Result<String> {
+    validate_provider_auth(p)?;
     if !matches!(pricing_scope, "direct_api" | "integration") {
         anyhow::bail!("invalid provider pricing scope '{pricing_scope}'");
     }
@@ -1343,6 +1424,7 @@ pub(crate) async fn insert_provider_in_transaction(
 
 pub fn auth_scheme_str(s: AuthScheme) -> &'static str {
     match s {
+        AuthScheme::None => "none",
         AuthScheme::Bearer => "bearer",
         AuthScheme::CustomHeader => "custom_header",
         AuthScheme::QueryParam => "query_param",
@@ -1355,7 +1437,9 @@ pub async fn update_provider(
     id: &str,
     p: &NewProvider<'_>,
     explicit_pricing_scope: Option<&str>,
+    connection_parameters: Option<Option<&crate::provider_connection::ConnectionParameters>>,
 ) -> Result<()> {
+    validate_provider_auth(p)?;
     let existing = get_provider(pool, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?;
@@ -1418,6 +1502,9 @@ pub async fn update_provider(
     if pricing_scope == "integration" || catalog_identity_changed {
         revoke_external_catalog_effective_pricing_in_transaction(&mut tx, id).await?;
     }
+    if let Some(parameters) = connection_parameters {
+        set_provider_connection_parameters_in_transaction(&mut tx, id, parameters).await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -1428,6 +1515,7 @@ pub(crate) async fn update_provider_in_transaction(
     p: &NewProvider<'_>,
     pricing_scope: &str,
 ) -> Result<()> {
+    validate_provider_auth(p)?;
     let existing = sqlx::query_as::<_, ProviderRow>("SELECT * FROM providers WHERE id=?")
         .bind(id)
         .fetch_optional(&mut **tx)

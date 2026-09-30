@@ -338,6 +338,7 @@ export default function App() {
   const handleUpdateProvider = (providerId: string, prov: Provider) =>
     withRefreshOrThrow(() =>
       Kinetix.updateProvider(providerId, {
+        connection_values: prov.connectionParameters?.values,
         name: prov.name,
         base_url: prov.baseUrl,
         wire_format: prov.wireFormat,

@@ -64,6 +64,7 @@ export function mapProvider(j: any): Provider {
     baseUrl: str(j.base_url),
     wireFormat: (j.wire_format as Provider['wireFormat']) || 'openai',
     authScheme: (j.auth_scheme as Provider['authScheme']) || 'bearer',
+    connectionParameters: j.connection_parameters ?? undefined,
     customHeaderName: j.custom_header_name ?? undefined,
     customParamName: j.custom_param_name ?? undefined,
     status,

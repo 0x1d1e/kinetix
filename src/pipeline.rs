@@ -8146,6 +8146,7 @@ mod route_policy_tests {
             pricing_scope: "direct_api".into(),
             integration_features: None,
             integration_protocols: None,
+            connection_parameters: None,
         }
     }
 

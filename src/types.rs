@@ -43,6 +43,7 @@ impl WireFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthScheme {
+    None,
     Bearer,
     CustomHeader,
     QueryParam,
@@ -51,6 +52,7 @@ pub enum AuthScheme {
 impl AuthScheme {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
+            "none" => Some(AuthScheme::None),
             "bearer" => Some(AuthScheme::Bearer),
             "custom_header" => Some(AuthScheme::CustomHeader),
             "query_param" => Some(AuthScheme::QueryParam),

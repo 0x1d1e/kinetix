@@ -213,7 +213,8 @@ impl Adapter for OpenAiAdapter {
     }
 
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
-        let base = ctx.provider.base_url.trim_end_matches('/');
+        let resolved = ctx.provider.resolved_base_url()?;
+        let base = resolved.trim_end_matches('/');
         Ok(format!("{base}/chat/completions"))
     }
 
@@ -224,6 +225,7 @@ impl Adapter for OpenAiAdapter {
     ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
         use crate::types::AuthScheme;
         Ok(match ctx.provider.auth() {
+            AuthScheme::None => req,
             AuthScheme::Bearer => req.bearer_auth(&ctx.credential),
             AuthScheme::CustomHeader => {
                 let name = ctx
@@ -674,6 +676,7 @@ mod tests {
             pricing_scope: "direct_api".into(),
             integration_features: None,
             integration_protocols: None,
+            connection_parameters: None,
         }
     }
 
@@ -1015,6 +1018,7 @@ mod param_default_tests {
             pricing_scope: "direct_api".into(),
             integration_features: None,
             integration_protocols: None,
+            connection_parameters: None,
         }
     }
 

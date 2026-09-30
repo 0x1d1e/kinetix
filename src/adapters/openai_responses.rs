@@ -505,7 +505,7 @@ impl Adapter for OpenAiResponsesAdapter {
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
         Ok(format!(
             "{}/responses",
-            ctx.provider.base_url.trim_end_matches('/')
+            ctx.provider.resolved_base_url()?.trim_end_matches('/')
         ))
     }
 
@@ -516,6 +516,7 @@ impl Adapter for OpenAiResponsesAdapter {
     ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
         use crate::types::AuthScheme;
         Ok(match ctx.provider.auth() {
+            AuthScheme::None => req,
             AuthScheme::Bearer => req.bearer_auth(&ctx.credential),
             AuthScheme::CustomHeader => {
                 let name = ctx
@@ -749,6 +750,7 @@ mod tests {
             pricing_scope: "direct_api".into(),
             integration_features: None,
             integration_protocols: None,
+            connection_parameters: None,
         }
     }
 

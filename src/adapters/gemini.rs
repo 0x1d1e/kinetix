@@ -616,7 +616,8 @@ impl Adapter for GeminiAdapter {
     }
 
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
-        let base = ctx.provider.base_url.trim_end_matches('/');
+        let resolved = ctx.provider.resolved_base_url()?;
+        let base = resolved.trim_end_matches('/');
         // Streaming-first: Kinetix always consumes an upstream stream (the
         // non-streaming path aggregates it), so always use the streaming method.
         Ok(format!(
@@ -632,6 +633,7 @@ impl Adapter for GeminiAdapter {
     ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
         use crate::types::AuthScheme;
         Ok(match ctx.provider.auth() {
+            AuthScheme::None => req,
             AuthScheme::Bearer => req.bearer_auth(&ctx.credential),
             AuthScheme::CustomHeader => {
                 let name = ctx
@@ -1316,6 +1318,7 @@ mod schema_tests {
             pricing_scope: "direct_api".into(),
             integration_features: None,
             integration_protocols: None,
+            connection_parameters: None,
         };
         let model = crate::db::ModelRow {
             id: "m".into(),

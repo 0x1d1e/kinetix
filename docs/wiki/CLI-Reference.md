@@ -66,13 +66,17 @@ kinetix key revoke <ID>           # hard-delete the key AND its usage logs
 ### `provider`
 ```bash
 kinetix provider add --name "My Provider" --base-url https://.../v1 \
-  --wire-format openai|anthropic|gemini --auth-scheme bearer|custom_header|query_param \
+  --wire-format openai|anthropic|gemini --auth-scheme none|bearer|custom_header|query_param \
   [--custom-header-name X] [--custom-param-name key] [--models-path /models] \
-  [--timeout-ms 120000] [--api-key sk-...] [--account-label primary]
+  [--timeout-ms 120000] [--api-key sk-...] [--account-label primary] \
+  [--connection-parameters public-parameters.json]
 kinetix provider list
 kinetix provider remove <ID>
 ```
 `--api-key` + `--account-label` create the provider's first account in one step.
+With `--auth-scheme none`, omit credential/custom-auth flags; Kinetix creates a
+secret-free routing account. For bounded public identifier files and templates,
+see [Public connection parameters](Plugins#public-connection-parameters).
 
 ### `model`
 ```bash

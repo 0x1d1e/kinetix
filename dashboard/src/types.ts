@@ -23,12 +23,19 @@ export interface VirtualKey {
   totalTokens: number;
 }
 
+export interface ConnectionParameters {
+  declarations: Record<string, { type: 'identifier'; min_length: number; max_length: number }>;
+  values: Record<string, string>;
+  network_hosts: string[];
+}
+
 export interface Provider {
   id: string;
   name: string;
   baseUrl: string;
   wireFormat: WireFormat;
-  authScheme: 'bearer' | 'custom_header' | 'query_param';
+  authScheme: 'none' | 'bearer' | 'custom_header' | 'query_param';
+  connectionParameters?: ConnectionParameters;
   customHeaderName?: string;
   customParamName?: string;
   status: 'healthy' | 'degraded' | 'error';

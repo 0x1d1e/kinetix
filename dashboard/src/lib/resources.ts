@@ -14,7 +14,7 @@ import {
   mapRequest,
   mapLiveRequest,
 } from './mappers';
-import { Account, AuditLog, Route, ModelAlias, ModelConfig, Provider, ProxyMetrics, RequestLog, VirtualKey, LiveRequest } from '../types';
+import { ConnectionParameters, Account, AuditLog, Route, ModelAlias, ModelConfig, Provider, ProxyMetrics, RequestLog, VirtualKey, LiveRequest } from '../types';
 
 export interface CreateKeyInput {
   name: string;
@@ -373,6 +373,7 @@ export interface PluginCatalogResponse {
 }
 
 export interface PluginIntegrationProvider {
+  parameters?: ConnectionParameters['declarations'];
   base_url: string;
   wire_format: string;
   auth_scheme: string;
@@ -777,9 +778,10 @@ export const Kinetix = {
     ),
   installPlugin: (body: PluginInstallInput) =>
     api.post<PluginInstallResult>('/admin/api/plugins/install', body),
-  setupPluginIntegrationProvider: (pluginId: string, integrationId: string) =>
+  setupPluginIntegrationProvider: (pluginId: string, integrationId: string, connectionValues: Record<string, string> = {}) =>
     api.post<{ id: string; name: string; created: boolean }>(
       `/admin/api/plugins/${encodeURIComponent(pluginId)}/integrations/${encodeURIComponent(integrationId)}/provider`,
+      { connection_values: connectionValues },
     ),
   startPluginAuth: (plugin_id: string, flow_name: string, provider_id: string) =>
     api.post<{

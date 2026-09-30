@@ -15,6 +15,11 @@ remove:
 `<DIR>/data`, `<DIR>/state` and **ignores any `.env`** — ideal for isolated or
 test instances.
 
+Anonymous bootstrap providers use `auth_scheme = "none"` and
+`credential_mode = "none"`, without credential accounts or custom auth fields.
+For public identifiers stored separately from tokens, see
+[Public connection parameters](Plugins#public-connection-parameters).
+
 ## Configuration precedence
 
 ```

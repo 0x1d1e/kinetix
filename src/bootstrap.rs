@@ -51,7 +51,29 @@ pub async fn seed_if_empty(
                 p.name
             );
         }
-        let auth = AuthScheme::parse(&p.auth_scheme).unwrap_or(AuthScheme::Bearer);
+        let auth = AuthScheme::parse(&p.auth_scheme)
+            .ok_or_else(|| anyhow::anyhow!("invalid auth_scheme"))?;
+        let anonymous = auth == AuthScheme::None;
+        anyhow::ensure!(
+            !anonymous || p.credential_mode == Some(crate::plugins::CredentialMode::None),
+            "auth_scheme 'none' requires credential_mode 'none'"
+        );
+        anyhow::ensure!(
+            !anonymous || p.accounts.is_empty(),
+            "no-auth providers must not configure account credentials"
+        );
+        anyhow::ensure!(
+            anonymous
+                || p.credential_mode
+                    .is_none_or(|mode| mode == crate::plugins::CredentialMode::Manual),
+            "authenticated bootstrap providers use manual credential enrollment"
+        );
+        crate::provider_connection::resolve_endpoint(
+            &p.base_url,
+            p.models_path.as_deref(),
+            p.connection_parameters.as_ref(),
+        )
+        .map_err(anyhow::Error::msg)?;
 
         let id = db::insert_provider(
             pool,
@@ -73,12 +95,19 @@ pub async fn seed_if_empty(
                 wire_plugin: p.wire_plugin.as_deref().unwrap_or(""),
                 credential_plugin: p.credential_plugin.as_deref().unwrap_or(""),
                 model_source_plugin: p.model_source_plugin.as_deref().unwrap_or(""),
-                credential_mode: "manual",
+                credential_mode: p
+                    .credential_mode
+                    .unwrap_or(crate::plugins::CredentialMode::Manual)
+                    .as_str(),
                 source_plugin_id: None,
                 source_integration_id: None,
             },
         )
         .await?;
+        db::set_provider_connection_parameters(pool, &id, p.connection_parameters.as_ref()).await?;
+        if anonymous {
+            db::insert_account(pool, &id, "__kinetix_noauth__", "", "", 1, 1, None, "none").await?;
+        }
         provider_ids.insert(p.name.clone(), id.clone());
 
         // Accounts.

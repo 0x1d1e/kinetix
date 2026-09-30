@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Server, Plus, RefreshCw, CheckCircle2, Globe, Cpu, Sliders, ExternalLink, HelpCircle, Trash2, X, Pencil, Search } from 'lucide-react';
 import { Provider, ModelConfig, Account } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
+import { ConnectionParameterFields } from '../ConnectionParameterFields';
 import { DESIGN_TOKENS } from '../../lib/designSystem';
 import { Kinetix, DiscoveredModel, ProviderLifecycleStatus } from '../../lib/resources';
 
@@ -327,7 +328,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [name, setName] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [wireFormat, setWireFormat] = useState<'gemini' | 'openai' | 'anthropic' | 'plugin'>('gemini');
-  const [authScheme, setAuthScheme] = useState<'bearer' | 'custom_header' | 'query_param'>('bearer');
+  const [authScheme, setAuthScheme] = useState<Provider['authScheme']>('bearer');
+  const [connectionParameters, setConnectionParameters] = useState<Provider['connectionParameters']>();
   const [customHeader, setCustomHeader] = useState('');
   const [customParam, setCustomParam] = useState('');
   const [modelsPath, setModelsPath] = useState('/models');
@@ -703,6 +705,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
 
   const resetProviderForm = () => {
     setEditingProviderId(null);
+    setConnectionParameters(undefined);
     setName('');
     setBaseUrl('');
     setWireFormat('gemini');
@@ -726,6 +729,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
 
   const openEditProvider = (p: Provider) => {
     setEditingProviderId(p.id);
+    setConnectionParameters(p.connectionParameters);
     setName(p.name);
     setBaseUrl(p.baseUrl);
     setWireFormat(p.wireFormat);
@@ -766,6 +770,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     wire_plugin: wirePlugin.trim(),
     credential_plugin: credentialPlugin.trim(),
     model_source_plugin: modelSourcePlugin.trim(),
+    connection_values: connectionParameters?.values,
     // Only sent when the admin actually typed a credential.
     ...(includeKey && apiKey.trim()
       ? { api_key: apiKey.trim(), account_label: accountLabel.trim() || null }
@@ -776,7 +781,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
     if (!name.trim() || !baseUrl.trim()) return;
     setValidating(true);
     try {
-      const r = await Kinetix.validateProvider(providerBody(false));
+      const r = await Kinetix.validateProvider({ ...providerBody(false), provider_id: editingProviderId });
       setValidation({ valid: r.valid, problems: r.problems || [], warnings: r.warnings || [] });
     } catch (e) {
       setValidation({ valid: false, problems: [(e as Error).message], warnings: [] });
@@ -798,6 +803,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
       baseUrl: baseUrl.trim(),
       wireFormat,
       authScheme,
+      connectionParameters,
       customHeaderName: authScheme === 'custom_header' ? customHeader : undefined,
       customParamName: authScheme === 'query_param' ? customParam : undefined,
       status: 'healthy',
@@ -2054,10 +2060,20 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     </label>
                     <select
                       value={authScheme}
-                      onChange={(e) => setAuthScheme(e.target.value as any)}
+                      disabled={editingProviderId !== null && authScheme === 'none'}
+                      onChange={(e) => {
+                        setAuthScheme(e.target.value as Provider['authScheme']);
+                        if (e.target.value === 'none') {
+                          setApiKey('');
+                          setCustomHeader('');
+                          setCustomParam('');
+                          setCredentialPlugin('');
+                        }
+                      }}
                       className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base sketch-shadow-sm focus:outline-none font-mono"
                       style={{ borderRadius: '255px 15px 225px 15px / 15px 225px 15px 255px' }}
                     >
+                      <option value="none" disabled={editingProviderId !== null && authScheme !== 'none'}>None (anonymous)</option>
                       <option value="bearer">Bearer Header (Authorization)</option>
                       <option value="custom_header">Custom Header (e.g. x-api-key)</option>
                       <option value="query_param">Query Param (?key=...)</option>
@@ -2065,6 +2081,15 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                   </div>
                 </div>
 
+                {connectionParameters && (
+                  <ConnectionParameterFields
+                    declarations={connectionParameters.declarations}
+                    values={connectionParameters.values}
+                    onChange={(values) => setConnectionParameters({ ...connectionParameters, values })}
+                    disabled={isSaving}
+                  />
+                )}
+                {authScheme === 'none' && <p className="text-sm font-body">Anonymous provider. No credential is stored or sent.</p>}
                 {authScheme === 'custom_header' && (
                   <div>
                     <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
@@ -2124,7 +2149,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
 
                 {/* Credential — needed for authenticated model discovery, and to
                     create the provider's first account (FR-10.11). */}
-                <div
+                {authScheme !== 'none' && <div
                   className="p-3 bg-[var(--postit)]/60 border-2 border-dashed border-[var(--ink)]/40"
                   style={{ borderRadius: DESIGN_TOKENS.radii.wobbly }}
                 >
@@ -2159,7 +2184,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     Stored encrypted at rest. Required to fetch an authenticated upstream model list
                     and to create the first account for this provider.
                   </p>
-                </div>
+                </div>}
 
                 <details className="text-sm font-body">
                   <summary className="cursor-pointer font-heading font-bold text-[var(--pen-blue)]">
@@ -2213,6 +2238,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                             type="text"
                             placeholder="plugin:dev.example.foo/foo-oauth"
                             value={credentialPlugin}
+                            disabled={authScheme === 'none'}
                             onChange={(e) => setCredentialPlugin(e.target.value)}
                             className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-sm font-mono sketch-shadow-sm focus:outline-none"
                           />

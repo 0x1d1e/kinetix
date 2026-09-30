@@ -28,6 +28,7 @@ import {
 } from '../../lib/resources';
 import { Provider } from '../../types';
 import { SketchBadge, SketchButton, WobblyCard } from '../HandDrawnElements';
+import { ConnectionParameterFields } from '../ConnectionParameterFields';
 import { useAuthEnrollment } from '../CredentialAuthFlow';
 
 function fileAsBase64(file: File): Promise<string> {
@@ -90,6 +91,7 @@ export const PluginsView: React.FC = () => {
   const [catalogPreview, setCatalogPreview] = useState<PluginCatalogPreview | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
+  const [connectionDrafts, setConnectionDrafts] = useState<Record<string, Record<string, string>>>({});
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [showInstall, setShowInstall] = useState(false);
@@ -480,7 +482,7 @@ export const PluginsView: React.FC = () => {
     setError(null);
     setNotice(null);
     try {
-      const provider = await Kinetix.setupPluginIntegrationProvider(pluginId, integrationId);
+      const provider = await Kinetix.setupPluginIntegrationProvider(pluginId, integrationId, connectionDrafts[`${pluginId}/${integrationId}`] || providers.find((provider) => provider.sourcePluginId === pluginId && provider.sourceIntegrationId === integrationId)?.connectionParameters?.values || {});
       await authEnrollment.begin(
         provider.id,
         () => Kinetix.startProviderCredentialEnrollment(provider.id),
@@ -497,7 +499,7 @@ export const PluginsView: React.FC = () => {
     setError(null);
     setNotice(null);
     try {
-      await Kinetix.setupPluginIntegrationProvider(pluginId, integrationId);
+      await Kinetix.setupPluginIntegrationProvider(pluginId, integrationId, connectionDrafts[`${pluginId}/${integrationId}`] || providers.find((provider) => provider.sourcePluginId === pluginId && provider.sourceIntegrationId === integrationId)?.connectionParameters?.values || {});
       setNotice('Provider created successfully.');
       await refresh(selectedId);
     } catch (err) {
@@ -1102,6 +1104,16 @@ export const PluginsView: React.FC = () => {
                           )}
                         </div>
 
+                        {integration.provider?.parameters && Object.keys(integration.provider.parameters).length > 0 && !providers.some((provider) => provider.sourcePluginId === selected.id && provider.sourceIntegrationId === integration.id) && (
+                          <div className="mt-3">
+                            <ConnectionParameterFields
+                              declarations={integration.provider.parameters}
+                              values={connectionDrafts[`${selected.id}/${integration.id}`] || {}}
+                              onChange={(values) => setConnectionDrafts((drafts) => ({ ...drafts, [`${selected.id}/${integration.id}`]: values }))}
+                              disabled={busy !== null || selected.status !== 'enabled'}
+                            />
+                          </div>
+                        )}
                         {providers.some(
                           (p) =>
                             p.baseUrl === integration.provider?.base_url &&
