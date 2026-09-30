@@ -22,8 +22,13 @@ A model's effective transport is resolved per selected target in this order:
 operator `transport_override` > discovered `discovery.transport.format` >
 provider `wire_format`. Existing models without an override or observation keep
 the provider default. Supported values are `openai`, `openai-responses`,
-`anthropic`, `gemini`, and a namespaced `plugin:<id>/<adapter>` reference.
-Rediscovery updates observed metadata without replacing the operator override.
+`anthropic`, `gemini`, and a namespaced `plugin:<id>/<adapter>` reference. A
+native provider may use a model-level plugin transport through an explicit
+`transport_override`, including from a config import. A plugin transport found
+only in discovery metadata requires a matching provider `wire_plugin` binding;
+otherwise set it explicitly as the model override. To use a plugin as the
+provider's default adapter, bind it through `wire_plugin`. Rediscovery updates
+observed metadata without replacing the operator override.
 
 Inbound formats include OpenAI Chat, OpenAI Responses, and Anthropic Messages.
 OpenAI Chat and Anthropic same-format requests use passthrough when their

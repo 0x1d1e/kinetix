@@ -4810,6 +4810,11 @@ pub async fn update_model_reconciliation(
                     .await
                     .map_err(ApiError::internal)?
                     .ok_or_else(|| ApiError::not_found("provider not found"))?;
+                validate_effective_model_transport_candidate(
+                    &provider,
+                    &json!({ "transport": { "format": transport } }),
+                    None,
+                )?;
                 Some(validate_model_transport_override(
                     &provider,
                     Some(transport),
@@ -8465,13 +8470,6 @@ fn validate_model_transport_override(
     };
     let parsed = crate::adapters::TargetTransport::parse(transport)
         .ok_or_else(|| ApiError::bad(format!("unsupported model transport '{transport}'")))?;
-    if matches!(&parsed, crate::adapters::TargetTransport::Plugin(_))
-        && provider.wire_plugin_ref().is_none()
-    {
-        return Err(ApiError::bad(
-            "plugin model transport requires an explicit provider adapter binding",
-        ));
-    }
     if let Some(reference) = provider.wire_plugin_ref() {
         let bound = crate::adapters::TargetTransport::Plugin(reference.to_string_ref());
         if parsed != bound {
@@ -8481,6 +8479,54 @@ fn validate_model_transport_override(
         }
     }
     Ok(Some(parsed.as_str().to_string()))
+}
+
+fn validate_effective_model_transport_candidate(
+    provider: &db::ProviderRow,
+    discovery: &Value,
+    transport_override: Option<&str>,
+) -> Result<(), ApiError> {
+    let mut effective_discovery = discovery
+        .as_object()
+        .cloned()
+        .map(Value::Object)
+        .unwrap_or_else(|| json!({}));
+    let object = effective_discovery
+        .as_object_mut()
+        .expect("effective discovery is an object");
+    object.remove("configured_transport");
+    if let Some(transport) = transport_override {
+        object.insert("configured_transport".into(), json!(transport));
+    }
+
+    let candidate = db::ModelRow {
+        id: "transport-validation".into(),
+        provider_id: provider.id.clone(),
+        upstream_id: String::new(),
+        display_name: String::new(),
+        enabled: 1,
+        context_window: None,
+        max_output_tokens: None,
+        capabilities: "{}".into(),
+        prices: "{}".into(),
+        parameters: "{}".into(),
+        thinking_map: "{}".into(),
+        extra_request: "{}".into(),
+        discovery: effective_discovery.to_string(),
+        created_at: String::new(),
+        opaque_state_plugin: String::new(),
+    };
+    let transport = crate::adapters::resolve_model_transport(provider, &candidate)
+        .map_err(|error| ApiError::bad(error.message))?;
+    if transport_override.is_none()
+        && matches!(transport, crate::adapters::TargetTransport::Plugin(_))
+        && provider.wire_plugin_ref().is_none()
+    {
+        return Err(ApiError::bad(
+            "discovered plugin model transport requires a provider wire_plugin binding; use an explicit transport_override for a model-level plugin transport",
+        ));
+    }
+    Ok(())
 }
 
 fn default_true() -> bool {
@@ -8670,6 +8716,11 @@ pub async fn create_model(
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     validate_thinking_map(&body.thinking_map)?;
     validate_discovery_execution(&body.discovery)?;
+    validate_effective_model_transport_candidate(
+        &provider,
+        &body.discovery,
+        transport_override.as_deref(),
+    )?;
     let thinking_map =
         serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible");
     let thinking_map_configured = !body.thinking_map.levels.is_empty()
@@ -8862,6 +8913,11 @@ pub async fn update_model(
     let caps = normalize_model_capabilities(&body.capabilities);
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     let existing_discovery = discovery_object(&model);
+    validate_effective_model_transport_candidate(
+        &provider,
+        &existing_discovery,
+        transport_override.as_deref(),
+    )?;
     let previous_prices = model.prices();
     let mut price_fields = effective_price_fields(&existing_discovery, &previous_prices);
     for field in PRICE_FIELDS {
@@ -11543,12 +11599,24 @@ async fn validate_portable_credential_target_transports(
         .await
         .map_err(|error| format!("could not inspect target model transports: {error}"))?;
     for model in models {
-        crate::adapters::resolve_model_transport(provider, &model).map_err(|error| {
-            format!(
-                "target model '{}' has an incompatible transport: {}",
-                model.display_name, error.message
-            )
-        })?;
+        let transport =
+            crate::adapters::resolve_model_transport(provider, &model).map_err(|error| {
+                format!(
+                    "target model '{}' has an incompatible transport: {}",
+                    model.display_name, error.message
+                )
+            })?;
+        if let crate::adapters::TargetTransport::Plugin(plugin) = transport {
+            let provider_plugin = provider
+                .wire_plugin_ref()
+                .map(|reference| reference.to_string_ref());
+            if provider_plugin.as_deref() != Some(plugin.as_str()) {
+                return Err(format!(
+                    "target model '{}' selects plugin transport '{plugin}' without matching provider wire_plugin binding",
+                    model.display_name
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -14146,10 +14214,15 @@ async fn import_config_apply(
         let existing = existing_models
             .iter()
             .find(|model| model.provider_id == *pid && model.upstream_id == upstream);
+        let existing_discovery = existing.map(discovery_object).unwrap_or_else(|| json!({}));
+        validate_effective_model_transport_candidate(
+            &provider_row,
+            &existing_discovery,
+            transport_override.as_deref(),
+        )?;
         if let Some(existing) = existing {
             let existing_id = existing.id.clone();
             model_ids.insert(model_key.clone(), existing_id.clone());
-            let existing_discovery = discovery_object(existing);
             let previous_prices = existing.prices();
             let (price_source, price_metadata, discovery_patch) = if let Some(ownership) =
                 imported_ownership.as_ref()
@@ -18740,6 +18813,33 @@ mod credential_enrollment_regression_tests {
         test_state_with_allow_insecure_tls(tag, true).await
     }
 
+    async fn insert_transport_test_model(
+        state: &AppState,
+        provider_id: &str,
+        upstream_id: &str,
+        discovery: Value,
+    ) -> String {
+        db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id,
+                upstream_id,
+                display_name: upstream_id,
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
     async fn test_state_with_allow_insecure_tls(
         tag: &str,
         allow_insecure_tls: bool,
@@ -18797,6 +18897,158 @@ mod credential_enrollment_regression_tests {
             0,
         );
         (state, root)
+    }
+
+    #[tokio::test]
+    async fn unbound_plugin_discovery_import_is_rejected_but_explicit_model_override_remains_supported(
+    ) {
+        let (state, root) = test_state("plugin-discovery-transport").await;
+        let provider_id = insert_provider(
+            &state,
+            "native-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let legacy_model_id = insert_transport_test_model(
+            &state,
+            &provider_id,
+            "legacy-plugin-model",
+            json!({ "configured_transport": "plugin:legacy/adapter" }),
+        )
+        .await;
+        state.registry.reload(&state.pool).await.unwrap();
+        let snapshot = state.registry.snapshot();
+        assert_eq!(
+            crate::adapters::resolve_execution_profile(
+                snapshot.providers.get(&provider_id).unwrap(),
+                snapshot.models.get(&legacy_model_id).unwrap()
+            )
+            .unwrap()
+            .transport,
+            crate::adapters::TargetTransport::Plugin("plugin:legacy/adapter".into())
+        );
+
+        let error = create_model(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(provider_id.clone()),
+            Json(ModelBody {
+                upstream_id: "discovered-plugin-model".into(),
+                display_name: None,
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({
+                    "imported_from_discovery": true,
+                    "execution_supported": true,
+                    "transport": { "format": "plugin:other/adapter" }
+                }),
+                transport_override: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("discovered plugin model transport"));
+        let models = db::models_for_provider(&state.pool, &provider_id)
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].upstream_id, "legacy-plugin-model");
+
+        let created = create_model(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(provider_id.clone()),
+            Json(ModelBody {
+                upstream_id: "explicit-plugin-model".into(),
+                display_name: None,
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({
+                    "imported_from_discovery": true,
+                    "execution_supported": true
+                }),
+                transport_override: Some("plugin:other/adapter".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let model_id = created.0["id"].as_str().unwrap();
+        let snapshot = state.registry.snapshot();
+        assert_eq!(
+            crate::adapters::resolve_execution_profile(
+                snapshot.providers.get(&provider_id).unwrap(),
+                snapshot.models.get(model_id).unwrap()
+            )
+            .unwrap()
+            .transport,
+            crate::adapters::TargetTransport::Plugin("plugin:other/adapter".into())
+        );
+
+        let reconciliation_model_id = insert_transport_test_model(
+            &state,
+            &provider_id,
+            "reconciliation-plugin-model",
+            json!({}),
+        )
+        .await;
+        db::merge_model_discovery(
+            &state.pool,
+            &reconciliation_model_id,
+            &json!({
+                "latest_observation": {
+                    "transport": { "format": "plugin:other/adapter" }
+                },
+                "reconciliation": { "diff": [{ "field": "transport" }] }
+            }),
+        )
+        .await
+        .unwrap();
+        let error = update_model_reconciliation(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(reconciliation_model_id.clone()),
+            Json(ReconciliationActionBody {
+                action: "accept".into(),
+                fields: vec!["transport".into()],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        let reconciliation_model = db::get_model(&state.pool, &reconciliation_model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(discovery_object(&reconciliation_model)
+            .get("configured_transport")
+            .is_none());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -29150,8 +29402,7 @@ storage = "2MiB"
                 .unwrap()
                 .iter()
                 .filter_map(Value::as_str)
-                .any(|problem| problem
-                    .contains("plugin transport requires a valid provider adapter binding")));
+                .any(|problem| problem.contains("without matching provider wire_plugin binding")));
             assert!(
                 db::list_accounts_for_provider(&target.pool, &target_provider_id)
                     .await

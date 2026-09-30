@@ -238,9 +238,7 @@ fn resolve_model_transport_from_discovery(
         TargetTransport::default_for_provider(provider)?
     };
 
-    if provider_plugin.is_none()
-        && (provider_wire == WireFormat::Plugin || matches!(&transport, TargetTransport::Plugin(_)))
-    {
+    if provider_plugin.is_none() && provider_wire == WireFormat::Plugin {
         return Err(ProxyError::unsupported(
             "plugin transport requires a valid provider adapter binding",
         ));
@@ -2410,26 +2408,30 @@ mod execution_profile_tests {
     }
 
     #[test]
-    fn model_plugin_transport_requires_a_provider_adapter_binding() {
+    fn model_plugin_transports_remain_runtime_supported_without_provider_binding() {
         let provider = provider();
         let mut model = model();
         model.discovery = serde_json::json!({
             "configured_transport": "plugin:other/adapter"
         })
         .to_string();
-        let error = resolve_execution_profile(&provider, &model).unwrap_err();
-        assert!(error
-            .message
-            .contains("plugin transport requires a valid provider adapter binding"));
+        assert_eq!(
+            resolve_execution_profile(&provider, &model)
+                .unwrap()
+                .transport,
+            TargetTransport::Plugin("plugin:other/adapter".into())
+        );
 
         model.discovery = serde_json::json!({
             "transport": {"format": "plugin:other/adapter"}
         })
         .to_string();
-        let error = resolve_execution_profile(&provider, &model).unwrap_err();
-        assert!(error
-            .message
-            .contains("plugin transport requires a valid provider adapter binding"));
+        assert_eq!(
+            resolve_execution_profile(&provider, &model)
+                .unwrap()
+                .transport,
+            TargetTransport::Plugin("plugin:other/adapter".into())
+        );
 
         let mut bound_provider = provider;
         bound_provider.wire_plugin = "plugin:trusted/adapter".into();
@@ -2467,6 +2469,9 @@ mod execution_profile_tests {
         .to_string();
         let mut provider = provider;
         provider.wire_format = "typo-openai".into();
+        assert!(resolve_execution_profile(&provider, &model).is_err());
+
+        provider.wire_format = "plugin".into();
         assert!(resolve_execution_profile(&provider, &model).is_err());
     }
 
