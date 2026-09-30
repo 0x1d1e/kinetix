@@ -24,7 +24,14 @@ A bundle has schema `llm-credential-bundle/v1` and contains records with a separ
               "base_url": "https://api.anthropic.com",
               "credential_plugin": "",
               "source_plugin_id": null,
-              "source_integration_id": null
+              "source_integration_id": null,
+              "wire_format": "openai",
+              "wire_plugin": "",
+              "allow_insecure_tls": false,
+              "credential_hosts": [],
+              "follow_redirects": false,
+              "custom_header_name": null,
+              "custom_param_name": null
             }
           }
         }
@@ -34,9 +41,9 @@ A bundle has schema `llm-credential-bundle/v1` and contains records with a separ
 }
 ```
 
-`kind` is `api_key`, `oauth`, `token`, `custom`, or `none`. `metadata.credential_mode` is required and explicitly identifies `manual`, `auth_flow`, or `none`; it is not inferred from missing fields. Namespaced `metadata.extensions` carry provider-specific compatibility data without imposing it on other producers. Kinetix accepts unknown optional fields and ignores them where unsupported. Its `org.prightcord.kinetix` extension includes the normalized `base_url` as endpoint identity.
+`kind` is `api_key`, `oauth`, `token`, `custom`, or `none`. `metadata.credential_mode` is required and explicitly identifies `manual`, `auth_flow`, or `none`; it is not inferred from missing fields. Namespaced `metadata.extensions` carry provider-specific compatibility data without imposing it on other producers. Kinetix accepts unknown optional fields and ignores them where unsupported. Its `org.prightcord.kinetix` extension binds the normalized `base_url` and credential-delivery settings: auth scheme and plugin bindings, wire format and adapter plugin, TLS verification, credential-host allowlist, redirect policy, and custom auth field names. `credential_hosts` is exported as a sorted, lowercase array.
 
-A `none` descriptor has kind `none` and no envelope. Manual descriptors use `api_key`, `token`, or `custom`; auth-flow descriptors use `oauth` or `custom`. Kinetix stores manual values as generic strings, so imported manual `token` and `custom` kinds are exported as `api_key` later. Auth-flow `oauth` versus `custom` is preserved. Kinetix matches `provider` to a unique configured provider name and `label` to an account label. Whenever Kinetix endpoint identity is present, it must match the configured provider; secret-bearing imports require it. Duplicate provider names and endpoint mismatches are rejected. This identity does not create or reconfigure providers; bundles do not transfer account policy or health state.
+A `none` descriptor has kind `none` and no envelope. Manual descriptors use `api_key`, `token`, or `custom`; auth-flow descriptors use `oauth` or `custom`. Kinetix stores manual values as generic strings, so imported manual `token` and `custom` kinds are exported as `api_key` later. Auth-flow `oauth` versus `custom` is preserved. Kinetix matches `provider` to a unique configured provider name and `label` to an account label. Kinetix rejects imports when the endpoint or any credential-delivery setting differs from the configured provider. Duplicate provider names are rejected. This identity does not create or reconfigure providers; bundles do not transfer account policy or health state.
 
 ## Encrypted secrets
 
@@ -115,6 +122,6 @@ Secret-inclusive export requires both explicit intent and a passphrase:
 
 Supply `passphrase` when the bundle contains secret envelopes. Dry-run returns `valid`, `plan`, `problems`, `conflicts`, `warnings`, and `missing_resources`. It writes nothing. Manual secrets must contain a non-whitespace character; auth-flow secrets must be JSON objects no larger than 256 KiB. Applying reruns validation and stages the next runtime snapshot inside one SQLite write transaction; validation, write, or snapshot-build failures roll back the whole import. Imported secrets are decrypted only in memory and re-encrypted with the destination's local key.
 
-Kinetix resolves descriptors by unique provider name and validates the explicit credential mode. Kinetix endpoint identity, when present, is always checked; secret-bearing imports require it. Kinetix bundles exported before endpoint identity was added must be re-exported. Auth-flow imports also require matching Kinetix integration bindings; installed plugin manifests are authoritative. An unavailable plugin integration is reported in `missing_resources`; the credential can still be stored, but the plugin must be installed before it can be used. No plugin-private KV state is imported. Secret-inclusive export currently rejects bundles containing auth-flow accounts because `accounts.secret_enc` may be stale relative to a plugin's rotated canonical credential. Import can create a new auth-flow account from an envelope as initial account-row state, but auth-flow replacement is rejected because updating only that row cannot safely replace plugin state or cached leases. Portable export and replacement need a versioned plugin snapshot/restore contract before they can be supported safely.
+Kinetix resolves descriptors by unique provider name and validates the explicit credential mode. It checks the endpoint and all credential-delivery settings before accepting an import. Kinetix bundles exported before delivery identity was added must be re-exported. Auth-flow imports also require matching Kinetix integration bindings; installed plugin manifests are authoritative. An unavailable plugin integration is reported in `missing_resources`; the credential can still be stored, but the plugin must be installed before it can be used. No plugin-private KV state is imported. Secret-inclusive export currently rejects bundles containing auth-flow accounts because `accounts.secret_enc` may be stale relative to a plugin's rotated canonical credential. Import can create a new auth-flow account from an envelope as initial account-row state, but auth-flow replacement is rejected because updating only that row cannot safely replace plugin state or cached leases. Portable export and replacement need a versioned plugin snapshot/restore contract before they can be supported safely.
 
 A descriptor without an envelope is validation-only: it can be checked or used as a template, but does not create a credential. Existing provider/label matches with an envelope are reported as conflicts and left unchanged unless `replace_existing: true`; auth-flow replacement is rejected even when explicitly requested. Manual replacement changes only credential material. New accounts use local defaults. A `none` descriptor verifies a credential-free provider and makes no account changes.

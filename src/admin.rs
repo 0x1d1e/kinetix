@@ -11022,6 +11022,37 @@ fn no_store_json(value: Value) -> Response {
     response
 }
 
+fn portable_credential_delivery_metadata(
+    provider: &db::ProviderRow,
+) -> serde_json::Map<String, Value> {
+    let mut credential_hosts = provider
+        .credential_hosts()
+        .into_iter()
+        .map(|host| host.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    credential_hosts.sort_unstable();
+    credential_hosts.dedup();
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("wire_format".into(), json!(provider.wire_format));
+    metadata.insert("wire_plugin".into(), json!(provider.wire_plugin));
+    metadata.insert("allow_insecure_tls".into(), json!(provider.insecure_tls()));
+    metadata.insert("credential_hosts".into(), json!(credential_hosts));
+    metadata.insert(
+        "follow_redirects".into(),
+        json!(provider.follows_redirects()),
+    );
+    metadata.insert(
+        "custom_header_name".into(),
+        json!(provider.custom_header_name),
+    );
+    metadata.insert(
+        "custom_param_name".into(),
+        json!(provider.custom_param_name),
+    );
+    metadata
+}
+
 fn portable_credential_descriptor(
     provider: &db::ProviderRow,
     label: &str,
@@ -11041,6 +11072,7 @@ fn portable_credential_descriptor(
         "source_integration_id".into(),
         json!(provider.source_integration_id),
     );
+    kinetix.extend(portable_credential_delivery_metadata(provider));
     let mut extensions = serde_json::Map::new();
     extensions.insert(
         crate::credential_interchange::KINETIX_EXTENSION.into(),
@@ -11542,6 +11574,14 @@ async fn validate_portable_credential_provider(
                 "credential '{} / {}' endpoint identity does not match the configured provider",
                 descriptor.provider, descriptor.label
             ));
+        }
+        for (field, expected) in portable_credential_delivery_metadata(provider) {
+            if extension.get(&field) != Some(&expected) {
+                return Err(format!(
+                    "credential '{} / {}' delivery identity field '{}' does not match the configured provider",
+                    descriptor.provider, descriptor.label, field
+                ));
+            }
         }
         if mode == "auth_flow" {
             let plugin_id = source_plugin_id
@@ -18609,6 +18649,13 @@ mod credential_enrollment_regression_tests {
     }
 
     async fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
+        test_state_with_allow_insecure_tls(tag, true).await
+    }
+
+    async fn test_state_with_allow_insecure_tls(
+        tag: &str,
+        allow_insecure_tls: bool,
+    ) -> (AppState, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "kinetix-credential-enrollment-{tag}-{}",
             uuid::Uuid::new_v4().simple()
@@ -18634,7 +18681,7 @@ mod credential_enrollment_regression_tests {
             log_json: false,
             bootstrap_file: None,
             allow_private_upstreams: true,
-            allow_insecure_tls: true,
+            allow_insecure_tls,
             data_dir: paths.data_dir.clone(),
             shutdown_grace_secs: 1,
             max_inflight_inferences: crate::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
@@ -27968,6 +28015,38 @@ storage = "2MiB"
             }
         }
 
+        async fn set_provider_delivery_profile(
+            state: &AppState,
+            provider_id: &str,
+            wire_format: &str,
+            wire_plugin: &str,
+            auth_scheme: &str,
+            custom_header_name: Option<&str>,
+            custom_param_name: Option<&str>,
+            follow_redirects: bool,
+            credential_hosts: &str,
+            allow_insecure_tls: bool,
+        ) {
+            sqlx::query(
+                "UPDATE providers SET base_url = ?, wire_format = ?, wire_plugin = ?, auth_scheme = ?, \
+                 custom_header_name = ?, custom_param_name = ?, follow_redirects = ?, \
+                 credential_hosts = ?, allow_insecure_tls = ? WHERE id = ?",
+            )
+            .bind("https://api.example.com")
+            .bind(wire_format)
+            .bind(wire_plugin)
+            .bind(auth_scheme)
+            .bind(custom_header_name)
+            .bind(custom_param_name)
+            .bind(follow_redirects as i64)
+            .bind(credential_hosts)
+            .bind(allow_insecure_tls as i64)
+            .bind(provider_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
         fn encrypted_import_bundle(
             entries: Vec<(crate::credential_interchange::CredentialDescriptor, String)>,
         ) -> Value {
@@ -28579,6 +28658,288 @@ storage = "2MiB"
             .await
             .unwrap_err();
             assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+            assert!(
+                db::list_accounts_for_provider(&target.pool, &target_provider_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn rejects_credentials_with_a_different_delivery_boundary() {
+            let (source, source_root) =
+                test_state_with_allow_insecure_tls("portable-delivery-source", false).await;
+            let (target, target_root) =
+                test_state_with_allow_insecure_tls("portable-delivery-target", false).await;
+            let source_provider_id = insert_provider(
+                &source,
+                "shared-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_provider_id = insert_provider(
+                &target,
+                "shared-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            set_provider_delivery_profile(
+                &source,
+                &source_provider_id,
+                "openai",
+                "",
+                "custom_header",
+                Some("x-api-key"),
+                None,
+                false,
+                "",
+                false,
+            )
+            .await;
+            set_provider_delivery_profile(
+                &target,
+                &target_provider_id,
+                "openai",
+                "",
+                "custom_header",
+                Some("x-api-key"),
+                None,
+                false,
+                "",
+                false,
+            )
+            .await;
+            add_account(
+                &source,
+                &source_provider_id,
+                "work",
+                "source-credential",
+                &crypto::mask_secret("source-credential"),
+                1,
+            )
+            .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            let compatible = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(compatible["valid"], true);
+
+            let delivery_mismatches = [
+                (
+                    "wire_format",
+                    "plugin",
+                    "plugin:other/adapter",
+                    "custom_header",
+                    Some("x-api-key"),
+                    None,
+                    false,
+                    "",
+                    false,
+                ),
+                (
+                    "wire_plugin",
+                    "openai",
+                    "plugin:other/adapter",
+                    "custom_header",
+                    Some("x-api-key"),
+                    None,
+                    false,
+                    "",
+                    false,
+                ),
+                (
+                    "allow_insecure_tls",
+                    "openai",
+                    "",
+                    "custom_header",
+                    Some("x-api-key"),
+                    None,
+                    false,
+                    "",
+                    true,
+                ),
+                (
+                    "credential_hosts",
+                    "openai",
+                    "",
+                    "custom_header",
+                    Some("x-api-key"),
+                    None,
+                    false,
+                    "other.example",
+                    false,
+                ),
+                (
+                    "follow_redirects",
+                    "openai",
+                    "",
+                    "custom_header",
+                    Some("x-api-key"),
+                    None,
+                    true,
+                    "",
+                    false,
+                ),
+                (
+                    "custom_header_name",
+                    "openai",
+                    "",
+                    "custom_header",
+                    Some("x-other-key"),
+                    None,
+                    false,
+                    "",
+                    false,
+                ),
+            ];
+            for (
+                changed_field,
+                wire_format,
+                wire_plugin,
+                auth_scheme,
+                custom_header_name,
+                custom_param_name,
+                follow_redirects,
+                credential_hosts,
+                allow_insecure_tls,
+            ) in delivery_mismatches
+            {
+                set_provider_delivery_profile(
+                    &target,
+                    &target_provider_id,
+                    wire_format,
+                    wire_plugin,
+                    auth_scheme,
+                    custom_header_name,
+                    custom_param_name,
+                    follow_redirects,
+                    credential_hosts,
+                    allow_insecure_tls,
+                )
+                .await;
+                let dry_run = response_json(
+                    import_credentials(
+                        State(target.clone()),
+                        auth(),
+                        Json(import_body(bundle.clone(), false)),
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .await;
+                assert_eq!(dry_run["valid"], false, "{changed_field} mismatch accepted");
+                assert!(dry_run["problems"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|problem| problem.contains(changed_field)));
+                assert!(
+                    db::list_accounts_for_provider(&target.pool, &target_provider_id)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+
+            set_provider_delivery_profile(
+                &source,
+                &source_provider_id,
+                "openai",
+                "",
+                "query_param",
+                None,
+                Some("api_key"),
+                false,
+                "",
+                false,
+            )
+            .await;
+            set_provider_delivery_profile(
+                &target,
+                &target_provider_id,
+                "openai",
+                "",
+                "query_param",
+                None,
+                Some("api_key"),
+                false,
+                "",
+                false,
+            )
+            .await;
+            let query_param_bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            set_provider_delivery_profile(
+                &target,
+                &target_provider_id,
+                "openai",
+                "",
+                "query_param",
+                None,
+                Some("access_token"),
+                false,
+                "",
+                false,
+            )
+            .await;
+            let query_param_mismatch = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(query_param_bundle, false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(query_param_mismatch["valid"], false);
+            assert!(query_param_mismatch["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|problem| problem.contains("custom_param_name")));
             assert!(
                 db::list_accounts_for_provider(&target.pool, &target_provider_id)
                     .await
