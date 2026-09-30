@@ -72,8 +72,6 @@ pub(crate) struct DispatchCandidateRecord {
     pub strategy_rank: Option<usize>,
     pub decision: PreDispatchDecision,
     pub selected: bool,
-    pub unreachable_after_quota: bool,
-    pub stochastic_frontier: bool,
     pub decision_reason: &'static str,
 }
 
@@ -239,8 +237,6 @@ pub(crate) fn plan_dispatch(
                 strategy_rank: effective_rank,
                 decision: decisions[index],
                 selected,
-                unreachable_after_quota,
-                stochastic_frontier: in_stochastic_frontier,
                 decision_reason,
             }
         })
@@ -457,7 +453,6 @@ mod tests {
             plan.candidates[0].decision,
             PreDispatchDecision::RateLimited
         );
-        assert!(plan.candidates[1].unreachable_after_quota);
         assert_eq!(
             plan.candidates[1].decision_reason,
             "unreachable_after_quota_failure"
@@ -480,7 +475,7 @@ mod tests {
         assert!(plan
             .candidates
             .iter()
-            .all(|candidate| candidate.stochastic_frontier));
+            .all(|candidate| candidate.decision_reason == "stochastic_selection"));
         assert!(plan.candidates.iter().all(|candidate| !candidate.selected));
     }
 
@@ -516,7 +511,10 @@ mod tests {
         );
         assert_eq!(plan.outcome, DispatchOutcome::Selected("first".into()));
         assert!(!plan.stochastic_selection);
-        assert!(!plan.candidates[1].stochastic_frontier);
+        assert_eq!(
+            plan.candidates[1].decision_reason,
+            "another_account_ordered_first"
+        );
     }
 
     #[test]

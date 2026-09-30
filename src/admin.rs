@@ -8112,11 +8112,11 @@ pub async fn probe_model_capability(
             (
                 "inconclusive",
                 status_code,
-                Some(truncate(&crypto::redact(&error), 400)),
+                Some(truncate(&crypto::redact(error), 400)),
             )
         } else if (200..300).contains(&status_code) {
             if body.capability == "reasoning_disable" {
-                let verified = serde_json::from_str::<Value>(&text)
+                let verified = serde_json::from_str::<Value>(text)
                     .ok()
                     .and_then(|payload| adapter.parse_full_response(&payload).ok())
                     .and_then(|events| reasoning_disable_probe_contract(&events));
@@ -8141,7 +8141,7 @@ pub async fn probe_model_capability(
                     }
             } else {
                 let contract_verified = match body.capability.as_str() {
-                    "tool_calling" => serde_json::from_str::<Value>(&text)
+                    "tool_calling" => serde_json::from_str::<Value>(text)
                         .ok()
                         .and_then(|payload| adapter.parse_full_response(&payload).ok())
                         .is_some_and(|events| {
@@ -8153,7 +8153,7 @@ pub async fn probe_model_capability(
                                 )
                             })
                         }),
-                    "structured_output" => serde_json::from_str::<Value>(&text)
+                    "structured_output" => serde_json::from_str::<Value>(text)
                         .ok()
                         .and_then(|payload| adapter.parse_full_response(&payload).ok())
                         .map(|events| {

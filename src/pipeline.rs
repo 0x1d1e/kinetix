@@ -4465,7 +4465,7 @@ fn capability_eligibility(
             Some(false) => "unsupported",
             None => "unknown",
         };
-        let supported = !needed || value == Some(true) || (value.is_none() && !strict);
+        let supported = !needed || value == Some(true) || !strict;
         if needed && !supported {
             eligible = false;
             reasons.push(format!(
@@ -6675,10 +6675,15 @@ mod route_policy_tests {
             vision: Some(false),
             ..Default::default()
         };
-        assert!(!capability_eligibility(&unsupported, &needs, false).eligible);
+        let permissive = capability_eligibility(&unsupported, &needs, false);
+        assert!(permissive.eligible);
+        assert_eq!(permissive.details["vision"]["status"], "unsupported");
+
+        let strict = capability_eligibility(&unsupported, &needs, true);
+        assert!(!strict.eligible);
         assert_eq!(
-            capability_eligibility(&unsupported, &needs, false).details["vision"]["status"],
-            "unsupported"
+            strict.reasons,
+            ["required vision capability is unsupported"]
         );
     }
 
