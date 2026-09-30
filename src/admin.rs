@@ -11177,6 +11177,65 @@ fn portable_credential_descriptor(
     })
 }
 
+fn validate_portable_credential_export_identities(
+    providers: &[db::ProviderRow],
+    accounts: &[db::AccountRow],
+) -> Result<(), ApiError> {
+    let mut exported_provider_ids = providers
+        .iter()
+        .filter(|provider| provider.credential_mode == "none")
+        .map(|provider| provider.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for account in accounts
+        .iter()
+        .filter(|account| account.label != "__kinetix_noauth__")
+    {
+        exported_provider_ids.insert(account.provider_id.clone());
+    }
+
+    let mut provider_name_counts = std::collections::HashMap::<&str, usize>::new();
+    for provider in providers {
+        *provider_name_counts
+            .entry(provider.name.as_str())
+            .or_default() += 1;
+    }
+    for provider_id in exported_provider_ids {
+        let provider = providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| ApiError::internal("credential references a missing provider"))?;
+        if provider_name_counts
+            .get(provider.name.as_str())
+            .copied()
+            .unwrap_or_default()
+            > 1
+        {
+            return Err(ApiError::bad(format!(
+                "credential export cannot represent ambiguous provider name '{}'",
+                provider.name
+            )));
+        }
+    }
+
+    let mut account_identities = std::collections::HashSet::new();
+    for account in accounts
+        .iter()
+        .filter(|account| account.label != "__kinetix_noauth__")
+    {
+        if !account_identities.insert((account.provider_id.as_str(), account.label.as_str())) {
+            let provider = providers
+                .iter()
+                .find(|provider| provider.id == account.provider_id)
+                .ok_or_else(|| ApiError::internal("account references a missing provider"))?;
+            return Err(ApiError::bad(format!(
+                "credential export cannot represent duplicate account label '{}' for provider '{}'",
+                account.label, provider.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub async fn export_credentials(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -11207,6 +11266,7 @@ pub async fn export_credentials(
     let snapshot = db::config_export_snapshot_with_hook(&state.pool, || async {})
         .await
         .map_err(ApiError::internal)?;
+    validate_portable_credential_export_identities(&snapshot.providers, &snapshot.accounts)?;
     let mut records = Vec::new();
     let mut descriptors = Vec::new();
     let mut secrets = Vec::new();
@@ -28705,6 +28765,108 @@ storage = "2MiB"
                 extensions: serde_json::Map::new(),
             })
             .unwrap()
+        }
+
+        #[tokio::test]
+        async fn secret_export_rejects_duplicate_provider_names() {
+            let (source, source_root) = test_state("portable-export-duplicate-providers").await;
+            let first_provider_id = insert_provider(
+                &source,
+                "duplicate-name",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let second_provider_id = insert_provider(
+                &source,
+                "duplicate-name",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &source,
+                &first_provider_id,
+                "work-a",
+                "secret-a",
+                &crypto::mask_secret("secret-a"),
+                1,
+            )
+            .await;
+            add_account(
+                &source,
+                &second_provider_id,
+                "work-b",
+                "secret-b",
+                &crypto::mask_secret("secret-b"),
+                1,
+            )
+            .await;
+
+            let error = export_credentials(
+                State(source.clone()),
+                auth(),
+                Json(CredentialExportBody {
+                    include_secrets: false,
+                    passphrase: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error.1.contains("ambiguous provider name"));
+
+            drop(source);
+            let _ = std::fs::remove_dir_all(source_root);
+        }
+
+        #[tokio::test]
+        async fn secret_export_rejects_duplicate_account_labels() {
+            let (source, source_root) = test_state("portable-export-duplicate-labels").await;
+            let provider_id = insert_provider(
+                &source,
+                "duplicate-label-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &source,
+                &provider_id,
+                "work",
+                "secret-a",
+                &crypto::mask_secret("secret-a"),
+                1,
+            )
+            .await;
+            add_account(
+                &source,
+                &provider_id,
+                "work",
+                "secret-b",
+                &crypto::mask_secret("secret-b"),
+                2,
+            )
+            .await;
+
+            let error = export_credentials(
+                State(source.clone()),
+                auth(),
+                Json(CredentialExportBody {
+                    include_secrets: false,
+                    passphrase: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error.1.contains("duplicate account label"));
+
+            drop(source);
+            let _ = std::fs::remove_dir_all(source_root);
         }
 
         #[tokio::test]
