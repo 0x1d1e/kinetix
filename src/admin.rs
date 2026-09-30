@@ -1911,6 +1911,14 @@ fn normalize_provider_endpoint_identity(base_url: &str) -> Option<String> {
     Some(url.to_string().trim_end_matches('/').to_string())
 }
 
+fn normalize_credential_endpoint_identity(base_url: &str) -> Option<String> {
+    let mut url = url::Url::parse(base_url).ok()?;
+    url.set_fragment(None);
+    let trimmed = url.path().trim_end_matches('/').to_string();
+    url.set_path(&trimmed);
+    Some(url.to_string().trim_end_matches('/').to_string())
+}
+
 fn validate_direct_api_integration_endpoint(
     name: &str,
     base_url: &str,
@@ -11018,9 +11026,12 @@ fn portable_credential_descriptor(
     provider: &db::ProviderRow,
     label: &str,
     kind: crate::credential_interchange::CredentialKind,
-) -> crate::credential_interchange::CredentialDescriptor {
+) -> Result<crate::credential_interchange::CredentialDescriptor, String> {
+    let base_url = normalize_credential_endpoint_identity(&provider.base_url)
+        .ok_or_else(|| format!("provider '{}' has an invalid endpoint URL", provider.name))?;
     let mut kinetix = serde_json::Map::new();
     kinetix.insert("auth_scheme".into(), json!(provider.auth_scheme));
+    kinetix.insert("base_url".into(), json!(base_url));
     kinetix.insert(
         "credential_plugin".into(),
         json!(provider.credential_plugin),
@@ -11035,7 +11046,7 @@ fn portable_credential_descriptor(
         crate::credential_interchange::KINETIX_EXTENSION.into(),
         Value::Object(kinetix),
     );
-    crate::credential_interchange::CredentialDescriptor {
+    Ok(crate::credential_interchange::CredentialDescriptor {
         schema: crate::credential_interchange::DESCRIPTOR_SCHEMA.into(),
         kind,
         provider: provider.name.clone(),
@@ -11045,7 +11056,7 @@ fn portable_credential_descriptor(
             "extensions": extensions,
         }),
         extensions: serde_json::Map::new(),
-    }
+    })
 }
 
 pub async fn export_credentials(
@@ -11089,7 +11100,8 @@ pub async fn export_credentials(
                     provider,
                     "default",
                     crate::credential_interchange::CredentialKind::None,
-                ),
+                )
+                .map_err(ApiError::internal)?,
                 secret_envelope: None,
                 extensions: serde_json::Map::new(),
             });
@@ -11123,7 +11135,8 @@ pub async fn export_credentials(
                 "secret-inclusive export of auth-flow credentials is unavailable until the credential plugin supports authoritative snapshot and restore",
             ));
         }
-        let descriptor = portable_credential_descriptor(provider, &account.label, kind);
+        let descriptor = portable_credential_descriptor(provider, &account.label, kind)
+            .map_err(ApiError::internal)?;
         let secret = if body.include_secrets {
             Some(
                 state
@@ -11223,10 +11236,13 @@ async fn build_portable_credential_import_plan(
         .fetch_all(&mut **tx)
         .await
         .map_err(ApiError::internal)?;
-    let providers_by_name = providers
-        .iter()
-        .map(|provider| (provider.name.as_str(), provider))
-        .collect::<std::collections::HashMap<_, _>>();
+    let mut providers_by_name = std::collections::HashMap::<&str, Vec<&db::ProviderRow>>::new();
+    for provider in &providers {
+        providers_by_name
+            .entry(provider.name.as_str())
+            .or_default()
+            .push(provider);
+    }
     let mut problems = Vec::<String>::new();
     let mut conflicts = Vec::<Value>::new();
     let mut warnings = Vec::<String>::new();
@@ -11262,13 +11278,29 @@ async fn build_portable_credential_import_plan(
             continue;
         }
 
-        let Some(provider) = providers_by_name.get(provider_name).copied() else {
-            missing_resources.push(json!({ "kind": "provider", "name": provider_name }));
-            problems.push(format!(
-                "credential references missing provider '{provider_name}'"
-            ));
-            continue;
+        let provider = match providers_by_name.get(provider_name).map(Vec::as_slice) {
+            Some([provider]) => *provider,
+            Some(matches) => {
+                conflicts.push(json!({
+                    "kind": "provider",
+                    "name": provider_name,
+                    "reason": "ambiguous provider name",
+                    "matches": matches.len(),
+                }));
+                problems.push(format!(
+                    "credential references ambiguous provider '{provider_name}'"
+                ));
+                continue;
+            }
+            None => {
+                missing_resources.push(json!({ "kind": "provider", "name": provider_name }));
+                problems.push(format!(
+                    "credential references missing provider '{provider_name}'"
+                ));
+                continue;
+            }
         };
+        let secret = secrets.get(index).cloned().flatten();
         if provider.credential_mode != mode {
             problems.push(format!(
                 "credential '{provider_name}/{label}' uses credential_mode '{mode}', but the target provider uses '{}'",
@@ -11276,7 +11308,9 @@ async fn build_portable_credential_import_plan(
             ));
             continue;
         }
-        match validate_portable_credential_provider(state, provider, descriptor).await {
+        match validate_portable_credential_provider(state, provider, descriptor, secret.is_some())
+            .await
+        {
             Ok(Some(resource)) => {
                 warnings.push(format!(
                     "credential '{provider_name}/{label}' targets an unavailable plugin integration"
@@ -11324,7 +11358,6 @@ async fn build_portable_credential_import_plan(
             continue;
         }
 
-        let secret = secrets.get(index).cloned().flatten();
         if secret.is_some()
             && mode == "manual"
             && descriptor.kind != crate::credential_interchange::CredentialKind::ApiKey
@@ -11432,6 +11465,7 @@ async fn validate_portable_credential_provider(
     state: &AppState,
     provider: &db::ProviderRow,
     descriptor: &crate::credential_interchange::CredentialDescriptor,
+    require_endpoint_identity: bool,
 ) -> Result<Option<Value>, String> {
     let mode = provider.credential_mode.as_str();
     let extension = descriptor
@@ -11442,6 +11476,12 @@ async fn validate_portable_credential_provider(
     if mode == "auth_flow" && extension.is_none() {
         return Err(format!(
             "credential '{} / {}' requires Kinetix integration metadata to verify auth-flow compatibility",
+            descriptor.provider, descriptor.label
+        ));
+    }
+    if require_endpoint_identity && extension.is_none() {
+        return Err(format!(
+            "credential '{} / {}' has no Kinetix endpoint identity",
             descriptor.provider, descriptor.label
         ));
     }
@@ -11471,6 +11511,35 @@ async fn validate_portable_credential_provider(
         {
             return Err(format!(
                 "credential '{} / {}' provider metadata does not match the configured provider",
+                descriptor.provider, descriptor.label
+            ));
+        }
+        let source_base_url = extension
+            .get("base_url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "credential '{} / {}' is missing its endpoint identity",
+                    descriptor.provider, descriptor.label
+                )
+            })?;
+        let source_endpoint =
+            normalize_credential_endpoint_identity(source_base_url).ok_or_else(|| {
+                format!(
+                    "credential '{} / {}' has an invalid endpoint identity",
+                    descriptor.provider, descriptor.label
+                )
+            })?;
+        let target_endpoint = normalize_credential_endpoint_identity(&provider.base_url)
+            .ok_or_else(|| {
+                format!(
+                    "credential '{} / {}' targets a provider with an invalid endpoint URL",
+                    descriptor.provider, descriptor.label
+                )
+            })?;
+        if source_endpoint != target_endpoint {
+            return Err(format!(
+                "credential '{} / {}' endpoint identity does not match the configured provider",
                 descriptor.provider, descriptor.label
             ));
         }
@@ -28250,7 +28319,8 @@ storage = "2MiB"
                     .unwrap(),
                 "oauth-work",
                 crate::credential_interchange::CredentialKind::OAuth,
-            );
+            )
+            .unwrap();
             let oauth_bundle = crate::credential_interchange::CredentialBundle {
                 schema: crate::credential_interchange::BUNDLE_SCHEMA.into(),
                 encryption: None,
@@ -28293,6 +28363,236 @@ storage = "2MiB"
         }
 
         #[tokio::test]
+        async fn rejects_ambiguous_provider_names_without_writing_credentials() {
+            let (state, root) = test_state("portable-duplicate-provider").await;
+            let first_id = insert_provider(
+                &state,
+                "duplicate-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let second_id = insert_provider(
+                &state,
+                "duplicate-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let provider = db::get_provider(&state.pool, &first_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let bundle = encrypted_import_bundle(vec![(
+                portable_credential_descriptor(
+                    &provider,
+                    "work",
+                    crate::credential_interchange::CredentialKind::ApiKey,
+                )
+                .unwrap(),
+                "must-not-be-imported".into(),
+            )]);
+
+            let dry_run = response_json(
+                import_credentials(
+                    State(state.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], false);
+            assert!(dry_run["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|problem| problem.contains("ambiguous provider")));
+            assert!(dry_run["conflicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|conflict| {
+                    conflict["kind"] == "provider"
+                        && conflict["reason"] == "ambiguous provider name"
+                }));
+
+            let apply_error = import_credentials(
+                State(state.clone()),
+                auth(),
+                Json(import_body(bundle, true)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+            assert!(db::list_accounts_for_provider(&state.pool, &first_id)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(db::list_accounts_for_provider(&state.pool, &second_id)
+                .await
+                .unwrap()
+                .is_empty());
+
+            drop(state);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[tokio::test]
+        async fn rejects_credentials_for_a_different_normalized_provider_endpoint() {
+            let (source, source_root) = test_state("portable-endpoint-source").await;
+            let (target, target_root) = test_state("portable-endpoint-target").await;
+            let source_provider_id = insert_provider(
+                &source,
+                "anthropic",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_provider_id = insert_provider(
+                &target,
+                "anthropic",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            sqlx::query("UPDATE providers SET base_url = ? WHERE id = ?")
+                .bind("https://api.anthropic.com")
+                .bind(&source_provider_id)
+                .execute(&source.pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE providers SET base_url = ? WHERE id = ?")
+                .bind("https://api.anthropic.com/")
+                .bind(&target_provider_id)
+                .execute(&target.pool)
+                .await
+                .unwrap();
+            add_account(
+                &source,
+                &source_provider_id,
+                "work",
+                "source-anthropic-key",
+                &crypto::mask_secret("source-anthropic-key"),
+                1,
+            )
+            .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+
+            assert_eq!(
+                bundle["credentials"][0]["descriptor"]["metadata"]["extensions"]
+                    [crate::credential_interchange::KINETIX_EXTENSION]["base_url"],
+                "https://api.anthropic.com"
+            );
+            let same_endpoint = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(same_endpoint["valid"], true);
+            assert!(
+                db::list_accounts_for_provider(&target.pool, &target_provider_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let mut legacy_descriptor: crate::credential_interchange::CredentialDescriptor =
+                serde_json::from_value(bundle["credentials"][0]["descriptor"].clone()).unwrap();
+            legacy_descriptor.metadata["extensions"]
+                [crate::credential_interchange::KINETIX_EXTENSION]
+                .as_object_mut()
+                .unwrap()
+                .remove("base_url");
+            let legacy_bundle =
+                encrypted_import_bundle(vec![(legacy_descriptor, "source-anthropic-key".into())]);
+            let legacy_plan = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(legacy_bundle, false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(legacy_plan["valid"], false);
+            assert!(legacy_plan["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|problem| problem.contains("missing its endpoint identity")));
+
+            sqlx::query("UPDATE providers SET base_url = ? WHERE id = ?")
+                .bind("https://attacker.example")
+                .bind(&target_provider_id)
+                .execute(&target.pool)
+                .await
+                .unwrap();
+            let dry_run = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], false);
+            assert!(dry_run["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|problem| problem.contains("endpoint identity")));
+
+            let apply_error = import_credentials(
+                State(target.clone()),
+                auth(),
+                Json(import_body(bundle, true)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+            assert!(
+                db::list_accounts_for_provider(&target.pool, &target_provider_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
         async fn rejects_invalid_imported_secret_contents_for_dry_run_and_apply() {
             let (state, root) = test_state("portable-secret-validation").await;
             let manual_id = insert_provider(
@@ -28327,7 +28627,8 @@ storage = "2MiB"
                         &manual,
                         "empty",
                         crate::credential_interchange::CredentialKind::ApiKey,
-                    ),
+                    )
+                    .unwrap(),
                     String::new(),
                 ),
                 (
@@ -28335,7 +28636,8 @@ storage = "2MiB"
                         &manual,
                         "whitespace",
                         crate::credential_interchange::CredentialKind::ApiKey,
-                    ),
+                    )
+                    .unwrap(),
                     " \t\n".into(),
                 ),
                 (
@@ -28343,7 +28645,8 @@ storage = "2MiB"
                         &auth_flow,
                         "invalid-json",
                         crate::credential_interchange::CredentialKind::OAuth,
-                    ),
+                    )
+                    .unwrap(),
                     "not json".into(),
                 ),
                 (
@@ -28351,7 +28654,8 @@ storage = "2MiB"
                         &auth_flow,
                         "non-object-json",
                         crate::credential_interchange::CredentialKind::OAuth,
-                    ),
+                    )
+                    .unwrap(),
                     "[]".into(),
                 ),
                 (
@@ -28359,7 +28663,8 @@ storage = "2MiB"
                         &auth_flow,
                         "oversized",
                         crate::credential_interchange::CredentialKind::OAuth,
-                    ),
+                    )
+                    .unwrap(),
                     oversized,
                 ),
             ]);
@@ -28440,7 +28745,8 @@ storage = "2MiB"
                     &provider,
                     "work",
                     crate::credential_interchange::CredentialKind::OAuth,
-                ),
+                )
+                .unwrap(),
                 secret.clone(),
             )]);
 
@@ -28521,7 +28827,8 @@ storage = "2MiB"
                 &provider,
                 "work",
                 crate::credential_interchange::CredentialKind::OAuth,
-            );
+            )
+            .unwrap();
             let new_secret =
                 json!({"access_token": "new", "refresh_token": "new-refresh"}).to_string();
             let (encryption, mut envelopes) = crate::credential_interchange::encrypt_secrets(
