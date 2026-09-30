@@ -11356,6 +11356,7 @@ pub async fn export_credentials(
         credentials: records,
         extensions: serde_json::Map::new(),
     };
+    bundle.validate().map_err(ApiError::bad)?;
     if body.include_secrets {
         let passphrase = body.passphrase.expect("checked above");
         let encrypted = tokio::task::spawn_blocking(move || {
@@ -11372,6 +11373,7 @@ pub async fn export_credentials(
             }
         }
     }
+    bundle.validate().map_err(ApiError::bad)?;
 
     Ok(no_store_json(
         serde_json::to_value(bundle).map_err(ApiError::internal)?,
@@ -28765,6 +28767,88 @@ storage = "2MiB"
                 extensions: serde_json::Map::new(),
             })
             .unwrap()
+        }
+
+        #[tokio::test]
+        async fn credential_export_rejects_names_outside_bundle_schema() {
+            let (state, root) = test_state("portable-export-invalid-identity").await;
+            let provider_id = insert_provider(
+                &state,
+                "valid-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &state,
+                &provider_id,
+                "valid-label",
+                "secret",
+                &crypto::mask_secret("secret"),
+                1,
+            )
+            .await;
+
+            let too_long_label = "x".repeat(257);
+            for invalid_label in ["", " \t", too_long_label.as_str()] {
+                sqlx::query("UPDATE accounts SET label = ? WHERE provider_id = ?")
+                    .bind(invalid_label)
+                    .bind(&provider_id)
+                    .execute(&state.pool)
+                    .await
+                    .unwrap();
+                for include_secrets in [false, true] {
+                    let error = export_credentials(
+                        State(state.clone()),
+                        auth(),
+                        Json(CredentialExportBody {
+                            include_secrets,
+                            passphrase: include_secrets.then(|| EXPORT_PASSPHRASE.to_string()),
+                        }),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+                    assert!(error
+                        .1
+                        .contains("credential descriptor label must be 1-256 bytes"));
+                }
+            }
+
+            sqlx::query("UPDATE accounts SET label = 'valid-label' WHERE provider_id = ?")
+                .bind(&provider_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            let too_long_provider_name = "x".repeat(257);
+            for invalid_provider_name in ["", " \t", too_long_provider_name.as_str()] {
+                sqlx::query("UPDATE providers SET name = ? WHERE id = ?")
+                    .bind(invalid_provider_name)
+                    .bind(&provider_id)
+                    .execute(&state.pool)
+                    .await
+                    .unwrap();
+                for include_secrets in [false, true] {
+                    let error = export_credentials(
+                        State(state.clone()),
+                        auth(),
+                        Json(CredentialExportBody {
+                            include_secrets,
+                            passphrase: include_secrets.then(|| EXPORT_PASSPHRASE.to_string()),
+                        }),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+                    assert!(error
+                        .1
+                        .contains("credential descriptor provider must be 1-256 bytes"));
+                }
+            }
+
+            drop(state);
+            let _ = std::fs::remove_dir_all(root);
         }
 
         #[tokio::test]
