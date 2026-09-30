@@ -3411,6 +3411,15 @@ fn payload_is_terminal(payload: &str, events: &[StreamEvent]) -> bool {
         == Some("message_stop")
 }
 
+fn normalize_malformed_upstream_failure(mut failure: UpstreamFailure) -> UpstreamFailure {
+    if failure.kind == FailureKind::MalformedUpstream && failure.status.is_none() {
+        // Malformed upstream data has no useful origin HTTP status. Treat it
+        // as a gateway 502 for provider-circuit health accounting.
+        failure.status = Some(502);
+    }
+    failure
+}
+
 fn payload_error_failure(adapter: &Arc<dyn Adapter>, payload: &str) -> Option<UpstreamFailure> {
     let value: Value = serde_json::from_str(payload).ok()?;
     let looks_error =
@@ -3558,10 +3567,13 @@ async fn prepare_success_response(
                         })
                         .with_precommit_usage(&precommit_usage));
                     }
-                    let events = adapter.parse_stream_chunk(&payload).map_err(|failure| {
-                        PreparedResponseFailure::from(failure)
-                            .with_precommit_usage(&precommit_usage)
-                    })?;
+                    let events = adapter
+                        .parse_stream_chunk(&payload)
+                        .map_err(normalize_malformed_upstream_failure)
+                        .map_err(|failure| {
+                            PreparedResponseFailure::from(failure)
+                                .with_precommit_usage(&precommit_usage)
+                        })?;
                     for event in &events {
                         if let StreamEvent::Usage(value) = event {
                             precommit_usage.merge(value);
@@ -3718,7 +3730,9 @@ async fn prepare_aggregated_sse_inner(
                         terminal_seen = true;
                         continue;
                     }
-                    let events = adapter.parse_stream_chunk(&payload)?;
+                    let events = adapter
+                        .parse_stream_chunk(&payload)
+                        .map_err(normalize_malformed_upstream_failure)?;
                     terminal_seen |= payload_is_terminal(&payload, &events);
                     semantic_seen |= events.iter().any(is_semantic_event);
                     for event in &events {
@@ -5427,7 +5441,6 @@ fn check_param_policy(
 }
 
 /// Build the client response: streaming or aggregated non-streaming.
-#[allow(clippy::too_many_arguments)]
 const STREAM_RESPONSE_CHANNEL_CAPACITY: usize = 64;
 
 fn stream_response_channel() -> (
@@ -5437,6 +5450,7 @@ fn stream_response_channel() -> (
     mpsc::channel(STREAM_RESPONSE_CHANNEL_CAPACITY)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_response(
     state: &AppState,
     snap: Arc<crate::registry::Snapshot>,
@@ -6033,6 +6047,7 @@ async fn drive_stream(
                             let events = match adapter.parse_stream_chunk(&payload) {
                                 Ok(events) => events,
                                 Err(failure) => {
+                                    let failure = normalize_malformed_upstream_failure(failure);
                                     stream_outcome = StreamOutcome::ProtocolViolation;
                                     provider_failure = Some((failure.kind, failure.status));
                                     error_message = Some(failure.message.clone());
@@ -6274,6 +6289,7 @@ async fn drive_stream_passthrough(
                                             }
                                         }
                                         Err(failure) => {
+                                            let failure = normalize_malformed_upstream_failure(failure);
                                             stream_outcome = StreamOutcome::ProtocolViolation;
                                             provider_failure = Some((failure.kind, failure.status));
                                             error_message = Some(failure.message);
@@ -6581,6 +6597,7 @@ async fn drive_aggregate(
                                 }
                             }
                             Err(failure) => {
+                                let failure = normalize_malformed_upstream_failure(failure);
                                 stream_outcome = StreamOutcome::ProtocolViolation;
                                 status = "stream_error";
                                 status_code = 502;

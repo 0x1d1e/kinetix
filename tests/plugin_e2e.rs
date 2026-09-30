@@ -468,6 +468,38 @@ async fn anthropic_messages_frontend_passes_thinking_and_tool_continuation_to_pl
         json!([{"type": "text", "text": "plugin accepted the continuation"}])
     );
 
+    let mut nonportable_continuation = request.clone();
+    nonportable_continuation["messages"][1]["content"] = json!([
+        {
+            "type": "thinking",
+            "thinking": "historical private reasoning",
+            "signature": "opaque-anthropic-signature"
+        },
+        {"type": "redacted_thinking", "data": "opaque-redacted-thinking"},
+        {
+            "type": "tool_use",
+            "id": "toolu_prior",
+            "name": "lookup",
+            "input": {"city": "Paris"}
+        }
+    ]);
+    let response = reqwest::Client::new()
+        .post(format!("http://{gateway_addr}/v1/messages"))
+        .header(AUTHORIZATION, format!("Bearer {CLIENT_KEY}"))
+        .json(&nonportable_continuation)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let response_body = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response_body}");
+    assert!(response_body.contains("non-portable provider continuation state"));
+    assert_eq!(
+        mock.0.lock().await.len(),
+        1,
+        "the reject policy must stop non-portable thinking before plugin egress"
+    );
+
     let received = mock.0.lock().await;
     assert_eq!(received.len(), 1);
     let canonical = &received[0];

@@ -289,6 +289,14 @@ async fn upstream(
             mock.0.clone(),
             Duration::ZERO,
         )),
+        "malformed_json" => response(body_from_chunks(
+            vec![
+                event("visible-before-malformed-json"),
+                Bytes::from_static(b"data: {\"choices\":[BROKEN]}\n\n"),
+            ],
+            mock.0.clone(),
+            Duration::ZERO,
+        )),
         "upstream_error" => response(body_from_chunks(
             vec![
                 event("visible-before-error"),
@@ -400,6 +408,8 @@ struct Harness {
     gateway_server: tokio::task::JoinHandle<()>,
     root: std::path::PathBuf,
     account_id: String,
+    fallback_primary_provider_id: String,
+    fallback_primary_account_id: String,
 }
 
 async fn setup() -> Harness {
@@ -441,14 +451,15 @@ async fn setup() -> Harness {
         "upstream-chat-model",
     )
     .await;
-    let (_, _, reset_primary_model_id) = insert_provider_model(
-        &pool,
-        &crypto,
-        "streaming-reset-primary",
-        &upstream_url,
-        "reset-primary-model",
-    )
-    .await;
+    let (fallback_primary_provider_id, fallback_primary_account_id, reset_primary_model_id) =
+        insert_provider_model(
+            &pool,
+            &crypto,
+            "streaming-reset-primary",
+            &upstream_url,
+            "reset-primary-model",
+        )
+        .await;
     let (_, _, reset_fallback_model_id) = insert_provider_model(
         &pool,
         &crypto,
@@ -604,6 +615,8 @@ async fn setup() -> Harness {
         gateway_server,
         root,
         account_id,
+        fallback_primary_provider_id,
+        fallback_primary_account_id,
     }
 }
 
@@ -635,12 +648,16 @@ impl Harness {
             .unwrap()
     }
 
-    async fn provider_failures(&self) -> i64 {
+    async fn account_failures(&self, account_id: &str) -> i64 {
         sqlx::query_scalar("SELECT consecutive_failures FROM accounts WHERE id = ?")
-            .bind(&self.account_id)
+            .bind(account_id)
             .fetch_one(&self.state.pool)
             .await
             .unwrap()
+    }
+
+    async fn provider_failures(&self) -> i64 {
+        self.account_failures(&self.account_id).await
     }
 
     async fn assert_admission_released(&self, expected_failures: i64) {
@@ -805,6 +822,51 @@ async fn streaming_transport_and_lifecycle_stress_regressions() {
             );
         }
     }
+
+    let account_failures_before = harness
+        .account_failures(&harness.fallback_primary_account_id)
+        .await;
+    let circuit_before = harness
+        .state
+        .provider_circuits
+        .snapshot(&harness.fallback_primary_provider_id);
+    let request_count_before = harness.probe.requests.lock().await.len();
+    let response = harness
+        .send_to_route(FALLBACK_ROUTE, "malformed_json", None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = String::from_utf8(response.bytes().await.unwrap().to_vec()).unwrap();
+    assert!(body.contains("visible-before-malformed-json"), "{body}");
+    let (outcome, commit, fallback_allowed) = harness.trace(&request_id).await;
+    assert_eq!(outcome.as_deref(), Some("protocol_violation"));
+    assert_eq!(commit, "committed");
+    assert_eq!(fallback_allowed, Some(0));
+    assert_eq!(
+        harness.probe.requests.lock().await.len(),
+        request_count_before + 1,
+        "a complete malformed JSON SSE frame after commit must not retry the fallback target"
+    );
+    assert_eq!(
+        harness
+            .account_failures(&harness.fallback_primary_account_id)
+            .await,
+        account_failures_before,
+        "malformed response data must not mutate credential-scoped account health"
+    );
+    let circuit_after = harness
+        .state
+        .provider_circuits
+        .snapshot(&harness.fallback_primary_provider_id);
+    assert_eq!(circuit_after.state, circuit_before.state);
+    assert_eq!(
+        circuit_after.recent_qualifying_failures,
+        circuit_before.recent_qualifying_failures + 1,
+        "malformed upstream data should contribute provider-circuit failure evidence"
+    );
 
     let response = harness.send("heartbeat_forever", None).await;
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
