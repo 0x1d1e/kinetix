@@ -249,6 +249,99 @@ impl CredentialMode {
     }
 }
 
+/// Versioned integration-level feature declarations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationFeaturesV1 {
+    pub schema_version: u32,
+    pub streaming: bool,
+    pub tools: bool,
+    pub parallel_tools: bool,
+    pub vision: bool,
+    pub reasoning: bool,
+    pub structured_output: bool,
+    pub model_discovery: bool,
+    pub quota_probe: bool,
+    pub health_probe: bool,
+}
+
+impl IntegrationFeaturesV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1 {
+            return Err(format!(
+                "unsupported integration feature schema_version {}",
+                self.schema_version
+            ));
+        }
+        if self.parallel_tools && !self.tools {
+            return Err("parallel_tools requires tools".into());
+        }
+        Ok(())
+    }
+}
+
+/// Versioned input and upstream protocol declarations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationProtocolsV1 {
+    pub input: Vec<String>,
+    pub upstream: Vec<String>,
+}
+
+impl IntegrationProtocolsV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        const FORMATS: &[&str] = &[
+            "openai-chat",
+            "openai-responses",
+            "anthropic",
+            "gemini",
+            "plugin-native",
+        ];
+        for (name, formats) in [("input", &self.input), ("upstream", &self.upstream)] {
+            let unique: std::collections::HashSet<_> = formats.iter().collect();
+            if unique.len() != formats.len() {
+                return Err(format!("protocols.{name} must not contain duplicates"));
+            }
+            if formats
+                .iter()
+                .any(|format| !FORMATS.contains(&format.as_str()))
+            {
+                return Err(format!("protocols.{name} contains an unknown protocol"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensure every declared upstream protocol can be served by this provider
+    /// transport. `plugin-native` is valid only with a configured adapter.
+    pub fn validate_upstream_wire_format(
+        &self,
+        wire_format: &str,
+        has_provider_adapter: bool,
+    ) -> Result<(), String> {
+        self.validate()?;
+        for protocol in &self.upstream {
+            let compatible = match protocol.as_str() {
+                "openai-chat" | "openai-responses" => wire_format == "openai",
+                "anthropic" => wire_format == "anthropic",
+                "gemini" => wire_format == "gemini",
+                "plugin-native" => wire_format == "plugin" && has_provider_adapter,
+                _ => false,
+            };
+            if !compatible {
+                return Err(format!(
+                    "upstream protocol '{protocol}' is incompatible with provider wire_format '{wire_format}'"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn allows_input(&self, protocol: &str) -> bool {
+        self.input.iter().any(|allowed| allowed == protocol)
+    }
+}
+
 /// A user-facing integration assembled from one or more capabilities provided
 /// by the same plugin. This metadata is declarative only: it grants no
 /// authority and contains no browser-executable code.
@@ -269,6 +362,10 @@ pub struct Integration {
     pub auth_flow: Option<String>,
     #[serde(default)]
     pub model_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<IntegrationFeaturesV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocols: Option<IntegrationProtocolsV1>,
     #[serde(default)]
     pub provider: Option<IntegrationProvider>,
 }
@@ -599,5 +696,30 @@ mod tests {
         assert_eq!(parse_size("4KiB"), Some(4096));
         assert_eq!(parse_size("1024"), Some(1024));
         assert_eq!(parse_size(""), None);
+    }
+
+    #[test]
+    fn integration_upstream_protocols_must_match_provider_transport() {
+        let protocols = IntegrationProtocolsV1 {
+            input: vec!["openai-chat".into(), "anthropic".into()],
+            upstream: vec!["openai-chat".into(), "openai-responses".into()],
+        };
+        assert!(protocols
+            .validate_upstream_wire_format("openai", false)
+            .is_ok());
+        assert!(protocols
+            .validate_upstream_wire_format("anthropic", false)
+            .is_err());
+
+        let plugin_protocols = IntegrationProtocolsV1 {
+            input: vec!["anthropic".into()],
+            upstream: vec!["plugin-native".into()],
+        };
+        assert!(plugin_protocols
+            .validate_upstream_wire_format("plugin", true)
+            .is_ok());
+        assert!(plugin_protocols
+            .validate_upstream_wire_format("plugin", false)
+            .is_err());
     }
 }

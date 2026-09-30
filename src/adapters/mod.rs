@@ -30,7 +30,7 @@ pub enum TargetTransport {
 impl TargetTransport {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "openai" => Some(Self::OpenAiChat),
+            "openai" | "openai-chat" => Some(Self::OpenAiChat),
             "openai-responses" => Some(Self::OpenAiResponses),
             "anthropic" => Some(Self::Anthropic),
             "gemini" => Some(Self::Gemini),
@@ -427,13 +427,18 @@ pub fn resolve_execution_profile_for_target(
             .get(name)
             .and_then(serde_json::Value::as_bool)
     };
-    let capabilities = ModelCapabilityFlags {
+    let mut capabilities = ModelCapabilityFlags {
         text: capability("text"),
         reasoning: capability("reasoning"),
         vision: capability("vision"),
         tool_calling: capability("tool_calling"),
+        parallel_tools: capability("parallel_tools"),
         structured_output: capability("structured_output"),
     };
+    let integration_features = provider.integration_feature_ceiling().map_err(|error| {
+        ProxyError::unsupported(format!("invalid integration feature ceiling: {error}"))
+    })?;
+    apply_integration_feature_ceiling(&mut capabilities, integration_features.as_ref());
 
     let mut parameters = model.params();
     let parameter_ownership = discovery.get("operator_parameter_overrides");
@@ -709,7 +714,41 @@ pub struct ModelCapabilityFlags {
     pub reasoning: Option<bool>,
     pub vision: Option<bool>,
     pub tool_calling: Option<bool>,
+    pub parallel_tools: Option<bool>,
     pub structured_output: Option<bool>,
+}
+
+/// Intersect model observations with the integration's declared support ceiling.
+/// A false integration flag vetoes support; a true flag never invents model support.
+fn apply_integration_feature_ceiling(
+    capabilities: &mut ModelCapabilityFlags,
+    ceiling: Option<&crate::plugins::types::IntegrationFeaturesV1>,
+) {
+    let Some(ceiling) = ceiling else {
+        return;
+    };
+    if !ceiling.tools {
+        capabilities.tool_calling = Some(false);
+    }
+    if !ceiling.parallel_tools {
+        capabilities.parallel_tools = Some(false);
+    }
+    if !ceiling.vision {
+        capabilities.vision = Some(false);
+    }
+    if !ceiling.reasoning {
+        capabilities.reasoning = Some(false);
+    }
+    if !ceiling.structured_output {
+        capabilities.structured_output = Some(false);
+    }
+    if capabilities.parallel_tools == Some(true) {
+        capabilities.parallel_tools = match capabilities.tool_calling {
+            Some(true) => Some(true),
+            Some(false) => Some(false),
+            None => None,
+        };
+    }
 }
 
 fn canonical_reasoning_levels(
@@ -830,6 +869,41 @@ struct ModelCapabilitiesV2 {
     modalities: Option<serde_json::Value>,
     identity: Option<ModelIdentityV2>,
     opaque_state: Option<OpaqueStateCapabilityV1>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelCapabilitiesV3 {
+    schema_version: u32,
+    transport: Option<ModelTransportCapabilityV3>,
+    text: Option<SupportCapabilityV1>,
+    reasoning: Option<PluginReasoningCapabilityV1>,
+    tools: Option<SupportCapabilityV1>,
+    parallel_tools: Option<SupportCapabilityV1>,
+    vision: Option<VisionCapabilityV1>,
+    structured_output: Option<SupportCapabilityV1>,
+    #[allow(dead_code)]
+    prices: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    modalities: Option<serde_json::Value>,
+    identity: Option<ModelIdentityV2>,
+    opaque_state: Option<OpaqueStateCapabilityV1>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelTransportCapabilityV3 {
+    format: String,
+    endpoint: Option<String>,
+    #[serde(default)]
+    alternatives: Vec<ModelTransportOptionV3>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelTransportOptionV3 {
+    format: String,
+    endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1088,6 +1162,117 @@ fn parse_model_capabilities_v2(metadata: &serde_json::Value) -> Option<ModelCapa
     metadata.is_valid().then_some(metadata)
 }
 
+fn valid_transport_format(format: &str) -> bool {
+    matches!(
+        format,
+        "openai-chat" | "openai-responses" | "anthropic" | "gemini" | "plugin-native"
+    )
+}
+
+fn valid_transport_endpoint(endpoint: Option<&str>) -> bool {
+    endpoint.is_none_or(|endpoint| {
+        endpoint.starts_with('/')
+            && !endpoint.starts_with("//")
+            && endpoint.trim() == endpoint
+            && !endpoint.chars().any(|character| {
+                character.is_control()
+                    || character.is_whitespace()
+                    || matches!(character, '?' | '#' | '\\')
+            })
+            && !endpoint
+                .split('/')
+                .any(|segment| matches!(segment, "." | ".."))
+    })
+}
+
+fn valid_capability_prices(prices: Option<&serde_json::Value>) -> bool {
+    let Some(prices) = prices else {
+        return true;
+    };
+    let Some(prices) = prices.as_object() else {
+        return false;
+    };
+    [
+        "input_per_1m",
+        "output_per_1m",
+        "cached_per_1m",
+        "cache_write_per_1m",
+        "thinking_per_1m",
+    ]
+    .iter()
+    .all(|key| {
+        let Some(value) = prices.get(*key) else {
+            return true;
+        };
+        if value.is_null() {
+            return true;
+        }
+        value
+            .as_f64()
+            .is_some_and(|value| value.is_finite() && value >= 0.0)
+    })
+}
+
+impl ModelCapabilitiesV3 {
+    fn is_valid(&self) -> bool {
+        if self.schema_version != 3
+            || self
+                .parallel_tools
+                .as_ref()
+                .is_some_and(|parallel| parallel.supported)
+                && !self.tools.as_ref().is_some_and(|tools| tools.supported)
+            || !self
+                .reasoning
+                .as_ref()
+                .map(PluginReasoningCapabilityV1::is_valid)
+                .unwrap_or(true)
+            || !self
+                .identity
+                .as_ref()
+                .map(ModelIdentityV2::is_valid)
+                .unwrap_or(true)
+            || !self
+                .opaque_state
+                .as_ref()
+                .map(OpaqueStateCapabilityV1::is_valid)
+                .unwrap_or(true)
+            || !valid_capability_prices(self.prices.as_ref())
+        {
+            return false;
+        }
+        let Some(transport) = &self.transport else {
+            return true;
+        };
+        if !valid_transport_format(&transport.format)
+            || !valid_transport_endpoint(transport.endpoint.as_deref())
+        {
+            return false;
+        }
+        let preferred = ModelTransportOptionV3 {
+            format: transport.format.clone(),
+            endpoint: transport.endpoint.clone(),
+        };
+        let mut options = std::collections::HashSet::from([preferred]);
+        transport.alternatives.iter().all(|alternative| {
+            valid_transport_format(&alternative.format)
+                && valid_transport_endpoint(alternative.endpoint.as_deref())
+                && options.insert(alternative.clone())
+        })
+    }
+}
+
+fn parse_model_capabilities_v3(metadata: &serde_json::Value) -> Option<ModelCapabilitiesV3> {
+    let metadata: ModelCapabilitiesV3 = serde_json::from_value(metadata.clone()).ok()?;
+    metadata.is_valid().then_some(metadata)
+}
+
+pub(crate) fn validated_model_capabilities_v3(
+    metadata: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    parse_model_capabilities_v3(metadata)?;
+    Some(metadata.clone())
+}
+
 fn plugin_schema_version(metadata: &serde_json::Value) -> Option<u64> {
     metadata.get("schema_version")?.as_u64()
 }
@@ -1097,6 +1282,7 @@ fn capability_flags(
     reasoning: Option<&PluginReasoningCapabilityV1>,
     vision: Option<&VisionCapabilityV1>,
     tools: Option<&SupportCapabilityV1>,
+    parallel_tools: Option<&SupportCapabilityV1>,
     structured_output: Option<&SupportCapabilityV1>,
 ) -> ModelCapabilityFlags {
     ModelCapabilityFlags {
@@ -1104,6 +1290,7 @@ fn capability_flags(
         reasoning: reasoning.map(|value| value.supported),
         vision: vision.map(|value| value.input),
         tool_calling: tools.map(|value| value.supported),
+        parallel_tools: parallel_tools.map(|value| value.supported),
         structured_output: structured_output.map(|value| value.supported),
     }
 }
@@ -1115,6 +1302,7 @@ pub fn plugin_capability_flags_v1(metadata: &serde_json::Value) -> Option<ModelC
         metadata.reasoning.as_ref(),
         metadata.vision.as_ref(),
         metadata.tools.as_ref(),
+        None,
         metadata.structured_output.as_ref(),
     ))
 }
@@ -1129,6 +1317,18 @@ pub fn plugin_capability_flags(metadata: &serde_json::Value) -> Option<ModelCapa
                 metadata.reasoning.as_ref(),
                 metadata.vision.as_ref(),
                 metadata.tools.as_ref(),
+                None,
+                metadata.structured_output.as_ref(),
+            ))
+        }
+        3 => {
+            let metadata = parse_model_capabilities_v3(metadata)?;
+            Some(capability_flags(
+                metadata.text.as_ref(),
+                metadata.reasoning.as_ref(),
+                metadata.vision.as_ref(),
+                metadata.tools.as_ref(),
+                metadata.parallel_tools.as_ref(),
                 metadata.structured_output.as_ref(),
             ))
         }
@@ -1148,12 +1348,15 @@ pub fn plugin_reasoning_support(metadata: &serde_json::Value) -> Option<bool> {
         2 => parse_model_capabilities_v2(metadata)?
             .reasoning
             .map(|reasoning| reasoning.supported),
+        3 => parse_model_capabilities_v3(metadata)?
+            .reasoning
+            .map(|reasoning| reasoning.supported),
         _ => None,
     }
 }
 
 fn normalize_plugin_reasoning_fields(
-    transport: Option<&TransportCapabilityV1>,
+    transport_format: Option<&str>,
     reasoning: PluginReasoningCapabilityV1,
 ) -> Option<ReasoningCapability> {
     if !reasoning.supported {
@@ -1172,8 +1375,8 @@ fn normalize_plugin_reasoning_fields(
         .map(|level| level.as_str().to_string())
         .collect();
     let default = reasoning.default.map(|level| level.as_str().to_string());
-    let upstream_format = match transport.map(|transport| transport.format.as_str()) {
-        Some("openai") => "openai_effort",
+    let upstream_format = match transport_format {
+        Some("openai" | "openai-chat") => "openai_effort",
         Some("openai-responses") => "responses_effort",
         Some("gemini") => "gemini_thinking_level",
         _ => "provider_declared",
@@ -1197,7 +1400,13 @@ pub fn normalize_plugin_reasoning_capability_v1(
     metadata: &serde_json::Value,
 ) -> Option<ReasoningCapability> {
     let metadata = parse_model_capabilities_v1(metadata)?;
-    normalize_plugin_reasoning_fields(metadata.transport.as_ref(), metadata.reasoning?)
+    normalize_plugin_reasoning_fields(
+        metadata
+            .transport
+            .as_ref()
+            .map(|transport| transport.format.as_str()),
+        metadata.reasoning?,
+    )
 }
 
 pub fn normalize_plugin_reasoning_capability(
@@ -1207,31 +1416,58 @@ pub fn normalize_plugin_reasoning_capability(
         1 => normalize_plugin_reasoning_capability_v1(metadata),
         2 => {
             let metadata = parse_model_capabilities_v2(metadata)?;
-            normalize_plugin_reasoning_fields(metadata.transport.as_ref(), metadata.reasoning?)
+            normalize_plugin_reasoning_fields(
+                metadata
+                    .transport
+                    .as_ref()
+                    .map(|transport| transport.format.as_str()),
+                metadata.reasoning?,
+            )
+        }
+        3 => {
+            let metadata = parse_model_capabilities_v3(metadata)?;
+            normalize_plugin_reasoning_fields(
+                metadata
+                    .transport
+                    .as_ref()
+                    .map(|transport| transport.format.as_str()),
+                metadata.reasoning?,
+            )
         }
         _ => None,
     }
 }
 
+fn plugin_identity_metadata(metadata: &serde_json::Value) -> Option<ModelIdentityV2> {
+    match plugin_schema_version(metadata)? {
+        2 => parse_model_capabilities_v2(metadata)?.identity,
+        3 => parse_model_capabilities_v3(metadata)?.identity,
+        _ => None,
+    }
+}
+
+fn plugin_opaque_state_metadata(metadata: &serde_json::Value) -> Option<OpaqueStateCapabilityV1> {
+    match plugin_schema_version(metadata)? {
+        2 => parse_model_capabilities_v2(metadata)?.opaque_state,
+        3 => parse_model_capabilities_v3(metadata)?.opaque_state,
+        _ => None,
+    }
+}
+
 pub fn plugin_identity(metadata: &serde_json::Value) -> Option<serde_json::Value> {
-    let metadata = parse_model_capabilities_v2(metadata)?;
-    serde_json::to_value(metadata.identity?).ok()
+    serde_json::to_value(plugin_identity_metadata(metadata)?).ok()
 }
 
 pub fn plugin_identity_hint(metadata: &serde_json::Value) -> Option<String> {
-    parse_model_capabilities_v2(metadata)?
-        .identity
-        .map(|identity| identity.canonical_model_id)
+    plugin_identity_metadata(metadata).map(|identity| identity.canonical_model_id)
 }
 
 pub fn plugin_provider_variant(metadata: &serde_json::Value) -> Option<serde_json::Value> {
-    let metadata = parse_model_capabilities_v2(metadata)?;
-    serde_json::to_value(metadata.identity?.variant?).ok()
+    serde_json::to_value(plugin_identity_metadata(metadata)?.variant?).ok()
 }
 
 pub fn plugin_opaque_state_capability(metadata: &serde_json::Value) -> Option<serde_json::Value> {
-    let metadata = parse_model_capabilities_v2(metadata)?;
-    serde_json::to_value(metadata.opaque_state?).ok()
+    serde_json::to_value(plugin_opaque_state_metadata(metadata)?).ok()
 }
 
 pub(crate) fn parse_plugin_opaque_state_capability(
@@ -1873,6 +2109,100 @@ mod reasoning_discovery_tests {
     }
 
     #[test]
+    fn schema_v3_exposes_typed_transport_and_capabilities() {
+        let metadata = serde_json::json!({
+            "schema_version": 3,
+            "transport": {
+                "format": "anthropic",
+                "endpoint": "/zen/v1/messages",
+                "alternatives": [{"format": "openai-chat"}]
+            },
+            "reasoning": {
+                "supported": true,
+                "mode": "level",
+                "levels": ["low", "high"],
+                "default": "high",
+                "can_disable": false
+            },
+            "tools": {"supported": true},
+            "parallel_tools": {"supported": true},
+            "vision": {"input": false},
+            "identity": {
+                "canonical_model_id": "opencode/union-alpha",
+                "variant": {
+                    "kind": "provider_alias",
+                    "id": "union-alpha",
+                    "fixed": false
+                }
+            },
+            "opaque_state": {
+                "kind": "gemini_thought_signature",
+                "family": "gemini",
+                "encoding_version": 1
+            },
+            "prices": {"input_per_1m": 0.0}
+        });
+
+        let flags = plugin_capability_flags(&metadata).unwrap();
+        assert_eq!(flags.reasoning, Some(true));
+        assert_eq!(flags.tool_calling, Some(true));
+        assert_eq!(flags.vision, Some(false));
+        let reasoning = normalize_plugin_reasoning_capability(&metadata).unwrap();
+        assert_eq!(reasoning.levels, vec!["low", "high"]);
+        assert_eq!(reasoning.default.as_deref(), Some("high"));
+        assert_eq!(reasoning.upstream_format, "provider_declared");
+        assert_eq!(
+            plugin_identity_hint(&metadata).as_deref(),
+            Some("opencode/union-alpha")
+        );
+        assert_eq!(
+            plugin_provider_variant(&metadata).unwrap()["id"],
+            "union-alpha"
+        );
+        assert_eq!(
+            plugin_opaque_state_capability(&metadata).unwrap()["family"],
+            "gemini"
+        );
+    }
+
+    #[test]
+    fn schema_v3_rejects_invalid_transport_and_parallel_tools() {
+        for metadata in [
+            serde_json::json!({
+                "schema_version": 3,
+                "transport": {"format": "unknown"}
+            }),
+            serde_json::json!({
+                "schema_version": 3,
+                "transport": {"format": "anthropic", "endpoint": "//evil.example"}
+            }),
+            serde_json::json!({
+                "schema_version": 3,
+                "transport": {
+                    "format": "anthropic",
+                    "alternatives": [{"format": "anthropic"}]
+                }
+            }),
+            serde_json::json!({
+                "schema_version": 3,
+                "parallel_tools": {"supported": true}
+            }),
+            serde_json::json!({
+                "schema_version": 3,
+                "prices": {"input_per_1m": -1.0}
+            }),
+            serde_json::json!({"schema_version": 3, "unknown": true}),
+            serde_json::json!({"schema_version": 99}),
+        ] {
+            assert!(plugin_capability_flags(&metadata).is_none(), "{metadata}");
+            assert!(
+                normalize_plugin_reasoning_capability(&metadata).is_none(),
+                "{metadata}"
+            );
+        }
+    }
+
+    #[test]
     fn schema_v1_generic_dispatch_matches_existing_helpers() {
         let metadata = serde_json::json!({
             "schema_version": 1,
@@ -1990,6 +2320,8 @@ mod execution_profile_tests {
             source_plugin_id: None,
             source_integration_id: None,
             pricing_scope: "direct_api".into(),
+            integration_features: None,
+            integration_protocols: None,
         }
     }
 
@@ -2035,6 +2367,17 @@ mod execution_profile_tests {
                 .unwrap()
                 .transport,
             TargetTransport::Anthropic
+        );
+
+        model.discovery = serde_json::json!({
+            "transport": {"format": "openai-chat"}
+        })
+        .to_string();
+        assert_eq!(
+            resolve_execution_profile(&provider, &model)
+                .unwrap()
+                .transport,
+            TargetTransport::OpenAiChat
         );
 
         model.discovery = "{}".into();
@@ -2096,6 +2439,69 @@ mod execution_profile_tests {
         .to_string();
         let profile = resolve_execution_profile(&provider, &model).unwrap();
         assert_eq!(profile.capabilities.text, None);
+    }
+
+    #[test]
+    fn integration_feature_ceiling_vetoes_model_capabilities() {
+        let mut provider = provider();
+        provider.integration_features = Some(
+            serde_json::json!({
+                "schema_version": 1,
+                "streaming": true,
+                "tools": false,
+                "parallel_tools": false,
+                "vision": false,
+                "reasoning": false,
+                "structured_output": false,
+                "model_discovery": true,
+                "quota_probe": false,
+                "health_probe": false
+            })
+            .to_string(),
+        );
+        let mut model = model();
+        model.capabilities = serde_json::json!({
+            "vision": true,
+            "tool_calling": true,
+            "parallel_tools": true,
+            "reasoning": true,
+            "structured_output": true
+        })
+        .to_string();
+
+        let profile = resolve_execution_profile(&provider, &model).unwrap();
+        assert_eq!(profile.capabilities.vision, Some(false));
+        assert_eq!(profile.capabilities.tool_calling, Some(false));
+        assert_eq!(profile.capabilities.parallel_tools, Some(false));
+        assert_eq!(profile.capabilities.reasoning, Some(false));
+        assert_eq!(profile.capabilities.structured_output, Some(false));
+    }
+
+    #[test]
+    fn integration_feature_ceiling_does_not_invent_model_capabilities() {
+        let mut provider = provider();
+        provider.integration_features = Some(
+            serde_json::json!({
+                "schema_version": 1,
+                "streaming": true,
+                "tools": true,
+                "parallel_tools": true,
+                "vision": true,
+                "reasoning": true,
+                "structured_output": true,
+                "model_discovery": true,
+                "quota_probe": true,
+                "health_probe": true
+            })
+            .to_string(),
+        );
+
+        let profile = resolve_execution_profile(&provider, &model()).unwrap();
+        assert_eq!(profile.capabilities.vision, None);
+        assert_eq!(profile.capabilities.tool_calling, None);
+        assert_eq!(profile.capabilities.parallel_tools, None);
+        assert_eq!(profile.capabilities.reasoning, None);
+        assert_eq!(profile.capabilities.structured_output, None);
     }
 
     #[test]

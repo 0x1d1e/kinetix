@@ -183,6 +183,7 @@ fn token_count_exact_target(
     state: &AppState,
     key: &db::VirtualKeyRow,
     req: &InternalRequest,
+    input_protocol: &str,
 ) -> Result<Option<ResolvedTarget>, ProxyError> {
     let snap = state.registry.snapshot();
     let resolved =
@@ -196,14 +197,16 @@ fn token_count_exact_target(
     let allowed_providers = key.allowed_providers();
 
     let eligible = |target: &ResolvedTarget| {
-        let capabilities_match = !target.provider.strict()
-            || crate::adapters::resolve_execution_profile_for_target(
-                &target.provider,
-                &target.model,
-                Some(target.account.id.as_str()),
-            )
-            .map(|profile| profile_satisfies_needs(&profile.capabilities, &needs))
-            .unwrap_or(false);
+        let capabilities_match = provider_accepts_input_protocol(&target.provider, input_protocol)
+            && integration_feature_ceiling_satisfies_needs(&target.provider, &needs)
+            && (!target.provider.strict()
+                || crate::adapters::resolve_execution_profile_for_target(
+                    &target.provider,
+                    &target.model,
+                    Some(target.account.id.as_str()),
+                )
+                .map(|profile| profile_satisfies_needs(&profile.capabilities, &needs))
+                .unwrap_or(false));
         (allowed_providers.is_empty() || allowed_providers.contains(&target.provider.id))
             && capabilities_match
     };
@@ -223,6 +226,11 @@ fn token_count_exact_target(
                 .get(&provider_id)
                 .cloned()
                 .ok_or_else(|| ProxyError::not_found("provider not found"))?;
+            if !provider_accepts_input_protocol(&provider, input_protocol) {
+                return Err(ProxyError::unsupported(format!(
+                    "provider integration does not allow input protocol '{input_protocol}'"
+                )));
+            }
             if !allowed_providers.is_empty() && !allowed_providers.contains(&provider.id) {
                 return Err(ProxyError::new(
                     crate::types::ErrorKind::Forbidden,
@@ -245,7 +253,7 @@ fn token_count_exact_target(
                 &model,
                 Some(account.id.as_str()),
             )?;
-            if provider.strict() && !profile_satisfies_needs(&profile.capabilities, &needs) {
+            if !provider_satisfies_needs(&provider, &profile.capabilities, &needs) {
                 return Err(ProxyError::unsupported(
                     "resolved model cannot satisfy this token-count request",
                 ));
@@ -305,7 +313,9 @@ pub async fn count_tokens(
         exact: false,
     };
 
-    let Some(target) = token_count_exact_target(state, key, req)? else {
+    let Some(target) =
+        token_count_exact_target(state, key, req, FrontendFormat::Anthropic.protocol())?
+    else {
         return Ok(estimate());
     };
     let profile = crate::adapters::resolve_execution_profile_for_target(
@@ -764,6 +774,18 @@ pub(crate) async fn run_with_disconnect(
             );
             return false;
         }
+        if !provider_accepts_input_protocol(&t.provider, format.protocol()) {
+            trace.step(
+                "skip",
+                Some(t.model.display_name.clone()),
+                format!(
+                    "model={} input protocol '{}' is not allowed by the integration",
+                    t.model.display_name,
+                    format.protocol()
+                ),
+            );
+            return false;
+        }
         if let Some(ctx) = t.model.context_window {
             if ctx > 0 && req.approx_input_tokens() > ctx as u64 {
                 trace.step(
@@ -827,7 +849,7 @@ pub(crate) async fn run_with_disconnect(
             .finish(&meta.request_id, "no_eligible_target", 0, None, None);
         let _ = db::insert_route_trace(&state.pool, &trace).await;
         return Err(ProxyError::unsupported(
-            "no configured target can satisfy this request (predicates, capabilities, or limits mismatch)",
+            "no configured target can satisfy this request (predicates, protocols, capabilities, or limits mismatch)",
         ));
     }
 
@@ -1024,7 +1046,7 @@ pub(crate) async fn run_with_disconnect(
                 continue;
             }
         };
-        if target.provider.strict() && !profile_satisfies_needs(&profile.capabilities, &needs) {
+        if !provider_satisfies_needs(&target.provider, &profile.capabilities, &needs) {
             trace.step(
                 "skip",
                 Some(target.model.display_name.clone()),
@@ -4027,15 +4049,71 @@ fn target_profile_supports_request(
     target: &ResolvedTarget,
     needs: &crate::types::CapabilityNeeds,
 ) -> bool {
-    crate::adapters::resolve_execution_profile_for_target(
-        &target.provider,
-        &target.model,
-        Some(target.account.id.as_str()),
-    )
-    .map(|profile| {
-        !target.provider.strict() || profile_satisfies_needs(&profile.capabilities, needs)
-    })
-    .unwrap_or(false)
+    integration_feature_ceiling_satisfies_needs(&target.provider, needs)
+        && (!target.provider.strict()
+            || crate::adapters::resolve_execution_profile_for_target(
+                &target.provider,
+                &target.model,
+                Some(target.account.id.as_str()),
+            )
+            .map(|profile| profile_satisfies_needs(&profile.capabilities, needs))
+            .unwrap_or(false))
+}
+
+/// Integration declarations are hard ceilings even for permissive providers;
+/// model capability metadata remains advisory in that mode.
+fn integration_feature_ceiling_satisfies_needs(
+    provider: &db::ProviderRow,
+    needs: &crate::types::CapabilityNeeds,
+) -> bool {
+    let ceiling = match provider.integration_feature_ceiling() {
+        Ok(Some(ceiling)) => ceiling,
+        Ok(None) => return true,
+        Err(_) => return false,
+    };
+    (!needs.vision || ceiling.vision)
+        && (!needs.tools || ceiling.tools)
+        && (!needs.parallel_tools || ceiling.parallel_tools)
+        && (!needs.streaming || ceiling.streaming)
+        && (!needs.reasoning || ceiling.reasoning)
+        && (!needs.structured_output || ceiling.structured_output)
+}
+
+fn provider_accepts_input_protocol(provider: &db::ProviderRow, protocol: &str) -> bool {
+    match provider.allows_input_protocol(protocol) {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            tracing::error!(
+                provider = %provider.id,
+                %error,
+                "invalid persisted integration protocol ceiling"
+            );
+            false
+        }
+    }
+}
+
+fn dry_run_provider_accepts_frontend(provider: &db::ProviderRow, frontend: &str) -> bool {
+    let protocol = match frontend {
+        "openai" | "openai-chat" => Some("openai-chat"),
+        "openai-responses" => Some("openai-responses"),
+        "anthropic" => Some("anthropic"),
+        "gemini" => Some("gemini"),
+        _ => None,
+    };
+    if let Some(protocol) = protocol {
+        return provider_accepts_input_protocol(provider, protocol);
+    }
+    matches!(provider.integration_protocol_ceiling(), Ok(None))
+}
+
+fn provider_satisfies_needs(
+    provider: &db::ProviderRow,
+    capabilities: &crate::adapters::ModelCapabilityFlags,
+    needs: &crate::types::CapabilityNeeds,
+) -> bool {
+    integration_feature_ceiling_satisfies_needs(provider, needs)
+        && (!provider.strict() || profile_satisfies_needs(capabilities, needs))
 }
 
 fn profile_satisfies_needs(
@@ -4044,7 +4122,9 @@ fn profile_satisfies_needs(
 ) -> bool {
     (!needs.vision || capabilities.vision != Some(false))
         && (!needs.tools || capabilities.tool_calling != Some(false))
+        && (!needs.parallel_tools || capabilities.parallel_tools != Some(false))
         && (!needs.reasoning || capabilities.reasoning != Some(false))
+        && (!needs.structured_output || capabilities.structured_output != Some(false))
 }
 
 fn check_param_policy(
@@ -5661,6 +5741,12 @@ pub struct DryRunRequest {
     #[serde(default)]
     pub has_reasoning: bool,
     #[serde(default)]
+    pub has_structured_output: bool,
+    #[serde(default)]
+    pub has_parallel_tools: bool,
+    #[serde(default)]
+    pub streaming: bool,
+    #[serde(default)]
     pub input_tokens: Option<u64>,
     /// Providers the calling key is restricted to (FR-12.19); empty = no
     /// restriction. The dashboard passes the selected key's allowlist so the
@@ -5689,7 +5775,10 @@ pub async fn dry_run(
     let needs = crate::types::CapabilityNeeds {
         vision: descriptor.has_images,
         tools: descriptor.has_tools,
+        parallel_tools: descriptor.has_parallel_tools,
+        streaming: descriptor.streaming,
         reasoning: descriptor.has_reasoning,
+        structured_output: descriptor.has_structured_output,
     };
 
     let (targets, route) = match resolved {
@@ -5775,7 +5864,8 @@ pub async fn dry_run(
                 .unwrap_or(true);
             let provider_allowed = descriptor.allowed_providers.is_empty()
                 || descriptor.allowed_providers.contains(&t.provider.id);
-            if predicate_ok && caps_ok && ctx_ok && provider_allowed {
+            let protocol_ok = dry_run_provider_accepts_frontend(&t.provider, frontend);
+            if predicate_ok && caps_ok && ctx_ok && provider_allowed && protocol_ok {
                 hard_eligible.push(t.clone());
             }
         }
@@ -5822,6 +5912,7 @@ pub async fn dry_run(
             .unwrap_or(true);
         let provider_allowed = descriptor.allowed_providers.is_empty()
             || descriptor.allowed_providers.contains(&t.provider.id);
+        let protocol_ok = dry_run_provider_accepts_frontend(&t.provider, frontend);
         let quota_ok = !descriptor.soft_quota_reached;
         let adaptive_capacity_ok = dry_run_traffic
             .as_ref()
@@ -5833,6 +5924,7 @@ pub async fn dry_run(
             && caps_ok
             && ctx_ok
             && provider_allowed
+            && protocol_ok
             && quota_ok
             && adaptive_capacity_ok;
         if would_select {
@@ -5862,6 +5954,9 @@ pub async fn dry_run(
         }
         if !provider_allowed {
             reasons.push("provider_not_permitted");
+        }
+        if !protocol_ok {
+            reasons.push("input_protocol");
         }
         if !quota_ok {
             reasons.push("soft_quota");
@@ -6142,6 +6237,8 @@ mod route_policy_tests {
             source_plugin_id: None,
             source_integration_id: None,
             pricing_scope: "direct_api".into(),
+            integration_features: None,
+            integration_protocols: None,
         }
     }
 
@@ -7028,6 +7125,214 @@ mod route_policy_tests {
         }));
 
         drop(permits);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn integration_ceiling_vetoes_capability_requests_for_permissive_provider() {
+        let (state, root, provider_id, model_id, _) = adaptive_dry_run_state().await;
+        let ceiling = crate::plugins::types::IntegrationFeaturesV1 {
+            schema_version: 1,
+            streaming: false,
+            tools: true,
+            parallel_tools: false,
+            vision: false,
+            reasoning: false,
+            structured_output: false,
+            model_discovery: false,
+            quota_probe: false,
+            health_probe: false,
+        };
+        db::set_provider_integration_features(&state.pool, &provider_id, Some(&ceiling))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE providers SET source_plugin_id=?, source_integration_id=? WHERE id=?")
+            .bind("plugin.test")
+            .bind("ceiling")
+            .bind(&provider_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE models SET capabilities=? WHERE id=?")
+            .bind(
+                serde_json::json!({
+                    "vision": true,
+                    "reasoning": true,
+                    "structured_output": true,
+                    "tool_calling": true,
+                    "parallel_tools": true
+                })
+                .to_string(),
+            )
+            .bind(&model_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let provider = state.registry.provider(&provider_id).unwrap();
+        assert!(!provider.strict());
+        assert_eq!(provider.source_plugin_id.as_deref(), Some("plugin.test"));
+        assert_eq!(provider.source_integration_id.as_deref(), Some("ceiling"));
+
+        for request in [
+            DryRunRequest {
+                has_images: true,
+                ..Default::default()
+            },
+            DryRunRequest {
+                has_reasoning: true,
+                ..Default::default()
+            },
+            DryRunRequest {
+                has_structured_output: true,
+                ..Default::default()
+            },
+            DryRunRequest {
+                streaming: true,
+                ..Default::default()
+            },
+            DryRunRequest {
+                has_tools: true,
+                has_parallel_tools: true,
+                ..Default::default()
+            },
+        ] {
+            let result = dry_run(&state, "adaptive-dry-run", &request).await.unwrap();
+            assert!(
+                result["would_select"].is_null(),
+                "request unexpectedly routed despite explicit integration veto: {result}"
+            );
+            assert!(result["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|candidate| {
+                    candidate["not_selected_reasons"]
+                        .as_array()
+                        .is_some_and(|reasons| {
+                            reasons
+                                .iter()
+                                .any(|reason| reason.as_str() == Some("capabilities"))
+                        })
+                }));
+        }
+
+        let request_bodies = [
+            serde_json::json!({
+                "model": "adaptive-dry-run",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": { "url": "https://example.com/image.png" }
+                    }]
+                }]
+            }),
+            serde_json::json!({
+                "model": "adaptive-dry-run",
+                "messages": [{ "role": "user", "content": "think" }],
+                "reasoning_effort": "high"
+            }),
+            serde_json::json!({
+                "model": "adaptive-dry-run",
+                "messages": [{ "role": "user", "content": "return JSON" }],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": { "name": "answer", "schema": { "type": "object" } }
+                }
+            }),
+            serde_json::json!({
+                "model": "adaptive-dry-run",
+                "messages": [{ "role": "user", "content": "stream this" }],
+                "stream": true
+            }),
+            serde_json::json!({
+                "model": "adaptive-dry-run",
+                "messages": [{ "role": "user", "content": "use tools" }],
+                "parallel_tool_calls": true,
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": { "type": "object", "properties": {} }
+                    }
+                }]
+            }),
+        ];
+        let mut errors = Vec::new();
+        for body in request_bodies {
+            let request = crate::frontends::openai::decode_request(body).unwrap();
+            errors.push(
+                run(
+                    &state,
+                    crate::frontends::FrontendFormat::OpenAi,
+                    None,
+                    request,
+                    uuid::Uuid::new_v4().to_string(),
+                    false,
+                    None,
+                    Vec::new(),
+                )
+                .await
+                .expect_err("request without manual-provider credentials must fail"),
+            );
+        }
+        assert!(
+            errors.iter().all(|error| {
+                error.kind == crate::types::ErrorKind::Unsupported
+                    && error.message.contains("target capabilities do not satisfy")
+            }),
+            "requests must be rejected by capability eligibility, got: {errors:?}"
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn integration_input_protocol_ceiling_rejects_other_frontends_before_credentials() {
+        let (state, root, provider_id, _, _) = adaptive_dry_run_state().await;
+        let protocols = crate::plugins::types::IntegrationProtocolsV1 {
+            input: vec!["anthropic".into()],
+            upstream: vec!["openai-chat".into()],
+        };
+        db::set_provider_integration_protocols(&state.pool, &provider_id, Some(&protocols))
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let provider = state.registry.provider(&provider_id).unwrap();
+        assert!(provider.allows_input_protocol("anthropic").unwrap());
+        assert!(!provider.allows_input_protocol("openai-chat").unwrap());
+
+        let dry_run = dry_run(&state, "adaptive-dry-run", &DryRunRequest::default())
+            .await
+            .unwrap();
+        assert!(dry_run["would_select"].is_null());
+        assert!(dry_run["candidates"][0]["not_selected_reasons"]
+            .as_array()
+            .is_some_and(|reasons| reasons.iter().any(|reason| reason == "input_protocol")));
+
+        let request = crate::frontends::openai::decode_request(serde_json::json!({
+            "model": "adaptive-dry-run",
+            "messages": [{ "role": "user", "content": "hello" }]
+        }))
+        .unwrap();
+        let error = run(
+            &state,
+            FrontendFormat::OpenAi,
+            None,
+            request,
+            uuid::Uuid::new_v4().to_string(),
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, crate::types::ErrorKind::Unsupported);
+        assert!(error.message.contains("protocols"), "{error}");
+
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }

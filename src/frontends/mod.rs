@@ -83,6 +83,14 @@ impl FrontendFormat {
             FrontendFormat::OpenAiResponses => "openai-responses",
         }
     }
+
+    pub fn protocol(&self) -> &'static str {
+        match self {
+            FrontendFormat::OpenAi => "openai-chat",
+            FrontendFormat::Anthropic => "anthropic",
+            FrontendFormat::OpenAiResponses => "openai-responses",
+        }
+    }
 }
 
 /// Fields echoed into synthesized Responses API response objects.

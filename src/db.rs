@@ -1003,6 +1003,10 @@ pub struct ProviderRow {
     #[serde(default)]
     pub source_integration_id: Option<String>,
     pub pricing_scope: String,
+    #[serde(default)]
+    pub integration_features: Option<String>,
+    #[serde(default)]
+    pub integration_protocols: Option<String>,
 }
 
 impl ProviderRow {
@@ -1053,6 +1057,40 @@ impl ProviderRow {
     /// The plugin capability supplying this provider's model discovery (§6.0).
     pub fn model_source_plugin_ref(&self) -> Option<crate::plugins::PluginRef> {
         crate::plugins::PluginRef::parse(&self.model_source_plugin)
+    }
+    /// Validated integration feature ceiling, if this provider was created
+    /// from an integration that declares one.
+    pub fn integration_feature_ceiling(
+        &self,
+    ) -> Result<Option<crate::plugins::types::IntegrationFeaturesV1>, String> {
+        let Some(raw) = self.integration_features.as_deref() else {
+            return Ok(None);
+        };
+        let features: crate::plugins::types::IntegrationFeaturesV1 =
+            serde_json::from_str(raw).map_err(|error| error.to_string())?;
+        features.validate()?;
+        Ok(Some(features))
+    }
+
+    /// Validated input/upstream protocol declarations for an integration-backed
+    /// provider. Missing declarations preserve legacy behavior.
+    pub fn integration_protocol_ceiling(
+        &self,
+    ) -> Result<Option<crate::plugins::types::IntegrationProtocolsV1>, String> {
+        let Some(raw) = self.integration_protocols.as_deref() else {
+            return Ok(None);
+        };
+        let protocols: crate::plugins::types::IntegrationProtocolsV1 =
+            serde_json::from_str(raw).map_err(|error| error.to_string())?;
+        protocols.validate()?;
+        Ok(Some(protocols))
+    }
+
+    pub fn allows_input_protocol(&self, protocol: &str) -> Result<bool, String> {
+        let Some(ceiling) = self.integration_protocol_ceiling()? else {
+            return Ok(true);
+        };
+        Ok(ceiling.allows_input(protocol))
     }
 
     /// Whether a destination host is authorized to receive this provider's
@@ -1130,6 +1168,74 @@ pub fn conservative_provider_pricing_scope(
     } else {
         "direct_api"
     }
+}
+
+pub async fn set_provider_integration_features(
+    pool: &Pool,
+    id: &str,
+    features: Option<&crate::plugins::types::IntegrationFeaturesV1>,
+) -> Result<()> {
+    if let Some(features) = features {
+        features.validate().map_err(anyhow::Error::msg)?;
+    }
+    let serialized = features.map(serde_json::to_string).transpose()?;
+    sqlx::query("UPDATE providers SET integration_features=? WHERE id=?")
+        .bind(serialized)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_provider_integration_protocols(
+    pool: &Pool,
+    id: &str,
+    protocols: Option<&crate::plugins::types::IntegrationProtocolsV1>,
+) -> Result<()> {
+    if let Some(protocols) = protocols {
+        protocols.validate().map_err(anyhow::Error::msg)?;
+    }
+    let serialized = protocols.map(serde_json::to_string).transpose()?;
+    sqlx::query("UPDATE providers SET integration_protocols=? WHERE id=?")
+        .bind(serialized)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn set_provider_integration_features_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    features: Option<&crate::plugins::types::IntegrationFeaturesV1>,
+) -> Result<()> {
+    if let Some(features) = features {
+        features.validate().map_err(anyhow::Error::msg)?;
+    }
+    let serialized = features.map(serde_json::to_string).transpose()?;
+    sqlx::query("UPDATE providers SET integration_features=? WHERE id=?")
+        .bind(serialized)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn set_provider_integration_protocols_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    protocols: Option<&crate::plugins::types::IntegrationProtocolsV1>,
+) -> Result<()> {
+    if let Some(protocols) = protocols {
+        protocols.validate().map_err(anyhow::Error::msg)?;
+    }
+    let serialized = protocols.map(serde_json::to_string).transpose()?;
+    sqlx::query("UPDATE providers SET integration_protocols=? WHERE id=?")
+        .bind(serialized)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String> {
@@ -1363,6 +1469,44 @@ pub(crate) async fn update_provider_in_transaction(
     if pricing_scope == "integration" || catalog_identity_changed {
         revoke_external_catalog_effective_pricing_in_transaction(tx, id).await?;
     }
+    Ok(())
+}
+
+pub async fn update_provider_integration_bindings(
+    pool: &Pool,
+    id: &str,
+    wire_format: WireFormat,
+    wire_plugin: &str,
+    credential_plugin: &str,
+    model_source_plugin: &str,
+) -> Result<()> {
+    let existing = get_provider(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("provider '{id}' not found"))?;
+    let bindings_changed = existing.wire_format != wire_format.as_str()
+        || existing.wire_plugin != wire_plugin
+        || existing.credential_plugin != credential_plugin
+        || existing.model_source_plugin != model_source_plugin;
+    if !bindings_changed {
+        return Ok(());
+    }
+
+    let _guards = provider_price_guards(pool, id).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE providers
+         SET wire_format=?, wire_plugin=?, credential_plugin=?, model_source_plugin=?
+         WHERE id=?",
+    )
+    .bind(wire_format.as_str())
+    .bind(wire_plugin)
+    .bind(credential_plugin)
+    .bind(model_source_plugin)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    revoke_external_catalog_effective_pricing_in_transaction(&mut tx, id).await?;
+    tx.commit().await?;
     Ok(())
 }
 

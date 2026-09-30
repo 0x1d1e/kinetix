@@ -456,6 +456,8 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         source_plugin_id: Some(id.into()),
         source_integration_id: Some("antigravity".into()),
         pricing_scope: "integration".into(),
+        integration_features: None,
+        integration_protocols: None,
     };
     assert_eq!(provider_row.wire(), WireFormat::Plugin);
     let registered = registry.for_provider(&provider_row);
@@ -746,6 +748,8 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         source_plugin_id: Some(API2_ID.into()),
         source_integration_id: Some("session-echo".into()),
         pricing_scope: "integration".into(),
+        integration_features: None,
+        integration_protocols: None,
     };
     let model = db::ModelRow {
         id: "model_fixture".into(),
