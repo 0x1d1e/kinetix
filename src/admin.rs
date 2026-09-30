@@ -2119,6 +2119,7 @@ pub async fn delete_provider(
     db::delete_provider(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?;
+    state.forget_deleted_provider(&id);
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -9202,9 +9203,15 @@ pub async fn delete_account(
     _auth: AdminAuth,
     Path(id): Path<String>,
 ) -> ApiResult {
+    let account = db::get_account(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?;
     db::delete_account(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?;
+    if let Some(account) = account {
+        state.forget_deleted_account(&account.provider_id, &account.id);
+    }
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -13410,6 +13417,7 @@ async fn reconcile_provider_account_mode(
                 .execute(&state.pool)
                 .await
                 .map_err(ApiError::internal)?;
+                state.forget_deleted_account(provider_id, &accounts[0].id);
             } else {
                 sqlx::query(
                     "UPDATE route_targets SET account_id=NULL
@@ -13424,6 +13432,9 @@ async fn reconcile_provider_account_mode(
                     .execute(&state.pool)
                     .await
                     .map_err(ApiError::internal)?;
+                for account in &accounts {
+                    state.forget_deleted_account(&account.provider_id, &account.id);
+                }
                 db::insert_account(
                     &state.pool,
                     provider_id,
@@ -13442,6 +13453,15 @@ async fn reconcile_provider_account_mode(
         crate::plugins::CredentialMode::Manual | crate::plugins::CredentialMode::AuthFlow => {
             // Credential-bearing modes must never route through synthetic
             // no-auth state left by a previous credential-free configuration.
+            let removed_accounts: Vec<_> = db::accounts_for_provider(&state.pool, provider_id)
+                .await
+                .map_err(ApiError::internal)?
+                .into_iter()
+                .filter(|account| {
+                    account.label == "__kinetix_noauth__"
+                        || (account.label == "public" && account.key_mask == legacy_public_mask)
+                })
+                .collect();
             sqlx::query(
                 "UPDATE route_targets SET account_id=NULL
                  WHERE account_id IN (
@@ -13465,6 +13485,9 @@ async fn reconcile_provider_account_mode(
             .execute(&state.pool)
             .await
             .map_err(ApiError::internal)?;
+            for account in &removed_accounts {
+                state.forget_deleted_account(&account.provider_id, &account.id);
+            }
         }
     }
 
@@ -18810,6 +18833,191 @@ mod credential_enrollment_regression_tests {
             api_key: api_key.map(str::to_string),
             account_label: Some("manual-key".into()),
         }
+    }
+
+    #[derive(Default)]
+    struct CredentialEvictionSpy {
+        accounts: parking_lot::Mutex<Vec<(String, String)>>,
+        providers: parking_lot::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::credentials::CredentialStrategy for CredentialEvictionSpy {
+        fn name(&self) -> &'static str {
+            "test_credential_eviction_spy"
+        }
+
+        async fn resolve(
+            &self,
+            _account: &db::AccountRow,
+        ) -> std::result::Result<
+            crate::credentials::ResolvedCredential,
+            crate::credentials::CredentialRotationError,
+        > {
+            Ok(crate::credentials::ResolvedCredential {
+                secret: "unused".into(),
+                expires_at: None,
+                refresh_after: None,
+                rotated: false,
+            })
+        }
+
+        fn forget_account(&self, provider_id: &str, account_id: &str) {
+            self.accounts
+                .lock()
+                .push((provider_id.to_owned(), account_id.to_owned()));
+        }
+
+        fn forget_provider(&self, provider_id: &str) {
+            self.providers.lock().push(provider_id.to_owned());
+        }
+    }
+
+    #[tokio::test]
+    async fn account_and_provider_deletion_evict_control_plane_state() {
+        let (state, root) = test_state("delete-control-plane-state").await;
+        let spy = Arc::new(CredentialEvictionSpy::default());
+        state.register_plugin_credential_strategy("test-eviction", spy.clone());
+
+        let account_provider_id = insert_provider(
+            &state,
+            "delete-account-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("account-secret").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &account_provider_id,
+            "account-to-delete",
+            &encrypted,
+            "test-key",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let scheduled = crate::credentials::ResolvedCredential {
+            secret: "schedule-secret".into(),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339()),
+            rotated: false,
+        };
+        state
+            .credential_refresh
+            .observe(&account_provider_id, &account_id, &scheduled);
+        drop(
+            state
+                .provider_work
+                .acquire(
+                    &account_provider_id,
+                    crate::provider_work::ProviderWorkClass::HealthProbe,
+                )
+                .await
+                .unwrap(),
+        );
+
+        let axum::Json(account_result) = delete_account(
+            axum::extract::State(state.clone()),
+            auth(),
+            Path(account_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(account_result["ok"], true);
+        assert!(db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .credential_refresh
+            .next_attempt_at(&account_provider_id, &account_id)
+            .is_none());
+        assert!(spy
+            .accounts
+            .lock()
+            .contains(&(account_provider_id.clone(), account_id.clone())));
+
+        let provider_id = insert_provider(
+            &state,
+            "delete-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("provider-account-secret").unwrap();
+        let provider_account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "provider-account",
+            &encrypted,
+            "test-key",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        state
+            .credential_refresh
+            .observe(&provider_id, &provider_account_id, &scheduled);
+        state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::HealthProbe,
+            )
+            .await
+            .unwrap()
+            .finish_failure(Some(
+                crate::provider_work::ProviderBackoffEvidence::Transient {
+                    retry_after_secs: None,
+                },
+            ))
+            .await;
+        assert!(state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::HealthProbe
+            )
+            .await
+            .is_err());
+
+        let axum::Json(provider_result) = delete_provider(
+            axum::extract::State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(provider_result["ok"], true);
+        assert!(db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .credential_refresh
+            .next_attempt_at(&provider_id, &provider_account_id)
+            .is_none());
+        assert!(spy.providers.lock().contains(&provider_id));
+        assert!(state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::HealthProbe
+            )
+            .await
+            .is_ok());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

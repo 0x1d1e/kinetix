@@ -99,6 +99,14 @@ pub trait CredentialStrategy: Send + Sync {
         Ok(None)
     }
 
+    /// Evict local credential state after this account is deleted or replaced.
+    /// Strategies without account-scoped caches may keep the default no-op.
+    fn forget_account(&self, _provider_id: &str, _account_id: &str) {}
+
+    /// Evict all local credential state for a deleted provider.
+    /// Strategies without provider-scoped caches may keep the default no-op.
+    fn forget_provider(&self, _provider_id: &str) {}
+
     /// Resolve the plaintext credential to send upstream for this account.
     /// Refresh-capable strategies may perform network work here.
     async fn resolve(

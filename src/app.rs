@@ -283,6 +283,23 @@ impl AppState {
         self.adapters.unregister_plugin(plugin_id);
     }
 
+    /// Release account-scoped credential cache and refresh state after deletion.
+    pub fn forget_deleted_account(&self, provider_id: &str, account_id: &str) {
+        self.credential_refresh.forget(provider_id, account_id);
+        for strategy in self.plugin_credentials.iter() {
+            strategy.value().forget_account(provider_id, account_id);
+        }
+    }
+
+    /// Release provider-scoped work and credential state after deletion.
+    pub fn forget_deleted_provider(&self, provider_id: &str) {
+        self.provider_work.forget_provider(provider_id);
+        self.credential_refresh.forget_provider(provider_id);
+        for strategy in self.plugin_credentials.iter() {
+            strategy.value().forget_provider(provider_id);
+        }
+    }
+
     /// Resolve the credential for an account, honouring a provider's plugin
     /// credential binding (§6.0). A bound-but-unavailable plugin fails closed.
     pub async fn credential_for(

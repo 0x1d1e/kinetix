@@ -37,7 +37,7 @@ fn credential_error(fault: super::runtime::PluginFault) -> CredentialRotationErr
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PluginCredentialLease {
     handle: String,
     expires_at: Option<String>,
@@ -151,6 +151,16 @@ impl PluginCredentialStrategy {
         }
     }
 
+    fn evict_lease_if_unchanged(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        lease: &PluginCredentialLease,
+    ) {
+        let key = (provider_id.to_owned(), account_id.to_owned());
+        self.leases.remove_if(&key, |_, cached| cached == lease);
+    }
+
     async fn lease_secret(
         &self,
         handle: &str,
@@ -211,7 +221,17 @@ impl CredentialStrategy for PluginCredentialStrategy {
             return Ok(None);
         }
 
-        let secret = self.lease_secret(&lease.handle).await?;
+        let secret = match self.lease_secret(&lease.handle).await {
+            Ok(secret) => secret,
+            Err(error) if !error.retryable => {
+                // Rotation may have removed the old secret before a new lease
+                // could be resolved. Do not let stale cache metadata block the
+                // next full plugin resolution.
+                self.evict_lease_if_unchanged(&account.provider_id, &account.id, &lease);
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Some(ResolvedCredential {
             secret,
             expires_at: lease.expires_at,
@@ -250,6 +270,16 @@ impl CredentialStrategy for PluginCredentialStrategy {
         })
     }
 
+    fn forget_account(&self, provider_id: &str, account_id: &str) {
+        self.leases
+            .remove(&(provider_id.to_owned(), account_id.to_owned()));
+    }
+
+    fn forget_provider(&self, provider_id: &str) {
+        self.leases
+            .retain(|(cached_provider, _), _| cached_provider != provider_id);
+    }
+
     async fn rotate(
         &self,
         account: &AccountRow,
@@ -257,7 +287,11 @@ impl CredentialStrategy for PluginCredentialStrategy {
         self.manager
             .rotate_lease(&self.plugin_id, &account.provider_id, &account.id)
             .await
-            .map_err(credential_error)
+            .map_err(credential_error)?;
+        // A successful rotation can invalidate the cached handle even when
+        // the follow-up resolve fails. Never keep the old lease across it.
+        self.forget_account(&account.provider_id, &account.id);
+        Ok(())
     }
 
     async fn health(&self, account: &AccountRow) -> CredentialHealth {
@@ -370,6 +404,81 @@ mod tests {
             _account_id: &str,
         ) -> Result<(), PluginFault> {
             self.rotations.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn health_state(
+            &self,
+            _plugin_id: &str,
+            _provider_id: &str,
+            _account_id: &str,
+        ) -> Result<PluginHealthObservation, PluginFault> {
+            Ok(PluginHealthObservation {
+                state: "healthy".into(),
+                reset_at: None,
+            })
+        }
+    }
+
+    struct RotatingLeaseHost {
+        pool: Pool,
+        crypto: Arc<Crypto>,
+        resolutions: AtomicUsize,
+        rotations: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CredentialPluginHost for RotatingLeaseHost {
+        async fn resolve_lease(
+            &self,
+            plugin_id: &str,
+            _provider_id: &str,
+            _account_id: &str,
+            _account_label: &str,
+        ) -> Result<PluginCredentialLease, PluginFault> {
+            let generation = self.resolutions.fetch_add(1, Ordering::Relaxed);
+            if generation == 1 && self.rotations.load(Ordering::Relaxed) > 0 {
+                return Err(PluginFault::PluginError {
+                    code: "upstream_unavailable".into(),
+                    message: "temporary failure after rotation".into(),
+                    retryable: true,
+                    retry_after: None,
+                });
+            }
+
+            let handle = format!("lease-{generation}");
+            crate::plugins::store::kv_put(
+                &self.pool,
+                &self.crypto,
+                plugin_id,
+                &format!("{LEASE_PREFIX}{handle}"),
+                b"rotated-access-token",
+            )
+            .await
+            .map_err(|error| PluginFault::Internal(error.to_string()))?;
+            let now = chrono::Utc::now();
+            Ok(PluginCredentialLease {
+                handle,
+                expires_at: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
+                refresh_after: Some((now + chrono::Duration::minutes(30)).to_rfc3339()),
+            })
+        }
+
+        async fn rotate_lease(
+            &self,
+            plugin_id: &str,
+            _provider_id: &str,
+            _account_id: &str,
+        ) -> Result<(), PluginFault> {
+            self.rotations.fetch_add(1, Ordering::Relaxed);
+            let generation = self.resolutions.load(Ordering::Relaxed).saturating_sub(1);
+            crate::plugins::store::kv_delete(
+                &self.pool,
+                plugin_id,
+                &format!("{LEASE_PREFIX}lease-{generation}"),
+            )
+            .await
+            .map_err(|error| PluginFault::Internal(error.to_string()))?;
             Ok(())
         }
 
@@ -631,6 +740,91 @@ mod tests {
             .expect("a failed lease must not prevent fresh resolution");
         assert_eq!(recovered.secret, "valid-access-token");
         assert_eq!(host.resolutions.load(Ordering::Relaxed), 2);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn post_rotation_resolution_retries_after_transient_failure() {
+        let (root, pool, crypto) = test_store("rotation-cache-eviction").await;
+        let host = Arc::new(RotatingLeaseHost {
+            pool: pool.clone(),
+            crypto: crypto.clone(),
+            resolutions: AtomicUsize::new(0),
+            rotations: AtomicUsize::new(0),
+        });
+        let concrete = Arc::new(PluginCredentialStrategy::with_host(
+            host.clone(),
+            pool.clone(),
+            crypto,
+            "test.plugin",
+        ));
+        let strategy: Arc<dyn CredentialStrategy> = concrete.clone();
+        let account = test_account("rotated-account", "rotated-provider");
+        let refresh = crate::credential_refresh::RefreshCoordinator::default();
+
+        refresh
+            .resolve(&account.provider_id, strategy.clone(), &account)
+            .await
+            .unwrap();
+        concrete.rotate(&account).await.unwrap();
+        assert!(concrete.resolve_cached(&account).await.unwrap().is_none());
+
+        assert!(refresh
+            .resolve(&account.provider_id, strategy.clone(), &account)
+            .await
+            .is_err());
+        let recovered = refresh
+            .resolve(&account.provider_id, strategy, &account)
+            .await
+            .expect("the next resolution must retry the plugin after rotation failure");
+        assert_eq!(recovered.secret, "rotated-access-token");
+        assert_eq!(host.resolutions.load(Ordering::Relaxed), 3);
+        assert_eq!(host.rotations.load(Ordering::Relaxed), 1);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn credential_cache_eviction_cleans_account_and_provider_entries() {
+        let (root, pool, crypto) = test_store("credential-cache-eviction").await;
+        let strategy = PluginCredentialStrategy::with_host(
+            Arc::new(RotatingLeaseHost {
+                pool: pool.clone(),
+                crypto: crypto.clone(),
+                resolutions: AtomicUsize::new(0),
+                rotations: AtomicUsize::new(0),
+            }),
+            pool.clone(),
+            crypto,
+            "test.plugin",
+        );
+        let lease = |handle: &str| PluginCredentialLease {
+            handle: handle.to_owned(),
+            expires_at: None,
+            refresh_after: None,
+        };
+        strategy
+            .leases
+            .insert(("provider-a".into(), "account-a".into()), lease("a"));
+        strategy
+            .leases
+            .insert(("provider-a".into(), "account-b".into()), lease("b"));
+        strategy
+            .leases
+            .insert(("provider-b".into(), "account-c".into()), lease("c"));
+
+        strategy.forget_account("provider-a", "account-a");
+        assert!(!strategy
+            .leases
+            .contains_key(&("provider-a".into(), "account-a".into())));
+        strategy.forget_provider("provider-a");
+        assert_eq!(strategy.leases.len(), 1);
+        assert!(strategy
+            .leases
+            .contains_key(&("provider-b".into(), "account-c".into())));
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);

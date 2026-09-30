@@ -198,9 +198,9 @@ pub enum ProviderWorkError<E> {
 
 /// Shared provider-level rate, concurrency, and backoff budgets.
 ///
-/// Provider and in-flight maps contain configured providers and active
-/// single-flights only. Metrics are aggregate counters with no high-cardinality
-/// provider/account/model labels.
+/// Provider gates are evicted when providers are deleted. In-flight
+/// single-flights are bounded independently. Metrics are aggregate counters
+/// with no high-cardinality provider/account/model labels.
 #[derive(Clone, Default)]
 pub struct ProviderWorkCoordinator {
     providers: Arc<DashMap<String, Arc<ProviderGate>>>,
@@ -214,6 +214,11 @@ impl ProviderWorkCoordinator {
             .entry(provider_id.to_string())
             .or_insert_with(|| Arc::new(ProviderGate::default()))
             .clone()
+    }
+
+    /// Release provider-scoped budget state after provider deletion.
+    pub fn forget_provider(&self, provider_id: &str) {
+        self.providers.remove(provider_id);
     }
 
     pub fn metrics_snapshot(&self) -> ProviderWorkMetricsSnapshot {
@@ -702,6 +707,20 @@ mod tests {
             .unwrap()
             .unwrap();
         drop((second, third, independent));
+    }
+
+    #[tokio::test]
+    async fn deleting_provider_releases_provider_work_gate() {
+        let coordinator = ProviderWorkCoordinator::default();
+        let permit = coordinator
+            .acquire("deleted-provider", ProviderWorkClass::HealthProbe)
+            .await
+            .unwrap();
+        drop(permit);
+        assert_eq!(coordinator.providers.len(), 1);
+
+        coordinator.forget_provider("deleted-provider");
+        assert!(coordinator.providers.is_empty());
     }
 
     #[tokio::test]

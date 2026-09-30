@@ -252,6 +252,13 @@ impl RefreshCoordinator {
         self.gates.remove(&key);
     }
 
+    /// Forget all proactive refresh state for a deleted provider.
+    pub fn forget_provider(&self, provider_id: &str) {
+        self.schedules
+            .retain(|key, _| key.provider_id != provider_id);
+        self.gates.retain(|key, _| key.provider_id != provider_id);
+    }
+
     /// Atomically claim every lease whose refresh deadline has arrived.
     ///
     /// Claiming records a separate grace marker so the scheduler cannot
@@ -777,6 +784,31 @@ mod tests {
             },
         );
         assert!(coordinator.next_attempt_at("p", "a").is_none());
+    }
+
+    #[test]
+    fn forgetting_provider_releases_all_refresh_maps() {
+        let coordinator = RefreshCoordinator::default();
+        let credential = ResolvedCredential {
+            secret: "secret".into(),
+            expires_at: Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339()),
+            refresh_after: Some((Utc::now() + ChronoDuration::minutes(10)).to_rfc3339()),
+            rotated: false,
+        };
+        coordinator.observe("p1", "a1", &credential);
+        coordinator.observe("p2", "a2", &credential);
+        coordinator.gate(&CredentialKey::new("p1", "a1"));
+        coordinator.gate(&CredentialKey::new("p2", "a2"));
+
+        coordinator.forget_provider("p1");
+
+        assert!(coordinator.next_attempt_at("p1", "a1").is_none());
+        assert!(coordinator.next_attempt_at("p2", "a2").is_some());
+        assert_eq!(coordinator.schedules.len(), 1);
+        assert_eq!(coordinator.gates.len(), 1);
+        assert!(coordinator
+            .gates
+            .contains_key(&CredentialKey::new("p2", "a2")));
     }
 
     #[test]
