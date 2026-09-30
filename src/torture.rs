@@ -344,11 +344,13 @@ fn anthropic_tool_args_split_across_frames() {
 fn keepalive_cadence_well_under_cloudflare_idle_timeout() {
     // FR-9.4: silent-thinking phases must be kept alive under the ~100s idle
     // window that Cloudflare enforces on proxied connections.
-    assert!(
-        crate::pipeline::KEEPALIVE_INTERVAL_SECS >= 1
-            && crate::pipeline::KEEPALIVE_INTERVAL_SECS < 100,
-        "keepalive interval must fit inside the ~100s Cloudflare idle timeout"
-    );
+    const {
+        assert!(
+            crate::pipeline::KEEPALIVE_INTERVAL_SECS >= 1
+                && crate::pipeline::KEEPALIVE_INTERVAL_SECS < 100,
+            "keepalive interval must fit inside the ~100s Cloudflare idle timeout"
+        );
+    }
 }
 
 /// A synthetic upstream that emits keepalive comments while it "thinks" for

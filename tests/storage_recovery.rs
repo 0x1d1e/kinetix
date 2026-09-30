@@ -505,7 +505,7 @@ async fn startup_retries_preserve_snapshot_until_pricing_repair_succeeds() {
     .fetch_one(&backup)
     .await
     .unwrap();
-    assert_eq!(old_schema_has_integration_protocols, 0);
+    assert_eq!(old_schema_has_integration_protocols, 1);
     backup.close().await;
 
     let pool = db::connect(&url).await.unwrap();

@@ -7093,15 +7093,12 @@ mod route_policy_tests {
                 account_id.clone(),
                 model_id.clone(),
             );
-            loop {
-                match state
-                    .upstream_traffic
-                    .acquire(key.clone(), Duration::ZERO)
-                    .await
-                {
-                    Ok(permit) => permits.push(permit),
-                    Err(_) => break,
-                }
+            while let Ok(permit) = state
+                .upstream_traffic
+                .acquire(key.clone(), Duration::ZERO)
+                .await
+            {
+                permits.push(permit);
             }
         }
 

@@ -14067,7 +14067,7 @@ pub async fn setup_plugin_integration_provider(
         });
     if let Some(provider) = existing {
         validate_integration_upstream_protocols(
-            &manager,
+            manager,
             integration.protocols.as_ref(),
             &provider.wire_format,
             &provider.wire_plugin,
@@ -14098,7 +14098,7 @@ pub async fn setup_plugin_integration_provider(
     }
 
     validate_integration_upstream_protocols(
-        &manager,
+        manager,
         integration.protocols.as_ref(),
         &template.wire_format,
         &wire_plugin,
