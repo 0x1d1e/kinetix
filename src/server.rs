@@ -800,11 +800,7 @@ async fn run_plugin_health_probes_for_provider(
                 Some(format!("account:{}", account.id)),
                 move || async move {
                     probe_manager
-                        .health_probe_with_snapshots(
-                            &probe_plugin,
-                            &probe_provider,
-                            &probe_account,
-                        )
+                        .health_probe_with_snapshots(&probe_plugin, &probe_provider, &probe_account)
                         .await
                 },
                 |error| {

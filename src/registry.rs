@@ -35,7 +35,6 @@ pub(crate) struct RegistryPublication<'a> {
     registry: &'a Registry,
     _guard: tokio::sync::MutexGuard<'a, ()>,
 }
-}
 
 #[derive(Clone, Default)]
 pub struct Snapshot {

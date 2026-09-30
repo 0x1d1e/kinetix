@@ -18109,8 +18109,6 @@ mod credential_enrollment_regression_tests {
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }
-        let _ = std::fs::remove_dir_all(root);
-    }
 
     #[tokio::test]
     async fn queued_plugin_routing_refresh_cannot_recreate_scope_after_unregister() {
