@@ -1119,8 +1119,7 @@ pub(crate) async fn run_with_disconnect(
                     format!("model={} soft quota reached", target.model.display_name),
                 );
                 state.record_skip();
-                if dispatch_record.decision == crate::pre_dispatch::PreDispatchDecision::RateLimited
-                {
+                if live_decision == crate::pre_dispatch::PreDispatchDecision::RateLimited {
                     trace.finish("failed");
                     state.live.finish(
                         &meta.request_id,
@@ -7999,7 +7998,7 @@ mod route_policy_tests {
 
     #[tokio::test]
     async fn runtime_refreshes_fallback_quota_after_dispatch_plan_creation() {
-        let (state, root, provider_id, _, account_ids) = adaptive_dry_run_state().await;
+        let (state, root, provider_id, model_id, account_ids) = adaptive_dry_run_state().await;
         let upstream = QuotaRaceUpstream {
             request_count: std::sync::Arc::default(),
             primary_started: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -8034,15 +8033,41 @@ mod route_policy_tests {
             .await
             .unwrap();
         sqlx::query(
-            "UPDATE routes SET strategy='priority', max_attempts=2, fallback_triggers='{}' WHERE id=?",
+            "UPDATE routes SET strategy='priority', max_attempts=3, fallback_triggers='{\"onQuota\":false}' WHERE id=?",
         )
         .bind(&route_id)
         .execute(&state.pool)
         .await
         .unwrap();
+        let later_account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "later",
+            "",
+            "",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        db::insert_route_target(
+            &state.pool,
+            &route_id,
+            Some(&later_account_id),
+            &model_id,
+            3,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .unwrap();
         for (account_id, key) in [
             (&account_ids[0], "primary-key"),
             (&account_ids[1], "fallback-key"),
+            (&later_account_id, "later-key"),
         ] {
             sqlx::query("UPDATE accounts SET secret_enc=?, key_mask=? WHERE id=?")
                 .bind(state.crypto.encrypt(key).unwrap())
@@ -8125,10 +8150,10 @@ mod route_policy_tests {
             .await
             .expect("runtime request should finish")
             .unwrap();
-        assert!(
-            result.is_err(),
-            "exhausted fallback account must not dispatch"
-        );
+        assert!(matches!(
+            result,
+            Err(error) if error.kind == crate::types::ErrorKind::RateLimited
+        ));
         assert_eq!(
             upstream
                 .request_count
