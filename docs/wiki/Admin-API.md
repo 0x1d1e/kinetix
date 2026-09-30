@@ -75,7 +75,10 @@ Account responses include `status_reason`, `status_changed_at`, and `retry_at`. 
 | `POST /admin/api/routes` | Create (name, strategy, fallback triggers, `portability_policy`, `cache_affinity`, `max_attempts`, targets). |
 | `PUT /admin/api/routes/{id}` | Update (replaces targets). |
 | `DELETE /admin/api/routes/{id}` | Delete. |
-| `POST /admin/api/routes/dry-run` | Route Dry Run: returns candidate ordering, predicate outcomes, eligibility, and the would-be selection **without** touching production. |
+| `POST /admin/api/routes/validate` | Validate a proposed Route against persisted provider, model, account, plugin, alias, and execution-profile metadata. Returns `valid` plus structured errors and warnings; does not save the Route. |
+| `POST /admin/api/routes/dry-run` | Simulate a representative request; returns candidate ordering, predicate outcomes, capability states, eligibility reasons, and the would-be selection without contacting an upstream. |
+
+Route creation, updates, and config imports apply the same semantic validation before saving. The dry-run descriptor accepts request capability flags, input-token count, provider allowlist, an optional quota override, request-level `allow_fallback` (omitted defaults to enabled), and an optional session key. For Routes with sticky or cache affinity enabled, a known session mapping promotes its target; unknown sessions do not. Candidate output distinguishes supported, unsupported, and unknown capabilities and includes account quota and current circuit/concurrency availability. When account quota is exhausted, the simulation follows both `allow_fallback` and the Route's `onQuota` trigger; with fallback disabled it reports HTTP 429 and marks later candidates unreachable. `selection_mode` is stochastic when runtime weighted selection or equal-priority account weighting can change the chosen target; in that case `would_select` is null and no exact strategy rank is claimed. Simulation reads routing snapshots but does not reserve capacity, advance round-robin state, or update affinity.
 
 ## Aliases
 
@@ -100,6 +103,8 @@ Account responses include `status_reason`, `status_changed_at`, and `retry_at`. 
 | --- | --- |
 | `GET /admin/api/config/export` | Export version 2 config (secret-free; `?include_secrets=true` adds encrypted blobs and opaque account references). |
 | `POST /admin/api/config/import` | Accepts version 1 and 2; unversioned configs are treated as version 1. `apply:false` validates without writes and reports problems, conflicts, warnings, and missing resources. `apply:true` applies all upserts in one transaction and rolls back on failure. Imported secrets do not replace existing credentials; changing a provider to `credential_mode: none` may remove its credential accounts. |
+
+Import dry-run semantically validates proposed Routes against an isolated snapshot containing the imported providers, accounts, models, Routes, and aliases. Exported pinned targets use opaque account references that import remaps to regenerated account IDs; unresolved references are rejected rather than widened to an account pool. Disabled pinned accounts remain pinned and disabled after import, with validation warning that they are non-dispatchable. Apply rejects validation failures before writing to live state.
 
 ## Usage, requests, traces
 

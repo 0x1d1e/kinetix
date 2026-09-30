@@ -3,7 +3,11 @@ import { Shuffle, Plus, ArrowDown, ArrowUp, Shield, Check, Layers, ArrowRight, T
 import { Route, Account, ModelConfig } from '../../types';
 import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { DESIGN_TOKENS } from '../../lib/designSystem';
-import { Kinetix } from '../../lib/resources';
+import {
+  DryRunResult,
+  Kinetix,
+  RouteValidationResult,
+} from '../../lib/resources';
 
 const ROUTE_STRATEGIES: ReadonlyArray<readonly [Route['selectionStrategy'], string]> = [
   ['priority', 'Priority (Ordered fallback on failure)'],
@@ -13,6 +17,39 @@ const ROUTE_STRATEGIES: ReadonlyArray<readonly [Route['selectionStrategy'], stri
   ['adaptive', 'Adaptive (capacity + TTFT EWMA)'],
 ];
 
+const DRY_RUN_REASON_LABELS: Record<string, string> = {
+  predicate: 'Predicate did not match',
+  account_state: 'Account unavailable',
+  provider_not_permitted: 'Key cannot access provider',
+  provider_circuit_open: 'Provider circuit unavailable',
+  route_concurrency: 'Route concurrency limit reached',
+  soft_quota: 'Simulated quota reached',
+  account_soft_quota: 'Account quota reached',
+  quota_fallback_disabled: 'Quota reached; fallback is disabled',
+  unreachable_after_quota_failure: 'Not reached after quota failure',
+  stochastic_selection: 'Selection may vary at runtime',
+  adaptive_saturated: 'Adaptive capacity exhausted',
+  context_window: 'Input exceeds context window',
+  higher_ranked_candidate_selected: 'Another eligible target ranked first',
+  another_account_ordered_first: 'Another account was ordered first',
+  selected_by_route_strategy: 'Selected by route strategy',
+  selected_by_account_pool: 'Selected from account pool',
+};
+
+const formatDryRunReason = (reason: string) => {
+  const label = DRY_RUN_REASON_LABELS[reason];
+  if (label) return label;
+
+  const capabilityReason = reason.match(
+    /^required (vision|tool_calling|reasoning) capability is (unknown|unsupported)( under strict capability mode)?$/,
+  );
+  if (capabilityReason) {
+    const [, capability, status, strictMode] = capabilityReason;
+    return `Required ${capability.replace('_', ' ')} support is ${status}${strictMode ? ' (strict mode)' : ''}`;
+  }
+
+  return reason.replaceAll('_', ' ');
+};
 
 interface RoutesViewProps {
   routes: Route[];
@@ -21,8 +58,9 @@ interface RoutesViewProps {
   /** Providers the selected virtual key is restricted to (FR-12.19); empty =
    *  no restriction. Used by the Dry Run to reflect access restrictions. */
   allowedProviders?: string[];
-  onAddRoute: (newRoute: Route) => void;
-  onUpdateRoute: (updated: Route) => void;
+  onAddRoute: (newRoute: Route) => Promise<void>;
+  onUpdateRoute: (updated: Route) => Promise<void>;
+  onValidateRoute: (route: Route) => Promise<RouteValidationResult>;
   onDeleteRoute: (routeId: string) => void;
 }
 
@@ -33,6 +71,7 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
   allowedProviders,
   onAddRoute,
   onUpdateRoute,
+  onValidateRoute,
   onDeleteRoute,
 }) => {
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -40,18 +79,30 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
   const [confirmDeleteRouteId, setConfirmDeleteRouteId] = useState<string | null>(null);
   const [confirmRemoveTargetId, setConfirmRemoveTargetId] = useState<string | null>(null);
   const [routeSearch, setRouteSearch] = useState('');
+  const [routeValidationResult, setRouteValidationResult] = useState<RouteValidationResult | null>(null);
+  const [routeValidationError, setRouteValidationError] = useState<string | null>(null);
+  const [validatingRoute, setValidatingRoute] = useState(false);
+  const [routeMutationError, setRouteMutationError] = useState<string | null>(null);
 
   // New route form
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+  const [initialTargetModelId, setInitialTargetModelId] = useState('');
+  const [initialTargetAccountId, setInitialTargetAccountId] = useState('');
   const [strategy, setStrategy] = useState<Route['selectionStrategy']>('priority');
   const [maxConcurrentRequests, setMaxConcurrentRequests] = useState('');
   const [on429, setOn429] = useState(true);
   const [onQuota, setOnQuota] = useState(true);
   const [on5xx, setOn5xx] = useState(true);
   const [sticky, setSticky] = useState(true);
-  const [dryRunResult, setDryRunResult] = useState<any | null>(null);
+  const [dryRunResult, setDryRunResult] = useState<(DryRunResult | { error: string }) | null>(null);
   const [dryRunning, setDryRunning] = useState(false);
+  const [dryRunHasTools, setDryRunHasTools] = useState(false);
+  const [dryRunHasImages, setDryRunHasImages] = useState(false);
+  const [dryRunHasReasoning, setDryRunHasReasoning] = useState(false);
+  const [dryRunInputTokens, setDryRunInputTokens] = useState('1000');
+  const [dryRunAllowFallback, setDryRunAllowFallback] = useState(true);
+  const [dryRunSession, setDryRunSession] = useState('');
 
   // Add-target form state (per selected route)
   const [newTargetModelId, setNewTargetModelId] = useState('');
@@ -81,6 +132,12 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
   const activeRoute =
     filteredRoutes.find((route) => route.id === selectedRouteId) ||
     filteredRoutes[0];
+  const initialTargetModel = models.find((model) => model.id === initialTargetModelId);
+  const initialTargetAccounts = accounts.filter(
+    (account) =>
+      account.providerId === initialTargetModel?.providerId &&
+      account.status !== 'disabled',
+  );
 
   /** Renumber targets by their (already ordered) position. */
   const renumber = (targets: Route['targets']): Route['targets'] =>
@@ -123,10 +180,12 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
     try {
       const r = await Kinetix.dryRunRoute(activeRoute.name, {
         frontend: 'openai',
-        has_tools: false,
-        has_images: false,
-        has_reasoning: false,
-        input_tokens: 1000,
+        has_tools: dryRunHasTools,
+        has_images: dryRunHasImages,
+        has_reasoning: dryRunHasReasoning,
+        input_tokens: Number(dryRunInputTokens) || 0,
+        allow_fallback: dryRunAllowFallback,
+        session: dryRunSession.trim() || undefined,
         allowed_providers: allowedProviders ?? [],
       });
       setDryRunResult(r);
@@ -137,11 +196,35 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
     }
   };
 
-  const handleCreateSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!name.trim()) return;
+  const handleValidateRoute = async () => {
+    if (!activeRoute) return;
+    setValidatingRoute(true);
+    setRouteValidationError(null);
+    try {
+      setRouteValidationResult(await onValidateRoute(activeRoute));
+    } catch (error) {
+      setRouteValidationResult(null);
+      setRouteValidationError((error as Error).message);
+    } finally {
+      setValidatingRoute(false);
+    }
+  };
 
-    // Routes start empty: the user adds their own fallback targets.
+  const handleCreateSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const model = models.find((candidate) => candidate.id === initialTargetModelId);
+    if (!name.trim() || !model) return;
+    const account = accounts.find((candidate) => candidate.id === initialTargetAccountId);
+    const target = {
+      id: `tgt-${Date.now()}`,
+      accountId: account?.id ?? '',
+      accountLabel: account?.label ?? '(auto)',
+      providerName: model.providerName,
+      modelId: model.id,
+      modelDisplayName: model.displayName,
+      priority: 1,
+      weight: 1,
+    };
     const newRoute: Route = {
       id: `route-${Date.now()}`,
       name: name.trim().toLowerCase().replace(/\s+/g, '-'),
@@ -153,21 +236,29 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
         on5xx,
         onTimeout: true,
       },
-      targets: [],
+      targets: [target],
       portabilityPolicy: 'strip_with_warning',
       cacheAffinity: true,
       stickyRouting: sticky,
+      maxAttempts: null,
       maxConcurrentRequests: maxConcurrentRequests === '' ? null : Number(maxConcurrentRequests),
       totalHops: 0,
       status: 'active',
     };
 
-    onAddRoute(newRoute);
-    setSelectedRouteId(newRoute.id);
-    setShowCreateModal(false);
-    setName('');
-    setDescription('');
-    setMaxConcurrentRequests('');
+    setRouteMutationError(null);
+    try {
+      await onAddRoute(newRoute);
+      setSelectedRouteId(newRoute.id);
+      setShowCreateModal(false);
+      setName('');
+      setDescription('');
+      setInitialTargetModelId('');
+      setInitialTargetAccountId('');
+      setMaxConcurrentRequests('');
+    } catch (error) {
+      setRouteMutationError((error as Error).message);
+    }
   };
 
   return (
@@ -312,6 +403,16 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                     </span>
 
                     <button
+                      onClick={handleValidateRoute}
+                      disabled={validatingRoute}
+                      className="px-2.5 py-1 text-xs font-heading font-bold text-[var(--pen-green)] hover:bg-[var(--tint-green)] border border-[var(--pen-green)]/50 hover:border-[var(--pen-green)] rounded flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-50"
+                      title="Check this Route against persisted local metadata without upstream calls"
+                    >
+                      <Shield className="w-3.5 h-3.5" />
+                      <span>{validatingRoute ? 'Validating…' : 'Validate'}</span>
+                    </button>
+
+                    <button
                       onClick={handleDryRun}
                       disabled={dryRunning}
                       className="px-2.5 py-1 text-xs font-heading font-bold text-[var(--pen-blue)] hover:bg-[var(--tint-blue)] border border-[var(--pen-blue)]/50 hover:border-[var(--pen-blue)] rounded flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-50"
@@ -352,6 +453,39 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                     )}
                   </div>
                 </div>
+
+                {(routeValidationResult || routeValidationError) && (
+                  <div
+                    className="mb-5 p-3 border-2 rounded text-sm"
+                    role={routeValidationError || !routeValidationResult?.valid ? 'alert' : 'status'}
+                    style={{
+                      borderColor: routeValidationError || !routeValidationResult?.valid
+                        ? 'var(--marker-red)'
+                        : 'var(--pen-green)',
+                    }}
+                  >
+                    {routeValidationError ? (
+                      <p>{routeValidationError}</p>
+                    ) : (
+                      <>
+                        <strong>
+                          {routeValidationResult?.valid ? 'Route is valid' : 'Route has validation errors'}
+                        </strong>
+                        {routeValidationResult?.issues.length ? (
+                          <ul className="mt-2 space-y-1">
+                            {routeValidationResult.issues.map((issue, index) => (
+                              <li key={`${issue.code}-${index}`}>
+                                <span className="font-bold">{issue.severity}: {issue.code}</span>
+                                {issue.target_index == null ? '' : ` (target ${issue.target_index + 1})`}
+                                {' - '}{issue.message}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                )}
 
                 {/* Targets Fallback Sequence */}
                 <div className="space-y-3 mb-6">
@@ -672,6 +806,63 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                 </div>
               </div>
 
+              <div className="mt-4 pt-3 border-t border-dashed border-[var(--ink)]/30">
+                <h5 className="font-heading font-bold text-sm text-[var(--ink)] mb-2">
+                  Representative request for simulation
+                </h5>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                  {[
+                    ['Tools', dryRunHasTools, setDryRunHasTools],
+                    ['Images', dryRunHasImages, setDryRunHasImages],
+                    ['Reasoning', dryRunHasReasoning, setDryRunHasReasoning],
+                  ].map(([label, checked, setChecked]) => (
+                    <label key={label as string} className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={checked as boolean}
+                        onChange={(event) => (setChecked as (value: boolean) => void)(event.target.checked)}
+                        className="accent-[var(--pen-blue)]"
+                      />
+                      <span>{label as string} required</span>
+                    </label>
+                  ))}
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={dryRunAllowFallback}
+                      onChange={(event) => setDryRunAllowFallback(event.target.checked)}
+                      className="accent-[var(--pen-blue)]"
+                    />
+                    <span title="The Route's onQuota trigger can still disable quota fallback.">
+                      Allow request fallback
+                    </span>
+                  </label>
+                  <label className="flex flex-col gap-1">
+                    <span>Input tokens</span>
+                    <input
+                      type="number"
+                      min="0"
+                      value={dryRunInputTokens}
+                      onChange={(event) => setDryRunInputTokens(event.target.value)}
+                      className="bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded font-mono"
+                    />
+                  </label>
+                  <label className="flex flex-col gap-1 col-span-2 md:col-span-4">
+                    <span>Session key (optional)</span>
+                    <input
+                      type="text"
+                      value={dryRunSession}
+                      onChange={(event) => setDryRunSession(event.target.value)}
+                      placeholder="Use a known session to simulate affinity"
+                      className="bg-[var(--surface)] border border-[var(--ink)] px-2 py-1 rounded font-mono"
+                    />
+                    <span className="text-[var(--ink)]/60">
+                      Uses in-memory affinity when this session has a known target.
+                    </span>
+                  </label>
+                </div>
+              </div>
+
               {dryRunResult && (
                 <div
                   className="mt-4 p-4 text-sm font-mono bg-[var(--surface)] border-2 border-[var(--pen-blue)]"
@@ -688,46 +879,81 @@ export const RoutesView: React.FC<RoutesViewProps> = ({
                       ✕
                     </button>
                   </div>
-                  {dryRunResult.error ? (
+                  {'error' in dryRunResult ? (
                     <div style={{ color: 'var(--danger-text)' }}>{dryRunResult.error}</div>
                   ) : (
                     <>
-                      <div className="mb-2">
-                        Would select:{' '}
+                      <div className="mb-1">
+                        Outcome:{' '}
                         <strong>
-                          {dryRunResult.would_select
-                            ? typeof dryRunResult.would_select === 'string'
-                              ? dryRunResult.would_select
-                              : `${dryRunResult.would_select.model} @ ${dryRunResult.would_select.account}`
-                            : '(no eligible target)'}
+                          {dryRunResult.outcome === 'stochastic'
+                            ? 'Stochastic; no exact target predicted'
+                            : dryRunResult.outcome === 'rate_limited'
+                              ? 'Would return HTTP 429; no target dispatched'
+                              : dryRunResult.would_select ?? '(no eligible target)'}
                         </strong>
                       </div>
-                      <table className="w-full text-xs">
-                        <thead>
-                          <tr className="text-left border-b border-[var(--ink)]/30">
-                            <th className="py-1">Target</th>
-                            <th>Predicate</th>
-                            <th>Caps</th>
-                            <th>Account</th>
-                            <th>Eligible</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {(dryRunResult.candidates || []).map((c: any, i: number) => (
-                            <tr key={i} className="border-b border-[var(--ink)]/10">
-                              <td className="py-1">
-                                {c.model} @ {c.account || '—'}
-                              </td>
-                              <td>{c.predicate_result ?? '—'}</td>
-                              <td>{c.capability_eligible ? 'ok' : 'no'}</td>
-                              <td>{c.account_status ?? '—'}</td>
-                              <td style={{ color: c.eligible ? 'var(--pen-green)' : 'var(--danger-text)' }}>
-                                {c.eligible ? 'yes' : 'no'}
-                              </td>
+                      <div className="mb-2 text-[var(--ink)]/70">
+                        {dryRunResult.selection_note}
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="min-w-[800px] w-full table-fixed text-xs">
+                          <thead>
+                            <tr className="text-left border-b border-[var(--ink)]/30">
+                              <th scope="col" className="w-[22%] whitespace-nowrap px-2 py-1">Candidate</th>
+                              <th scope="col" className="w-[12%] whitespace-nowrap px-2">Predicate</th>
+                              <th scope="col" className="w-[18%] whitespace-nowrap px-2">Capabilities</th>
+                              <th scope="col" className="w-[18%] whitespace-nowrap px-2">Availability</th>
+                              <th scope="col" className="w-[12%] whitespace-nowrap px-2">Decision</th>
+                              <th scope="col" className="w-[18%] whitespace-nowrap px-2">Reason</th>
                             </tr>
-                          ))}
-                        </tbody>
-                      </table>
+                          </thead>
+                          <tbody>
+                            {dryRunResult.candidates.map((candidate, index) => {
+                              const capabilitySummary = Object.entries(candidate.capability_details)
+                                .map(([name, detail]) =>
+                                  typeof detail === 'string'
+                                    ? `${name}: ${detail}`
+                                    : `${detail.required ? '* ' : ''}${name}: ${detail.status}`,
+                                )
+                                .join(', ');
+                              const reasons = candidate.not_selected_reasons.map(formatDryRunReason);
+                              return (
+                                <tr key={candidate.candidate_id || index} className={`border-b border-[var(--ink)]/10 ${candidate.selected ? 'bg-[var(--tint-blue)] font-bold' : ''}`}>
+                                  <td className="px-2 py-2 align-top break-words">
+                                    {candidate.strategy_rank == null ? '-' : `#${candidate.strategy_rank + 1}`} · {candidate.model} @ {candidate.account || '-'}
+                                  </td>
+                                  <td className="px-2 py-2 align-top break-words" title={candidate.predicate_explanation || undefined}>
+                                    {candidate.predicate_result || '-'}
+                                  </td>
+                                  <td className="px-2 py-2 align-top break-words">{capabilitySummary || (candidate.capability_eligible ? 'ok' : 'unknown')}</td>
+                                  <td className="px-2 py-2 align-top break-words">
+                                    {candidate.account_status} · circuit {candidate.provider_circuit_state}
+                                    {candidate.route_capacity_available === false ? ' · route full' : ''}
+                                    {candidate.account_quota_available === false ? ' · account quota' : ''}
+                                  </td>
+                                  <td className="px-2 py-2 align-top break-words" style={{ color: candidate.selected ? 'var(--pen-blue)' : candidate.eligible ? 'var(--pen-green)' : 'var(--danger-text)' }}>
+                                    {candidate.selected ? 'selected' : candidate.eligible ? 'eligible' : 'skipped'}
+                                  </td>
+                                  <td className="px-2 py-2 align-top break-words">
+                                    {reasons.length
+                                      ? reasons.join('; ')
+                                      : formatDryRunReason(candidate.decision_reason)}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      {dryRunResult.plugin_fact_failures.length > 0 && (
+                        <p className="mt-2 text-[var(--danger-text)]">
+                          Routing facts unavailable:{' '}
+                          {dryRunResult.plugin_fact_failures
+                            .map(({ plugin, reason }) => `${plugin}: ${reason}`)
+                            .join('; ')}
+                        </p>
+                      )}
                       <div className="mt-2 text-[var(--ink)]/60">{dryRunResult.note}</div>
                     </>
                   )}

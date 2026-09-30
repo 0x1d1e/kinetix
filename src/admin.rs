@@ -27,6 +27,7 @@ use crate::db::{self, Pool};
 use crate::frontends::FrontendFormat;
 use crate::limits;
 use crate::pipeline;
+use crate::route_validation;
 use crate::types::{AuthScheme, Prices, ThinkingMap, WireFormat};
 
 type ApiResult = Result<Json<Value>, ApiError>;
@@ -8111,11 +8112,11 @@ pub async fn probe_model_capability(
             (
                 "inconclusive",
                 status_code,
-                Some(truncate(&crypto::redact(&error), 400)),
+                Some(truncate(&crypto::redact(error), 400)),
             )
         } else if (200..300).contains(&status_code) {
             if body.capability == "reasoning_disable" {
-                let verified = serde_json::from_str::<Value>(&text)
+                let verified = serde_json::from_str::<Value>(text)
                     .ok()
                     .and_then(|payload| adapter.parse_full_response(&payload).ok())
                     .and_then(|events| reasoning_disable_probe_contract(&events));
@@ -8140,7 +8141,7 @@ pub async fn probe_model_capability(
                     }
             } else {
                 let contract_verified = match body.capability.as_str() {
-                    "tool_calling" => serde_json::from_str::<Value>(&text)
+                    "tool_calling" => serde_json::from_str::<Value>(text)
                         .ok()
                         .and_then(|payload| adapter.parse_full_response(&payload).ok())
                         .is_some_and(|events| {
@@ -8152,7 +8153,7 @@ pub async fn probe_model_capability(
                                 )
                             })
                         }),
-                    "structured_output" => serde_json::from_str::<Value>(&text)
+                    "structured_output" => serde_json::from_str::<Value>(text)
                         .ok()
                         .and_then(|payload| adapter.parse_full_response(&payload).ok())
                         .map(|events| {
@@ -9345,51 +9346,68 @@ fn portability_default() -> String {
     "strip_with_warning".into()
 }
 
-fn validate_route_body(body: &RouteBody) -> Result<(), ApiError> {
-    if !matches!(
-        body.strategy.as_str(),
-        "priority" | "round-robin" | "weighted" | "least-used" | "adaptive"
-    ) {
-        return Err(ApiError::bad("invalid route strategy"));
+fn route_validation_config(body: &RouteBody, id: Option<&str>) -> route_validation::RouteConfig {
+    route_validation::RouteConfig {
+        id: id.map(str::to_owned),
+        name: body.name.clone(),
+        strategy: body.strategy.clone(),
+        portability_policy: body.portability_policy.clone(),
+        fallback_triggers: body.fallback_triggers.clone(),
+        max_attempts: body.max_attempts,
+        max_concurrent_requests: body.max_concurrent_requests,
+        enabled: true,
+        targets: body
+            .targets
+            .iter()
+            .map(|target| route_validation::RouteTargetConfig {
+                model_id: target.model_id.clone(),
+                account_id: target.account_id.clone(),
+                priority: target.priority,
+                weight: target.weight,
+                predicate: target.predicate.clone(),
+                param_overrides: target.param_overrides.clone(),
+            })
+            .collect(),
     }
-    if body.max_concurrent_requests.is_some_and(|limit| limit < 0) {
-        return Err(ApiError::bad(
-            "max_concurrent_requests must be positive or zero for unlimited",
-        ));
-    }
-    if !matches!(
-        body.portability_policy.as_str(),
-        "reject" | "strip_with_warning"
-    ) {
-        return Err(ApiError::bad(
-            "portability_policy must be 'reject' or 'strip_with_warning'",
-        ));
-    }
-    if !body.fallback_triggers.is_null() {
-        let Some(triggers) = body.fallback_triggers.as_object() else {
-            return Err(ApiError::bad("fallback_triggers must be a JSON object"));
-        };
-        for key in ["on429", "onQuota", "on5xx", "onTimeout"] {
-            if let Some(value) = triggers.get(key) {
-                if !value.is_boolean() {
-                    return Err(ApiError::bad(format!(
-                        "fallback_triggers.{key} must be boolean"
-                    )));
-                }
-            }
-        }
-    }
-    for target in &body.targets {
-        if !target.param_overrides.is_null() && !target.param_overrides.is_object() {
-            return Err(ApiError::bad(
-                "route target param_overrides must be a JSON object",
-            ));
-        }
+}
+
+fn validate_route_structure(body: &RouteBody) -> Result<(), ApiError> {
+    let validation = route_validation::validate_structure(&route_validation_config(body, None));
+    if !validation.valid {
+        let errors = validation
+            .issues
+            .iter()
+            .filter(|issue| issue.severity == "error")
+            .map(|issue| format!("{}: {}", issue.code, issue.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::bad(format!("Route validation failed: {errors}")));
     }
     Ok(())
 }
 
-#[derive(Deserialize)]
+async fn validate_route_body(
+    state: &AppState,
+    body: &RouteBody,
+    id: Option<&str>,
+) -> Result<route_validation::RouteValidation, ApiError> {
+    let validation = route_validation::validate(state, &route_validation_config(body, id))
+        .await
+        .map_err(ApiError::internal)?;
+    if !validation.valid {
+        let errors = validation
+            .issues
+            .iter()
+            .filter(|issue| issue.severity == "error")
+            .map(|issue| format!("{}: {}", issue.code, issue.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::bad(format!("Route validation failed: {errors}")));
+    }
+    Ok(validation)
+}
+
+#[derive(Clone, Deserialize)]
 pub struct RouteTargetBody {
     pub account_id: Option<String>,
     pub model_id: String,
@@ -9410,7 +9428,7 @@ pub async fn create_route(
     _auth: AdminAuth,
     Json(body): Json<RouteBody>,
 ) -> ApiResult {
-    validate_route_body(&body)?;
+    validate_route_body(&state, &body, None).await?;
     let id = db::insert_route(
         &state.pool,
         &db::NewRoute {
@@ -9456,7 +9474,7 @@ pub async fn update_route(
     Path(id): Path<String>,
     Json(body): Json<RouteBody>,
 ) -> ApiResult {
-    validate_route_body(&body)?;
+    validate_route_body(&state, &body, Some(&id)).await?;
     db::update_route(
         &state.pool,
         &id,
@@ -9549,6 +9567,31 @@ pub async fn delete_route(
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// `POST /admin/api/routes/validate`: validate proposed Route configuration
+/// against persisted provider, account, model, plugin, and alias metadata.
+#[derive(Deserialize)]
+pub struct ProposedRouteBody {
+    /// Existing Route id to exclude from duplicate-name checks during updates.
+    #[serde(default)]
+    pub route_id: Option<String>,
+    #[serde(flatten)]
+    pub route: RouteBody,
+}
+
+pub async fn validate_route_config(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Json(body): Json<ProposedRouteBody>,
+) -> ApiResult {
+    let validation = route_validation::validate(
+        &state,
+        &route_validation_config(&body.route, body.route_id.as_deref()),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!(validation)))
 }
 
 /// `POST /admin/api/routes/dry-run` (FR-8.7): evaluate routing for a
@@ -10971,8 +11014,26 @@ where
         .await
         .map_err(ApiError::internal)?;
     let providers = snapshot.providers;
-    let accounts: Vec<_> = snapshot
-        .accounts
+    let all_accounts = snapshot.accounts;
+    let mut portable_account_refs = std::collections::HashMap::new();
+    let mut noauth_account_refs = std::collections::HashMap::new();
+    let mut noauth_account_disabled = std::collections::HashMap::new();
+    let mut account_index = 0;
+    let mut noauth_index = 0;
+    for account in &all_accounts {
+        if account.label == "__kinetix_noauth__" {
+            noauth_index += 1;
+            let reference = format!("noauth-account-{noauth_index}");
+            portable_account_refs.insert(account.id.clone(), reference.clone());
+            noauth_account_refs.insert(account.provider_id.clone(), reference);
+            noauth_account_disabled
+                .insert(account.provider_id.clone(), account.status == "disabled");
+        } else {
+            account_index += 1;
+            portable_account_refs.insert(account.id.clone(), format!("account-{account_index}"));
+        }
+    }
+    let accounts: Vec<_> = all_accounts
         .into_iter()
         .filter(|account| account.label != "__kinetix_noauth__")
         .collect();
@@ -11007,6 +11068,8 @@ where
         providers_json.push(json!({
             "name": p.name,
             "base_url": p.base_url,
+            "noauth_account_ref": noauth_account_refs.get(&p.id),
+            "noauth_account_disabled": noauth_account_disabled.get(&p.id).copied().unwrap_or(false),
             "wire_format": p.wire_format,
             "auth_scheme": p.auth_scheme,
             "custom_header_name": p.custom_header_name,
@@ -11032,11 +11095,6 @@ where
         }));
     }
 
-    let portable_account_refs: std::collections::HashMap<String, String> = accounts
-        .iter()
-        .enumerate()
-        .map(|(index, account)| (account.id.clone(), format!("account-{}", index + 1)))
-        .collect();
     let accounts_json: Vec<Value> = accounts
         .iter()
         .enumerate()
@@ -11651,7 +11709,7 @@ fn validate_imported_integration_bindings(
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ImportBody {
     pub config: Value,
     /// When false (default) only plan the changes and return them.
@@ -11659,10 +11717,155 @@ pub struct ImportBody {
     pub apply: bool,
 }
 
+struct ImportStagingDirectory(std::path::PathBuf);
+
+impl Drop for ImportStagingDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn import_staging_state(
+    state: &AppState,
+) -> Result<(AppState, ImportStagingDirectory), ApiError> {
+    let directory = ImportStagingDirectory(std::env::temp_dir().join(format!(
+        "kinetix-import-validation-{}",
+        uuid::Uuid::new_v4().simple()
+    )));
+    tokio::fs::create_dir(&directory.0)
+        .await
+        .map_err(ApiError::internal)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(ApiError::internal)?;
+    }
+
+    let database_path = directory.0.join("kinetix.db");
+    db::snapshot(&state.pool, &database_path)
+        .await
+        .map_err(ApiError::internal)?;
+    let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+    let pool = db::connect(&database_url)
+        .await
+        .map_err(ApiError::internal)?;
+    let registry = std::sync::Arc::new(crate::registry::Registry::new());
+    registry.reload(&pool).await.map_err(ApiError::internal)?;
+
+    let mut staged_state = state.clone();
+    staged_state.pool = pool;
+    staged_state.registry = registry;
+    let mut config = (*state.config).clone();
+    config.database_url = database_url;
+    staged_state.config = std::sync::Arc::new(config);
+    Ok((staged_state, directory))
+}
+
 pub async fn import_config(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Json(body): Json<ImportBody>,
+) -> ApiResult {
+    let _import_guard = if body.apply {
+        Some(state.registry.config_import_lock().await)
+    } else {
+        None
+    };
+    let validation = import_config_apply(
+        state.clone(),
+        ImportBody {
+            config: body.config.clone(),
+            apply: false,
+        },
+        false,
+    )
+    .await?
+    .0;
+    if validation["valid"].as_bool() != Some(true) {
+        if !body.apply {
+            return Ok(Json(validation));
+        }
+        let problems = validation["problems"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::bad(format!(
+            "config validation failed: {problems}"
+        )));
+    }
+
+    let (staged_state, staging_directory) = import_staging_state(&state).await?;
+    let _ = import_config_apply(
+        staged_state.clone(),
+        ImportBody {
+            config: body.config.clone(),
+            apply: true,
+        },
+        true,
+    )
+    .await?;
+    let mut validation = validation;
+    let mut semantic_problems = Vec::new();
+    if let Some(routes) = body.config["routes"].as_array() {
+        for route in routes {
+            let name = route["name"].as_str().unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let result = route_validation::validate_saved(&staged_state, name)
+                .await
+                .map_err(ApiError::internal)?;
+            let errors = result
+                .issues
+                .iter()
+                .filter(|issue| issue.severity == "error")
+                .map(|issue| format!("{}: {}", issue.code, issue.message))
+                .collect::<Vec<_>>();
+            if !errors.is_empty() {
+                semantic_problems.push(format!(
+                    "route '{name}' failed semantic validation: {}",
+                    errors.join("; ")
+                ));
+            }
+        }
+    }
+    drop(staged_state);
+    drop(staging_directory);
+
+    if !semantic_problems.is_empty() {
+        validation["valid"] = json!(false);
+        let problems = validation["problems"]
+            .as_array_mut()
+            .expect("config dry-run always returns a problems array");
+        problems.extend(semantic_problems.into_iter().map(Value::String));
+    }
+    if !body.apply {
+        return Ok(Json(validation));
+    }
+    if validation["valid"].as_bool() != Some(true) {
+        let problems = validation["problems"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::bad(format!(
+            "config validation failed: {problems}"
+        )));
+    }
+    import_config_apply(state, body, false).await
+}
+
+async fn import_config_apply(
+    state: AppState,
+    body: ImportBody,
+    acquire_import_lock: bool,
 ) -> ApiResult {
     let (config, source_version, compatibility_warnings) = normalize_import_config(body.config)?;
     let cfg = &config;
@@ -11671,7 +11874,7 @@ pub async fn import_config(
     let mut warnings = compatibility_warnings;
     let mut conflicts: Vec<Value> = Vec::new();
     let mut missing_resources: Vec<Value> = Vec::new();
-    let _import_guard = if body.apply {
+    let _import_guard = if body.apply && acquire_import_lock {
         Some(state.registry.config_import_lock().await)
     } else {
         None
@@ -12404,6 +12607,62 @@ pub async fn import_config(
         }
     }
 
+    for provider in providers {
+        let name = provider["name"].as_str().unwrap_or("");
+        if provider
+            .get("noauth_account_disabled")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            problems.push(format!(
+                "provider '{name}' noauth_account_disabled must be a boolean"
+            ));
+        }
+        let Some(value) = provider.get("noauth_account_ref") else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let Some(reference) = value.as_str() else {
+            problems.push(format!(
+                "provider '{name}' noauth_account_ref must be a string or null"
+            ));
+            continue;
+        };
+        if reference.trim().is_empty() {
+            problems.push(format!("provider '{name}' has an empty noauth_account_ref"));
+            continue;
+        }
+        if !known_provider_names.contains(name) {
+            missing_resources.push(json!({ "kind": "provider", "name": name }));
+            problems.push(format!(
+                "no-auth account reference belongs to missing provider '{name}'"
+            ));
+        }
+        let will_exist = effective_provider_modes
+            .get(name)
+            .is_some_and(|mode| mode == "none");
+        if imported_accounts_by_ref
+            .insert(
+                reference.to_string(),
+                (
+                    name.to_string(),
+                    "__kinetix_noauth__".to_string(),
+                    false,
+                    will_exist,
+                ),
+            )
+            .is_some()
+        {
+            conflicts.push(
+                json!({ "kind": "account", "ref": reference, "reason": "duplicate reference" }),
+            );
+            problems.push(format!(
+                "account reference '{reference}' appears more than once"
+            ));
+        }
+    }
+
     let mut known_model_keys: std::collections::HashSet<String> = existing_models
         .iter()
         .filter_map(|model| {
@@ -12449,7 +12708,16 @@ pub async fn import_config(
         let target_bodies: Vec<RouteTargetBody> = target_values
             .iter()
             .map(|target| RouteTargetBody {
-                account_id: None,
+                account_id: target
+                    .get("account_ref")
+                    .filter(|value| !value.is_null())
+                    .and_then(Value::as_str)
+                    .map(|reference| format!("account-ref:{reference}"))
+                    .or_else(|| {
+                        target["account_id"]
+                            .as_str()
+                            .map(|account_id| format!("account-id:{account_id}"))
+                    }),
                 model_id: target["model"].as_str().unwrap_or("").to_string(),
                 priority: target["priority"].as_i64().unwrap_or(1),
                 weight: target["weight"].as_i64().unwrap_or(1),
@@ -12476,7 +12744,7 @@ pub async fn import_config(
             max_concurrent_requests: r["max_concurrent_requests"].as_i64(),
             targets: target_bodies,
         };
-        if let Err(error) = validate_route_body(&route_body) {
+        if let Err(error) = validate_route_structure(&route_body) {
             problems.push(format!("route '{name}': {}", error.1));
         }
         if r.get("enabled").is_some_and(|value| !value.is_null()) && !r["enabled"].is_boolean() {
@@ -12638,6 +12906,18 @@ pub async fn import_config(
     let mut provider_modes: std::collections::HashMap<String, String> = existing_providers
         .iter()
         .map(|provider| (provider.name.clone(), provider.credential_mode.clone()))
+        .collect();
+    let noauth_account_refs_by_provider: Vec<(String, String, bool)> = providers
+        .iter()
+        .filter_map(|provider| {
+            Some((
+                provider["name"].as_str()?.to_string(),
+                provider["noauth_account_ref"].as_str()?.to_string(),
+                provider["noauth_account_disabled"]
+                    .as_bool()
+                    .unwrap_or(false),
+            ))
+        })
         .collect();
 
     for p in providers {
@@ -12881,6 +13161,49 @@ pub async fn import_config(
         .await
         .map_err(ApiError::internal)?;
         account_ids_by_ref.insert(reference, account_id);
+    }
+    for (provider_name, reference, noauth_disabled) in noauth_account_refs_by_provider {
+        if !provider_modes
+            .get(&provider_name)
+            .is_some_and(|mode| mode == "none")
+        {
+            continue;
+        }
+        let Some(provider_id) = provider_ids.get(&provider_name) else {
+            continue;
+        };
+        if let Some(account_id) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM accounts WHERE provider_id=? AND label='__kinetix_noauth__'",
+        )
+        .bind(provider_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?
+        {
+            if noauth_disabled {
+                let (priority, weight, soft_quota_usd, quota_type, quota_window_s) =
+                    sqlx::query_as::<_, (i64, i64, Option<f64>, String, Option<i64>)>(
+                        "SELECT priority, weight, soft_quota_usd, quota_type, quota_window_s FROM accounts WHERE id=?",
+                    )
+                    .bind(&account_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(ApiError::internal)?;
+                db::update_account_policy_in_transaction(
+                    &mut tx,
+                    &account_id,
+                    false,
+                    priority,
+                    weight,
+                    soft_quota_usd,
+                    &quota_type,
+                    quota_window_s,
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            }
+            account_ids_by_ref.insert(reference, account_id);
+        }
     }
 
     let mut model_ids: std::collections::HashMap<String, String> = existing_models
@@ -13141,7 +13464,6 @@ pub async fn import_config(
             max_concurrent_requests: r["max_concurrent_requests"].as_i64(),
             targets: Vec::new(),
         };
-        validate_route_body(&body)?;
         let mut target_bodies = Vec::new();
         for t in r["targets"].as_array().unwrap_or(&empty) {
             let model_key = t["model"].as_str().unwrap_or("");
@@ -13172,7 +13494,7 @@ pub async fn import_config(
         }
         let mut body = body;
         body.targets = target_bodies;
-        validate_route_body(&body)?;
+        validate_route_structure(&body)?;
         let rid = match route_ids.get(name).cloned() {
             Some(route_id) => {
                 sqlx::query(
@@ -24042,6 +24364,17 @@ mod credential_enrollment_regression_tests {
             .into_iter()
             .find(|account| account.label == "__kinetix_noauth__")
             .unwrap();
+        db::set_account_status(
+            &source.pool,
+            &noauth_account.id,
+            "disabled",
+            "operator_disabled",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let route_id = db::insert_route(
             &source.pool,
             &db::NewRoute {
@@ -24103,6 +24436,7 @@ mod credential_enrollment_regression_tests {
         assert_eq!(public["credential_mode"], "none");
         assert_eq!(public["source_plugin_id"], "plugin.public");
         assert_eq!(public["source_integration_id"], "public");
+        assert_eq!(public["noauth_account_disabled"], true);
         assert!(exported["accounts"]
             .as_array()
             .unwrap()
@@ -24110,7 +24444,7 @@ mod credential_enrollment_regression_tests {
             .all(|account| account["label"] != "__kinetix_noauth__"));
         assert_eq!(
             exported["routes"][0]["targets"][0]["account_ref"],
-            Value::Null
+            public["noauth_account_ref"]
         );
         assert_eq!(
             exported["models"][0]["transport_override"],
@@ -24190,7 +24524,7 @@ mod credential_enrollment_regression_tests {
             .await
             .unwrap();
         assert_eq!(imported_route_targets.len(), 1);
-        assert_eq!(imported_route_targets[0].account_id, None);
+        assert!(imported_route_targets[0].account_id.is_some());
         match target.registry.resolve("limited-route").unwrap() {
             crate::registry::Resolved::Route { targets, .. } => {
                 assert_eq!(targets.len(), 1);
@@ -24199,11 +24533,16 @@ mod credential_enrollment_regression_tests {
             _ => panic!("expected an imported route"),
         }
 
-        let public_accounts = db::accounts_for_provider(&target.pool, &public.id)
+        let public_accounts = db::list_accounts_for_provider(&target.pool, &public.id)
             .await
             .unwrap();
         assert_eq!(public_accounts.len(), 1);
         assert_eq!(public_accounts[0].label, "__kinetix_noauth__");
+        assert_eq!(public_accounts[0].status, "disabled");
+        assert_eq!(
+            imported_route_targets[0].account_id.as_deref(),
+            Some(public_accounts[0].id.as_str())
+        );
         assert_eq!(
             target
                 .crypto
@@ -24212,6 +24551,185 @@ mod credential_enrollment_regression_tests {
             ""
         );
 
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn config_export_import_preserves_pinned_disabled_account_for_fresh_install() {
+        let (source, source_root) = test_state("pinned-account-export-source").await;
+        let provider_id = db::insert_provider(
+            &source.pool,
+            &db::NewProvider {
+                name: "portable-pinned-provider",
+                base_url: "https://portable.example/v1",
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 1_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let model_id = db::insert_model(
+            &source.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "portable-model",
+                display_name: "Portable Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let secret = source.crypto.encrypt("portable-secret").unwrap();
+        let account_id = db::insert_account(
+            &source.pool,
+            &provider_id,
+            "primary",
+            &secret,
+            "••••",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        db::set_account_status(
+            &source.pool,
+            &account_id,
+            "disabled",
+            "operator_disabled",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let route_id = db::insert_route(
+            &source.pool,
+            &db::NewRoute {
+                name: "pinned-route",
+                description: "",
+                strategy: "priority",
+                fallback_triggers: json!({
+                    "on429": true,
+                    "onQuota": true,
+                    "on5xx": true,
+                    "onTimeout": true
+                }),
+                portability_policy: "strip_with_warning",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: None,
+                max_concurrent_requests: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::insert_route_target(
+            &source.pool,
+            &route_id,
+            Some(&account_id),
+            &model_id,
+            1,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        let exported = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let account_ref = exported["accounts"][0]["ref"]
+            .as_str()
+            .expect("portable account reference");
+        assert_eq!(exported["accounts"][0]["status"], "disabled");
+        assert_eq!(
+            exported["routes"][0]["targets"][0]["account_ref"],
+            account_ref
+        );
+        assert!(exported["routes"][0]["targets"][0]
+            .get("account_id")
+            .is_none());
+
+        let (target, target_root) = test_state("pinned-account-export-target").await;
+        let _ = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let imported_provider = db::list_providers(&target.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "portable-pinned-provider")
+            .unwrap();
+        let imported_account = db::list_accounts_for_provider(&target.pool, &imported_provider.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|account| account.label == "primary")
+            .unwrap();
+        assert_ne!(imported_account.id, account_id);
+        assert_eq!(imported_account.status, "disabled");
+        assert_eq!(
+            target.crypto.decrypt(&imported_account.secret_enc).unwrap(),
+            "portable-secret"
+        );
+        let imported_route = db::get_route_by_name(&target.pool, "pinned-route")
+            .await
+            .unwrap()
+            .unwrap();
+        let imported_targets = db::route_targets(&target.pool, &imported_route.id)
+            .await
+            .unwrap();
+        assert_eq!(imported_targets.len(), 1);
+        assert_eq!(
+            imported_targets[0].account_id.as_deref(),
+            Some(imported_account.id.as_str())
+        );
+
+        drop(source);
+        drop(target);
         let _ = std::fs::remove_dir_all(source_root);
         let _ = std::fs::remove_dir_all(target_root);
     }
@@ -25409,6 +25927,183 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn config_import_rejects_structurally_invalid_routes_without_writes() {
+        let (state, root) = test_state("empty-route-import").await;
+        let config = json!({
+            "kinetix_config_version": 2,
+            "routes": [{"name": "empty-route", "targets": []}]
+        });
+
+        let dry_run = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: config.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], false);
+        assert!(dry_run["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|problem| problem
+                .as_str()
+                .is_some_and(|problem| problem.contains("has no targets"))));
+
+        let apply_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+        assert!(db::list_routes(&state.pool).await.unwrap().is_empty());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn config_import_validates_proposed_routes_on_staging_snapshot() {
+        let (state, root) = test_state("staged-route-semantic-validation").await;
+        let provider_id = insert_provider(
+            &state,
+            "staged-route-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let secret = state.crypto.encrypt("staged-route-key").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "staged-route-account",
+            &secret,
+            "staged:****",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "staged-route-model",
+                display_name: "Staged Route Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        let route_id = db::insert_route(
+            &state.pool,
+            &db::NewRoute {
+                name: "staged-route",
+                description: "",
+                strategy: "priority",
+                fallback_triggers: json!({}),
+                portability_policy: "strip_with_warning",
+                sticky_routing: false,
+                cache_affinity: false,
+                max_attempts: None,
+                max_concurrent_requests: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::insert_route_target(
+            &state.pool,
+            &route_id,
+            Some(&account_id),
+            &model_id,
+            1,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        let mut config = export_config(
+            State(state.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        config["models"][0]["enabled"] = json!(false);
+
+        let dry_run = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config: config.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], false);
+        assert!(dry_run["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|problem| {
+                problem.as_str().is_some_and(|problem| {
+                    problem.contains("failed semantic validation")
+                        && problem.contains("disabled_model")
+                })
+            }));
+
+        let apply_error = import_config(
+            State(state.clone()),
+            auth(),
+            Json(ImportBody {
+                config,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            db::get_model(&state.pool, &model_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled,
+            1
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn config_import_rolls_back_every_resource_when_a_late_write_fails() {
         let (state, root) = test_state("config-import-transaction-rollback").await;
         sqlx::query(
@@ -25800,7 +26495,7 @@ mod credential_enrollment_regression_tests {
         assert!(feature_veto["candidates"][0]["not_selected_reasons"]
             .as_array()
             .unwrap()
-            .contains(&json!("capabilities")));
+            .contains(&json!("integration_feature_ceiling")));
 
         drop(source);
         drop(target);
@@ -26005,7 +26700,7 @@ mod credential_enrollment_regression_tests {
         assert!(feature_veto["candidates"][0]["not_selected_reasons"]
             .as_array()
             .unwrap()
-            .contains(&json!("capabilities")));
+            .contains(&json!("integration_feature_ceiling")));
 
         drop(source);
         drop(target);

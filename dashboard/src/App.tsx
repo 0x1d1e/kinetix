@@ -23,7 +23,13 @@ import { AliasesView } from './components/views/AliasesView';
 import { AuditView } from './components/views/AuditView';
 import { SquiggleDivider } from './components/HandDrawnElements';
 import { EMPTY_METRICS } from './lib/mappers';
-import { Kinetix, ExportFile, UsageDay } from './lib/resources';
+import {
+  Kinetix,
+  ExportFile,
+  UsageDay,
+  RouteConfigInput,
+  RouteValidationResult,
+} from './lib/resources';
 import { SettingsView } from './components/views/SettingsView';
 import { PluginsView } from './components/views/PluginsView';
 import { ApiError } from './lib/api';
@@ -42,6 +48,36 @@ import {
 import { AlertTriangle } from 'lucide-react';
 
 type AuthState = 'checking' | 'signed-out' | 'signed-in';
+
+function routeConfigInput(route: Route, routeId?: string): RouteConfigInput {
+  return {
+    route_id: routeId,
+    name: route.name,
+    description: route.description,
+    strategy: route.selectionStrategy,
+    fallback_triggers: route.fallbackTriggers,
+    portability_policy: route.portabilityPolicy,
+    cache_affinity: route.cacheAffinity,
+    sticky_routing: route.stickyRouting,
+    max_attempts: route.maxAttempts,
+    max_concurrent_requests: route.maxConcurrentRequests,
+    targets: route.targets.map((target) => ({
+      account_id: target.accountId || null,
+      model_id: target.modelId,
+      priority: target.priority,
+      weight: target.weight ?? 1,
+      predicate: target.predicate ?? null,
+      param_overrides: target.paramOverrides ?? null,
+    })),
+  };
+}
+
+function routeValidationMessage(validation: RouteValidationResult): string {
+  return validation.issues
+    .filter((issue) => issue.severity === 'error')
+    .map((issue) => `${issue.code}: ${issue.message}`)
+    .join('; ');
+}
 
 function getTabFromPath(path: string): NavTab {
   const normalized = path.replace(/\/$/, '');
@@ -250,45 +286,28 @@ export default function App() {
 
   const handleDeleteKey = (id: string) => withRefresh(() => Kinetix.deleteKey(id));
 
-  const handleAddRoute = (newRoute: Route) =>
-    withRefresh(() =>
-      Kinetix.createRoute({
-        name: newRoute.name,
-        description: newRoute.description,
-        strategy: newRoute.selectionStrategy,
-        fallback_triggers: newRoute.fallbackTriggers,
-        portability_policy: newRoute.portabilityPolicy,
-        cache_affinity: newRoute.cacheAffinity,
-        sticky_routing: newRoute.stickyRouting,
-        max_concurrent_requests: newRoute.maxConcurrentRequests,
-        targets: newRoute.targets.map((t) => ({
-          account_id: t.accountId || null,
-          model_id: t.modelId,
-          priority: t.priority,
-          weight: t.weight ?? 1,
-        })),
-      }),
-    );
+  const handleAddRoute = async (newRoute: Route) => {
+    const body = routeConfigInput(newRoute);
+    const validation = await Kinetix.validateRoute(body);
+    if (!validation.valid) {
+      throw new Error(`Route validation failed: ${routeValidationMessage(validation)}`);
+    }
+    await Kinetix.createRoute(body);
+    await refresh();
+  };
 
   const handleUpdateRoute = (updated: Route) =>
-    withRefresh(() =>
-      Kinetix.updateRoute(updated.id, {
-        name: updated.name,
-        description: updated.description,
-        strategy: updated.selectionStrategy,
-        fallback_triggers: updated.fallbackTriggers,
-        portability_policy: updated.portabilityPolicy,
-        cache_affinity: updated.cacheAffinity,
-        sticky_routing: updated.stickyRouting,
-        max_concurrent_requests: updated.maxConcurrentRequests,
-        targets: updated.targets.map((t) => ({
-          account_id: t.accountId || null,
-          model_id: t.modelId,
-          priority: t.priority,
-          weight: t.weight ?? 1,
-        })),
-      }),
-    );
+    withRefresh(async () => {
+      const body = routeConfigInput(updated, updated.id);
+      const validation = await Kinetix.validateRoute(body);
+      if (!validation.valid) {
+        throw new Error(`Route validation failed: ${routeValidationMessage(validation)}`);
+      }
+      return Kinetix.updateRoute(updated.id, body);
+    });
+
+  const handleValidateRoute = (route: Route): Promise<RouteValidationResult> =>
+    Kinetix.validateRoute(routeConfigInput(route, route.id));
 
   const handleDeleteRoute = (routeId: string) => withRefresh(() => Kinetix.deleteRoute(routeId));
 
@@ -527,6 +546,7 @@ export default function App() {
             allowedProviders={keys[0]?.allowedProviders ?? []}
             onAddRoute={handleAddRoute}
             onUpdateRoute={handleUpdateRoute}
+            onValidateRoute={handleValidateRoute}
             onDeleteRoute={handleDeleteRoute}
           />
         )}

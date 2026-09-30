@@ -99,10 +99,20 @@ kinetix route add --name resilient \
   [--portability-policy reject|strip_with_warning] [--cache-affinity] \
   [--max-attempts 5]
 kinetix route list
+kinetix route validate <NAME_OR_ID>
+kinetix route dry-run --model <MODEL_OR_ROUTE> [--descriptor <JSON_FILE>]
 kinetix route remove <ID>
 ```
-`--target` is repeatable and ordered (`provider/upstream_id`). See
-[Routing and Fallback](Routing-and-Fallback).
+`--target` is repeatable and ordered (`provider/upstream_id`). `route validate`
+checks a saved Route against local provider, model, account, plugin, alias, and
+execution-profile metadata. `route dry-run` simulates a request without upstream
+calls or routing-state mutation; its optional descriptor uses the Admin API
+request fields. See [Routing and Fallback](Routing-and-Fallback).
+
+`route validate` prints structured errors and warnings, returning a non-zero exit
+status when the Route is invalid. `route dry-run` prints candidate eligibility,
+ordering, and selection diagnostics as JSON. These commands open the local
+control-plane database directly and do not require a running server.
 
 ### `alias`
 ```bash

@@ -133,6 +133,8 @@ export interface RouteTarget {
   modelDisplayName: string;
   priority: number;
   weight?: number;
+  predicate?: Record<string, unknown> | null;
+  paramOverrides?: Record<string, unknown> | null;
 }
 
 export interface Route {
@@ -150,6 +152,7 @@ export interface Route {
   portabilityPolicy: 'reject' | 'strip_with_warning';
   cacheAffinity: boolean;
   stickyRouting: boolean;
+  maxAttempts: number | null;
   maxConcurrentRequests: number | null;
   totalHops: number;
   status: 'active' | 'degraded' | 'all_exhausted';

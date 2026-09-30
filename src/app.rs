@@ -729,6 +729,14 @@ impl AppState {
             .clone()
     }
 
+    /// Read the round-robin cursor without creating or advancing routing state.
+    pub fn rr_counter_snapshot(&self, route_id: &str) -> u64 {
+        self.rr_counters
+            .get(route_id)
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .unwrap_or_default()
+    }
+
     /// Remember the last successful target for affinity and state provenance.
     pub fn sticky_remember(&self, session: &str, target_key: String) {
         self.sticky.insert(
