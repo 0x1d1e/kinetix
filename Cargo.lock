@@ -1734,7 +1734,7 @@ dependencies = [
 
 [[package]]
 name = "kinetix"
-version = "0.5.11"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
