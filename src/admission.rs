@@ -211,21 +211,22 @@ struct KeyLedger {
     active: HashMap<u64, ActiveReservation>,
     daily_day: Option<NaiveDate>,
     daily_spend: f64,
+    daily_has_unknown_settled_cost: bool,
     monthly_key: Option<(i32, u32)>,
     monthly_spend: f64,
+    monthly_has_unknown_settled_cost: bool,
 }
 
 struct MinuteUse {
     at: Instant,
-    tokens: u64,
+    // Unknown persisted usage blocks TPM admission for the rest of this window.
+    tokens: Option<u64>,
 }
 
 struct ActiveReservation {
     at: Instant,
     tokens: u64,
     cost: Option<f64>,
-    day: NaiveDate,
-    month: (i32, u32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -234,21 +235,56 @@ pub struct AdmissionEstimate {
     pub cost: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdmissionBudgetPeriodSnapshot {
+    pub settled_spend_usd: f64,
+    pub active_reserved_usd: f64,
+    pub has_unknown_active_cost: bool,
+    pub has_unknown_settled_cost: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdmissionBudgetSnapshot {
+    pub daily: AdmissionBudgetPeriodSnapshot,
+    pub monthly: AdmissionBudgetPeriodSnapshot,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AdmissionBudgetSnapshotAt {
+    pub captured_at: chrono::DateTime<Utc>,
+    pub snapshot: AdmissionBudgetSnapshot,
+}
+
 pub struct AdmissionReservation {
     entry: Arc<KeyAdmission>,
     // Instrument the existing reservation lifetime without changing ledger policy.
     metrics: Arc<AdmissionMetrics>,
     id: u64,
     estimate_tokens: u64,
+    estimated_cost: Option<f64>,
     settled: bool,
 }
 
 impl AdmissionReservation {
-    pub(crate) fn reconcile_incomplete(self) {
-        self.reconcile(&TokenUsage::default(), None);
+    pub(crate) fn conservative_cost_estimate(&self) -> Option<f64> {
+        self.estimated_cost
     }
 
-    pub fn reconcile(mut self, usage: &TokenUsage, actual_cost: Option<f64>) {
+    /// Settle the request count and retain its conservative token estimate.
+    pub(crate) fn reconcile_incomplete_at(self, now_wall: chrono::DateTime<Utc>) {
+        self.reconcile_at(&TokenUsage::default(), None, now_wall);
+    }
+
+    pub fn reconcile(self, usage: &TokenUsage, actual_cost: Option<f64>) {
+        self.reconcile_at(usage, actual_cost, Utc::now());
+    }
+
+    pub(crate) fn reconcile_at(
+        mut self,
+        usage: &TokenUsage,
+        actual_cost: Option<f64>,
+        now_wall: chrono::DateTime<Utc>,
+    ) {
         let actual_tokens = match (usage.input, usage.output) {
             (Some(input), Some(output)) => Some(input.saturating_add(output)),
             _ => None,
@@ -258,7 +294,7 @@ impl AdmissionReservation {
             self.id,
             actual_tokens,
             actual_cost,
-            Utc::now(),
+            now_wall,
             Instant::now(),
         );
         self.metrics
@@ -316,6 +352,34 @@ impl AdmissionController {
             .copied()
             .unwrap_or_default()
             < limit as u64
+    }
+
+    /// Number of currently admitted inference requests for one virtual key.
+    pub fn key_inflight(&self, key_id: &str) -> u64 {
+        self.concurrency
+            .lock()
+            .keys
+            .get(key_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Client-safe aggregate view, timestamped atomically with the ledger snapshot.
+    pub async fn budget_snapshot_current(
+        &self,
+        pool: &Pool,
+        key_id: &str,
+    ) -> anyhow::Result<AdmissionBudgetSnapshotAt> {
+        let entry = self.entry(key_id);
+        self.ensure_initialized(pool, key_id, &entry).await?;
+
+        let mut ledger = entry.ledger.lock();
+        let captured_at = Utc::now();
+        let snapshot = ledger.budget_snapshot(captured_at, Instant::now());
+        Ok(AdmissionBudgetSnapshotAt {
+            captured_at,
+            snapshot,
+        })
     }
 
     pub fn reserve_concurrency(
@@ -383,59 +447,78 @@ impl AdmissionController {
             .clone()
     }
 
-    async fn ensure_initialized(&self, pool: &Pool, key_id: &str, entry: &Arc<KeyAdmission>) {
+    async fn ensure_initialized(
+        &self,
+        pool: &Pool,
+        key_id: &str,
+        entry: &Arc<KeyAdmission>,
+    ) -> anyhow::Result<()> {
+        self.ensure_initialized_at(pool, key_id, entry, Utc::now(), Instant::now())
+            .await
+    }
+
+    async fn ensure_initialized_at(
+        &self,
+        pool: &Pool,
+        key_id: &str,
+        entry: &Arc<KeyAdmission>,
+        wall_now: chrono::DateTime<Utc>,
+        instant_now: Instant,
+    ) -> anyhow::Result<()> {
         if entry.initialized.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
 
         let _guard = entry.init_lock.lock().await;
         if entry.initialized.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
 
-        let wall_now = Utc::now();
-        let instant_now = Instant::now();
         let minute_since = (wall_now - chrono::Duration::seconds(60)).to_rfc3339();
-        let daily_since = crate::pool::window_start("daily", None);
-        let monthly_since = crate::pool::window_start("monthly", None);
+        let daily_since = wall_now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .map(|start| start.and_utc())
+            .unwrap_or(wall_now)
+            .to_rfc3339();
+        let monthly_since = wall_now
+            .date_naive()
+            .with_day(1)
+            .and_then(|first| first.and_hms_opt(0, 0, 0))
+            .map(|start| start.and_utc())
+            .unwrap_or(wall_now)
+            .to_rfc3339();
 
-        let (minute, daily, monthly) = tokio::join!(
+        let (minute, daily, monthly) = tokio::try_join!(
             db::key_usage_entries_since(pool, key_id, &minute_since),
-            db::key_spend_since(pool, key_id, &daily_since),
-            db::key_spend_since(pool, key_id, &monthly_since),
-        );
+            db::key_admission_budget_seed_since(pool, key_id, &daily_since),
+            db::key_admission_budget_seed_since(pool, key_id, &monthly_since),
+        )?;
 
         let mut ledger = entry.ledger.lock();
         ledger.roll_periods(wall_now);
-        match minute {
-            Ok(rows) => {
-                for (ts, tokens) in rows {
-                    let Some(at) = db::parse_dt(&ts) else {
-                        continue;
-                    };
-                    let age = wall_now
-                        .signed_duration_since(at)
-                        .to_std()
-                        .unwrap_or_default()
-                        .min(MINUTE_WINDOW);
-                    ledger.minute.push_back(MinuteUse {
-                        at: instant_now.checked_sub(age).unwrap_or(instant_now),
-                        tokens: tokens.max(0) as u64,
-                    });
-                }
-            }
-            Err(error) => tracing::warn!(%error, key_id, "could not seed admission minute window"),
+        for (ts, tokens) in minute {
+            let Some(at) = db::parse_dt(&ts) else {
+                continue;
+            };
+            let age = wall_now
+                .signed_duration_since(at)
+                .to_std()
+                .unwrap_or_default()
+                .min(MINUTE_WINDOW);
+            ledger.minute.push_back(MinuteUse {
+                at: instant_now.checked_sub(age).unwrap_or(instant_now),
+                // Keep persisted unknown token counts unknown.
+                tokens: tokens.map(|tokens| tokens.max(0) as u64),
+            });
         }
-        match daily {
-            Ok(spend) => ledger.daily_spend = spend.max(0.0),
-            Err(error) => tracing::warn!(%error, key_id, "could not seed daily admission spend"),
-        }
-        match monthly {
-            Ok(spend) => ledger.monthly_spend = spend.max(0.0),
-            Err(error) => tracing::warn!(%error, key_id, "could not seed monthly admission spend"),
-        }
+        ledger.daily_spend = daily.spend_usd.max(0.0);
+        ledger.daily_has_unknown_settled_cost = daily.has_unknown_cost;
+        ledger.monthly_spend = monthly.spend_usd.max(0.0);
+        ledger.monthly_has_unknown_settled_cost = monthly.has_unknown_cost;
         ledger.prune(instant_now);
         entry.initialized.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub async fn reserve(
@@ -447,13 +530,23 @@ impl AdmissionController {
     ) -> Result<AdmissionReservation, ProxyError> {
         let estimate = estimate_request(snapshot, key, req)?;
         let entry = self.entry(&key.id);
-        self.ensure_initialized(pool, &key.id, &entry).await;
+        self.ensure_initialized(pool, &key.id, &entry)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, key_id = %key.id, "could not initialize key admission state");
+                ProxyError::unavailable("admission state temporarily unavailable")
+            })?;
         self.reserve_initialized(entry, key, estimate)
     }
 
     pub async fn check_current(&self, pool: &Pool, key: &VirtualKeyRow) -> Result<(), ProxyError> {
         let entry = self.entry(&key.id);
-        self.ensure_initialized(pool, &key.id, &entry).await;
+        self.ensure_initialized(pool, &key.id, &entry)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, key_id = %key.id, "could not initialize key admission state");
+                ProxyError::unavailable("admission state temporarily unavailable")
+            })?;
         let result = entry
             .ledger
             .lock()
@@ -492,6 +585,7 @@ impl AdmissionController {
             metrics: self.metrics.clone(),
             id,
             estimate_tokens: estimate.tokens,
+            estimated_cost: estimate.cost,
             settled: false,
         })
     }
@@ -500,14 +594,16 @@ impl AdmissionController {
 impl KeyLedger {
     fn roll_periods(&mut self, now: chrono::DateTime<Utc>) {
         let day = now.date_naive();
-        if self.daily_day != Some(day) {
+        if self.daily_day.is_none_or(|current| day > current) {
             self.daily_day = Some(day);
             self.daily_spend = 0.0;
+            self.daily_has_unknown_settled_cost = false;
         }
         let month = (now.year(), now.month());
-        if self.monthly_key != Some(month) {
+        if self.monthly_key.is_none_or(|current| month > current) {
             self.monthly_key = Some(month);
             self.monthly_spend = 0.0;
+            self.monthly_has_unknown_settled_cost = false;
         }
     }
 
@@ -525,29 +621,64 @@ impl KeyLedger {
     fn current(&mut self, now_wall: chrono::DateTime<Utc>, now: Instant) -> (u64, u64, f64, f64) {
         self.roll_periods(now_wall);
         self.prune(now);
-        let day = now_wall.date_naive();
-        let month = (now_wall.year(), now_wall.month());
-
         let mut requests = self.minute.len() as u64;
-        let mut tokens: u64 = self.minute.iter().map(|entry| entry.tokens).sum();
+        let mut tokens = self.minute.iter().fold(0_u64, |total, entry| {
+            entry
+                .tokens
+                .map_or(u64::MAX, |tokens| total.saturating_add(tokens))
+        });
         let mut daily = self.daily_spend;
         let mut monthly = self.monthly_spend;
 
+        // Usage rows are timestamped at completion, so active reservations belong
+        // to the period currently being admitted, regardless of start time.
         for active in self.active.values() {
             if now.saturating_duration_since(active.at) < MINUTE_WINDOW {
                 requests = requests.saturating_add(1);
                 tokens = tokens.saturating_add(active.tokens);
             }
             if let Some(cost) = active.cost {
-                if active.day == day {
-                    daily += cost;
-                }
-                if active.month == month {
-                    monthly += cost;
-                }
+                daily += cost;
+                monthly += cost;
             }
         }
         (requests, tokens, daily, monthly)
+    }
+
+    fn budget_snapshot(
+        &mut self,
+        now_wall: chrono::DateTime<Utc>,
+        now: Instant,
+    ) -> AdmissionBudgetSnapshot {
+        self.roll_periods(now_wall);
+        self.prune(now);
+        let mut snapshot = AdmissionBudgetSnapshot {
+            daily: AdmissionBudgetPeriodSnapshot {
+                settled_spend_usd: self.daily_spend,
+                has_unknown_settled_cost: self.daily_has_unknown_settled_cost,
+                ..Default::default()
+            },
+            monthly: AdmissionBudgetPeriodSnapshot {
+                settled_spend_usd: self.monthly_spend,
+                has_unknown_settled_cost: self.monthly_has_unknown_settled_cost,
+                ..Default::default()
+            },
+        };
+
+        // Match admission: any active reservation may settle into this period.
+        for active in self.active.values() {
+            match active.cost {
+                Some(cost) => {
+                    snapshot.daily.active_reserved_usd += cost;
+                    snapshot.monthly.active_reserved_usd += cost;
+                }
+                None => {
+                    snapshot.daily.has_unknown_active_cost = true;
+                    snapshot.monthly.has_unknown_active_cost = true;
+                }
+            }
+        }
+        snapshot
     }
 
     fn check_current(
@@ -676,8 +807,6 @@ impl KeyLedger {
                 at: now,
                 tokens: estimate.tokens,
                 cost: estimate.cost,
-                day: now_wall.date_naive(),
-                month: (now_wall.year(), now_wall.month()),
             },
         );
         Ok(())
@@ -701,18 +830,19 @@ impl KeyLedger {
         if now.saturating_duration_since(active.at) < MINUTE_WINDOW {
             self.minute.push_back(MinuteUse {
                 at: active.at,
-                tokens,
+                tokens: Some(tokens),
             });
         }
 
+        // roll_periods() selected the completion period, matching the usage row timestamp.
+        if actual_cost.is_none() {
+            self.daily_has_unknown_settled_cost = true;
+            self.monthly_has_unknown_settled_cost = true;
+        }
         let cost = actual_cost.or(active.cost);
         if let Some(cost) = cost {
-            if self.daily_day == Some(active.day) {
-                self.daily_spend += cost;
-            }
-            if self.monthly_key == Some(active.month) {
-                self.monthly_spend += cost;
-            }
+            self.daily_spend += cost;
+            self.monthly_spend += cost;
         }
     }
 
@@ -873,6 +1003,34 @@ mod tests {
         (controller, entry)
     }
 
+    #[tokio::test]
+    async fn current_budget_snapshot_timestamps_the_locked_ledger_period() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-admission-current-snapshot-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = db::connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+            .await
+            .unwrap();
+        let (controller, entry) = initialized_controller();
+
+        let budget_at = controller
+            .budget_snapshot_current(&pool, "key")
+            .await
+            .unwrap();
+        {
+            let ledger = entry.ledger.lock();
+            assert_eq!(ledger.daily_day, Some(budget_at.captured_at.date_naive()));
+            assert_eq!(
+                ledger.monthly_key,
+                Some((budget_at.captured_at.year(), budget_at.captured_at.month()))
+            );
+        }
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn burst(
         controller: AdmissionController,
         entry: Arc<KeyAdmission>,
@@ -1023,6 +1181,223 @@ mod tests {
         assert_eq!(reservations.len(), 3);
     }
 
+    #[tokio::test]
+    async fn active_budget_reservations_follow_completion_period_across_utc_rollover() {
+        let before_midnight = chrono::DateTime::parse_from_rfc3339("2026-01-31T23:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let after_midnight = chrono::DateTime::parse_from_rfc3339("2026-02-01T00:00:02Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let before_instant = Instant::now();
+        let after_instant = before_instant + Duration::from_secs(3);
+        let estimate = AdmissionEstimate {
+            tokens: 1,
+            cost: Some(0.8),
+        };
+        let mut key = key();
+        key.daily_budget = Some(1.0);
+        key.monthly_budget = Some(1.0);
+
+        let mut ledger = KeyLedger::default();
+        assert!(ledger
+            .reserve(1, &key, estimate, before_midnight, before_instant)
+            .is_ok());
+
+        let active = ledger.budget_snapshot(after_midnight, after_instant);
+        assert_eq!(active.daily.active_reserved_usd, 0.8);
+        assert_eq!(active.monthly.active_reserved_usd, 0.8);
+        assert!(ledger
+            .reserve(
+                2,
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.8),
+                },
+                after_midnight,
+                after_instant,
+            )
+            .is_err());
+
+        ledger.reconcile(1, Some(1), Some(0.8), after_midnight, after_instant);
+        let settled = ledger.budget_snapshot(after_midnight, after_instant);
+        assert_eq!(settled.daily.settled_spend_usd, 0.8);
+        assert_eq!(settled.monthly.settled_spend_usd, 0.8);
+        assert!(ledger
+            .reserve(
+                3,
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.3),
+                },
+                after_midnight,
+                after_instant,
+            )
+            .is_err());
+
+        // A historical timestamp must not roll the authoritative ledger back.
+        ledger.roll_periods(before_midnight);
+        assert_eq!(ledger.daily_spend, 0.8);
+        assert_eq!(ledger.monthly_spend, 0.8);
+        assert_eq!(ledger.daily_day, Some(after_midnight.date_naive()));
+        assert_eq!(
+            ledger.monthly_key,
+            Some((after_midnight.year(), after_midnight.month()))
+        );
+        assert!(ledger
+            .reserve(
+                4,
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.3),
+                },
+                after_midnight,
+                after_instant,
+            )
+            .is_err());
+
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-admission-rollover-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = db::connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+            .await
+            .unwrap();
+        db::migrate(&pool).await.unwrap();
+        let completion_ts = after_midnight.to_rfc3339();
+        sqlx::query(
+            "INSERT INTO usage_logs
+             (id, request_id, ts, key_id, client_format, requested_model, status, status_code,
+              input_tokens, output_tokens, cost_usd, cost_known)
+             VALUES ('rollover', 'rollover', ?, 'key', 'openai', 'model', 'success', 200, 1, 1, 0.8, 1)",
+        )
+        .bind(&completion_ts)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let day_start = "2026-02-01T00:00:00+00:00";
+        assert_eq!(
+            db::key_admission_budget_seed_since(&pool, "key", day_start)
+                .await
+                .unwrap()
+                .spend_usd,
+            settled.daily.settled_spend_usd
+        );
+        let persisted_usage =
+            db::client_usage_summary(&pool, "key", day_start, "2026-02-02T00:00:00+00:00")
+                .await
+                .unwrap();
+        assert_eq!(
+            persisted_usage.known_cost_usd,
+            settled.daily.settled_spend_usd
+        );
+
+        let restarted = AdmissionController::default();
+        let restarted_entry = restarted.entry("key");
+        restarted
+            .ensure_initialized_at(
+                &pool,
+                "key",
+                &restarted_entry,
+                after_midnight,
+                after_instant,
+            )
+            .await
+            .unwrap();
+        let restored = restarted_entry
+            .ledger
+            .lock()
+            .budget_snapshot(after_midnight, after_instant);
+        assert_eq!(
+            restored.daily.settled_spend_usd,
+            settled.daily.settled_spend_usd
+        );
+        assert_eq!(
+            restored.monthly.settled_spend_usd,
+            settled.monthly.settled_spend_usd
+        );
+        assert!(restarted_entry
+            .ledger
+            .lock()
+            .reserve(
+                1,
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.3),
+                },
+                after_midnight,
+                after_instant,
+            )
+            .is_err());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn budget_snapshot_includes_active_reservations_without_exposing_them_individually() {
+        let (controller, entry) = initialized_controller();
+        let mut key = key();
+        key.daily_budget = Some(1.0);
+        key.monthly_budget = Some(2.0);
+        let reservation = controller
+            .reserve_initialized(
+                entry.clone(),
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.8),
+                },
+            )
+            .unwrap();
+
+        let snapshot = entry
+            .ledger
+            .lock()
+            .budget_snapshot(Utc::now(), Instant::now());
+        assert_eq!(snapshot.daily.settled_spend_usd, 0.0);
+        assert_eq!(snapshot.daily.active_reserved_usd, 0.8);
+        assert!(!snapshot.daily.has_unknown_active_cost);
+        assert_eq!(snapshot.monthly.active_reserved_usd, 0.8);
+        assert!(!snapshot.monthly.has_unknown_active_cost);
+        assert!(controller
+            .reserve_initialized(
+                entry.clone(),
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.3),
+                },
+            )
+            .is_err());
+
+        let unknown = controller
+            .reserve_initialized(
+                entry.clone(),
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: None,
+                },
+            )
+            .unwrap();
+        let snapshot = entry
+            .ledger
+            .lock()
+            .budget_snapshot(Utc::now(), Instant::now());
+        assert!(snapshot.daily.has_unknown_active_cost);
+        assert!(snapshot.monthly.has_unknown_active_cost);
+        assert_eq!(snapshot.daily.active_reserved_usd, 0.8);
+        drop(unknown);
+        drop(reservation);
+    }
+
     #[test]
     fn concurrent_budget_burst_reserves_spend_atomically() {
         let (controller, entry) = initialized_controller();
@@ -1076,10 +1451,38 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_usage_keeps_conservative_reservation() {
+    fn incomplete_usage_keeps_the_live_tpm_estimate() {
         let (controller, entry) = initialized_controller();
         let mut key = key();
         key.tpm_limit = Some(100);
+        let reservation = controller
+            .reserve_initialized(
+                entry.clone(),
+                &key,
+                AdmissionEstimate {
+                    tokens: 80,
+                    cost: Some(0.8),
+                },
+            )
+            .unwrap();
+        reservation.reconcile_incomplete_at(Utc::now());
+        let second = controller.reserve_initialized(
+            entry,
+            &key,
+            AdmissionEstimate {
+                tokens: 20,
+                cost: Some(0.1),
+            },
+        );
+        assert!(second.is_ok());
+    }
+
+    #[test]
+    fn settled_unknown_cost_keeps_conservative_spend_and_unknown_status() {
+        let (controller, entry) = initialized_controller();
+        let mut key = key();
+        key.daily_budget = Some(1.0);
+        key.monthly_budget = Some(1.0);
         let reservation = controller
             .reserve_initialized(
                 entry.clone(),
@@ -1098,15 +1501,191 @@ mod tests {
             },
             None,
         );
-        let second = controller.reserve_initialized(
+
+        let snapshot = entry
+            .ledger
+            .lock()
+            .budget_snapshot(Utc::now(), Instant::now());
+        assert_eq!(snapshot.daily.settled_spend_usd, 0.8);
+        assert_eq!(snapshot.monthly.settled_spend_usd, 0.8);
+        assert!(snapshot.daily.has_unknown_settled_cost);
+        assert!(snapshot.monthly.has_unknown_settled_cost);
+        assert!(controller
+            .reserve_initialized(
+                entry,
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.3),
+                },
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn settled_unknown_cost_flags_roll_with_utc_budget_periods() {
+        let jan_30 = NaiveDate::from_ymd_opt(2026, 1, 30)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let mut ledger = KeyLedger::default();
+        ledger.roll_periods(jan_30);
+        ledger.daily_spend = 0.8;
+        ledger.monthly_spend = 0.8;
+        ledger.daily_has_unknown_settled_cost = true;
+        ledger.monthly_has_unknown_settled_cost = true;
+
+        ledger.roll_periods(jan_30 + chrono::Duration::days(1));
+        assert_eq!(ledger.daily_spend, 0.0);
+        assert!(!ledger.daily_has_unknown_settled_cost);
+        assert_eq!(ledger.monthly_spend, 0.8);
+        assert!(ledger.monthly_has_unknown_settled_cost);
+
+        let feb_1 = NaiveDate::from_ymd_opt(2026, 2, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        ledger.roll_periods(feb_1);
+        assert_eq!(ledger.monthly_spend, 0.0);
+        assert!(!ledger.monthly_has_unknown_settled_cost);
+    }
+
+    #[tokio::test]
+    async fn persisted_unknown_tokens_fail_closed_for_tpm() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-admission-unknown-tokens-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = db::connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+            .await
+            .unwrap();
+        db::migrate(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs
+             (id, request_id, ts, key_id, client_format, requested_model, status, status_code)
+             VALUES (?, ?, ?, ?, 'openai', 'model', 'upstream_error', 502)",
+        )
+        .bind("failed-request")
+        .bind("failed-request")
+        .bind(db::now_iso())
+        .bind("key")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let controller = AdmissionController::default();
+        let entry = controller.entry("key");
+        controller
+            .ensure_initialized(&pool, "key", &entry)
+            .await
+            .unwrap();
+        let mut key = key();
+        key.tpm_limit = Some(100);
+        let next = controller.reserve_initialized(
             entry,
             &key,
             AdmissionEstimate {
-                tokens: 30,
-                cost: Some(0.1),
+                tokens: 1,
+                cost: None,
             },
         );
-        assert!(second.is_err());
+        assert!(next.is_err());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn persisted_unknown_cost_retains_budget_and_unknown_marker_after_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-admission-unknown-cost-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = db::connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+            .await
+            .unwrap();
+        db::migrate(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs
+             (id, request_id, ts, key_id, client_format, requested_model, status, status_code,
+              cost_usd, cost_known, admission_cost_usd)
+             VALUES (?, ?, ?, ?, 'openai', 'model', 'upstream_error', 502, NULL, 0, ?)",
+        )
+        .bind("failed-request")
+        .bind("failed-request")
+        .bind(db::now_iso())
+        .bind("key")
+        .bind(0.8f64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs
+             (id, request_id, ts, key_id, client_format, requested_model, status, status_code,
+              cost_usd, cost_known)
+             VALUES (?, ?, ?, ?, 'openai', 'model', 'upstream_error', 502, NULL, 0)",
+        )
+        .bind("unpriced-request")
+        .bind("unpriced-request")
+        .bind(db::now_iso())
+        .bind("unpriced-key")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let daily_since = crate::pool::window_start("daily", None);
+        assert_eq!(
+            db::key_spend_since(&pool, "key", &daily_since)
+                .await
+                .unwrap(),
+            0.0
+        );
+        assert_eq!(
+            db::key_admission_budget_seed_since(&pool, "key", &daily_since)
+                .await
+                .unwrap()
+                .spend_usd,
+            0.8
+        );
+
+        let controller = AdmissionController::default();
+        let budget_at = controller
+            .budget_snapshot_current(&pool, "key")
+            .await
+            .unwrap();
+        assert_eq!(budget_at.snapshot.daily.settled_spend_usd, 0.8);
+        assert_eq!(budget_at.snapshot.monthly.settled_spend_usd, 0.8);
+        assert!(budget_at.snapshot.daily.has_unknown_settled_cost);
+        assert!(budget_at.snapshot.monthly.has_unknown_settled_cost);
+
+        let unpriced = controller
+            .budget_snapshot_current(&pool, "unpriced-key")
+            .await
+            .unwrap();
+        assert_eq!(unpriced.snapshot.daily.settled_spend_usd, 0.0);
+        assert_eq!(unpriced.snapshot.monthly.settled_spend_usd, 0.0);
+        assert!(unpriced.snapshot.daily.has_unknown_settled_cost);
+        assert!(unpriced.snapshot.monthly.has_unknown_settled_cost);
+
+        let entry = controller.entry("key");
+        let mut key = key();
+        key.daily_budget = Some(1.0);
+        let next = controller.reserve_initialized(
+            entry,
+            &key,
+            AdmissionEstimate {
+                tokens: 1,
+                cost: Some(0.4),
+            },
+        );
+        assert!(next.is_err());
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

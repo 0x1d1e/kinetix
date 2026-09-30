@@ -18,6 +18,65 @@ allowed_models = ["syn-openai", "syn-openai-alias", "syn-fallback"]
 rpm_limit = 100000
 tpm_limit = 100000000
 
+[[virtual_keys]]
+name = "Failed Request RPM Key"
+key = "sk-kinetix-smoke-failure-rpm"
+owner = "smoke"
+tag = "failure-rpm"
+allowed_models = ["syn-fail"]
+rpm_limit = 1
+tpm_limit = 100000000
+
+[[virtual_keys]]
+name = "Failed Request Budget Key"
+key = "sk-kinetix-smoke-budget-reservation"
+owner = "smoke"
+tag = "failure-budget"
+allowed_models = ["syn-fail-budget"]
+daily_budget = 1.0
+
+[[virtual_keys]]
+name = "Partial Usage Budget Key"
+key = "sk-kinetix-smoke-partial-usage-budget"
+owner = "smoke"
+tag = "partial-usage-budget"
+allowed_models = ["syn-openai-partial"]
+daily_budget = 1.0
+
+[[virtual_keys]]
+name = "Active Budget Key"
+key = "__ACTIVE_BUDGET_KEY__"
+owner = "smoke"
+tag = "active-budget"
+allowed_models = ["syn-openai-partial"]
+daily_budget = 1.0
+
+[[virtual_keys]]
+name = "Active Unknown Budget Key"
+key = "__ACTIVE_UNKNOWN_BUDGET_KEY__"
+owner = "smoke"
+tag = "active-unknown-budget"
+allowed_models = ["syn-openai"]
+daily_budget = 1.0
+
+[[virtual_keys]]
+name = "Pre-dispatch RPM Key"
+key = "__PRE_DISPATCH_RPM_KEY__"
+owner = "smoke"
+tag = "pre-dispatch-rpm"
+allowed_models = ["syn-pre-dispatch"]
+rpm_limit = 1
+tpm_limit = 100000000
+
+[[virtual_keys]]
+name = "Pre-dispatch TPM Key"
+key = "__PRE_DISPATCH_TPM_KEY__"
+owner = "smoke"
+tag = "pre-dispatch-tpm"
+allowed_models = ["syn-pre-dispatch"]
+rpm_limit = 100000
+tpm_limit = 6000
+
 [[providers]]
 name = "Synth OpenAI"
 base_url = "http://127.0.0.1:9199/openai/v1"
@@ -41,6 +100,15 @@ models_path = "/models"
   max_output_tokens = 8192
   capabilities = ["text", "vision", "reasoning", "tool_calling"]
   thinking_map = { levels = { low = { "reasoning_effort" = "low" }, medium = { "reasoning_effort" = "medium" }, high = { "reasoning_effort" = "high" } } }
+
+  [[providers.models]]
+  upstream_id = "syn-openai-partial"
+  display_name = "Synthetic OpenAI Partial Usage"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text"]
+  prices = { input_per_1m = 100.0, output_per_1m = 100.0 }
 
   [[providers.models]]
   upstream_id = "syn-openai-a"
@@ -149,6 +217,52 @@ capability_mode = "permissive"
   max_output_tokens = 8192
   capabilities = ["text", "vision", "reasoning", "tool_calling"]
   thinking_map = { levels = { low = { "thinkingConfig.thinkingBudget" = 512 }, medium = { "thinkingConfig.thinkingBudget" = 2048 }, high = { "thinkingConfig.thinkingBudget" = 4096 } } }
+
+[[providers]]
+name = "Synth Failure Budget"
+base_url = "http://127.0.0.1:9199/gemini/v1beta"
+wire_format = "gemini"
+auth_scheme = "custom_header"
+custom_header_name = "x-goog-api-key"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-failure-budget"
+  api_key = "smoke-failure-budget-key"
+  priority = 1
+  quota_type = "none"
+
+  [[providers.models]]
+  upstream_id = "syn-fail-budget"
+  display_name = "Synthetic Failing Budget Model"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 8192
+  capabilities = ["text"]
+  prices = { input_per_1m = 100.0, output_per_1m = 100.0 }
+
+[[providers]]
+name = "Synth DNS Failure"
+base_url = "http://kinetix-smoke-no-dns.invalid/openai/v1"
+wire_format = "openai"
+auth_scheme = "bearer"
+timeout_ms = 120000
+capability_mode = "permissive"
+
+  [[providers.accounts]]
+  label = "synth-dns-failure"
+  api_key = "smoke-dns-failure-key"
+  priority = 1
+  quota_type = "none"
+
+  [[providers.models]]
+  upstream_id = "syn-pre-dispatch"
+  display_name = "Synthetic Pre-dispatch DNS Failure"
+  enabled = true
+  context_window = 200000
+  max_output_tokens = 5000
+  capabilities = ["text"]
 
 [[providers]]
 name = "Synth Anthropic"

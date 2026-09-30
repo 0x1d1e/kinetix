@@ -3780,6 +3780,10 @@ pub struct UsageLogRow {
     pub retry_count: i64,
     pub route_trace_id: Option<String>,
     pub opaque_route_id: Option<String>,
+    /// Conservative cost reserved for admission when actual cost is unknown.
+    /// This internal value is not part of serialized usage reports.
+    #[serde(skip_serializing, default)]
+    pub admission_cost_usd: Option<f64>,
 }
 
 pub async fn insert_usage_log(pool: &Pool, u: &UsageLogRow) -> Result<()> {
@@ -3794,8 +3798,8 @@ async fn insert_usage_log_on(conn: &mut sqlx::SqliteConnection, u: &UsageLogRow)
          route_name, fallback_hops, fallback_path, status, status_code, latency_ms, ttft_ms, input_tokens,
          output_tokens, cached_tokens, cache_write_tokens, thinking_tokens, cost_usd, cost_known, price_version_id, cache_status,
          serving_account_id, serving_account, serving_provider, upstream_request_id, flagged, error_message,
-         usage_confidence, commit_state, retry_count, route_trace_id, opaque_route_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         usage_confidence, commit_state, retry_count, route_trace_id, opaque_route_id, admission_cost_usd)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&u.id)
     .bind(&u.request_id)
@@ -3833,6 +3837,7 @@ async fn insert_usage_log_on(conn: &mut sqlx::SqliteConnection, u: &UsageLogRow)
     .bind(u.retry_count)
     .bind(&u.route_trace_id)
     .bind(&u.opaque_route_id)
+    .bind(u.admission_cost_usd)
     .execute(conn)
     .await?;
     Ok(())
@@ -3927,9 +3932,9 @@ pub struct UsageAccountingBundle {
 pub async fn insert_usage_bundle(pool: &Pool, bundle: &UsageAccountingBundle) -> Result<()> {
     let mut tx = pool.begin().await?;
     for attempt in &bundle.attempts {
-        insert_usage_attempt_on(&mut *tx, attempt).await?;
+        insert_usage_attempt_on(&mut tx, attempt).await?;
     }
-    insert_usage_log_on(&mut *tx, &bundle.request).await?;
+    insert_usage_log_on(&mut tx, &bundle.request).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -4070,6 +4075,35 @@ pub async fn key_spend_since(pool: &Pool, key_id: &str, since_iso: &str) -> Resu
     Ok(row.get::<f64, _>("total"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyAdmissionBudgetSeed {
+    pub spend_usd: f64,
+    pub has_unknown_cost: bool,
+}
+
+/// Rebuild budget admission after restart. Unknown actual costs use their
+/// persisted conservative reservation and remain marked as unknown.
+pub async fn key_admission_budget_seed_since(
+    pool: &Pool,
+    key_id: &str,
+    since_iso: &str,
+) -> Result<KeyAdmissionBudgetSeed> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(COALESCE(admission_cost_usd, cost_usd)),0.0) as total,
+                COALESCE(MAX(CASE WHEN cost_known = 0 OR cost_usd IS NULL THEN 1 ELSE 0 END),0)
+                    as has_unknown_cost
+         FROM usage_logs WHERE key_id = ? AND ts >= ?",
+    )
+    .bind(key_id)
+    .bind(since_iso)
+    .fetch_one(pool)
+    .await?;
+    Ok(KeyAdmissionBudgetSeed {
+        spend_usd: row.get::<f64, _>("total"),
+        has_unknown_cost: row.get::<i64, _>("has_unknown_cost") != 0,
+    })
+}
+
 /// Sum of cost for an account within a time window (for soft quotas).
 pub async fn account_spend_since(pool: &Pool, account_id: &str, since_iso: &str) -> Result<f64> {
     let row = sqlx::query(
@@ -4088,14 +4122,16 @@ pub async fn key_usage_entries_since(
     pool: &Pool,
     key_id: &str,
     since_iso: &str,
-) -> Result<Vec<(String, i64)>> {
+) -> Result<Vec<(String, Option<i64>)>> {
+    // Keep unknown token totals as None; admission handles them conservatively
+    // instead of converting them to zero after restart.
     let rows = sqlx::query(
-        "SELECT r.ts,
-                COALESCE(a.reported_input_tokens,0) + COALESCE(a.reported_output_tokens,0) AS tokens
-         FROM usage_request_logs r
-         LEFT JOIN usage_request_accounting a ON a.request_id = r.request_id
-         WHERE r.key_id = ? AND r.ts >= ?
-         ORDER BY r.ts ASC",
+        "SELECT ts,
+                CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN NULL
+                     ELSE input_tokens + output_tokens END AS tokens
+         FROM usage_request_logs
+         WHERE key_id = ? AND ts >= ?
+         ORDER BY ts ASC",
     )
     .bind(key_id)
     .bind(since_iso)
@@ -4104,7 +4140,12 @@ pub async fn key_usage_entries_since(
 
     Ok(rows
         .into_iter()
-        .map(|row| (row.get::<String, _>("ts"), row.get::<i64, _>("tokens")))
+        .map(|row| {
+            (
+                row.get::<String, _>("ts"),
+                row.get::<Option<i64>, _>("tokens"),
+            )
+        })
         .collect())
 }
 
@@ -4121,6 +4162,56 @@ pub async fn key_usage_since(pool: &Pool, key_id: &str, since_iso: &str) -> Resu
     .fetch_one(pool)
     .await?;
     Ok((row.get::<i64, _>("n"), row.get::<i64, _>("t")))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientUsageSummary {
+    pub requests: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub known_cost_usd: f64,
+    pub unknown_cost_requests: i64,
+    pub unknown_usage_requests: i64,
+}
+
+/// Bounded usage summary for one key over `[from, to)`. Token totals remain
+/// unknown when any request lacks the corresponding count; known cost is the
+/// numeric subtotal of priced requests, including zero when none are priced.
+pub async fn client_usage_summary(
+    pool: &Pool,
+    key_id: &str,
+    from_iso: &str,
+    to_iso: &str,
+) -> Result<ClientUsageSummary> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS requests,
+            CASE WHEN COUNT(*) = 0 THEN 0
+                 WHEN SUM(CASE WHEN input_tokens IS NULL THEN 1 ELSE 0 END) = 0
+                 THEN SUM(input_tokens) ELSE NULL END AS input_tokens,
+            CASE WHEN COUNT(*) = 0 THEN 0
+                 WHEN SUM(CASE WHEN output_tokens IS NULL THEN 1 ELSE 0 END) = 0
+                 THEN SUM(output_tokens) ELSE NULL END AS output_tokens,
+            COALESCE(SUM(CASE WHEN cost_known != 0 AND cost_usd IS NOT NULL THEN cost_usd ELSE 0.0 END), 0.0)
+                AS known_cost_usd,
+            COALESCE(SUM(CASE WHEN cost_known = 0 OR cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS unknown_cost_requests,
+            COALESCE(SUM(CASE WHEN usage_confidence = 'unknown' THEN 1 ELSE 0 END), 0) AS unknown_usage_requests
+         FROM usage_logs
+         WHERE key_id = ? AND ts >= ? AND ts < ?",
+    )
+    .bind(key_id)
+    .bind(from_iso)
+    .bind(to_iso)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(ClientUsageSummary {
+        requests: row.get("requests"),
+        input_tokens: row.get("input_tokens"),
+        output_tokens: row.get("output_tokens"),
+        known_cost_usd: row.get("known_cost_usd"),
+        unknown_cost_requests: row.get("unknown_cost_requests"),
+        unknown_usage_requests: row.get("unknown_usage_requests"),
+    })
 }
 
 // ===========================================================================
@@ -5702,6 +5793,7 @@ mod usage_request_log_tests {
             retry_count: fallback_hops,
             route_trace_id: None,
             opaque_route_id: None,
+            admission_cost_usd: None,
         }
     }
 
@@ -5846,6 +5938,12 @@ mod usage_request_log_tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/20260930150000_usage_request_log_admission_cost.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         let attempts: Vec<(i64, String)> = sqlx::query_as(
             "SELECT attempt_number, status FROM usage_attempts WHERE request_id = ? ORDER BY attempt_number",
         )
@@ -5888,7 +5986,7 @@ mod usage_request_log_tests {
             .await
             .unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].1, 23);
+        assert_eq!(entries[0].1, Some(23));
         assert_eq!(
             key_usage_since(&pool, "usage-view-key", "2026-01-02T00:00:00Z")
                 .await

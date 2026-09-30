@@ -5,7 +5,8 @@
 
 use crate::types::{Prices, TokenUsage};
 
-/// Compute USD cost for a request. Returns `None` when prices are not configured.
+/// Compute USD cost for a request. Returns `None` when prices are not configured
+/// or canonical totals are incomplete.
 /// Format a USD amount for human-facing messages, keeping precision for tiny
 /// amounts so a budget of $0.0001 does not read as "0.00".
 pub fn format_usd(v: f64) -> String {
@@ -20,8 +21,11 @@ pub fn compute_cost(prices: &Prices, usage: &TokenUsage) -> Option<f64> {
     if !prices.is_configured() {
         return None;
     }
-    let input = usage.input.unwrap_or(0) as f64;
-    let output = usage.output.unwrap_or(0) as f64;
+    let (Some(input), Some(output)) = (usage.input, usage.output) else {
+        return None;
+    };
+    let input = input as f64;
+    let output = output as f64;
 
     // Canonical input/output are inclusive totals. Partition reported
     // breakdowns within those totals so malformed overlapping detail counters
@@ -69,6 +73,28 @@ mod tests {
             ..Default::default()
         };
         assert!(compute_cost(&p, &u).is_none());
+    }
+
+    #[test]
+    fn incomplete_canonical_totals_are_unknown() {
+        let p = Prices {
+            input_per_1m: Some(1.0),
+            output_per_1m: Some(2.0),
+            ..Default::default()
+        };
+        let input_only = TokenUsage {
+            input: Some(100),
+            output: None,
+            ..Default::default()
+        };
+        let output_only = TokenUsage {
+            input: None,
+            output: Some(50),
+            ..Default::default()
+        };
+
+        assert!(compute_cost(&p, &input_only).is_none());
+        assert!(compute_cost(&p, &output_only).is_none());
     }
 
     #[test]

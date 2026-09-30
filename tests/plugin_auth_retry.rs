@@ -788,8 +788,8 @@ async fn retryable_rotation_failure_remains_terminal_when_attempt_budget_is_exha
             .fetch_optional(&harness.pool)
             .await
             .unwrap();
-            if row.is_some() {
-                break row.unwrap();
+            if let Some(row) = row {
+                break row;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

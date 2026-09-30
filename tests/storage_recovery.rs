@@ -343,7 +343,11 @@ async fn startup_retries_preserve_snapshot_until_pricing_repair_succeeds() {
     let db_path = root.join("kinetix.db");
     let url = database_url(&db_path);
     let pool = db::connect(&url).await.unwrap();
-    migrate_to_prefix(&pool, MIGRATOR.iter().len() - 1).await;
+    let pre_account_state_migration_count = MIGRATOR
+        .iter()
+        .take_while(|migration| migration.version < 20260929100000)
+        .count();
+    migrate_to_prefix(&pool, pre_account_state_migration_count).await;
 
     for (provider_id, model_id) in [("provider-a", "model-a"), ("provider-b", "model-b")] {
         sqlx::query(
@@ -477,7 +481,10 @@ async fn startup_retries_preserve_snapshot_until_pricing_repair_succeeds() {
         .fetch_one(&backup)
         .await
         .unwrap();
-    assert_eq!(old_schema_migrations, MIGRATOR.iter().len() as i64 - 1);
+    assert_eq!(
+        old_schema_migrations,
+        pre_account_state_migration_count as i64
+    );
     let old_schema_has_pricing_scope: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('providers') WHERE name='pricing_scope'",
     )
@@ -491,21 +498,21 @@ async fn startup_retries_preserve_snapshot_until_pricing_repair_succeeds() {
     .fetch_one(&backup)
     .await
     .unwrap();
-    assert_eq!(old_schema_has_account_state_version, 1);
+    assert_eq!(old_schema_has_account_state_version, 0);
     let old_schema_has_integration_features: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('providers') WHERE name='integration_features'",
     )
     .fetch_one(&backup)
     .await
     .unwrap();
-    assert_eq!(old_schema_has_integration_features, 1);
+    assert_eq!(old_schema_has_integration_features, 0);
     let old_schema_has_integration_protocols: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('providers') WHERE name='integration_protocols'",
     )
     .fetch_one(&backup)
     .await
     .unwrap();
-    assert_eq!(old_schema_has_integration_protocols, 1);
+    assert_eq!(old_schema_has_integration_protocols, 0);
     backup.close().await;
 
     let pool = db::connect(&url).await.unwrap();

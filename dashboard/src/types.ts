@@ -193,7 +193,7 @@ export interface RequestLog {
   servingAccount: string;
   servingProvider: string;
   opaqueRouteId: string;
-  usageConfidence: 'provider_reported' | 'estimated' | 'unknown';
+  usageConfidence: 'provider_reported' | 'estimated' | 'unknown' | 'not_dispatched';
   commitState: string;
   retryCount: number;
   promptPreview: string;

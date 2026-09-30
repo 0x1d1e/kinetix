@@ -364,6 +364,12 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        usage = (
+            {"prompt_tokens": 100}
+            if _fixture(req, "partial-usage")
+            else {"prompt_tokens": 100, "completion_tokens": TOKENS, "total_tokens": 100 + TOKENS}
+        )
+
         if not stream:
             message = {
                 "role": "assistant",
@@ -395,7 +401,7 @@ class Handler(BaseHTTPRequestHandler):
                         "message": message,
                         "finish_reason": finish_reason,
                     }],
-                    "usage": {"prompt_tokens": 100, "completion_tokens": TOKENS, "total_tokens": 100 + TOKENS},
+                    "usage": usage,
                 }
             ).encode()
             self.send_response(200)
@@ -425,6 +431,8 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(TTFT_MS / 1000.0)
             frame({"id": "syn-1", "object": "chat.completion.chunk", "model": model,
                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+            if _fixture(req, "hold-budget"):
+                time.sleep(5)
             if want_tools:
                 # Emit a function call with the arguments split across frames so
                 # the tool-argument reassembly path is exercised.
@@ -464,8 +472,7 @@ class Handler(BaseHTTPRequestHandler):
             frame({"id": "syn-1", "object": "chat.completion.chunk", "model": model,
                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
             frame({"id": "syn-1", "object": "chat.completion.chunk", "model": model,
-                   "choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": TOKENS,
-                                            "total_tokens": 100 + TOKENS}})
+                   "choices": [], "usage": usage})
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (_Disconnected, BrokenPipeError, ConnectionResetError):

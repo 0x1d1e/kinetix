@@ -122,8 +122,8 @@ pub struct RequestMeta {
     pub cache_status: &'static str,
     pub commit_state: &'static str,
     pub session: Option<String>,
-    /// Atomic RPM/TPM/budget reservation owned by this request. A disconnect
-    /// after upstream dispatch reconciles it as incomplete instead of canceling it.
+    /// Atomic RPM/TPM/budget reservation owned by this request. A dispatched
+    /// failure or disconnect reconciles it as incomplete instead of canceling it.
     pub admission: Option<crate::admission::AdmissionReservation>,
     /// Usage and costs from failed precommit provider attempts. Persisted as
     /// per-attempt rows and included in admission reconciliation.
@@ -189,18 +189,19 @@ impl Drop for RequestMeta {
                 .as_ref()
                 .is_some_and(crate::client_disconnect::ClientDisconnect::is_cancelled);
         if disconnected_after_dispatch {
-            self.record_cancelled_accounting();
+            let completion_time = chrono::Utc::now();
+            self.record_cancelled_accounting(completion_time);
             if let Some(admission) = self.admission.take() {
                 // The active dispatch may have incurred unreported usage. Earlier
                 // attempts cannot make this request's total exact.
-                admission.reconcile_incomplete();
+                admission.reconcile_incomplete_at(completion_time);
             }
         }
     }
 }
 
 impl RequestMeta {
-    fn record_cancelled_accounting(&mut self) {
+    fn record_cancelled_accounting(&mut self, completion_time: chrono::DateTime<chrono::Utc>) {
         if self.accounting_enqueued.load(Ordering::Acquire) {
             return;
         }
@@ -242,7 +243,7 @@ impl RequestMeta {
         let request_row = UsageLogRow {
             id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
             request_id: self.request_id.clone(),
-            ts: db::now_iso(),
+            ts: completion_time.to_rfc3339(),
             key_id: self.key_id.clone(),
             key_name: self.key_name.clone(),
             client_format: self.client_format.to_string(),
@@ -281,6 +282,10 @@ impl RequestMeta {
             retry_count: self.partial_attempts.len().saturating_sub(1) as i64,
             route_trace_id: last_attempt.row.opaque_route_id.clone(),
             opaque_route_id: last_attempt.row.opaque_route_id.clone(),
+            admission_cost_usd: self
+                .admission
+                .as_ref()
+                .and_then(|admission| admission.conservative_cost_estimate()),
         };
         log_queue.enqueue_bundle(db::UsageAccountingBundle {
             request: request_row,
@@ -1966,9 +1971,8 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                     None,
                                 );
-                                reconcile_partial_attempts(&mut meta);
                                 let client_error = failure_to_error(&failure, target);
-                                record_precommit_request_log(
+                                let completion_time = record_precommit_request_log(
                                     state,
                                     &meta,
                                     &req,
@@ -1983,6 +1987,15 @@ pub(crate) async fn run_with_disconnect(
                                     attempts_done,
                                 );
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
+                                enqueue_precommit_failure_at(
+                                    state,
+                                    &req,
+                                    &mut meta,
+                                    started,
+                                    attempts_done,
+                                    &client_error,
+                                    completion_time,
+                                );
                                 return Err(client_error);
                             }
                             let client_error = failure_to_error(&failure, target);
@@ -2303,8 +2316,7 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                     None,
                                 );
-                                reconcile_partial_attempts(&mut meta);
-                                record_precommit_request_log(
+                                let completion_time = record_precommit_request_log(
                                     state,
                                     &meta,
                                     &req,
@@ -2319,6 +2331,15 @@ pub(crate) async fn run_with_disconnect(
                                     attempts_done,
                                 );
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
+                                enqueue_precommit_failure_at(
+                                    state,
+                                    &req,
+                                    &mut meta,
+                                    started,
+                                    attempts_done,
+                                    &refresh_error,
+                                    completion_time,
+                                );
                                 return Err(refresh_error);
                             }
                             last_error = Some(refresh_error);
@@ -2356,8 +2377,7 @@ pub(crate) async fn run_with_disconnect(
                         None,
                         None,
                     );
-                    reconcile_partial_attempts(&mut meta);
-                    record_precommit_request_log(
+                    let completion_time = record_precommit_request_log(
                         state,
                         &meta,
                         &req,
@@ -2372,6 +2392,15 @@ pub(crate) async fn run_with_disconnect(
                         attempts_done,
                     );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
+                    enqueue_precommit_failure_at(
+                        state,
+                        &req,
+                        &mut meta,
+                        started,
+                        attempts_done,
+                        &client_error,
+                        completion_time,
+                    );
                     return Err(client_error);
                 }
                 if failure.kind == FailureKind::TargetError {
@@ -2456,8 +2485,7 @@ pub(crate) async fn run_with_disconnect(
                         None,
                         None,
                     );
-                    reconcile_partial_attempts(&mut meta);
-                    record_precommit_request_log(
+                    let completion_time = record_precommit_request_log(
                         state,
                         &meta,
                         &req,
@@ -2472,6 +2500,15 @@ pub(crate) async fn run_with_disconnect(
                         attempts_done,
                     );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
+                    enqueue_precommit_failure_at(
+                        state,
+                        &req,
+                        &mut meta,
+                        started,
+                        attempts_done,
+                        &client_error,
+                        completion_time,
+                    );
                     return Err(client_error);
                 }
                 last_error = Some(client_error);
@@ -2482,7 +2519,6 @@ pub(crate) async fn run_with_disconnect(
 
     // 4. Every target unavailable (FR-12.12).
     state.failures_pre_commit.fetch_add(1, Ordering::Relaxed);
-    reconcile_partial_attempts(&mut meta);
     let retry_after = pool::soonest_recovery(&all_accounts)
         .map(|t| ((t - chrono::Utc::now()).num_seconds().max(1)) as u64);
     let name = route
@@ -2496,7 +2532,7 @@ pub(crate) async fn run_with_disconnect(
         .unwrap_or_else(|| format!("all targets of {name} are currently unavailable"));
     trace.finish("all_targets_unavailable");
     if let Some(failure) = last_precommit_failure.as_ref() {
-        record_precommit_request_log(
+        let completion_time = record_precommit_request_log(
             state,
             &meta,
             &req,
@@ -2509,6 +2545,15 @@ pub(crate) async fn run_with_disconnect(
             failure.termination,
             started,
             failure.attempts_done,
+        );
+        enqueue_precommit_failure_at(
+            state,
+            &req,
+            &mut meta,
+            started,
+            failure.attempts_done,
+            &failure.client_error,
+            completion_time,
         );
     }
     state.live.finish(
@@ -2525,6 +2570,9 @@ pub(crate) async fn run_with_disconnect(
         return Err(failure.client_error);
     }
     if let Some(error) = last_error {
+        if attempts_done > 0 {
+            enqueue_precommit_failure(state, &req, &mut meta, started, attempts_done, &error);
+        }
         return Err(error);
     }
 
@@ -2545,6 +2593,118 @@ pub(crate) async fn run_with_disconnect(
         format!("{name}: {msg}"),
         retry_after,
     ))
+}
+
+fn enqueue_precommit_failure(
+    state: &AppState,
+    req: &InternalRequest,
+    meta: &mut RequestMeta,
+    started: Instant,
+    attempts_done: usize,
+    error: &ProxyError,
+) {
+    enqueue_precommit_failure_at(
+        state,
+        req,
+        meta,
+        started,
+        attempts_done,
+        error,
+        chrono::Utc::now(),
+    );
+}
+
+fn enqueue_precommit_failure_at(
+    state: &AppState,
+    req: &InternalRequest,
+    meta: &mut RequestMeta,
+    started: Instant,
+    attempts_done: usize,
+    error: &ProxyError,
+    completion_time: chrono::DateTime<chrono::Utc>,
+) {
+    let retries = attempts_done.saturating_sub(1) as i64;
+    let completion_ts = completion_time.to_rfc3339();
+    let upstream_dispatched = meta.upstream_dispatched.load(Ordering::Acquire);
+    let not_dispatched = !upstream_dispatched;
+    let usage = TokenUsage {
+        input: not_dispatched.then_some(0),
+        output: not_dispatched.then_some(0),
+        cached: not_dispatched.then_some(0),
+        cache_write: not_dispatched.then_some(0),
+        thinking: not_dispatched.then_some(0),
+    };
+    let cost = not_dispatched.then_some(0.0);
+    let admission_cost_usd = upstream_dispatched
+        .then(|| {
+            meta.admission
+                .as_ref()
+                .and_then(|admission| admission.conservative_cost_estimate())
+        })
+        .flatten();
+    if !meta.accounting_enqueued.swap(true, Ordering::AcqRel) {
+        let row = db::UsageLogRow {
+            id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
+            request_id: meta.request_id.clone(),
+            ts: completion_ts,
+            key_id: meta.key_id.clone(),
+            key_name: meta.key_name.clone(),
+            client_format: meta.client_format.to_string(),
+            requested_model: req.requested_model.clone(),
+            effective_model: None,
+            route_id: None,
+            route_name: None,
+            fallback_hops: retries,
+            fallback_path: "[]".into(),
+            status: "upstream_error".into(),
+            status_code: i64::from(error.http_status()),
+            latency_ms: Some(started.elapsed().as_millis() as i64),
+            ttft_ms: None,
+            input_tokens: usage.input.map(|tokens| tokens as i64),
+            output_tokens: usage.output.map(|tokens| tokens as i64),
+            cached_tokens: usage.cached.map(|tokens| tokens as i64),
+            cache_write_tokens: usage.cache_write.map(|tokens| tokens as i64),
+            thinking_tokens: usage.thinking.map(|tokens| tokens as i64),
+            cost_usd: cost,
+            cost_known: i64::from(cost.is_some()),
+            price_version_id: None,
+            cache_status: "bypass".into(),
+            serving_account_id: None,
+            serving_account: None,
+            serving_provider: None,
+            upstream_request_id: None,
+            flagged: 0,
+            error_message: None,
+            usage_confidence: if not_dispatched {
+                "not_dispatched"
+            } else {
+                "unknown"
+            }
+            .into(),
+            commit_state: "pre_commit".into(),
+            retry_count: retries,
+            route_trace_id: None,
+            opaque_route_id: None,
+            admission_cost_usd,
+        };
+        state.log_queue.enqueue_bundle(db::UsageAccountingBundle {
+            request: row,
+            attempts: meta
+                .partial_attempts
+                .iter()
+                .map(|attempt| attempt.row.clone())
+                .collect(),
+        });
+    }
+    if let Some(admission) = meta.admission.take() {
+        if upstream_dispatched {
+            let (admission_usage, admission_cost) =
+                aggregate_admission_accounting(meta, None, None);
+            admission.reconcile_at(&admission_usage, admission_cost, completion_time);
+        } else {
+            admission.reconcile_at(&usage, cost, completion_time);
+        }
+    }
 }
 
 fn target_key(route: &db::RouteRow, t: &ResolvedTarget) -> String {
@@ -6603,16 +6763,6 @@ fn aggregate_admission_accounting(
     )
 }
 
-fn reconcile_partial_attempts(meta: &mut RequestMeta) {
-    if meta.partial_attempts.is_empty() {
-        return;
-    }
-    if let Some(admission) = meta.admission.take() {
-        let (usage, cost) = aggregate_admission_accounting(meta, None, None);
-        admission.reconcile(&usage, cost);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn record_precommit_attempt_usage(
     state: &AppState,
@@ -6758,8 +6908,22 @@ fn record_precommit_request_log(
     termination: StreamTermination,
     started: Instant,
     attempts_done: usize,
-) {
+) -> chrono::DateTime<chrono::Utc> {
+    let completion_time = chrono::Utc::now();
+    let completion_ts = completion_time.to_rfc3339();
     let (usage, cost) = aggregate_request_accounting(meta, None, None);
+    let admission_cost_usd = if usage.input.is_some() && usage.output.is_some() && cost.is_some() {
+        None
+    } else {
+        meta.upstream_dispatched
+            .load(Ordering::Acquire)
+            .then(|| {
+                meta.admission
+                    .as_ref()
+                    .and_then(|admission| admission.conservative_cost_estimate())
+            })
+            .flatten()
+    };
     let usage_confidence = if usage_has_reported_tokens(&usage) {
         "provider_reported"
     } else {
@@ -6768,7 +6932,7 @@ fn record_precommit_request_log(
     let row = UsageLogRow {
         id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
         request_id: meta.request_id.clone(),
-        ts: db::now_iso(),
+        ts: completion_ts,
         key_id: key.map(|key| key.id.clone()),
         key_name: key.map(|key| key.name.clone()),
         client_format: meta.client_format.to_string(),
@@ -6802,6 +6966,7 @@ fn record_precommit_request_log(
         retry_count: attempts_done.saturating_sub(1) as i64,
         route_trace_id: Some(trace.opaque_route_id.clone()),
         opaque_route_id: Some(trace.opaque_route_id.clone()),
+        admission_cost_usd,
     };
     state.log_queue.enqueue_bundle(db::UsageAccountingBundle {
         request: row,
@@ -6812,6 +6977,7 @@ fn record_precommit_request_log(
             .collect(),
     });
     meta.accounting_enqueued.store(true, Ordering::Release);
+    completion_time
 }
 
 /// Compute cost and enqueue the usage row (never blocks the request path),
@@ -6985,19 +7151,32 @@ async fn finalize_log(
     );
     let (request_usage, request_cost) = aggregate_request_accounting(meta, Some(&usage), cost);
 
-    // Reconcile against every provider attempt, not only the final fallback
-    // target. Incomplete fields retain the conservative reservation estimate.
+    // Only complete token totals and cost replace the reservation with actuals.
+    // Persist its conservative estimate otherwise, so restart admission matches
+    // the live ledger.
+    let (admission_usage, admission_cost) =
+        aggregate_admission_accounting(meta, Some(&usage), cost);
+    let admission_cost_usd = if admission_usage.input.is_some()
+        && admission_usage.output.is_some()
+        && admission_cost.is_some()
+    {
+        None
+    } else {
+        meta.admission
+            .as_ref()
+            .and_then(|admission| admission.conservative_cost_estimate())
+    };
+    let completion_time = chrono::Utc::now();
+    let completion_ts = completion_time.to_rfc3339();
     if let Some(admission) = meta.admission.take() {
-        let (admission_usage, admission_cost) =
-            aggregate_admission_accounting(meta, Some(&usage), cost);
-        admission.reconcile(&admission_usage, admission_cost);
+        admission.reconcile_at(&admission_usage, admission_cost, completion_time);
     }
 
     // Accounting truthfulness (FR-6.8): provider-reported vs unknown.
-    let usage_confidence = if request_usage.input.is_some() || request_usage.output.is_some() {
-        "provider_reported"
-    } else {
-        "unknown"
+    // Partial canonical totals are incomplete, not provider-reported usage.
+    let usage_confidence = match (request_usage.input, request_usage.output) {
+        (Some(_), Some(_)) => "provider_reported",
+        _ => "unknown",
     };
 
     // Persist authoritative cache status from final provider-reported usage.
@@ -7044,7 +7223,7 @@ async fn finalize_log(
     let row = UsageLogRow {
         id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
         request_id: meta.request_id.clone(),
-        ts: db::now_iso(),
+        ts: completion_ts,
         key_id: key.as_ref().map(|k| k.id.clone()),
         key_name: key.as_ref().map(|k| k.name.clone()),
         client_format: meta.client_format.to_string(),
@@ -7084,6 +7263,7 @@ async fn finalize_log(
         retry_count: meta.retry_count,
         route_trace_id: Some(trace.opaque_route_id.clone()),
         opaque_route_id: Some(trace.opaque_route_id.clone()),
+        admission_cost_usd,
     };
     let mut attempt_rows = meta
         .partial_attempts

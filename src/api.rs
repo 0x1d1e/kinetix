@@ -6,11 +6,13 @@ use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::Datelike;
 use serde_json::Value;
 
 use crate::app::AppState;
 use crate::auth::{authenticate_virtual_key, extract_virtual_key};
 use crate::client_disconnect::ClientDisconnect;
+use crate::db;
 use crate::frontends::{self, FrontendFormat};
 use crate::limits;
 use crate::pipeline;
@@ -482,6 +484,172 @@ pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> R
     Json(body).into_response()
 }
 
+/// `GET /v1/usage` returns bounded, self-service usage for the authenticated key.
+pub async fn client_usage(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let request_id = new_request_id();
+    let format = if headers.contains_key("x-api-key")
+        || headers
+            .get("anthropic-version")
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+    {
+        FrontendFormat::Anthropic
+    } else {
+        FrontendFormat::OpenAi
+    };
+
+    if let Err(retry) = state.ip_limiter.check(limits::client_ip(&headers)) {
+        return error_response(
+            format,
+            &request_id,
+            ProxyError::rate_limited("too many requests from this client", Some(retry)),
+        );
+    }
+    let presented = match extract_virtual_key(&headers) {
+        Some(key) => key,
+        None => {
+            return error_response(
+                format,
+                &request_id,
+                ProxyError::unauthorized("missing API key"),
+            )
+        }
+    };
+    let key = match authenticate_virtual_key(&state, &presented).await {
+        Ok(key) => key,
+        Err(error) => return error_response(format, &request_id, error),
+    };
+    if let Err(error) = limits::validate_status(&key) {
+        return error_response(format, &request_id, error);
+    }
+    if let Err(error) = limits::enforce_ip(&key, limits::client_ip(&headers)) {
+        return error_response(format, &request_id, error);
+    }
+
+    let budget_at = match state
+        .admission
+        .budget_snapshot_current(&state.pool, &key.id)
+        .await
+    {
+        Ok(budget_at) => budget_at,
+        Err(error) => {
+            tracing::error!(%error, key_id = %key.id, "client usage admission snapshot failed");
+            return error_response(
+                format,
+                &request_id,
+                ProxyError::unavailable("usage temporarily unavailable"),
+            );
+        }
+    };
+    client_usage_for_key(&state, &key, format, request_id, budget_at).await
+}
+
+async fn client_usage_for_key(
+    state: &AppState,
+    key: &crate::db::VirtualKeyRow,
+    format: FrontendFormat,
+    request_id: String,
+    budget_at: crate::admission::AdmissionBudgetSnapshotAt,
+) -> Response {
+    let now = budget_at.captured_at;
+    let budget = budget_at.snapshot;
+    let daily_start = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_utc();
+    let monthly_start = now
+        .date_naive()
+        .with_day(1)
+        .expect("the first day of a month is valid")
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_utc();
+    let daily_reset = daily_start + chrono::Duration::days(1);
+    let next_month_date = if now.month() == 12 {
+        chrono::NaiveDate::from_ymd_opt(now.year() + 1, 1, 1)
+    } else {
+        chrono::NaiveDate::from_ymd_opt(now.year(), now.month() + 1, 1)
+    }
+    .expect("the next month is a valid date");
+    let monthly_reset = next_month_date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_utc();
+    let now_iso = now.to_rfc3339();
+    let daily_from = daily_start.to_rfc3339();
+    let monthly_from = monthly_start.to_rfc3339();
+
+    let (daily, monthly) = match tokio::try_join!(
+        db::client_usage_summary(&state.pool, &key.id, &daily_from, &now_iso),
+        db::client_usage_summary(&state.pool, &key.id, &monthly_from, &now_iso),
+    ) {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            tracing::error!(%error, "client usage query failed");
+            return error_response(
+                format,
+                &request_id,
+                ProxyError::unavailable("usage temporarily unavailable"),
+            );
+        }
+    };
+
+    let remaining =
+        |limit: Option<f64>,
+         summary: &db::ClientUsageSummary,
+         admission: crate::admission::AdmissionBudgetPeriodSnapshot| {
+            let limit = limit.filter(|value| *value > 0.0)?;
+            if summary.unknown_cost_requests > 0
+                || admission.has_unknown_active_cost
+                || admission.has_unknown_settled_cost
+            {
+                return None;
+            }
+            Some((limit - admission.settled_spend_usd - admission.active_reserved_usd).max(0.0))
+        };
+    Json(serde_json::json!({
+        "periods": {
+            "daily": { "from": daily_from, "to": now_iso, "timezone": "UTC" },
+            "monthly": { "from": monthly_from, "to": now_iso, "timezone": "UTC" },
+        },
+        "usage": { "daily": daily, "monthly": monthly },
+        "limits": {
+            "rpm": key.rpm_limit.filter(|value| *value > 0),
+            "tpm": key.tpm_limit.filter(|value| *value > 0),
+            "concurrency": key.max_concurrent_requests.filter(|value| *value > 0),
+            "daily_budget_usd": key.daily_budget.filter(|value| *value > 0.0),
+            "monthly_budget_usd": key.monthly_budget.filter(|value| *value > 0.0),
+        },
+        "remaining": {
+            "daily_budget_usd": remaining(key.daily_budget, &daily, budget.daily),
+            "monthly_budget_usd": remaining(key.monthly_budget, &monthly, budget.monthly),
+        },
+        "resets": {
+            "daily": daily_reset.to_rfc3339(),
+            "monthly": monthly_reset.to_rfc3339(),
+        },
+        "admission": {
+            "in_flight": state.admission.key_inflight(&key.id),
+            "budget": {
+                "daily": {
+                    "settled_spend_usd": budget.daily.settled_spend_usd,
+                    "active_reserved_usd": budget.daily.active_reserved_usd,
+                    "unknown_active_cost": budget.daily.has_unknown_active_cost,
+                    "unknown_settled_cost": budget.daily.has_unknown_settled_cost,
+                },
+                "monthly": {
+                    "settled_spend_usd": budget.monthly.settled_spend_usd,
+                    "active_reserved_usd": budget.monthly.active_reserved_usd,
+                    "unknown_active_cost": budget.monthly.has_unknown_active_cost,
+                    "unknown_settled_cost": budget.monthly.has_unknown_settled_cost,
+                },
+            },
+        },
+    }))
+    .into_response()
+}
+
 pub async fn healthz(State(state): State<AppState>) -> Response {
     // Lightweight process + database check (Monitoring section).
     let db_ok = sqlx::query("SELECT 1").fetch_one(&state.pool).await.is_ok();
@@ -575,5 +743,637 @@ mod protocol_tests {
             ]
         );
         assert!(extract_protocol_headers(FrontendFormat::OpenAi, &headers).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod client_usage_tests {
+    use super::*;
+    use crate::db::{self, UsageLogRow, VirtualKeyRow};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    async fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-client-usage-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = crate::paths::Paths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+        };
+        paths.ensure_dirs().unwrap();
+        let database_url = paths.database_url();
+        let pool = db::connect(&database_url).await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let config = Arc::new(crate::config::Config {
+            bind: "127.0.0.1:0".into(),
+            public_base_url: "http://127.0.0.1".into(),
+            database_url,
+            master_key: [42_u8; 32],
+            admin_token: "test-admin".into(),
+            cf_access_aud: None,
+            cf_access_team_domain: None,
+            log_json: false,
+            bootstrap_file: None,
+            allow_private_upstreams: true,
+            allow_insecure_tls: true,
+            data_dir: paths.data_dir.clone(),
+            shutdown_grace_secs: 1,
+            max_inflight_inferences: crate::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
+            alert_webhook_url: None,
+            alert_fallback_rate: 1.0,
+            alert_error_rate: 1.0,
+            alert_min_requests: 1,
+            alert_interval_secs: 60,
+            alert_p95_latency_ms: 1_000,
+            ip_rate_limit_per_min: 0,
+            session_ttl_minutes: 60,
+            export_retention_days: 1,
+            paths,
+            generated_admin_password: None,
+        });
+        let registry = Arc::new(crate::registry::Registry::new());
+        registry.reload(&pool).await.unwrap();
+        let state = AppState::new(
+            config,
+            pool.clone(),
+            registry,
+            Arc::new(crate::crypto::Crypto::new(&[42_u8; 32])),
+            reqwest::Client::new(),
+            crate::logqueue::UsageLogQueue::new(pool, 16),
+            0,
+        );
+        (state, root)
+    }
+
+    fn test_key(id: &str, secret: &str, status: &str) -> VirtualKeyRow {
+        VirtualKeyRow {
+            id: id.into(),
+            key_hash: crate::crypto::hash_virtual_key(secret),
+            name: format!("{id} name"),
+            owner: String::new(),
+            tag: String::new(),
+            allowed_models: "[\"*\"]".into(),
+            allowed_providers: "[]".into(),
+            rpm_limit: Some(20),
+            tpm_limit: Some(1000),
+            max_concurrent_requests: Some(2),
+            daily_budget: Some(5.0),
+            monthly_budget: Some(50.0),
+            expires_at: None,
+            status: status.into(),
+            allowed_ips: "[]".into(),
+            body_logging: 0,
+            created_at: db::now_iso(),
+            revoked_at: None,
+        }
+    }
+
+    fn usage_row(
+        key_id: &str,
+        input: Option<i64>,
+        output: Option<i64>,
+        cost: Option<f64>,
+    ) -> UsageLogRow {
+        UsageLogRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            request_id: format!("req-{}", uuid::Uuid::new_v4()),
+            ts: chrono::Utc::now().to_rfc3339(),
+            key_id: Some(key_id.into()),
+            key_name: Some("private key name".into()),
+            client_format: "openai".into(),
+            requested_model: "private-model".into(),
+            effective_model: Some("private-model".into()),
+            route_id: Some("private-route-id".into()),
+            route_name: Some("private-route-name".into()),
+            fallback_hops: 0,
+            fallback_path: "[]".into(),
+            status: if cost.is_some() {
+                "success"
+            } else {
+                "upstream_error"
+            }
+            .into(),
+            status_code: if cost.is_some() { 200 } else { 502 },
+            latency_ms: Some(10),
+            ttft_ms: None,
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: None,
+            cache_write_tokens: None,
+            thinking_tokens: None,
+            cost_usd: cost,
+            cost_known: i64::from(cost.is_some()),
+            price_version_id: None,
+            cache_status: "bypass".into(),
+            serving_account_id: Some("private-account-id".into()),
+            serving_account: Some("private-account-label".into()),
+            serving_provider: Some("private-provider-name".into()),
+            upstream_request_id: Some("private-upstream-request-id".into()),
+            flagged: 0,
+            error_message: None,
+            usage_confidence: if input.is_some() && output.is_some() {
+                "provider_reported"
+            } else {
+                "unknown"
+            }
+            .into(),
+            commit_state: "committed".into(),
+            retry_count: 0,
+            route_trace_id: None,
+            opaque_route_id: Some("private-opaque-route-id".into()),
+            admission_cost_usd: None,
+        }
+    }
+
+    fn admission_fixture(
+        prices: crate::types::Prices,
+    ) -> (crate::registry::Snapshot, crate::types::InternalRequest) {
+        let mut snapshot = crate::registry::Snapshot::default();
+        let model = crate::db::ModelRow {
+            id: "seed-model".into(),
+            provider_id: "seed-provider".into(),
+            upstream_id: "seed-model".into(),
+            display_name: "Seed model".into(),
+            enabled: 1,
+            context_window: None,
+            max_output_tokens: Some(50),
+            capabilities: "{}".into(),
+            prices: serde_json::to_string(&prices).unwrap(),
+            parameters: "{}".into(),
+            thinking_map: "{}".into(),
+            extra_request: "{}".into(),
+            discovery: "{}".into(),
+            created_at: String::new(),
+            opaque_state_plugin: String::new(),
+        };
+        snapshot.models.insert(model.id.clone(), model);
+        let request = crate::types::InternalRequest {
+            requested_model: "seed-model".into(),
+            system: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            tool_choice_name: None,
+            params: crate::types::SamplingParams {
+                max_tokens: Some(50),
+                ..Default::default()
+            },
+            stream: false,
+            include_usage: false,
+            thinking: None,
+            extra: Default::default(),
+            raw_body: None,
+        };
+        (snapshot, request)
+    }
+
+    async fn request_usage(app: &axum::Router, path: &str, secret: Option<&str>) -> Response {
+        let mut request = axum::http::Request::builder().method("GET").uri(path);
+        if let Some(secret) = secret {
+            request = request.header("authorization", format!("Bearer {secret}"));
+        }
+        app.clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn usage_is_key_scoped_and_does_not_expose_routing_topology() {
+        let (state, root) = test_state("scope").await;
+        let key = test_key("own-key-id", "own-client-key", "active");
+        let other = test_key("other-key-id", "other-client-key", "active");
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        db::insert_virtual_key(&state.pool, &other).await.unwrap();
+        db::insert_usage_log(
+            &state.pool,
+            &usage_row(&key.id, Some(3), Some(4), Some(0.5)),
+        )
+        .await
+        .unwrap();
+        db::insert_usage_log(&state.pool, &usage_row(&key.id, None, Some(2), None))
+            .await
+            .unwrap();
+        db::insert_usage_log(
+            &state.pool,
+            &usage_row(&other.id, Some(100), Some(200), Some(9.0)),
+        )
+        .await
+        .unwrap();
+        let _in_flight = state
+            .admission
+            .reserve_concurrency(Some((&key.id, key.max_concurrent_requests)), None)
+            .unwrap();
+        let app = crate::router::build(state.clone());
+
+        let response = request_usage(
+            &app,
+            "/v1/usage?key_id=other-key-id",
+            Some("own-client-key"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["limits"]["rpm"], 20);
+        assert_eq!(body["limits"]["tpm"], 1000);
+        assert_eq!(body["limits"]["concurrency"], 2);
+        assert_eq!(body["limits"]["daily_budget_usd"], 5.0);
+        assert_eq!(body["limits"]["monthly_budget_usd"], 50.0);
+        assert_eq!(body["admission"]["in_flight"], 1);
+        for period in ["daily", "monthly"] {
+            assert_eq!(body["usage"][period]["requests"], 2);
+            assert!(body["usage"][period]["input_tokens"].is_null());
+            assert_eq!(body["usage"][period]["output_tokens"], 6);
+            assert_eq!(body["usage"][period]["known_cost_usd"], 0.5);
+            assert_eq!(body["usage"][period]["unknown_cost_requests"], 1);
+            assert_eq!(body["usage"][period]["unknown_usage_requests"], 1);
+        }
+        assert!(body["remaining"]["daily_budget_usd"].is_null());
+        assert!(body["remaining"]["monthly_budget_usd"].is_null());
+        assert!(body["periods"]["daily"]["from"].is_string());
+        assert!(body["periods"]["monthly"]["from"].is_string());
+        assert!(body["resets"]["daily"].is_string());
+        assert!(body["resets"]["monthly"].is_string());
+
+        let serialized = body.to_string();
+        for private_value in [
+            "other-key-id",
+            "private key name",
+            "private-model",
+            "private-route-id",
+            "private-route-name",
+            "private-account-id",
+            "private-account-label",
+            "private-provider-name",
+            "private-upstream-request-id",
+            "private-opaque-route-id",
+        ] {
+            assert!(
+                !serialized.contains(private_value),
+                "leaked {private_value}"
+            );
+        }
+        drop(_in_flight);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn usage_shows_full_remaining_budget_when_no_usage_exists() {
+        let (state, root) = test_state("empty").await;
+        let key = test_key("empty-key", "empty-client-key", "active");
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        let app = crate::router::build(state.clone());
+        let response = request_usage(&app, "/v1/usage", Some("empty-client-key")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        for period in ["daily", "monthly"] {
+            assert_eq!(body["usage"][period]["requests"], 0);
+            assert_eq!(body["usage"][period]["input_tokens"], 0);
+            assert_eq!(body["usage"][period]["output_tokens"], 0);
+            assert_eq!(body["usage"][period]["known_cost_usd"], 0.0);
+        }
+        assert_eq!(body["remaining"]["daily_budget_usd"], 5.0);
+        assert_eq!(body["remaining"]["monthly_budget_usd"], 50.0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unknown_cost_has_zero_known_subtotal_and_unknown_remaining_budget() {
+        let (state, root) = test_state("unknown-cost-only").await;
+        let key = test_key("unknown-cost-key", "unknown-cost-client-key", "active");
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        db::insert_usage_log(&state.pool, &usage_row(&key.id, None, None, None))
+            .await
+            .unwrap();
+        let app = crate::router::build(state.clone());
+
+        let response = request_usage(&app, "/v1/usage", Some("unknown-cost-client-key")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        for period in ["daily", "monthly"] {
+            assert_eq!(body["usage"][period]["known_cost_usd"], 0.0);
+            assert_eq!(body["usage"][period]["unknown_cost_requests"], 1);
+        }
+        assert!(body["remaining"]["daily_budget_usd"].is_null());
+        assert!(body["remaining"]["monthly_budget_usd"].is_null());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn known_cost_reduces_daily_and_monthly_remaining_budgets() {
+        let (state, root) = test_state("known-cost").await;
+        let key = test_key("priced-key", "priced-client-key", "active");
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        db::insert_usage_log(
+            &state.pool,
+            &usage_row(&key.id, Some(3), Some(4), Some(1.25)),
+        )
+        .await
+        .unwrap();
+        let app = crate::router::build(state.clone());
+
+        let response = request_usage(&app, "/v1/usage", Some("priced-client-key")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["remaining"]["daily_budget_usd"], 3.75);
+        assert_eq!(body["remaining"]["monthly_budget_usd"], 48.75);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn usage_snapshot_uses_admission_period_across_midnight() {
+        let (state, root) = test_state("usage-period-rollover").await;
+        let key = test_key("period-key", "period-client-key", "active");
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        // Simulate a request straddling midnight. The response receives only the timestamp
+        // paired with the newer admission snapshot, never the earlier handler timestamp.
+        let stale_api_time = chrono::DateTime::parse_from_rfc3339("2026-01-31T23:59:59.999Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let captured_at = chrono::DateTime::parse_from_rfc3339("2026-02-01T00:00:02Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(stale_api_time < captured_at);
+
+        let mut prior_period_row = usage_row(&key.id, None, None, None);
+        prior_period_row.ts = "2026-01-31T12:00:00+00:00".into();
+        db::insert_usage_log(&state.pool, &prior_period_row)
+            .await
+            .unwrap();
+        let mut current_period_row = usage_row(&key.id, Some(10), Some(20), Some(0.8));
+        current_period_row.ts = "2026-02-01T00:00:01+00:00".into();
+        db::insert_usage_log(&state.pool, &current_period_row)
+            .await
+            .unwrap();
+
+        let budget_at = crate::admission::AdmissionBudgetSnapshotAt {
+            captured_at,
+            snapshot: crate::admission::AdmissionBudgetSnapshot {
+                daily: crate::admission::AdmissionBudgetPeriodSnapshot {
+                    settled_spend_usd: 0.8,
+                    ..Default::default()
+                },
+                monthly: crate::admission::AdmissionBudgetPeriodSnapshot {
+                    settled_spend_usd: 0.8,
+                    ..Default::default()
+                },
+            },
+        };
+        let response = client_usage_for_key(
+            &state,
+            &key,
+            FrontendFormat::OpenAi,
+            "period-rollover-test".into(),
+            budget_at,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let expected_daily_from = captured_at
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .to_rfc3339();
+        let expected_daily_reset = (captured_at.date_naive() + chrono::Duration::days(1))
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .to_rfc3339();
+        let expected_monthly_from = captured_at
+            .date_naive()
+            .with_day(1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .to_rfc3339();
+        let next_month = if captured_at.month() == 12 {
+            chrono::NaiveDate::from_ymd_opt(captured_at.year() + 1, 1, 1)
+        } else {
+            chrono::NaiveDate::from_ymd_opt(captured_at.year(), captured_at.month() + 1, 1)
+        }
+        .unwrap();
+        let expected_monthly_reset = next_month
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .to_rfc3339();
+        assert_eq!(body["periods"]["daily"]["from"], expected_daily_from);
+        assert_eq!(body["periods"]["daily"]["to"], captured_at.to_rfc3339());
+        assert_eq!(body["resets"]["daily"], expected_daily_reset);
+        assert_eq!(body["usage"]["daily"]["requests"], 1);
+        assert_eq!(body["usage"]["daily"]["known_cost_usd"], 0.8);
+        assert_eq!(body["usage"]["daily"]["unknown_cost_requests"], 0);
+        assert_eq!(body["remaining"]["daily_budget_usd"], 4.2);
+        assert_eq!(body["periods"]["monthly"]["from"], expected_monthly_from);
+        assert_eq!(body["periods"]["monthly"]["to"], captured_at.to_rfc3339());
+        assert_eq!(body["resets"]["monthly"], expected_monthly_reset);
+        assert_eq!(body["usage"]["monthly"]["requests"], 1);
+        assert_eq!(body["usage"]["monthly"]["unknown_cost_requests"], 0);
+        assert_eq!(body["remaining"]["monthly_budget_usd"], 49.2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn usage_admission_seed_failure_returns_503_and_retries_before_inference() {
+        let (state, root) = test_state("admission-seed-retry").await;
+        let mut key = test_key("seed-retry-key", "seed-retry-client-key", "active");
+        key.rpm_limit = Some(1);
+        key.daily_budget = Some(0.5);
+        key.monthly_budget = Some(0.5);
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        db::insert_usage_log(
+            &state.pool,
+            &usage_row(&key.id, Some(10), Some(10), Some(0.8)),
+        )
+        .await
+        .unwrap();
+
+        let (snapshot, request) = admission_fixture(crate::types::Prices {
+            input_per_1m: Some(1_000_000.0),
+            output_per_1m: Some(1_000_000.0),
+            ..Default::default()
+        });
+
+        // Drop the request view while simulating a missing storage column;
+        // otherwise SQLite rejects the rename because the view references it.
+        sqlx::query("DROP VIEW usage_request_logs")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "ALTER TABLE usage_logs RENAME COLUMN admission_cost_usd TO broken_admission_cost_usd",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let app = crate::router::build(state.clone());
+        let response = request_usage(&app, "/v1/usage", Some("seed-retry-client-key")).await;
+        let status = response.status();
+        let body = response_json(response).await.to_string();
+        let inference_error = state
+            .admission
+            .reserve(&state.pool, &snapshot, &key, &request)
+            .await
+            .err()
+            .expect("inference must fail closed while admission seeds are unavailable");
+        assert_eq!(
+            inference_error.kind,
+            crate::types::ErrorKind::ServiceUnavailable
+        );
+        sqlx::query(
+            "ALTER TABLE usage_logs RENAME COLUMN broken_admission_cost_usd TO admission_cost_usd",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/20260930150000_usage_request_log_admission_cost.sql"
+        ))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("usage temporarily unavailable"));
+        assert!(!body.contains("broken_admission_cost_usd"));
+        assert!(!body.contains("admission_cost_usd"));
+        assert!(!body.contains(&state.config.database_url));
+        assert!(!body.contains("SELECT"));
+
+        let rpm_error = state
+            .admission
+            .reserve(&state.pool, &snapshot, &key, &request)
+            .await
+            .err()
+            .expect("persisted RPM usage must be re-seeded");
+        assert_eq!(rpm_error.kind, crate::types::ErrorKind::RateLimited);
+
+        key.rpm_limit = None;
+        let budget_error = state
+            .admission
+            .reserve(&state.pool, &snapshot, &key, &request)
+            .await
+            .err()
+            .expect("persisted budget spend must be re-seeded");
+        assert_eq!(budget_error.kind, crate::types::ErrorKind::BudgetExceeded);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn usage_keeps_settled_unknown_cost_after_usage_log_write_failure() {
+        let (state, root) = test_state("settled-unknown-cost-log-failure").await;
+        let key = test_key("unknown-cost-key", "unknown-cost-client-key", "active");
+        db::insert_virtual_key(&state.pool, &key).await.unwrap();
+        let (snapshot, request) = admission_fixture(crate::types::Prices::default());
+        let reservation = state
+            .admission
+            .reserve(&state.pool, &snapshot, &key, &request)
+            .await
+            .unwrap();
+        reservation.reconcile(
+            &crate::types::TokenUsage {
+                input: Some(10),
+                output: Some(20),
+                ..Default::default()
+            },
+            None,
+        );
+
+        sqlx::query(
+            "CREATE TRIGGER force_usage_log_write_failure
+             BEFORE INSERT ON usage_logs
+             BEGIN SELECT RAISE(FAIL, 'forced usage log write failure'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        state.log_queue.enqueue_bundle(db::UsageAccountingBundle {
+            request: usage_row(&key.id, Some(10), Some(20), None),
+            attempts: Vec::new(),
+        });
+        for _ in 0..100 {
+            if state.log_queue.dropped() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.log_queue.dropped(), 1);
+        sqlx::query("DROP TRIGGER force_usage_log_write_failure")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let app = crate::router::build(state.clone());
+        let response = request_usage(&app, "/v1/usage", Some("unknown-cost-client-key")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["usage"]["daily"]["requests"], 0);
+        assert_eq!(body["usage"]["monthly"]["requests"], 0);
+        assert!(body["remaining"]["daily_budget_usd"].is_null());
+        assert!(body["remaining"]["monthly_budget_usd"].is_null());
+        assert_eq!(
+            body["admission"]["budget"]["daily"]["unknown_settled_cost"],
+            true
+        );
+        assert_eq!(
+            body["admission"]["budget"]["monthly"]["unknown_settled_cost"],
+            true
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn usage_requires_a_valid_active_unexpired_virtual_key() {
+        let (state, root) = test_state("auth").await;
+        let revoked = test_key("revoked-key", "revoked-client-key", "revoked");
+        let disabled = test_key("disabled-key", "disabled-client-key", "disabled");
+        let mut expired = test_key("expired-key", "expired-client-key", "active");
+        expired.expires_at = Some((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+        for key in [&revoked, &disabled, &expired] {
+            db::insert_virtual_key(&state.pool, key).await.unwrap();
+        }
+        let app = crate::router::build(state.clone());
+
+        assert_eq!(
+            request_usage(&app, "/v1/usage", None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request_usage(&app, "/v1/usage", Some("unknown-client-key"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request_usage(&app, "/v1/usage", Some("revoked-client-key"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request_usage(&app, "/v1/usage", Some("expired-client-key"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request_usage(&app, "/v1/usage", Some("disabled-client-key"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

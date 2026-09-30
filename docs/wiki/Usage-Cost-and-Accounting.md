@@ -17,23 +17,26 @@ account/provider (admin-only), the opaque Route id, the upstream request id, a
 
 | Field | Values | Meaning |
 | --- | --- | --- |
-| `usage_confidence` | `provider_reported` | The upstream reported the counts. |
-| | `estimated` | A derived/partial count. |
-| | `unknown` | Not known (e.g. a client disconnect). |
-| `cost_known` | `1` / `0` | Whether the model has prices so cost could be computed. |
+| `usage_confidence` | `provider_reported` | The upstream reported complete input and output totals. |
+| | `estimated` | A count was derived rather than reported. |
+| | `unknown` | A required total is missing or unavailable (including partial reports). |
+| | `not_dispatched` | No upstream request was dispatched; token counts and cost are known zero. |
+| `cost_known` | `1` / `0` | Whether cost is known from complete priced totals or because no request was dispatched. |
 
 Unknown token counts are **omitted** from client responses rather than coerced to
-zero. A spend total is never presented as complete when some usage is unpriced —
+zero. A request that failed before dispatch contributes known zero tokens and
+cost. A spend total is never presented as complete when some usage is unpriced —
 the overview/metrics also expose `unknown_usage_requests`, `estimated_usage_requests`,
 and `unknown_cost_requests`.
 
 ## Cost
 
 Cost is billed per 1M tokens: `(input − cached) × input + cached × cached_price +
-output × output + thinking × thinking_price`. Cached defaults to the input price
-and thinking to the output price. **If prices are unconfigured, cost is `None`
-(unknown), not `0.0`.** A `price_versions` table keeps price history so past costs
-stay reproducible.
+output × output + thinking × thinking_price`. Both canonical input and output
+totals must be known; a missing total is not treated as zero. Cached defaults to
+the input price and thinking to the output price. **If prices or required totals
+are unavailable, cost is `None` (unknown), not `0.0`.** A `price_versions` table
+keeps price history so past costs stay reproducible.
 
 ## Per-key limits and budgets
 
@@ -46,16 +49,26 @@ Enforced before proxying:
 Inference admission is atomic per virtual key. Kinetix reserves one RPM slot,
 a conservative token allowance, and conservative priced spend before dispatch.
 Active reservations participate in later admission decisions immediately, so a
-concurrent burst cannot all observe the same stale counter. Complete provider
-usage reconciles the reservation after the request; partial/unknown usage keeps
-the conservative reservation.
+concurrent burst cannot all observe the same stale counter. An active budget
+reservation applies to the current UTC day and month, even if the request began
+in an earlier period. Completion settles its cost into the completion period,
+matching usage-log timestamps and restart reconstruction. Complete provider
+usage reconciles the reservation after the request. If token usage is unknown,
+the live TPM ledger retains the conservative estimate. After a restart, a
+persisted unknown token total fails closed for the rest of that 60-second
+window because the estimate is not part of reported usage. If actual cost is
+unknown, the live ledger retains its conservative estimate when available and
+marks the completion period's cost as unknown. Failures before upstream dispatch
+reconcile RPM with known zero tokens and cost, both live and after restart.
+Unknown token values remain unknown in reports; they are never counted as zero.
 
 The in-memory ledger is seeded once from durable usage history. After that,
 usage-log writes are for reporting/accounting durability rather than admission
 correctness: an async/dropped log cannot reopen capacity in the running process.
-If historical counters cannot be read during startup/first use, Kinetix starts
-that key's in-memory ledger from zero so a control-plane outage still does not
-take down the data plane.
+Admission seeding is fail-closed: if any required history query fails on first
+use, the request returns 503 and the key's ledger remains uninitialized so a
+later request can retry. Kinetix never seeds a ledger from zero when persisted
+counters cannot be read.
 
 USD reservation remains unavailable when any possible target is unpriced.
 Kinetix does not invent vendor prices.
@@ -73,6 +86,83 @@ rows, with legacy request rows included when no attempt data exists.
 - **Dashboard → Request Inspector** — per-request rows with a live view.
 - **Admin API** — `GET /admin/api/usage` (alias `/requests`) returns rows +
   summary.
+- **Client API** - `GET /v1/usage` uses the caller's virtual key and returns only
+  that key's usage. Daily and monthly windows use UTC `[from,to)` bounds from
+  each period's start to request time; `resets` gives the next UTC boundaries.
+  `admission` exposes the current in-flight count and aggregate budget state,
+  never individual reservation details.
+
+```json
+{
+  "periods": {
+    "daily": { "from": "...", "to": "...", "timezone": "UTC" },
+    "monthly": { "from": "...", "to": "...", "timezone": "UTC" }
+  },
+  "usage": {
+    "daily": {
+      "requests": 0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "known_cost_usd": 0,
+      "unknown_cost_requests": 0,
+      "unknown_usage_requests": 0
+    },
+    "monthly": {
+      "requests": 0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "known_cost_usd": 0,
+      "unknown_cost_requests": 0,
+      "unknown_usage_requests": 0
+    }
+  },
+  "limits": {
+    "rpm": null,
+    "tpm": null,
+    "concurrency": null,
+    "daily_budget_usd": null,
+    "monthly_budget_usd": null
+  },
+  "remaining": { "daily_budget_usd": null, "monthly_budget_usd": null },
+  "resets": { "daily": "...", "monthly": "..." },
+  "admission": {
+    "in_flight": 0,
+    "budget": {
+      "daily": {
+        "settled_spend_usd": 0,
+        "active_reserved_usd": 0,
+        "unknown_active_cost": false,
+        "unknown_settled_cost": false
+      },
+      "monthly": {
+        "settled_spend_usd": 0,
+        "active_reserved_usd": 0,
+        "unknown_active_cost": false,
+        "unknown_settled_cost": false
+      }
+    }
+  }
+}
+```
+
+`usage` includes failed requests with usage rows. Token totals are `null` if any
+request in the window lacks that token count. `known_cost_usd` is the numeric
+subtotal for priced requests, including `0` when none are priced;
+`unknown_cost_requests` counts unpriced requests and signals that total spend is
+incomplete. Remaining budgets are `null` when any persisted request is
+unpriced, an active request has unknown cost, or the live ledger has settled a
+request whose actual cost is unknown. Otherwise, remaining budgets subtract
+settled admission spend and active conservative reservations, matching budget
+admission. `admission.budget` exposes only per-period aggregates: settled spend,
+active reserved cost, and whether active or settled costs are unknown. It never
+exposes individual reservations. The live ledger retains conservative cost
+estimates and unknown-cost state for requests whose actual cost is unknown,
+including failed, partially reported, or unpriced requests. A persisted usage
+row is needed to reconstruct that state after restart. Estimates are not
+reported as known cost. Unset limits are `null`. The endpoint never returns
+model, Route, provider, account, or other key identities. Database failures
+during key authentication or usage aggregation return a generic 503; details are
+logged server-side.
 
 ## Exports (JSONL + CSV)
 

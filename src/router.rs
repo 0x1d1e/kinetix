@@ -54,6 +54,7 @@ pub fn build(state: AppState) -> Router {
         .route("/v1/messages", post(api::messages))
         .route("/v1/messages/count_tokens", post(api::count_message_tokens))
         .route("/v1/models", get(api::list_models))
+        .route("/v1/usage", get(api::client_usage))
         .layer(axum::middleware::from_fn(attach_client_disconnect));
 
     let admin_api = Router::new()
