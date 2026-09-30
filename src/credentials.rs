@@ -90,9 +90,25 @@ impl ResolvedCredential {
 pub trait CredentialStrategy: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// Return a credential from a local cache without invoking refresh-capable
+    /// strategy work. `None` means a full resolution is required.
+    async fn resolve_cached(
+        &self,
+        _account: &AccountRow,
+    ) -> std::result::Result<Option<ResolvedCredential>, CredentialRotationError> {
+        Ok(None)
+    }
+
+    /// Evict local credential state after this account is deleted or replaced.
+    /// Strategies without account-scoped caches may keep the default no-op.
+    fn forget_account(&self, _provider_id: &str, _account_id: &str) {}
+
+    /// Evict all local credential state for a deleted provider.
+    /// Strategies without provider-scoped caches may keep the default no-op.
+    fn forget_provider(&self, _provider_id: &str) {}
+
     /// Resolve the plaintext credential to send upstream for this account.
-    /// Static strategies ignore `now`; refresh-capable strategies use it to
-    /// decide whether the cached/derived credential is still valid.
+    /// Refresh-capable strategies may perform network work here.
     async fn resolve(
         &self,
         account: &AccountRow,
@@ -140,6 +156,13 @@ impl StaticKeyStrategy {
 impl CredentialStrategy for StaticKeyStrategy {
     fn name(&self) -> &'static str {
         "static_api_key"
+    }
+
+    async fn resolve_cached(
+        &self,
+        account: &AccountRow,
+    ) -> std::result::Result<Option<ResolvedCredential>, CredentialRotationError> {
+        self.resolve(account).await.map(Some)
     }
 
     async fn resolve(

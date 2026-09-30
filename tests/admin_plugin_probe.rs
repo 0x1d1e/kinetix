@@ -177,6 +177,7 @@ async fn account_probe_uses_registered_plugin_adapter() {
         0,
     );
 
+    state.registry.reload(&state.pool).await.unwrap();
     let plugin_adapter = state.adapters.for_format(WireFormat::Openai);
     state.register_plugin_adapter(plugin_ref, plugin_adapter);
 

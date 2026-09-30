@@ -32,17 +32,45 @@ use crate::types::{AuthScheme, Prices, ThinkingMap, WireFormat};
 type ApiResult = Result<Json<Value>, ApiError>;
 
 #[derive(Debug)]
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(
+    StatusCode,
+    String,
+    Option<crate::provider_work::ProviderBackoffEvidence>,
+);
 
 impl ApiError {
     fn bad(msg: impl Into<String>) -> Self {
-        ApiError(StatusCode::BAD_REQUEST, msg.into())
+        ApiError(StatusCode::BAD_REQUEST, msg.into(), None)
     }
     fn not_found(msg: impl Into<String>) -> Self {
-        ApiError(StatusCode::NOT_FOUND, msg.into())
+        ApiError(StatusCode::NOT_FOUND, msg.into(), None)
     }
     fn internal(e: impl std::fmt::Display) -> Self {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), None)
+    }
+
+    fn with_provider_backoff(
+        mut self,
+        evidence: Option<crate::provider_work::ProviderBackoffEvidence>,
+    ) -> Self {
+        self.2 = evidence;
+        self
+    }
+}
+
+fn provider_work_acquire_error(error: crate::provider_work::ProviderWorkAcquireError) -> ApiError {
+    match error {
+        crate::provider_work::ProviderWorkAcquireError::BackedOff(wait) => ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "provider work is temporarily backed off; retry in {}s",
+                wait.as_secs().max(1)
+            ),
+            None,
+        ),
+        crate::provider_work::ProviderWorkAcquireError::Aborted => {
+            ApiError::not_found("provider not found")
+        }
     }
 }
 
@@ -73,6 +101,7 @@ pub async fn login(
         return Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "admin authentication unavailable: control plane degraded".into(),
+            None,
         ));
     }
     if !auth::verify_admin_password(&state, &body.password).await {
@@ -89,6 +118,7 @@ pub async fn login(
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,
             "invalid admin password".into(),
+            None,
         ));
     }
     // Sessions are in-memory with a TTL: a restart drops them all, so a browser
@@ -159,12 +189,14 @@ pub async fn change_password(
         return Err(ApiError(
             StatusCode::UNAUTHORIZED,
             "current password is incorrect".into(),
+            None,
         ));
     }
     if body.new_password.trim().len() < 8 {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "new password must be at least 8 characters".into(),
+            None,
         ));
     }
     auth::set_admin_password(&state, &body.new_password)
@@ -388,6 +420,101 @@ async fn run_model_lifecycle_lane(
     provider_id: &str,
     lane: ModelLifecycleLane,
 ) -> Result<Value, ApiError> {
+    if db::get_provider(&state.pool, provider_id)
+        .await
+        .map_err(ApiError::internal)?
+        .is_none()
+    {
+        return Err(ApiError::not_found("provider not found"));
+    }
+    let identity = state
+        .provider_work_identity(provider_id, None)
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    let state = state.clone();
+    let provider_id = provider_id.to_string();
+    let class = match lane {
+        ModelLifecycleLane::Reconciliation => {
+            crate::provider_work::ProviderWorkClass::ModelDiscovery
+        }
+        ModelLifecycleLane::PricingSync => crate::provider_work::ProviderWorkClass::PricingRefresh,
+    };
+    let result = match lane {
+        ModelLifecycleLane::Reconciliation => {
+            let lifecycle_state = state.clone();
+            let lifecycle_provider_id = provider_id.clone();
+            let lifecycle_identity = identity.clone();
+            state
+                .provider_work
+                .coalesce(
+                    identity.clone(),
+                    class,
+                    lane.name().to_string(),
+                    move || async move {
+                        run_model_lifecycle_lane_inner(
+                            &lifecycle_state,
+                            &lifecycle_provider_id,
+                            lifecycle_identity,
+                            lane,
+                        )
+                        .await
+                    },
+                )
+                .await
+        }
+        ModelLifecycleLane::PricingSync => {
+            let lifecycle_state = state.clone();
+            let lifecycle_provider_id = provider_id.clone();
+            let lifecycle_identity = identity.clone();
+            state
+                .provider_work
+                .run(
+                    identity,
+                    class,
+                    Some(lane.name().to_string()),
+                    move || async move {
+                        run_model_lifecycle_lane_inner(
+                            &lifecycle_state,
+                            &lifecycle_provider_id,
+                            lifecycle_identity,
+                            lane,
+                        )
+                        .await
+                    },
+                    |error: &ApiError| error.2,
+                )
+                .await
+        }
+    };
+    match result {
+        Ok(payload) => Ok(payload.as_ref().clone()),
+        Err(error) => match error.as_ref() {
+            crate::provider_work::ProviderWorkError::BackedOff(wait) => Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "provider work is temporarily backed off; retry in {}s",
+                    wait.as_secs().max(1)
+                ),
+                None,
+            )),
+            crate::provider_work::ProviderWorkError::Operation(error) => {
+                Err(ApiError(error.0, error.1.clone(), error.2))
+            }
+            crate::provider_work::ProviderWorkError::Aborted => Err(ApiError::internal(
+                "provider work coordinator stopped before completion",
+            )),
+        },
+    }
+}
+
+async fn run_model_lifecycle_lane_inner(
+    state: &AppState,
+    provider_id: &str,
+    identity: crate::registry::ProviderWorkIdentity,
+    lane: ModelLifecycleLane,
+) -> Result<Value, ApiError> {
+    if !identity.is_current() {
+        return Err(ApiError::not_found("provider not found"));
+    }
     let lane_name = lane.name();
     db::set_setting(
         &state.pool,
@@ -398,8 +525,12 @@ async fn run_model_lifecycle_lane(
     .map_err(ApiError::internal)?;
 
     let result = match lane {
-        ModelLifecycleLane::Reconciliation => reconcile_provider_id(state, provider_id).await,
-        ModelLifecycleLane::PricingSync => sync_provider_pricing_id(state, provider_id).await,
+        ModelLifecycleLane::Reconciliation => {
+            reconcile_provider_id(state, provider_id, &identity).await
+        }
+        ModelLifecycleLane::PricingSync => {
+            sync_provider_pricing_id(state, provider_id, &identity).await
+        }
     };
 
     match result {
@@ -651,47 +782,72 @@ pub(crate) async fn run_scheduled_model_lifecycle(state: &AppState) {
         }
     };
 
-    for provider in providers {
-        let reconcile_key = lifecycle_setting_key("reconciliation", "last_attempt", &provider.id);
-        let pricing_key = lifecycle_setting_key("pricing_sync", "last_attempt", &provider.id);
-        let reconcile_due = scheduled_due(
-            &state.pool,
-            &reconcile_key,
-            settings.reconciliation_interval_secs,
-            settings.jitter_secs,
-        )
-        .await;
-        let pricing_due = scheduled_due(
-            &state.pool,
-            &pricing_key,
-            settings.pricing_sync_interval_secs,
-            settings.jitter_secs,
-        )
-        .await;
-
-        if reconcile_due {
-            if let Err(error) =
-                run_model_lifecycle_lane(state, &provider.id, ModelLifecycleLane::Reconciliation)
-                    .await
-            {
-                tracing::warn!(
-                    provider = %provider.id,
-                    error = ?error,
-                    "scheduled model reconciliation failed; existing state left intact"
-                );
+    let task_errors = crate::provider_work::run_bounded_provider_jobs(providers, {
+        let state = state.clone();
+        move |provider| {
+            let state = state.clone();
+            async move {
+                run_scheduled_model_lifecycle_for_provider(&state, provider, settings).await;
             }
         }
+    })
+    .await;
+    for error in task_errors {
+        tracing::warn!(%error, "scheduled model lifecycle provider task failed");
+    }
+}
 
-        if pricing_due {
-            if let Err(error) =
-                run_model_lifecycle_lane(state, &provider.id, ModelLifecycleLane::PricingSync).await
-            {
-                tracing::warn!(
-                    provider = %provider.id,
-                    error = ?error,
-                    "scheduled pricing sync failed; preserving last-known metadata and prices"
-                );
-            }
+async fn run_scheduled_model_lifecycle_for_provider(
+    state: &AppState,
+    provider: db::ProviderRow,
+    settings: ModelLifecycleSettings,
+) {
+    match db::get_provider(&state.pool, &provider.id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return,
+        Err(error) => {
+            tracing::debug!(provider = %provider.id, %error, "could not revalidate scheduled lifecycle provider");
+            return;
+        }
+    }
+    let reconcile_key = lifecycle_setting_key("reconciliation", "last_attempt", &provider.id);
+    let pricing_key = lifecycle_setting_key("pricing_sync", "last_attempt", &provider.id);
+    let reconcile_due = scheduled_due(
+        &state.pool,
+        &reconcile_key,
+        settings.reconciliation_interval_secs,
+        settings.jitter_secs,
+    )
+    .await;
+    let pricing_due = scheduled_due(
+        &state.pool,
+        &pricing_key,
+        settings.pricing_sync_interval_secs,
+        settings.jitter_secs,
+    )
+    .await;
+
+    if reconcile_due {
+        if let Err(error) =
+            run_model_lifecycle_lane(state, &provider.id, ModelLifecycleLane::Reconciliation).await
+        {
+            tracing::warn!(
+                provider = %provider.id,
+                error = ?error,
+                "scheduled model reconciliation failed; existing state left intact"
+            );
+        }
+    }
+
+    if pricing_due {
+        if let Err(error) =
+            run_model_lifecycle_lane(state, &provider.id, ModelLifecycleLane::PricingSync).await
+        {
+            tracing::warn!(
+                provider = %provider.id,
+                error = ?error,
+                "scheduled pricing sync failed; preserving last-known metadata and prices"
+            );
         }
     }
 }
@@ -1023,6 +1179,7 @@ fn profile_policy_error(error: crate::types::ProxyError) -> ApiError {
     ApiError(
         StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
         error.message,
+        None,
     )
 }
 
@@ -1068,6 +1225,7 @@ pub async fn generate_client_profile(
             ApiError(
                 StatusCode::FORBIDDEN,
                 "selected model or Route is not currently available to this key".into(),
+                None,
             )
         })?;
 
@@ -2007,6 +2165,7 @@ pub async fn delete_provider(
     db::delete_provider(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?;
+    state.forget_deleted_provider(&id);
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -3488,13 +3647,21 @@ fn model_reconciliation_lock(provider_id: &str) -> std::sync::Arc<tokio::sync::M
 
 /// `POST /admin/api/providers/:id/discover` — fetch the upstream model list
 /// using the provider's credentials (FR-10.4).
-pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<Value, ApiError> {
+pub(crate) async fn reconcile_provider_id(
+    state: &AppState,
+    id: &str,
+    identity: &crate::registry::ProviderWorkIdentity,
+) -> Result<Value, ApiError> {
     // Manual discovery and scheduled reconciliation reuse this path. Serialize
     // work per provider so overlapping refreshes cannot race observation,
     // ignore, or pin state. Pricing sync shares the same provider lock but has
     // an independent state machine and never invokes reconciliation implicitly.
     let lock = model_reconciliation_lock(id);
     let _guard = lock.lock().await;
+    // Keep the existing missing-provider response for work invalidated by deletion.
+    if !identity.is_current() {
+        return Err(ApiError::not_found("provider not found"));
+    }
     let provider = db::get_provider(&state.pool, id)
         .await
         .map_err(ApiError::internal)?
@@ -3536,7 +3703,18 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
 
             let mut combined = Vec::new();
             for account in accounts {
-                let account_models = manager
+                let work_identity = state
+                    .account_work_identity(identity, &account.id)
+                    .ok_or_else(|| ApiError::not_found("account not found"))?;
+                let permit = state
+                    .provider_work
+                    .acquire(
+                        work_identity,
+                        crate::provider_work::ProviderWorkClass::ModelDiscovery,
+                    )
+                    .await
+                    .map_err(provider_work_acquire_error)?;
+                let account_models = match manager
                     .account_model_discover(
                         &pref.plugin_id,
                         &provider.id,
@@ -3545,18 +3723,38 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                         &models_path,
                     )
                     .await
-                    .map_err(|fault| {
-                        ApiError::bad(format!(
+                {
+                    Ok(models) => {
+                        permit.finish_success().await;
+                        models
+                    }
+                    Err(fault) => {
+                        let evidence = crate::provider_work::plugin_backoff_evidence_for_scope(
+                            &fault,
+                            crate::provider_work::RateLimitScope::Account,
+                        );
+                        permit.finish_failure(evidence).await;
+                        return Err(ApiError::bad(format!(
                             "plugin model discovery failed for account '{}': {}",
                             account.label,
                             crate::crypto::redact(&fault.message())
                         ))
-                    })?;
+                        .with_provider_backoff(evidence));
+                    }
+                };
                 extend_unique_by_id(&mut combined, account_models, |model| model.id.clone());
             }
             combined
         } else {
-            manager
+            let permit = state
+                .provider_work
+                .acquire(
+                    identity.clone(),
+                    crate::provider_work::ProviderWorkClass::ModelDiscovery,
+                )
+                .await
+                .map_err(provider_work_acquire_error)?;
+            match manager
                 .model_discover(
                     &pref.plugin_id,
                     &provider.id,
@@ -3564,12 +3762,24 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
                     &models_path,
                 )
                 .await
-                .map_err(|fault| {
-                    ApiError::bad(format!(
+            {
+                Ok(models) => {
+                    permit.finish_success().await;
+                    models
+                }
+                Err(fault) => {
+                    let evidence = crate::provider_work::plugin_backoff_evidence_for_scope(
+                        &fault,
+                        crate::provider_work::RateLimitScope::Provider,
+                    );
+                    permit.finish_failure(evidence).await;
+                    return Err(ApiError::bad(format!(
                         "plugin model discovery failed: {}",
                         crate::crypto::redact(&fault.message())
                     ))
-                })?
+                    .with_provider_backoff(evidence));
+                }
+            }
         };
 
         let models_dev =
@@ -3609,7 +3819,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
             .collect();
         (discovered, models_dev_available)
     } else {
-        discover_models_native(state, &provider).await?
+        discover_models_native(state, &provider, identity).await?
     };
 
     // Mark which are already imported and record the observation (FR-10.5).
@@ -4921,9 +5131,14 @@ async fn apply_provider_pricing_sync(
 pub(crate) async fn sync_provider_pricing_id(
     state: &AppState,
     id: &str,
+    identity: &crate::registry::ProviderWorkIdentity,
 ) -> Result<Value, ApiError> {
     let lock = model_reconciliation_lock(id);
     let _guard = lock.lock().await;
+    // Keep the existing missing-provider response for work invalidated by deletion.
+    if !identity.is_current() {
+        return Err(ApiError::not_found("provider not found"));
+    }
 
     let provider = db::get_provider(&state.pool, id)
         .await
@@ -4994,6 +5209,7 @@ async fn credential_for_admin_action(
 async fn discover_models_native(
     state: &AppState,
     provider: &db::ProviderRow,
+    identity: &crate::registry::ProviderWorkIdentity,
 ) -> Result<(Vec<DiscoveredObservation>, bool), ApiError> {
     let accounts = db::accounts_for_provider(&state.pool, &provider.id)
         .await
@@ -5040,6 +5256,9 @@ async fn discover_models_native(
 
     let mut discovered = Vec::new();
     for account in accounts {
+        let work_identity = state
+            .account_work_identity(identity, &account.id)
+            .ok_or_else(|| ApiError::not_found("account not found"))?;
         let credential = credential_for_admin_action(
             state,
             provider,
@@ -5054,7 +5273,15 @@ async fn discover_models_native(
             session_context: None,
             credential,
         };
-        let resp = crate::outbound::send_provider_request(
+        let permit = state
+            .provider_work
+            .acquire(
+                work_identity,
+                crate::provider_work::ProviderWorkClass::ModelDiscovery,
+            )
+            .await
+            .map_err(provider_work_acquire_error)?;
+        let resp = match crate::outbound::send_provider_request(
             &state.outbound_clients,
             state.config.allow_private_upstreams,
             state.config.allow_insecure_tls,
@@ -5073,23 +5300,47 @@ async fn discover_models_native(
             },
         )
         .await
-        .map_err(|e| {
-            ApiError::bad(format!(
-                "discovery request failed for account '{}': {}",
-                account.label,
-                crate::crypto::redact(&e.message)
-            ))
-        })?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let evidence = crate::provider_work::outbound_error_backoff_evidence(
+                    &error,
+                    crate::provider_work::RateLimitScope::Account,
+                );
+                permit.finish_failure(evidence).await;
+                return Err(ApiError::bad(format!(
+                    "discovery request failed for account '{}': {}",
+                    account.label,
+                    crate::crypto::redact(&error.message)
+                ))
+                .with_provider_backoff(evidence));
+            }
+        };
         let status = resp.status();
+        let headers = resp.headers().clone();
         let body_text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            let native = adapter.classify_error(status.as_u16(), &body_text, &headers);
+            let failure = crate::pipeline::apply_provider_failure_rules(
+                provider,
+                status.as_u16(),
+                &body_text,
+                native,
+            );
+            let evidence = crate::provider_work::upstream_backoff_evidence(
+                &failure,
+                crate::provider_work::RateLimitScope::Account,
+            );
+            permit.finish_failure(evidence).await;
             return Err(ApiError::bad(format!(
                 "upstream returned HTTP {} for account '{}': {}",
                 status.as_u16(),
                 account.label,
                 crate::crypto::redact(&truncate(&body_text, 400))
-            )));
+            ))
+            .with_provider_backoff(evidence));
         }
+        permit.finish_success().await;
         let parsed: Value = serde_json::from_str(&body_text)
             .map_err(|e| ApiError::bad(format!("invalid discovery response: {e}")))?;
         let account_observations = adapter
@@ -5149,6 +5400,9 @@ pub async fn test_provider(
             .next()
             .ok_or_else(|| ApiError::bad("provider has no credentials to test with"))?
     };
+    let work_identity = state
+        .provider_work_identity(&provider.id, Some(&account.id))
+        .ok_or_else(|| ApiError::not_found("account not found"))?;
     let credential = credential_for_admin_action(
         &state,
         &provider,
@@ -5239,6 +5493,14 @@ pub async fn test_provider(
     let parsed_url =
         url::Url::parse(&url).map_err(|e| ApiError::bad(format!("invalid probe URL: {e}")))?;
 
+    let permit = state
+        .provider_work
+        .acquire(
+            work_identity,
+            crate::provider_work::ProviderWorkClass::HealthProbe,
+        )
+        .await
+        .map_err(provider_work_acquire_error)?;
     let started = std::time::Instant::now();
     match crate::outbound::send_provider_request(
         &state.outbound_clients,
@@ -5264,10 +5526,17 @@ pub async fn test_provider(
             let status = resp.status().as_u16();
             let latency = started.elapsed().as_millis() as i64;
             if !(200..300).contains(&status) {
+                let response_headers = resp.headers().clone();
                 let text = resp.text().await.unwrap_or_default();
-                let native = adapter.classify_error(status, &text, &axum::http::HeaderMap::new());
+                let native = adapter.classify_error(status, &text, &response_headers);
                 let failure =
                     crate::pipeline::apply_provider_failure_rules(&provider, status, &text, native);
+                permit
+                    .finish_failure(crate::provider_work::upstream_backoff_evidence(
+                        &failure,
+                        crate::provider_work::RateLimitScope::Account,
+                    ))
+                    .await;
                 return Ok(Json(json!({
                     "ok": false, "status": status, "latency_ms": latency,
                     "error": failure.message,
@@ -5282,15 +5551,23 @@ pub async fn test_provider(
                 .unwrap_or("")
                 .to_string();
             let preview = read_probe_preview(resp, content_type.contains("event-stream")).await;
+            permit.finish_success().await;
             Ok(Json(json!({
                 "ok": true, "status": status, "latency_ms": latency,
                 "response_preview": truncate(&preview, 400),
             })))
         }
-        Err(e) => Ok(Json(json!({
-            "ok": false, "status": 0,
-            "error": e.message,
-        }))),
+        Err(e) => {
+            let evidence = crate::provider_work::outbound_error_backoff_evidence(
+                &e,
+                crate::provider_work::RateLimitScope::Account,
+            );
+            permit.finish_failure(evidence).await;
+            Ok(Json(json!({
+                "ok": false, "status": 0,
+                "error": e.message,
+            })))
+        }
     }
 }
 
@@ -7338,6 +7615,130 @@ async fn read_capability_probe_response(mut response: reqwest::Response) -> Resu
     String::from_utf8(bytes).map_err(|_| "upstream probe response was not valid UTF-8".to_string())
 }
 
+struct CapabilityProbeExchange {
+    status_code: u16,
+    text: String,
+    body_read_error: Option<String>,
+    request_error: Option<String>,
+}
+
+fn capability_probe_singleflight_key(
+    provider_id: &str,
+    account_id: &str,
+    model_id: &str,
+    transport: &str,
+    capability: &str,
+    value: Option<&Value>,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let value = serde_json::to_vec(&value).expect("JSON values always serialize");
+    let value_hash = hex::encode(Sha256::digest(value));
+    format!(
+        "provider:{provider_id}:account:{account_id}:model:{model_id}:transport:{transport}:capability:{capability}:value:{value_hash}"
+    )
+}
+
+async fn execute_capability_probe_request(
+    state: AppState,
+    provider: db::ProviderRow,
+    execution_model: db::ModelRow,
+    account_id: String,
+    identity: crate::registry::ProviderWorkIdentity,
+    credential: String,
+    adapter: std::sync::Arc<dyn crate::adapters::Adapter>,
+    url: url::Url,
+    outbound: Value,
+) -> Result<CapabilityProbeExchange, ApiError> {
+    let permit = state
+        .provider_work
+        .acquire(
+            identity,
+            crate::provider_work::ProviderWorkClass::CapabilityProbe,
+        )
+        .await
+        .map_err(provider_work_acquire_error)?;
+    let ctx = UpstreamContext {
+        provider: &provider,
+        model: &execution_model,
+        account_id: Some(&account_id),
+        session_context: None,
+        credential,
+    };
+    let response = crate::outbound::send_provider_request(
+        &state.outbound_clients,
+        state.config.allow_private_upstreams,
+        state.config.allow_insecure_tls,
+        &adapter,
+        &ctx,
+        crate::outbound::ProviderRequest {
+            method: reqwest::Method::POST,
+            url,
+            json_body: Some(outbound),
+            accept_event_stream: false,
+            request_id: None,
+            headers: Vec::new(),
+            total_timeout: Some(std::time::Duration::from_secs(10)),
+        },
+    )
+    .await;
+
+    match response {
+        Err(error) => {
+            let evidence = crate::provider_work::outbound_error_backoff_evidence(
+                &error,
+                crate::provider_work::RateLimitScope::Account,
+            );
+            permit.finish_failure(evidence).await;
+            Ok(CapabilityProbeExchange {
+                status_code: 0,
+                text: String::new(),
+                body_read_error: None,
+                request_error: Some(error.message),
+            })
+        }
+        Ok(response) => {
+            let status_code = response.status().as_u16();
+            let response_headers = response.headers().clone();
+            let (text, body_read_error) = match read_capability_probe_response(response).await {
+                Ok(text) => (text, None),
+                Err(error) => (String::new(), Some(error)),
+            };
+            // Classification belongs to this provider-scoped operation so the
+            // shared probe installs the same backoff evidence for every waiter.
+            let failure_evidence =
+                if body_read_error.is_none() && !(200..300).contains(&status_code) {
+                    let native = adapter.classify_error(status_code, &text, &response_headers);
+                    let failure = crate::pipeline::apply_provider_failure_rules(
+                        &provider,
+                        status_code,
+                        &text,
+                        native,
+                    );
+                    crate::provider_work::upstream_backoff_evidence(
+                        &failure,
+                        crate::provider_work::RateLimitScope::Account,
+                    )
+                } else {
+                    None
+                };
+            if body_read_error.is_some() {
+                permit.finish_failure(None).await;
+            } else if !(200..300).contains(&status_code) {
+                permit.finish_failure(failure_evidence).await;
+            } else {
+                permit.finish_success().await;
+            }
+            Ok(CapabilityProbeExchange {
+                status_code,
+                text,
+                body_read_error,
+                request_error: None,
+            })
+        }
+    }
+}
+
 /// Run one explicit, bounded upstream capability probe against the selected
 /// provider/account/model/transport execution profile. No automatic path calls
 /// this handler.
@@ -7588,7 +7989,7 @@ pub async fn probe_model_capability(
         model: &execution_model,
         account_id: Some(account.id.as_str()),
         session_context: None,
-        credential,
+        credential: credential.clone(),
     };
     let url = adapter
         .build_url(&ctx)
@@ -7624,23 +8025,69 @@ pub async fn probe_model_capability(
         .map_err(|error| ApiError::bad(format!("invalid probe URL: {error}")))?;
 
     let started = std::time::Instant::now();
-    let response = crate::outbound::send_provider_request(
-        &state.outbound_clients,
-        state.config.allow_private_upstreams,
-        state.config.allow_insecure_tls,
-        &adapter,
-        &ctx,
-        crate::outbound::ProviderRequest {
-            method: reqwest::Method::POST,
-            url: parsed_url,
-            json_body: Some(outbound),
-            accept_event_stream: false,
-            request_id: None,
-            headers: Vec::new(),
-            total_timeout: Some(std::time::Duration::from_secs(10)),
+    let singleflight_key = capability_probe_singleflight_key(
+        &provider.id,
+        &account.id,
+        &model.id,
+        profile.transport.as_str(),
+        &body.capability,
+        probe_value.as_ref(),
+    );
+    let work_identity = state
+        .provider_work_identity(&provider.id, Some(&account.id))
+        .ok_or_else(|| ApiError::not_found("account not found"))?;
+    let work_state = state.clone();
+    let work_provider = provider.clone();
+    let work_model = execution_model.clone();
+    let work_account_id = account.id.clone();
+    let work_adapter = adapter.clone();
+    let work_credential = credential;
+    let work_url = parsed_url;
+    let work_outbound = outbound;
+    let exchange = state
+        .provider_work
+        .coalesce(
+            work_identity.clone(),
+            crate::provider_work::ProviderWorkClass::CapabilityProbe,
+            singleflight_key,
+            move || async move {
+                execute_capability_probe_request(
+                    work_state,
+                    work_provider,
+                    work_model,
+                    work_account_id,
+                    work_identity,
+                    work_credential,
+                    work_adapter,
+                    work_url,
+                    work_outbound,
+                )
+                .await
+            },
+        )
+        .await;
+    let exchange = match exchange {
+        Ok(exchange) => exchange,
+        Err(error) => match error.as_ref() {
+            crate::provider_work::ProviderWorkError::Operation(error) => {
+                return Err(ApiError(error.0, error.1.clone(), error.2));
+            }
+            crate::provider_work::ProviderWorkError::BackedOff(wait) => {
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "provider work is temporarily backed off; retry in {}s",
+                        wait.as_secs().max(1)
+                    ),
+                    None,
+                ));
+            }
+            crate::provider_work::ProviderWorkError::Aborted => {
+                return Err(ApiError::internal("capability probe work was aborted"));
+            }
         },
-    )
-    .await;
+    };
+    let exchange = exchange.as_ref();
 
     let verified_at = chrono::Utc::now();
     let freshness_secs = db::get_setting(&state.pool, "model_probe_freshness_secs")
@@ -7651,26 +8098,28 @@ pub async fn probe_model_capability(
         .filter(|value| *value > 0)
         .unwrap_or(30 * 24 * 3600);
     let fresh_until = verified_at + chrono::Duration::seconds(freshness_secs);
-    let (status, status_code, detail) = match response {
-        Ok(response) => {
-            let status_code = response.status().as_u16();
-            let (text, body_read_error) = match read_capability_probe_response(response).await {
-                Ok(text) => (text, None),
-                Err(error) => (String::new(), Some(error)),
-            };
-            if let Some(error) = body_read_error {
-                (
-                    "inconclusive",
-                    status_code,
-                    Some(truncate(&crypto::redact(&error), 400)),
-                )
-            } else if (200..300).contains(&status_code) {
-                if body.capability == "reasoning_disable" {
-                    let verified = serde_json::from_str::<Value>(&text)
-                        .ok()
-                        .and_then(|payload| adapter.parse_full_response(&payload).ok())
-                        .and_then(|events| reasoning_disable_probe_contract(&events));
-                    match verified {
+    let (status, status_code, detail) = if let Some(error) = exchange.request_error.as_ref() {
+        (
+            "inconclusive",
+            0,
+            Some(truncate(&crypto::redact(error), 400)),
+        )
+    } else {
+        let status_code = exchange.status_code;
+        let text = exchange.text.as_str();
+        if let Some(error) = exchange.body_read_error.as_ref() {
+            (
+                "inconclusive",
+                status_code,
+                Some(truncate(&crypto::redact(&error), 400)),
+            )
+        } else if (200..300).contains(&status_code) {
+            if body.capability == "reasoning_disable" {
+                let verified = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|payload| adapter.parse_full_response(&payload).ok())
+                    .and_then(|events| reasoning_disable_probe_contract(&events));
+                match verified {
                         Some(true) => ("supported", status_code, None),
                         Some(false) => (
                             "unsupported",
@@ -7689,69 +8138,63 @@ pub async fn probe_model_capability(
                             ),
                         ),
                     }
-                } else {
-                    let contract_verified = match body.capability.as_str() {
-                        "tool_calling" => serde_json::from_str::<Value>(&text)
-                            .ok()
-                            .and_then(|payload| adapter.parse_full_response(&payload).ok())
-                            .is_some_and(|events| {
-                                events.iter().any(|event| {
-                                    matches!(
-                                        event,
-                                        crate::types::StreamEvent::ToolCallStart { name, .. }
-                                            if name == "kinetix_probe_noop"
-                                    )
-                                })
-                            }),
-                        "structured_output" => serde_json::from_str::<Value>(&text)
-                            .ok()
-                            .and_then(|payload| adapter.parse_full_response(&payload).ok())
-                            .map(|events| {
-                                events
-                                    .into_iter()
-                                    .filter_map(|event| match event {
-                                        crate::types::StreamEvent::TextDelta(text) => Some(text),
-                                        _ => None,
-                                    })
-                                    .collect::<String>()
-                            })
-                            .and_then(|text| serde_json::from_str::<Value>(text.trim()).ok())
-                            .is_some_and(|value| structured_output_probe_contract(&value)),
-                        _ => true,
-                    };
-                    if contract_verified {
-                        ("supported", status_code, None)
-                    } else {
-                        (
-                            "inconclusive",
-                            status_code,
-                            Some(format!(
-                                "upstream returned success but did not satisfy the {} probe contract",
-                                body.capability
-                            )),
-                        )
-                    }
-                }
             } else {
-                let redacted = crypto::redact(&text);
-                let status = if deterministic_probe_rejection(
-                    &body.capability,
-                    probe_value.as_ref(),
-                    status_code,
-                    &redacted,
-                ) {
-                    "unsupported"
-                } else {
-                    "inconclusive"
+                let contract_verified = match body.capability.as_str() {
+                    "tool_calling" => serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|payload| adapter.parse_full_response(&payload).ok())
+                        .is_some_and(|events| {
+                            events.iter().any(|event| {
+                                matches!(
+                                    event,
+                                    crate::types::StreamEvent::ToolCallStart { name, .. }
+                                        if name == "kinetix_probe_noop"
+                                )
+                            })
+                        }),
+                    "structured_output" => serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|payload| adapter.parse_full_response(&payload).ok())
+                        .map(|events| {
+                            events
+                                .into_iter()
+                                .filter_map(|event| match event {
+                                    crate::types::StreamEvent::TextDelta(text) => Some(text),
+                                    _ => None,
+                                })
+                                .collect::<String>()
+                        })
+                        .and_then(|text| serde_json::from_str::<Value>(text.trim()).ok())
+                        .is_some_and(|value| structured_output_probe_contract(&value)),
+                    _ => true,
                 };
-                (status, status_code, Some(truncate(&redacted, 400)))
+                if contract_verified {
+                    ("supported", status_code, None)
+                } else {
+                    (
+                        "inconclusive",
+                        status_code,
+                        Some(format!(
+                            "upstream returned success but did not satisfy the {} probe contract",
+                            body.capability
+                        )),
+                    )
+                }
             }
+        } else {
+            let redacted = crypto::redact(text);
+            let status = if deterministic_probe_rejection(
+                &body.capability,
+                probe_value.as_ref(),
+                status_code,
+                &redacted,
+            ) {
+                "unsupported"
+            } else {
+                "inconclusive"
+            };
+            (status, status_code, Some(truncate(&redacted, 400)))
         }
-        Err(error) => (
-            "inconclusive",
-            0,
-            Some(truncate(&crypto::redact(&error.message), 400)),
-        ),
     };
 
     let evidence_value = json!({
@@ -8789,9 +9232,15 @@ pub async fn delete_account(
     _auth: AdminAuth,
     Path(id): Path<String>,
 ) -> ApiResult {
+    let account = db::get_account(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?;
     db::delete_account(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?;
+    if let Some(account) = account {
+        state.forget_deleted_account(&account.provider_id, &account.id);
+    }
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -9158,7 +9607,7 @@ pub async fn validate_provider(
     } else {
         match validate_outbound_url(&state, &body.base_url) {
             Ok(()) => security = Value::String("passed".into()),
-            Err(ApiError(_, msg)) => problems.push(msg),
+            Err(ApiError(_, msg, _)) => problems.push(msg),
         }
     }
     if body.wire_format == "anthropic"
@@ -9770,6 +10219,48 @@ pub async fn metrics(State(state): State<AppState>, _auth: AdminAuth) -> Respons
         body.push_str(&format!(
             "kinetix_error_rate {}\n",
             errs as f64 / reqs as f64
+        ));
+    }
+    let work = state.provider_work.metrics_snapshot();
+    for (name, help, value) in [
+        (
+            "scheduled",
+            "Provider control-plane work scheduled",
+            work.scheduled,
+        ),
+        (
+            "executed",
+            "Provider control-plane work started",
+            work.executed,
+        ),
+        (
+            "coalesced",
+            "Equivalent provider control-plane work calls coalesced",
+            work.coalesced,
+        ),
+        (
+            "rate_limited",
+            "Provider control-plane work delayed by local budgets",
+            work.rate_limited,
+        ),
+        (
+            "provider_throttled",
+            "Provider control-plane work failures classified as provider-wide transient evidence",
+            work.provider_throttled,
+        ),
+        (
+            "backed_off",
+            "Provider control-plane work suppressed by provider backoff",
+            work.backed_off,
+        ),
+        (
+            "failed",
+            "Provider control-plane work failures",
+            work.failed,
+        ),
+    ] {
+        body.push_str(&format!(
+            "# HELP kinetix_provider_work_{name}_total {help}\n# TYPE kinetix_provider_work_{name}_total counter\nkinetix_provider_work_{name}_total {value}\n"
         ));
     }
     let admission = state.admission.metrics_snapshot();
@@ -12860,6 +13351,7 @@ fn plugin_manager(
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "plugin host is not available".into(),
+            None,
         )
     })
 }
@@ -12878,10 +13370,22 @@ pub(crate) async fn register_enabled_plugin_capabilities(state: &AppState, id: &
     let crypto = state.crypto.clone();
     let pool = state.pool.clone();
     // `enable` has already succeeded, so the row exists and is enabled.
-    let provides = match manager.get(id).await {
-        Ok(Some(row)) => row.manifest().map(|m| m.provides).unwrap_or_default(),
+    let (provides, cached_routing_facts) = match manager.get(id).await {
+        Ok(Some(row)) if row.status().is_enabled() => {
+            let Some(manifest) = row.manifest() else {
+                return;
+            };
+            let cached_routing_facts = manifest.routing_facts_mode == "cached"
+                && !manifest.provides.routing_facts.is_empty();
+            (manifest.provides, cached_routing_facts)
+        }
         _ => return,
     };
+    if cached_routing_facts {
+        state
+            .provider_work
+            .activate_auxiliary_scope(&format!("plugin:{id}"));
+    }
     if !provides.credential_strategies.is_empty() {
         let strategy: std::sync::Arc<dyn crate::credentials::CredentialStrategy> =
             std::sync::Arc::new(crate::plugins::credential::PluginCredentialStrategy::new(
@@ -12954,6 +13458,7 @@ async fn reconcile_provider_account_mode(
                 .execute(&state.pool)
                 .await
                 .map_err(ApiError::internal)?;
+                state.forget_deleted_account(provider_id, &accounts[0].id);
             } else {
                 sqlx::query(
                     "UPDATE route_targets SET account_id=NULL
@@ -12968,6 +13473,9 @@ async fn reconcile_provider_account_mode(
                     .execute(&state.pool)
                     .await
                     .map_err(ApiError::internal)?;
+                for account in &accounts {
+                    state.forget_deleted_account(&account.provider_id, &account.id);
+                }
                 db::insert_account(
                     &state.pool,
                     provider_id,
@@ -12986,6 +13494,15 @@ async fn reconcile_provider_account_mode(
         crate::plugins::CredentialMode::Manual | crate::plugins::CredentialMode::AuthFlow => {
             // Credential-bearing modes must never route through synthetic
             // no-auth state left by a previous credential-free configuration.
+            let removed_accounts: Vec<_> = db::accounts_for_provider(&state.pool, provider_id)
+                .await
+                .map_err(ApiError::internal)?
+                .into_iter()
+                .filter(|account| {
+                    account.label == "__kinetix_noauth__"
+                        || (account.label == "public" && account.key_mask == legacy_public_mask)
+                })
+                .collect();
             sqlx::query(
                 "UPDATE route_targets SET account_id=NULL
                  WHERE account_id IN (
@@ -13009,6 +13526,9 @@ async fn reconcile_provider_account_mode(
             .execute(&state.pool)
             .await
             .map_err(ApiError::internal)?;
+            for account in &removed_accounts {
+                state.forget_deleted_account(&account.provider_id, &account.id);
+            }
         }
     }
 
@@ -15025,6 +15545,7 @@ pub async fn plugin_auth_callback(
         return Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "plugin account authorization unavailable: control plane degraded".into(),
+            None,
         ));
     }
 
@@ -15094,6 +15615,7 @@ pub async fn complete_plugin_auth_manual(
         return Err(ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
             "plugin account authorization unavailable: control plane degraded".into(),
+            None,
         ));
     }
 
@@ -17460,6 +17982,192 @@ mod credential_enrollment_regression_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn unregistering_plugin_resets_routing_work_state_and_flights() {
+        use tokio::sync::{Notify, Semaphore};
+
+        let (state, root) = test_state("plugin-routing-work-unregister").await;
+        let plugin_id = "routing-plugin";
+        let scope = format!("plugin:{plugin_id}");
+        let old_identity = state.provider_work.activate_auxiliary_scope(&scope);
+        let old_started = Arc::new(Notify::new());
+        let release_old = Arc::new(Semaphore::new(0));
+        let old_coordinator = state.provider_work.clone();
+        let old_flight_identity = old_identity.clone();
+        let old_started_task = old_started.clone();
+        let release_old_task = release_old.clone();
+        let old_flight = tokio::spawn(async move {
+            old_coordinator
+                .coalesce(
+                    old_flight_identity,
+                    crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+                    "cached_snapshot".into(),
+                    move || async move {
+                        old_started_task.notify_one();
+                        release_old_task.acquire_owned().await.unwrap().forget();
+                        Ok::<_, String>("old-generation".to_owned())
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), old_started.notified())
+            .await
+            .expect("routing refresh should be in flight");
+
+        state
+            .provider_work
+            .acquire(
+                old_identity.clone(),
+                crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+            )
+            .await
+            .unwrap()
+            .finish_failure(Some(
+                crate::provider_work::ProviderBackoffEvidence::Transient {
+                    retry_after_secs: Some(30),
+                },
+            ))
+            .await;
+        assert!(matches!(
+            state
+                .provider_work
+                .acquire(
+                    old_identity.clone(),
+                    crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+                )
+                .await,
+            Err(crate::provider_work::ProviderWorkAcquireError::BackedOff(_))
+        ));
+
+        state.unregister_plugin_capabilities(plugin_id);
+        let state_after_unregister = state.provider_work.state_counts();
+        let old_generation_invalidated = !old_identity.is_current();
+        let new_identity = state.provider_work.activate_auxiliary_scope(&scope);
+        let generation_changed = !Arc::ptr_eq(
+            &old_identity.provider_generation,
+            &new_identity.provider_generation,
+        );
+        let fresh_admission = state
+            .provider_work
+            .acquire(
+                new_identity.clone(),
+                crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+            )
+            .await;
+        let fresh_gate = fresh_admission.is_ok();
+        if let Ok(permit) = fresh_admission {
+            permit.finish_success().await;
+        }
+
+        let new_runs = Arc::new(AtomicUsize::new(0));
+        let new_runs_task = new_runs.clone();
+        let new_coordinator = state.provider_work.clone();
+        let new_flight = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            new_coordinator.coalesce(
+                new_identity,
+                crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+                "cached_snapshot".into(),
+                move || async move {
+                    new_runs_task.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, String>("new-generation".to_owned())
+                },
+            ),
+        )
+        .await;
+
+        release_old.add_permits(1);
+        let old_result = tokio::time::timeout(std::time::Duration::from_secs(1), old_flight)
+            .await
+            .expect("old routing refresh should finish after release")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*old_result, "old-generation");
+        assert_eq!(
+            state_after_unregister,
+            (0, 0),
+            "unregistering capabilities must evict the synthetic provider gate and flight"
+        );
+        assert!(
+            old_generation_invalidated,
+            "unregistration invalidates work holding the previous generation"
+        );
+        assert!(
+            generation_changed,
+            "re-enabled plugin gets a fresh generation"
+        );
+        assert!(
+            fresh_gate,
+            "new generation must not inherit provider backoff"
+        );
+        let new_result = new_flight
+            .expect("new generation must not join the old flight")
+            .expect("new generation routing refresh should succeed");
+        assert_eq!(&*new_result, "new-generation");
+        assert_eq!(new_runs.load(Ordering::Relaxed), 1);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn queued_plugin_routing_refresh_cannot_recreate_scope_after_unregister() {
+        let (state, root) = test_state("queued-plugin-routing-work-unregister").await;
+        let plugin_id = "queued-routing-plugin";
+        let scope = format!("plugin:{plugin_id}");
+        state.provider_work.activate_auxiliary_scope(&scope);
+
+        let queued_coordinator = state.provider_work.clone();
+        let queued_scope = scope.clone();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let queued_executions = executions.clone();
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let queued_job = tokio::spawn(async move {
+            let _ = queued_tx.send(());
+            resume_rx.await.unwrap();
+            let Some(identity) = queued_coordinator.auxiliary_identity(&queued_scope) else {
+                return Err(Arc::new(crate::provider_work::ProviderWorkError::Aborted));
+            };
+            queued_coordinator
+                .run(
+                    identity,
+                    crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+                    Some("cached_snapshot".into()),
+                    move || async move {
+                        queued_executions.fetch_add(1, Ordering::Relaxed);
+                        Err::<(), _>("plugin was disabled before refresh started".to_owned())
+                    },
+                    |_| None,
+                )
+                .await
+        });
+        queued_rx.await.unwrap();
+
+        state.unregister_plugin_capabilities(plugin_id);
+        assert_eq!(state.provider_work.state_counts(), (0, 0));
+        resume_tx.send(()).unwrap();
+        let result = queued_job.await.unwrap();
+
+        assert!(
+            matches!(
+                result,
+                Err(error)
+                    if matches!(
+                        error.as_ref(),
+                        crate::provider_work::ProviderWorkError::Aborted
+                    )
+            ),
+            "queued refresh must not acquire a new identity after unregister"
+        );
+        assert_eq!(executions.load(Ordering::Relaxed), 0);
+        assert_eq!(state.provider_work.state_counts(), (0, 0));
+        assert_eq!(state.provider_work.metrics_snapshot().scheduled, 0);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     async fn test_state_with_plugins(tag: &str) -> (AppState, std::path::PathBuf) {
         let (state, root) = test_state(tag).await;
         let manager = crate::plugins::PluginManager::new(
@@ -17705,6 +18413,570 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn native_discovery_account_rate_limit_does_not_back_off_sibling_work() {
+        let (state, root) = test_state("native-discovery-account-rate-limit").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    r#"{"error":{"message":"account rate limited"}}"#,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base_url = format!("http://{address}");
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "native-discovery-rate-limit-provider",
+                base_url: &base_url,
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 2_000,
+                capability_mode: "permissive",
+                models_path: Some("/models"),
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "127.0.0.1",
+                allow_insecure_tls: true,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        for (label, priority) in [("account-a", 1), ("account-b", 2)] {
+            let encrypted = state.crypto.encrypt(&format!("{label}-key")).unwrap();
+            db::insert_account(
+                &state.pool,
+                &provider_id,
+                label,
+                &encrypted,
+                "test-key",
+                priority,
+                1,
+                None,
+                "none",
+            )
+            .await
+            .unwrap();
+        }
+        state.registry.reload(&state.pool).await.unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let identity = state
+            .provider_work_identity(&provider_id, None)
+            .expect("provider should have an active work identity");
+        let error = discover_models_native(&state, &provider, &identity)
+            .await
+            .expect_err("account A should be rate limited");
+        assert!(error.1.contains("account 'account-a'"), "{error:?}");
+
+        let sibling = state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::ModelDiscovery,
+            )
+            .await
+            .expect("account A's 429 must not block account B's provider work");
+        sibling.finish_success().await;
+
+        server.abort();
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn provider_test_honors_retry_after_response_header() {
+        let (state, root) = test_state("provider-test-retry-after").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("retry-after", "120")],
+                    r#"{"error":{"message":"temporary outage"}}"#,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base_url = format!("http://{address}/v1");
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "retry-after-provider",
+                base_url: &base_url,
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 2_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "127.0.0.1",
+                allow_insecure_tls: true,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let encrypted = state.crypto.encrypt("probe-key").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "probe-account",
+            &encrypted,
+            "probe-key",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "probe-model",
+                display_name: "Probe Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: Some(64),
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+
+        let response = test_provider(
+            State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+            Json(TestBody {
+                model: Some("probe-model".into()),
+                account_id: Some(account_id),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["status"], 503);
+        let wait = match state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::HealthProbe,
+            )
+            .await
+        {
+            Err(wait) => wait,
+            Ok(permit) => {
+                drop(permit);
+                panic!("the provider probe should install provider backoff");
+            }
+        };
+        let wait = match wait {
+            crate::provider_work::ProviderWorkAcquireError::BackedOff(wait) => wait,
+            crate::provider_work::ProviderWorkAcquireError::Aborted => {
+                panic!("provider identity unexpectedly invalidated")
+            }
+        };
+        assert!(wait >= std::time::Duration::from_secs(100), "got {wait:?}");
+
+        server.abort();
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn insert_capability_probe_target(
+        state: &AppState,
+        base_url: &str,
+        name: &str,
+    ) -> (String, String, String) {
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name,
+                base_url,
+                wire_format: WireFormat::Openai,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 2_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "127.0.0.1",
+                allow_insecure_tls: true,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let encrypted = state.crypto.encrypt("probe-key").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "probe-account",
+            &encrypted,
+            "probe-key",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "probe-model",
+                display_name: "Probe Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: Some(64),
+                capabilities: json!({}),
+                prices: json!({ "input_per_1m": 1.0, "output_per_1m": 1.0 }),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        (provider_id, account_id, model_id)
+    }
+
+    #[tokio::test]
+    async fn provider_test_account_rate_limit_does_not_back_off_sibling_work() {
+        let (state, root) = test_state("provider-test-account-rate-limit").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    r#"{"error":{"message":"account rate limited"}}"#,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{address}/v1");
+        let (provider_id, account_id, _model_id) =
+            insert_capability_probe_target(&state, &base_url, "provider-test-rate-limit").await;
+
+        let response = test_provider(
+            State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+            Json(TestBody {
+                model: Some("probe-model".into()),
+                account_id: Some(account_id),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["status"], 429);
+
+        let sibling = state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::HealthProbe,
+            )
+            .await
+            .expect("an account's 429 must not block sibling provider work");
+        sibling.finish_success().await;
+
+        server.abort();
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn identical_capability_probes_share_one_upstream_request() {
+        let (state, root) = test_state("capability-probe-singleflight").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post({
+                let requests = requests.clone();
+                let arrived = arrived.clone();
+                let release = release.clone();
+                move || {
+                    let requests = requests.clone();
+                    let arrived = arrived.clone();
+                    let release = release.clone();
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        arrived.notify_one();
+                        release.acquire_owned().await.unwrap().forget();
+                        (StatusCode::OK, r#"{"choices":[]}"#)
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{address}/v1");
+        let (provider_id, account_id, model_id) =
+            insert_capability_probe_target(&state, &base_url, "singleflight-provider").await;
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let probes = (0..2)
+            .map(|_| {
+                let state = state.clone();
+                let start = start.clone();
+                let provider_id = provider_id.clone();
+                let account_id = account_id.clone();
+                let model_id = model_id.clone();
+                tokio::spawn(async move {
+                    start.wait().await;
+                    probe_model_capability(
+                        State(state),
+                        auth(),
+                        Path(model_id),
+                        Json(CapabilityProbeBody {
+                            account_id: Some(account_id),
+                            capability: "transport".into(),
+                            value: None,
+                            max_cost_usd: Some(1.0),
+                            transport: None,
+                        }),
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("provider {provider_id} probe failed: {error:?}")
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait().await;
+        let coalescing_observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.provider_work.metrics_snapshot().coalesced > 0
+                    || requests.load(std::sync::atomic::Ordering::Relaxed) > 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        release.add_permits(2);
+        for probe in probes {
+            let _ = probe.await.unwrap();
+        }
+        assert!(
+            coalescing_observed,
+            "neither coalescing nor duplicate execution was observed"
+        );
+        assert_eq!(state.provider_work.metrics_snapshot().coalesced, 1);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        server.abort();
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn capability_probe_body_read_failure_is_unclassified_and_preserves_backoff_count() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (state, root) = test_state("capability-probe-body-read-failure").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let base_url = format!("http://{address}/v1");
+        let (provider_id, account_id, model_id) =
+            insert_capability_probe_target(&state, &base_url, "read-failure-provider").await;
+        let identity = state
+            .provider_work_identity(&provider_id, None)
+            .expect("provider should have an active work identity");
+        state
+            .provider_work
+            .acquire(
+                identity,
+                crate::provider_work::ProviderWorkClass::CapabilityProbe,
+            )
+            .await
+            .unwrap()
+            .finish_failure(Some(
+                crate::provider_work::ProviderBackoffEvidence::Transient {
+                    retry_after_secs: Some(1),
+                },
+            ))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let failed_before = state.provider_work.metrics_snapshot().failed;
+
+        let response = probe_model_capability(
+            State(state.clone()),
+            auth(),
+            Path(model_id),
+            Json(CapabilityProbeBody {
+                account_id: Some(account_id),
+                capability: "transport".into(),
+                value: None,
+                max_cost_usd: Some(1.0),
+                transport: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["evidence"]["status"], "inconclusive");
+        assert_eq!(
+            state.provider_work.metrics_snapshot().failed,
+            failed_before + 1
+        );
+        server.await.unwrap();
+
+        let permit = state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::CapabilityProbe,
+            )
+            .await
+            .expect("unclassified body read failure must not install provider backoff");
+        drop(permit);
+        state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::CapabilityProbe,
+            )
+            .await
+            .unwrap()
+            .finish_failure(Some(
+                crate::provider_work::ProviderBackoffEvidence::Transient {
+                    retry_after_secs: None,
+                },
+            ))
+            .await;
+        let wait = match state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::CapabilityProbe,
+            )
+            .await
+        {
+            Err(wait) => wait,
+            Ok(permit) => {
+                drop(permit);
+                panic!("the second transient failure should extend provider backoff");
+            }
+        };
+        let wait = match wait {
+            crate::provider_work::ProviderWorkAcquireError::BackedOff(wait) => wait,
+            crate::provider_work::ProviderWorkAcquireError::Aborted => {
+                panic!("provider identity unexpectedly invalidated")
+            }
+        };
+        assert!(wait >= std::time::Duration::from_secs(8), "got {wait:?}");
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn capability_probe_singleflight_key_is_stable_and_value_specific() {
+        let key = capability_probe_singleflight_key(
+            "provider-a",
+            "account-a",
+            "model-a",
+            "openai",
+            "reasoning",
+            Some(&json!("low")),
+        );
+        assert_eq!(
+            key,
+            capability_probe_singleflight_key(
+                "provider-a",
+                "account-a",
+                "model-a",
+                "openai",
+                "reasoning",
+                Some(&json!("low")),
+            )
+        );
+        assert_ne!(
+            key,
+            capability_probe_singleflight_key(
+                "provider-a",
+                "account-a",
+                "model-a",
+                "openai",
+                "reasoning",
+                Some(&json!("high")),
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn reasoning_disable_api_validates_value_before_model_lookup() {
         let (state, root) = test_state("reasoning-disable-probe").await;
 
@@ -17809,6 +19081,463 @@ mod credential_enrollment_regression_tests {
             api_key: api_key.map(str::to_string),
             account_label: Some("manual-key".into()),
         }
+    }
+
+    #[derive(Default)]
+    struct CredentialEvictionSpy {
+        accounts: parking_lot::Mutex<Vec<(String, String)>>,
+        providers: parking_lot::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::credentials::CredentialStrategy for CredentialEvictionSpy {
+        fn name(&self) -> &'static str {
+            "test_credential_eviction_spy"
+        }
+
+        async fn resolve(
+            &self,
+            _account: &db::AccountRow,
+        ) -> std::result::Result<
+            crate::credentials::ResolvedCredential,
+            crate::credentials::CredentialRotationError,
+        > {
+            Ok(crate::credentials::ResolvedCredential {
+                secret: "unused".into(),
+                expires_at: None,
+                refresh_after: None,
+                rotated: false,
+            })
+        }
+
+        fn forget_account(&self, provider_id: &str, account_id: &str) {
+            self.accounts
+                .lock()
+                .push((provider_id.to_owned(), account_id.to_owned()));
+        }
+
+        fn forget_provider(&self, provider_id: &str) {
+            self.providers.lock().push(provider_id.to_owned());
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_credential_snapshot_after_account_deletion_does_not_recreate_state() {
+        let (state, root) = test_state("stale-credential-after-delete").await;
+        let spy = Arc::new(CredentialEvictionSpy::default());
+        state.register_plugin_credential_strategy("test-eviction", spy);
+        let provider_id = insert_provider(
+            &state,
+            "stale-credential-provider",
+            crate::plugins::CredentialMode::AuthFlow,
+            Some("test-eviction"),
+            Some("integration"),
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("account-secret").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "stale-account",
+            &encrypted,
+            "test-key",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let stale_provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_account = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let _ = delete_account(
+            axum::extract::State(state.clone()),
+            auth(),
+            Path(account_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!state
+            .registry
+            .contains_provider_account(&provider_id, &account_id));
+        let scheduled_before = state.provider_work.metrics_snapshot().scheduled;
+
+        let error = state
+            .credential_for(&stale_provider, &stale_account)
+            .await
+            .expect_err("stale account snapshot must be rejected after deletion");
+        assert_eq!(error.code, "credential_state_evicted");
+        assert_eq!(
+            state.provider_work.metrics_snapshot().scheduled,
+            scheduled_before,
+            "stale credential resolution must not enter provider-work coordination"
+        );
+        assert!(state
+            .credential_refresh
+            .next_attempt_at(&provider_id, &account_id)
+            .is_none());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stale_credential_snapshot_after_provider_deletion_does_not_recreate_state() {
+        let (state, root) = test_state("stale-credential-after-provider-delete").await;
+        state.register_plugin_credential_strategy(
+            "test-eviction",
+            Arc::new(CredentialEvictionSpy::default()),
+        );
+        let provider_id = insert_provider(
+            &state,
+            "stale-credential-provider-delete",
+            crate::plugins::CredentialMode::AuthFlow,
+            Some("test-eviction"),
+            Some("integration"),
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("account-secret").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "stale-account",
+            &encrypted,
+            "test-key",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let stale_provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stale_account = db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let _ = delete_provider(
+            axum::extract::State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+        )
+        .await
+        .unwrap();
+        let scheduled_before = state.provider_work.metrics_snapshot().scheduled;
+
+        let error = state
+            .credential_for(&stale_provider, &stale_account)
+            .await
+            .expect_err("stale provider/account snapshot must be rejected after deletion");
+        assert_eq!(error.code, "credential_state_evicted");
+        assert_eq!(
+            state.provider_work.metrics_snapshot().scheduled,
+            scheduled_before,
+            "stale credential resolution must not enter provider-work coordination"
+        );
+        assert!(state
+            .credential_refresh
+            .next_attempt_at(&provider_id, &account_id)
+            .is_none());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stale_scheduled_provider_snapshot_after_deletion_does_not_recreate_gate() {
+        let (state, root) = test_state("stale-scheduled-provider-after-delete").await;
+        let provider_id = insert_provider(
+            &state,
+            "stale-scheduled-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        state.registry.reload(&state.pool).await.unwrap();
+        let stale_provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let _ = delete_provider(
+            axum::extract::State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state.registry.provider(&provider_id).is_none());
+        let scheduled_before = state.provider_work.metrics_snapshot().scheduled;
+        run_scheduled_model_lifecycle_for_provider(
+            &state,
+            stale_provider,
+            ModelLifecycleSettings {
+                reconciliation_interval_secs: 300,
+                pricing_sync_interval_secs: 0,
+                jitter_secs: 0,
+                probe_freshness_secs: 3600,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            state.provider_work.metrics_snapshot().scheduled,
+            scheduled_before,
+            "stale scheduled work must be rejected before entering provider-work coordination"
+        );
+        assert!(db::get_setting(
+            &state.pool,
+            &lifecycle_setting_key("reconciliation", "last_attempt", &provider_id)
+        )
+        .await
+        .unwrap()
+        .is_none());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn deletion_between_validation_and_coordinator_admission_rejects_lifecycle_work() {
+        let (state, root) = test_state("delete-before-provider-work-admission").await;
+        let provider_id = insert_provider(
+            &state,
+            "delete-before-provider-work-admission",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        state.registry.reload(&state.pool).await.unwrap();
+
+        assert!(db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .is_some());
+        let identity = state
+            .provider_work_identity(&provider_id, None)
+            .expect("provider validation should capture its active generation");
+        let validated = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let work_state = state.clone();
+        let work_validated = validated.clone();
+        let work_resume = resume.clone();
+        let work = tokio::spawn(async move {
+            work_validated.wait().await;
+            work_resume.wait().await;
+            let executions = Arc::new(AtomicUsize::new(0));
+            let invoked = executions.clone();
+            let result = work_state
+                .provider_work
+                .coalesce(
+                    identity,
+                    crate::provider_work::ProviderWorkClass::ModelDiscovery,
+                    "reconciliation".into(),
+                    move || async move {
+                        invoked.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, String>(())
+                    },
+                )
+                .await;
+            (result, executions.load(Ordering::Relaxed))
+        });
+
+        validated.wait().await;
+        let _ = delete_provider(
+            axum::extract::State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+        )
+        .await
+        .unwrap();
+        resume.wait().await;
+
+        let (result, executions) = work.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(error)
+                if matches!(
+                    error.as_ref(),
+                    crate::provider_work::ProviderWorkError::Aborted
+                )
+        ));
+        assert_eq!(executions, 0, "deleted lifecycle work must not start");
+        assert_eq!(state.provider_work.metrics_snapshot().scheduled, 0);
+        assert_eq!(state.provider_work.state_counts(), (0, 0));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn account_and_provider_deletion_evict_control_plane_state() {
+        let (state, root) = test_state("delete-control-plane-state").await;
+        let spy = Arc::new(CredentialEvictionSpy::default());
+        state.register_plugin_credential_strategy("test-eviction", spy.clone());
+
+        let account_provider_id = insert_provider(
+            &state,
+            "delete-account-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("account-secret").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &account_provider_id,
+            "account-to-delete",
+            &encrypted,
+            "test-key",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let scheduled = crate::credentials::ResolvedCredential {
+            secret: "schedule-secret".into(),
+            expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339()),
+            rotated: false,
+        };
+        state
+            .credential_refresh
+            .observe(&account_provider_id, &account_id, &scheduled);
+        drop(
+            state
+                .provider_work
+                .acquire(
+                    &account_provider_id,
+                    crate::provider_work::ProviderWorkClass::HealthProbe,
+                )
+                .await
+                .unwrap(),
+        );
+
+        let axum::Json(account_result) = delete_account(
+            axum::extract::State(state.clone()),
+            auth(),
+            Path(account_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(account_result["ok"], true);
+        assert!(db::get_account(&state.pool, &account_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .credential_refresh
+            .next_attempt_at(&account_provider_id, &account_id)
+            .is_none());
+        assert!(spy
+            .accounts
+            .lock()
+            .contains(&(account_provider_id.clone(), account_id.clone())));
+
+        let provider_id = insert_provider(
+            &state,
+            "delete-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let encrypted = state.crypto.encrypt("provider-account-secret").unwrap();
+        let provider_account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "provider-account",
+            &encrypted,
+            "test-key",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        state
+            .credential_refresh
+            .observe(&provider_id, &provider_account_id, &scheduled);
+        state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::HealthProbe,
+            )
+            .await
+            .unwrap()
+            .finish_failure(Some(
+                crate::provider_work::ProviderBackoffEvidence::Transient {
+                    retry_after_secs: None,
+                },
+            ))
+            .await;
+        assert!(state
+            .provider_work
+            .acquire(
+                &provider_id,
+                crate::provider_work::ProviderWorkClass::HealthProbe
+            )
+            .await
+            .is_err());
+
+        let axum::Json(provider_result) = delete_provider(
+            axum::extract::State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(provider_result["ok"], true);
+        assert!(db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .credential_refresh
+            .next_attempt_at(&provider_id, &provider_account_id)
+            .is_none());
+        assert!(spy.providers.lock().contains(&provider_id));
+        assert!(matches!(
+            state
+                .provider_work
+                .acquire(
+                    &provider_id,
+                    crate::provider_work::ProviderWorkClass::HealthProbe
+                )
+                .await,
+            Err(crate::provider_work::ProviderWorkAcquireError::Aborted)
+        ));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -20599,6 +22328,7 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
         let provider = db::get_provider(&state.pool, &provider_id)
             .await
             .unwrap()
@@ -21181,6 +22911,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
         state.register_plugin_credential_strategy("plugin.test", Arc::new(ExpiredCredential));
+        state.registry.reload(&state.pool).await.unwrap();
         let provider = db::get_provider(&state.pool, &provider_id)
             .await
             .unwrap()

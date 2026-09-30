@@ -5,6 +5,7 @@
 //! In-flight requests keep the `Arc<Registry>` snapshot they started with.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -24,6 +25,8 @@ pub struct Registry {
     inner: Arc<RwLock<Arc<Snapshot>>>,
     publication: Arc<tokio::sync::Mutex<()>>,
     config_imports: Arc<tokio::sync::Mutex<()>>,
+    revision: Arc<AtomicU64>,
+    lifecycle: Arc<parking_lot::Mutex<()>>,
 }
 
 /// Holds the registry publication lock across a control-plane database update.
@@ -33,7 +36,7 @@ pub(crate) struct RegistryPublication<'a> {
     _guard: tokio::sync::MutexGuard<'a, ()>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Snapshot {
     pub providers: HashMap<String, ProviderRow>,
     pub provider_order: Vec<String>,
@@ -44,6 +47,66 @@ pub struct Snapshot {
     pub aliases: HashMap<String, AliasRow>,
     pub routes: HashMap<String, RouteRow>,
     pub route_targets: HashMap<String, Vec<RouteTargetRow>>,
+    pub(crate) provider_work_generations: HashMap<String, Arc<AtomicBool>>,
+    pub(crate) account_work_generations: HashMap<String, Arc<AtomicBool>>,
+}
+
+/// Opaque lifecycle identity captured from the active registry snapshot. Work
+/// admitted with an older identity is rejected after provider/account removal.
+#[derive(Clone)]
+pub struct ProviderWorkIdentity {
+    pub(crate) provider_id: String,
+    pub(crate) provider_generation: Arc<AtomicBool>,
+    pub(crate) account_generation: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    pub(crate) test_provider_id_only: bool,
+}
+
+impl ProviderWorkIdentity {
+    pub(crate) fn is_current(&self) -> bool {
+        self.provider_generation.load(Ordering::Acquire)
+            && self
+                .account_generation
+                .as_ref()
+                .is_none_or(|generation| generation.load(Ordering::Acquire))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(provider_id: impl Into<String>) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            provider_generation: Arc::new(AtomicBool::new(true)),
+            account_generation: None,
+            test_provider_id_only: false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for ProviderWorkIdentity {
+    fn from(provider_id: &str) -> Self {
+        let mut identity = Self::for_test(provider_id);
+        identity.test_provider_id_only = true;
+        identity
+    }
+}
+
+#[cfg(test)]
+impl From<String> for ProviderWorkIdentity {
+    fn from(provider_id: String) -> Self {
+        let mut identity = Self::for_test(provider_id);
+        identity.test_provider_id_only = true;
+        identity
+    }
+}
+
+#[cfg(test)]
+impl From<&String> for ProviderWorkIdentity {
+    fn from(provider_id: &String) -> Self {
+        let mut identity = Self::for_test(provider_id.clone());
+        identity.test_provider_id_only = true;
+        identity
+    }
 }
 
 /// A resolved routing decision for a client-requested model name.
@@ -84,6 +147,8 @@ impl Registry {
             inner: Arc::new(RwLock::new(Arc::new(Snapshot::default()))),
             publication: Arc::new(tokio::sync::Mutex::new(())),
             config_imports: Arc::new(tokio::sync::Mutex::new(())),
+            revision: Arc::new(AtomicU64::new(0)),
+            lifecycle: Arc::new(parking_lot::Mutex::new(())),
         }
     }
 
@@ -168,8 +233,68 @@ impl Registry {
 
     /// Atomically activate a fully built immutable snapshot while publication
     /// is serialized by `RegistryPublication`.
-    fn activate(&self, snapshot: Snapshot) {
-        *self.inner.write() = Arc::new(snapshot);
+    fn activate(&self, mut snapshot: Snapshot, expected_revision: Option<u64>) {
+        let _lifecycle = self.lifecycle.lock();
+        let mut current = self.inner.write();
+        if expected_revision
+            .is_some_and(|revision| self.revision.load(Ordering::Acquire) != revision)
+        {
+            return;
+        }
+        if expected_revision.is_none() {
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
+
+        let previous = current.clone();
+        for provider_id in snapshot.providers.keys() {
+            let generation = previous
+                .provider_work_generations
+                .get(provider_id)
+                .filter(|generation| generation.load(Ordering::Acquire))
+                .cloned()
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
+            snapshot
+                .provider_work_generations
+                .insert(provider_id.clone(), generation);
+        }
+        for account_id in snapshot.accounts.keys() {
+            let is_active = snapshot
+                .accounts
+                .get(account_id)
+                .is_some_and(|account| account.status != "disabled");
+            if !is_active {
+                continue;
+            }
+            let same_provider = previous
+                .accounts
+                .get(account_id)
+                .zip(snapshot.accounts.get(account_id))
+                .is_some_and(|(old, new)| {
+                    old.provider_id == new.provider_id && old.status != "disabled"
+                });
+            let generation = same_provider
+                .then(|| previous.account_work_generations.get(account_id))
+                .flatten()
+                .filter(|generation| generation.load(Ordering::Acquire))
+                .cloned()
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
+            snapshot
+                .account_work_generations
+                .insert(account_id.clone(), generation);
+        }
+
+        for (provider_id, generation) in &previous.provider_work_generations {
+            if !snapshot.providers.contains_key(provider_id) {
+                generation.store(false, Ordering::Release);
+            }
+        }
+        for (account_id, generation) in &previous.account_work_generations {
+            if !snapshot.account_work_generations.contains_key(account_id) {
+                generation.store(false, Ordering::Release);
+            }
+        }
+
+        *current = Arc::new(snapshot);
     }
 
     fn snapshot_from_rows(
@@ -219,12 +344,147 @@ impl Registry {
         snap
     }
 
+    pub(crate) fn lifecycle_lock(&self) -> Arc<parking_lot::Mutex<()>> {
+        self.lifecycle.clone()
+    }
+
     /// Take a reference to the current immutable snapshot.
     ///
     /// A request should call this once at the start and use the returned Arc
     /// throughout, so it is unaffected by concurrent configuration changes.
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.inner.read().clone()
+    }
+
+    /// Whether an account still belongs to a provider in the active runtime
+    /// snapshot. Credential resolution uses this to reject stale request
+    /// snapshots after account/provider deletion without retaining tombstones.
+    pub fn contains_provider_account(&self, provider_id: &str, account_id: &str) -> bool {
+        let snapshot = self.snapshot();
+        snapshot.providers.contains_key(provider_id)
+            && snapshot.accounts.get(account_id).is_some_and(|account| {
+                account.provider_id == provider_id && account.status != "disabled"
+            })
+    }
+
+    /// Capture the lifecycle generation to use for provider-scoped work. When
+    /// an account is supplied, its identity is fenced as well.
+    pub fn provider_work_identity(
+        &self,
+        provider_id: &str,
+        account_id: Option<&str>,
+    ) -> Option<ProviderWorkIdentity> {
+        let snapshot = self.inner.read();
+        if !snapshot.providers.contains_key(provider_id) {
+            return None;
+        }
+        let provider_generation = snapshot.provider_work_generations.get(provider_id)?.clone();
+        let account_generation = if let Some(account_id) = account_id {
+            let account = snapshot.accounts.get(account_id)?;
+            if account.provider_id != provider_id || account.status == "disabled" {
+                return None;
+            }
+            Some(snapshot.account_work_generations.get(account_id)?.clone())
+        } else {
+            None
+        };
+        let identity = ProviderWorkIdentity {
+            provider_id: provider_id.to_string(),
+            provider_generation,
+            account_generation,
+            #[cfg(test)]
+            test_provider_id_only: false,
+        };
+        identity.is_current().then_some(identity)
+    }
+
+    /// Bind account work to an already captured provider generation. This
+    /// prevents a queued operation from attaching itself to a recreated
+    /// provider that happens to reuse the same ID.
+    pub fn account_work_identity(
+        &self,
+        provider_identity: &ProviderWorkIdentity,
+        account_id: &str,
+    ) -> Option<ProviderWorkIdentity> {
+        if !provider_identity.is_current() {
+            return None;
+        }
+        let snapshot = self.inner.read();
+        let current_generation = snapshot
+            .provider_work_generations
+            .get(&provider_identity.provider_id)?;
+        if !Arc::ptr_eq(current_generation, &provider_identity.provider_generation) {
+            return None;
+        }
+        let account = snapshot.accounts.get(account_id)?;
+        if account.provider_id != provider_identity.provider_id || account.status == "disabled" {
+            return None;
+        }
+        let identity = ProviderWorkIdentity {
+            provider_id: provider_identity.provider_id.clone(),
+            provider_generation: provider_identity.provider_generation.clone(),
+            account_generation: Some(snapshot.account_work_generations.get(account_id)?.clone()),
+            #[cfg(test)]
+            test_provider_id_only: false,
+        };
+        identity.is_current().then_some(identity)
+    }
+
+    /// Remove a deleted account from the active snapshot immediately. The next
+    /// database-backed reload will publish the complete canonical snapshot.
+    pub fn forget_account(&self, account_id: &str) {
+        let _lifecycle = self.lifecycle.lock();
+        self.forget_account_locked(account_id);
+    }
+
+    pub(crate) fn forget_account_locked(&self, account_id: &str) {
+        let mut current = self.inner.write();
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        let mut snapshot = (**current).clone();
+        snapshot.accounts.remove(account_id);
+        if let Some(generation) = snapshot.account_work_generations.remove(account_id) {
+            generation.store(false, Ordering::Release);
+        }
+        *current = Arc::new(snapshot);
+    }
+
+    /// Remove a deleted provider and its runtime-owned children immediately.
+    pub fn forget_provider(&self, provider_id: &str) {
+        let _lifecycle = self.lifecycle.lock();
+        self.forget_provider_locked(provider_id);
+    }
+
+    pub(crate) fn forget_provider_locked(&self, provider_id: &str) {
+        let mut current = self.inner.write();
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        let mut snapshot = (**current).clone();
+        snapshot.providers.remove(provider_id);
+        if let Some(generation) = snapshot.provider_work_generations.remove(provider_id) {
+            generation.store(false, Ordering::Release);
+        }
+        let removed_accounts = snapshot
+            .accounts
+            .values()
+            .filter(|account| account.provider_id == provider_id)
+            .map(|account| account.id.clone())
+            .collect::<Vec<_>>();
+        for account_id in removed_accounts {
+            snapshot.accounts.remove(&account_id);
+            if let Some(generation) = snapshot.account_work_generations.remove(&account_id) {
+                generation.store(false, Ordering::Release);
+            }
+        }
+        snapshot.provider_order.retain(|id| id != provider_id);
+        snapshot
+            .accounts
+            .retain(|_, account| account.provider_id != provider_id);
+        snapshot
+            .models
+            .retain(|_, model| model.provider_id != provider_id);
+        snapshot
+            .model_by_upstream
+            .retain(|(id, _), _| id != provider_id);
+        *current = Arc::new(snapshot);
     }
 
     /// The number of providers currently in the active snapshot.
@@ -415,15 +675,16 @@ impl Registry {
 impl RegistryPublication<'_> {
     /// Build and publish a fresh snapshot while holding the publication lock.
     pub(crate) async fn reload(self, pool: &Pool) -> Result<()> {
+        let revision = self.registry.revision.fetch_add(1, Ordering::AcqRel) + 1;
         let snapshot = Registry::build_snapshot(pool).await?;
-        self.activate(snapshot);
+        self.registry.activate(snapshot, Some(revision));
         Ok(())
     }
 
     /// Publish a snapshot staged from a transaction after that transaction has
     /// committed. The lock excludes concurrent reloads until activation.
     pub(crate) fn activate(self, snapshot: Snapshot) {
-        self.registry.activate(snapshot);
+        self.registry.activate(snapshot, None);
     }
 }
 

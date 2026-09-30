@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -93,6 +94,7 @@ struct TestCredential {
     secret: Mutex<String>,
     rotations: AtomicUsize,
     mode: RotationMode,
+    cached: Mutex<HashMap<String, ResolvedCredential>>,
 }
 
 impl TestCredential {
@@ -101,6 +103,7 @@ impl TestCredential {
             secret: Mutex::new("stale-token".into()),
             rotations: AtomicUsize::new(0),
             mode,
+            cached: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -109,6 +112,22 @@ impl TestCredential {
 impl CredentialStrategy for TestCredential {
     fn name(&self) -> &'static str {
         "test_rotating_credential"
+    }
+
+    async fn resolve_cached(
+        &self,
+        account: &db::AccountRow,
+    ) -> std::result::Result<Option<ResolvedCredential>, CredentialRotationError> {
+        Ok(self
+            .cached
+            .lock()
+            .await
+            .get(&account.id)
+            .cloned()
+            .map(|mut credential| {
+                credential.rotated = false;
+                credential
+            }))
     }
 
     async fn resolve(
@@ -120,12 +139,17 @@ impl CredentialStrategy for TestCredential {
         } else {
             self.secret.lock().await.clone()
         };
-        Ok(ResolvedCredential {
+        let credential = ResolvedCredential {
             secret,
             expires_at: None,
             refresh_after: None,
             rotated: self.rotations.load(Ordering::Relaxed) > 0,
-        })
+        };
+        self.cached
+            .lock()
+            .await
+            .insert(account.id.clone(), credential.clone());
+        Ok(credential)
     }
 
     async fn health(&self, _account: &db::AccountRow) -> CredentialHealth {
@@ -134,9 +158,10 @@ impl CredentialStrategy for TestCredential {
 
     async fn rotate(
         &self,
-        _account: &db::AccountRow,
+        account: &db::AccountRow,
     ) -> std::result::Result<(), CredentialRotationError> {
         self.rotations.fetch_add(1, Ordering::Relaxed);
+        self.cached.lock().await.remove(&account.id);
         match self.mode {
             RotationMode::Success { delay_ms } => {
                 if delay_ms > 0 {
@@ -165,6 +190,7 @@ struct ResolveRefreshingCredential {
     secret: Mutex<String>,
     refreshes: AtomicUsize,
     rotations: AtomicUsize,
+    cached: Mutex<HashMap<String, ResolvedCredential>>,
 }
 
 impl ResolveRefreshingCredential {
@@ -173,6 +199,7 @@ impl ResolveRefreshingCredential {
             secret: Mutex::new("stale-token".into()),
             refreshes: AtomicUsize::new(0),
             rotations: AtomicUsize::new(0),
+            cached: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -183,17 +210,38 @@ impl CredentialStrategy for ResolveRefreshingCredential {
         "test_resolve_refreshing_credential"
     }
 
+    async fn resolve_cached(
+        &self,
+        account: &db::AccountRow,
+    ) -> std::result::Result<Option<ResolvedCredential>, CredentialRotationError> {
+        Ok(self
+            .cached
+            .lock()
+            .await
+            .get(&account.id)
+            .cloned()
+            .map(|mut credential| {
+                credential.rotated = false;
+                credential
+            }))
+    }
+
     async fn resolve(
         &self,
         account: &db::AccountRow,
     ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
         if account.label == "fallback-account" {
-            return Ok(ResolvedCredential {
+            let credential = ResolvedCredential {
                 secret: "fallback-token".into(),
                 expires_at: None,
                 refresh_after: None,
                 rotated: false,
-            });
+            };
+            self.cached
+                .lock()
+                .await
+                .insert(account.id.clone(), credential.clone());
+            return Ok(credential);
         }
 
         let stale = self.secret.lock().await.as_str() == "stale-token";
@@ -204,12 +252,17 @@ impl CredentialStrategy for ResolveRefreshingCredential {
         }
 
         let now = chrono::Utc::now();
-        Ok(ResolvedCredential {
+        let credential = ResolvedCredential {
             secret: self.secret.lock().await.clone(),
-            expires_at: Some((now.to_owned() + chrono::Duration::hours(2)).to_rfc3339()),
-            refresh_after: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
+            expires_at: Some((now.to_owned() + chrono::Duration::hours(1)).to_rfc3339()),
+            refresh_after: Some((now - chrono::Duration::seconds(1)).to_rfc3339()),
             rotated: stale,
-        })
+        };
+        self.cached
+            .lock()
+            .await
+            .insert(account.id.clone(), credential.clone());
+        Ok(credential)
     }
 
     async fn rotate(
@@ -223,12 +276,14 @@ impl CredentialStrategy for ResolveRefreshingCredential {
 
 struct TerminalResolveCredential {
     rotations: AtomicUsize,
+    cached: Mutex<HashMap<String, ResolvedCredential>>,
 }
 
 impl TerminalResolveCredential {
     fn new() -> Self {
         Self {
             rotations: AtomicUsize::new(0),
+            cached: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -239,17 +294,29 @@ impl CredentialStrategy for TerminalResolveCredential {
         "test_terminal_resolve_credential"
     }
 
+    async fn resolve_cached(
+        &self,
+        account: &db::AccountRow,
+    ) -> std::result::Result<Option<ResolvedCredential>, CredentialRotationError> {
+        Ok(self.cached.lock().await.get(&account.id).cloned())
+    }
+
     async fn resolve(
         &self,
         account: &db::AccountRow,
     ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
         if account.label == "fallback-account" {
-            return Ok(ResolvedCredential {
+            let credential = ResolvedCredential {
                 secret: "fallback-token".into(),
                 expires_at: None,
                 refresh_after: None,
                 rotated: false,
-            });
+            };
+            self.cached
+                .lock()
+                .await
+                .insert(account.id.clone(), credential.clone());
+            return Ok(credential);
         }
 
         Err(CredentialRotationError::new(
@@ -508,6 +575,68 @@ async fn cleanup(harness: Harness) {
 }
 
 #[tokio::test]
+async fn active_provider_work_backoff_does_not_block_inference_credential_resolution() {
+    let strategy = Arc::new(ResolveRefreshingCredential::new());
+    let harness = setup(strategy.clone(), None, 1).await;
+    let provider = db::get_provider(&harness.pool, &harness.provider_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let account = db::get_account(&harness.pool, &harness.account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    harness
+        .state
+        .credential_for(&provider, &account)
+        .await
+        .expect("initial plugin resolution should prime the valid credential cache");
+
+    let work_identity = harness
+        .state
+        .registry
+        .provider_work_identity(&harness.provider_id, None)
+        .expect("test provider should have an active work identity");
+    harness
+        .state
+        .provider_work
+        .acquire(
+            work_identity,
+            kinetix::provider_work::ProviderWorkClass::ModelDiscovery,
+        )
+        .await
+        .unwrap()
+        .finish_failure(Some(
+            kinetix::provider_work::ProviderBackoffEvidence::Transient {
+                retry_after_secs: None,
+            },
+        ))
+        .await;
+
+    let response = pipeline::run(
+        &harness.state,
+        FrontendFormat::OpenAi,
+        None,
+        harness.request.clone(),
+        "req_credential_resolution_during_provider_backoff".into(),
+        true,
+        None,
+        vec![],
+    )
+    .await
+    .expect("provider-scoped control-plane backoff must not block inference");
+    consume(response).await;
+
+    assert_eq!(strategy.refreshes.load(Ordering::Relaxed), 1);
+    assert_eq!(strategy.rotations.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        harness.upstream.attempts.lock().await.as_slice(),
+        ["Bearer fresh-token"]
+    );
+    cleanup(harness).await;
+}
+
+#[tokio::test]
 async fn plugin_auth_error_rotates_and_retries_same_account_before_disable() {
     let strategy = Arc::new(TestCredential::new(RotationMode::Success { delay_ms: 0 }));
     let harness = setup(strategy.clone(), None, 1).await;
@@ -544,6 +673,11 @@ async fn plugin_auth_error_rotates_and_retries_same_account_before_disable() {
 async fn retryable_rotation_failure_cools_down_and_falls_back_without_disabling() {
     let strategy = Arc::new(TestCredential::new(RotationMode::RetryableFailure));
     let harness = setup(strategy.clone(), None, 2).await;
+    let fallback_account = db::get_account(&harness.pool, &harness.fallback_account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    strategy.resolve(&fallback_account).await.unwrap();
 
     let response = pipeline::run(
         &harness.state,

@@ -55,21 +55,6 @@ when it skips multiple targets behind an open provider circuit.
 | `kinetix_cost_usd_total` | Total known spend. |
 | `kinetix_avg_latency_ms` / `kinetix_avg_ttft_ms` | Averages. |
 | `kinetix_cached_tokens_total` / `kinetix_cache_write_tokens_total` | Cache-read / cache-write token totals. |
-
-Admission metrics omit key and Route identities to keep label cardinality bounded. Incomplete usage keeps the conservative token reservation; the oldest-reservation age is exposed without imposing a fixed stale threshold.
-
-Cache status is derived from final normalized provider usage, not cache affinity or
-a static request flag:
-
-- `cached_tokens > 0` → `hit`
-- otherwise `cache_write_tokens > 0` → `miss`
-- neither observed → `bypass`
-
-For Anthropic streaming, `message_start` normally reports cache usage before
-Kinetix commits the downstream response, so `X-Kinetix-Cache` uses that
-pre-commit value. Persisted request/usage records are authoritative and are
-recomputed from the final usage even when a protocol cannot expose cache usage
-before response commit.
 | `kinetix_fallback_hops_total` / `kinetix_route_fallbacks_total` / `kinetix_route_skip_total` | Routing. |
 | `kinetix_failures_pre_commit_total` / `kinetix_failures_post_commit_total` | Failures before/after the commit point. |
 | `kinetix_cancellations_total` / `kinetix_cancellation_latency_ms` | Client disconnects + detection latency. |
@@ -88,7 +73,39 @@ before response commit.
 | `kinetix_admission_rejections_total{reason}` | Local RPM, TPM, budget, and concurrency rejections; label values are a fixed set. |
 | `kinetix_admission_inflight_inferences` | Current requests counted against the instance-wide cap. |
 | `kinetix_admission_reservation_oldest_age_seconds` | Age of the oldest active reservation; use workload-specific alert thresholds. |
+| `kinetix_provider_work_scheduled_total` | Provider-scoped work submitted to the coordinator. |
+| `kinetix_provider_work_executed_total` | Work started after acquiring a provider budget permit. |
+| `kinetix_provider_work_coalesced_total` | Calls sharing equivalent in-flight provider work. |
+| `kinetix_provider_work_rate_limited_total` | Work delayed by local rate or spacing budgets. |
+| `kinetix_provider_work_provider_throttled_total` | Failures classified as provider-wide throttling or transient unavailability. |
+| `kinetix_provider_work_backed_off_total` | Work suppressed by provider backoff. |
+| `kinetix_provider_work_failed_total` | Failed or interrupted provider work. |
 | `kinetix_allocations_total` / `kinetix_alloc_bytes_total` | Allocations per request (only when built `--features alloc-stats`; `0` otherwise = honestly "not measured"). |
+
+Provider-work counters omit provider, account, and model labels. The coordinator
+budgets refresh-capable credential resolution, discovery, probes, pricing refresh,
+and cached routing-fact refresh. Each actual per-account discovery operation gets
+its own permit while reconciliation remains singleflight. Cached credential reads
+bypass this coordinator on inference paths; probes, discovery, and routing-fact
+refresh stay off inference paths. The coordinator uses the scope assigned by
+Kinetix to each operation: account-scoped rate limits retain account cooldown
+behavior, while provider-scoped evidence can trigger bounded provider backoff.
+This describes Kinetix policy, not upstream quota semantics.
+
+Admission metrics omit key and Route identities to keep label cardinality bounded. Incomplete usage keeps the conservative token reservation; the oldest-reservation age is exposed without imposing a fixed stale threshold.
+
+Cache status is derived from final normalized provider usage, not cache affinity or
+a static request flag:
+
+- `cached_tokens > 0` → `hit`
+- otherwise `cache_write_tokens > 0` → `miss`
+- neither observed → `bypass`
+
+For Anthropic streaming, `message_start` normally reports cache usage before
+Kinetix commits the downstream response, so `X-Kinetix-Cache` uses that
+pre-commit value. Persisted request/usage records are authoritative and are
+recomputed from the final usage even when a protocol cannot expose cache usage
+before response commit.
 
 ## Route Trace
 
