@@ -249,6 +249,12 @@ pub struct AdmissionBudgetSnapshot {
     pub monthly: AdmissionBudgetPeriodSnapshot,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AdmissionBudgetSnapshotAt {
+    pub captured_at: chrono::DateTime<Utc>,
+    pub snapshot: AdmissionBudgetSnapshot,
+}
+
 pub struct AdmissionReservation {
     entry: Arc<KeyAdmission>,
     // Instrument the existing reservation lifetime without changing ledger policy.
@@ -358,28 +364,22 @@ impl AdmissionController {
             .unwrap_or_default()
     }
 
-    /// Client-safe aggregate view of settled spend and active budget reservations.
-    pub async fn budget_snapshot(
+    /// Client-safe aggregate view, timestamped atomically with the ledger snapshot.
+    pub async fn budget_snapshot_current(
         &self,
         pool: &Pool,
         key_id: &str,
-    ) -> anyhow::Result<AdmissionBudgetSnapshot> {
-        self.budget_snapshot_at(pool, key_id, Utc::now(), Instant::now())
-            .await
-    }
-
-    pub async fn budget_snapshot_at(
-        &self,
-        pool: &Pool,
-        key_id: &str,
-        wall_now: chrono::DateTime<Utc>,
-        instant_now: Instant,
-    ) -> anyhow::Result<AdmissionBudgetSnapshot> {
+    ) -> anyhow::Result<AdmissionBudgetSnapshotAt> {
         let entry = self.entry(key_id);
-        self.ensure_initialized_at(pool, key_id, &entry, wall_now, instant_now)
-            .await?;
-        let snapshot = entry.ledger.lock().budget_snapshot(wall_now, instant_now);
-        Ok(snapshot)
+        self.ensure_initialized(pool, key_id, &entry).await?;
+
+        let mut ledger = entry.ledger.lock();
+        let captured_at = Utc::now();
+        let snapshot = ledger.budget_snapshot(captured_at, Instant::now());
+        Ok(AdmissionBudgetSnapshotAt {
+            captured_at,
+            snapshot,
+        })
     }
 
     pub fn reserve_concurrency(
@@ -1001,6 +1001,33 @@ mod tests {
         (controller, entry)
     }
 
+    #[tokio::test]
+    async fn current_budget_snapshot_timestamps_the_locked_ledger_period() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-admission-current-snapshot-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = db::connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+            .await
+            .unwrap();
+        let (controller, entry) = initialized_controller();
+
+        let budget_at = controller
+            .budget_snapshot_current(&pool, "key")
+            .await
+            .unwrap();
+        let ledger = entry.ledger.lock();
+        assert_eq!(ledger.daily_day, Some(budget_at.captured_at.date_naive()));
+        assert_eq!(
+            ledger.monthly_key,
+            Some((budget_at.captured_at.year(), budget_at.captured_at.month()))
+        );
+        drop(ledger);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn burst(
         controller: AdmissionController,
         entry: Arc<KeyAdmission>,
@@ -1207,9 +1234,10 @@ mod tests {
             )
             .is_err());
 
-        let stale_snapshot = ledger.budget_snapshot(before_midnight, before_instant);
-        assert_eq!(stale_snapshot.daily.settled_spend_usd, 0.8);
-        assert_eq!(stale_snapshot.monthly.settled_spend_usd, 0.8);
+        // A historical timestamp must not roll the authoritative ledger back.
+        ledger.roll_periods(before_midnight);
+        assert_eq!(ledger.daily_spend, 0.8);
+        assert_eq!(ledger.monthly_spend, 0.8);
         assert_eq!(ledger.daily_day, Some(after_midnight.date_naive()));
         assert_eq!(
             ledger.monthly_key,

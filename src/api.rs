@@ -526,8 +526,22 @@ pub async fn client_usage(State(state): State<AppState>, headers: HeaderMap) -> 
         return error_response(format, &request_id, error);
     }
 
-    let now = chrono::Utc::now();
-    client_usage_for_key(&state, &key, format, request_id, now).await
+    let budget_at = match state
+        .admission
+        .budget_snapshot_current(&state.pool, &key.id)
+        .await
+    {
+        Ok(budget_at) => budget_at,
+        Err(error) => {
+            tracing::error!(%error, key_id = %key.id, "client usage admission snapshot failed");
+            return error_response(
+                format,
+                &request_id,
+                ProxyError::unavailable("usage temporarily unavailable"),
+            );
+        }
+    };
+    client_usage_for_key(&state, &key, format, request_id, budget_at).await
 }
 
 async fn client_usage_for_key(
@@ -535,8 +549,10 @@ async fn client_usage_for_key(
     key: &crate::db::VirtualKeyRow,
     format: FrontendFormat,
     request_id: String,
-    now: chrono::DateTime<chrono::Utc>,
+    budget_at: crate::admission::AdmissionBudgetSnapshotAt,
 ) -> Response {
+    let now = budget_at.captured_at;
+    let budget = budget_at.snapshot;
     let daily_start = now
         .date_naive()
         .and_hms_opt(0, 0, 0)
@@ -563,21 +579,6 @@ async fn client_usage_for_key(
     let now_iso = now.to_rfc3339();
     let daily_from = daily_start.to_rfc3339();
     let monthly_from = monthly_start.to_rfc3339();
-    let budget = match state
-        .admission
-        .budget_snapshot_at(&state.pool, &key.id, now, std::time::Instant::now())
-        .await
-    {
-        Ok(budget) => budget,
-        Err(error) => {
-            tracing::error!(%error, key_id = %key.id, "client usage admission snapshot failed");
-            return error_response(
-                format,
-                &request_id,
-                ProxyError::unavailable("usage temporarily unavailable"),
-            );
-        }
-    };
 
     let (daily, monthly) = match tokio::try_join!(
         db::client_usage_summary(&state.pool, &key.id, &daily_from, &now_iso),
@@ -1090,33 +1091,50 @@ mod client_usage_tests {
     }
 
     #[tokio::test]
-    async fn usage_snapshot_uses_captured_utc_period_across_midnight() {
+    async fn usage_snapshot_uses_admission_period_across_midnight() {
         let (state, root) = test_state("usage-period-rollover").await;
         let key = test_key("period-key", "period-client-key", "active");
         db::insert_virtual_key(&state.pool, &key).await.unwrap();
-        let captured_at = chrono::Utc::now()
-            .date_naive()
-            .pred_opt()
+        // Simulate a request straddling midnight. The response receives only the timestamp
+        // paired with the newer admission snapshot, never the earlier handler timestamp.
+        let stale_api_time = chrono::DateTime::parse_from_rfc3339("2026-01-31T23:59:59.999Z")
             .unwrap()
-            .and_hms_milli_opt(23, 59, 59, 999)
+            .with_timezone(&chrono::Utc);
+        let captured_at = chrono::DateTime::parse_from_rfc3339("2026-02-01T00:00:02Z")
             .unwrap()
-            .and_utc();
-        let mut row = usage_row(&key.id, Some(10), Some(20), Some(0.8));
-        row.ts = captured_at
-            .date_naive()
-            .and_hms_opt(12, 0, 0)
-            .unwrap()
-            .and_utc()
-            .to_rfc3339();
-        db::insert_usage_log(&state.pool, &row).await.unwrap();
-        assert!(chrono::Utc::now().date_naive() > captured_at.date_naive());
+            .with_timezone(&chrono::Utc);
+        assert!(stale_api_time < captured_at);
 
+        let mut prior_period_row = usage_row(&key.id, None, None, None);
+        prior_period_row.ts = "2026-01-31T12:00:00+00:00".into();
+        db::insert_usage_log(&state.pool, &prior_period_row)
+            .await
+            .unwrap();
+        let mut current_period_row = usage_row(&key.id, Some(10), Some(20), Some(0.8));
+        current_period_row.ts = "2026-02-01T00:00:01+00:00".into();
+        db::insert_usage_log(&state.pool, &current_period_row)
+            .await
+            .unwrap();
+
+        let budget_at = crate::admission::AdmissionBudgetSnapshotAt {
+            captured_at,
+            snapshot: crate::admission::AdmissionBudgetSnapshot {
+                daily: crate::admission::AdmissionBudgetPeriodSnapshot {
+                    settled_spend_usd: 0.8,
+                    ..Default::default()
+                },
+                monthly: crate::admission::AdmissionBudgetPeriodSnapshot {
+                    settled_spend_usd: 0.8,
+                    ..Default::default()
+                },
+            },
+        };
         let response = client_usage_for_key(
             &state,
             &key,
             FrontendFormat::OpenAi,
             "period-rollover-test".into(),
-            captured_at,
+            budget_at,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1156,11 +1174,13 @@ mod client_usage_tests {
         assert_eq!(body["resets"]["daily"], expected_daily_reset);
         assert_eq!(body["usage"]["daily"]["requests"], 1);
         assert_eq!(body["usage"]["daily"]["known_cost_usd"], 0.8);
+        assert_eq!(body["usage"]["daily"]["unknown_cost_requests"], 0);
         assert_eq!(body["remaining"]["daily_budget_usd"], 4.2);
         assert_eq!(body["periods"]["monthly"]["from"], expected_monthly_from);
         assert_eq!(body["periods"]["monthly"]["to"], captured_at.to_rfc3339());
         assert_eq!(body["resets"]["monthly"], expected_monthly_reset);
         assert_eq!(body["usage"]["monthly"]["requests"], 1);
+        assert_eq!(body["usage"]["monthly"]["unknown_cost_requests"], 0);
         assert_eq!(body["remaining"]["monthly_budget_usd"], 49.2);
         let _ = std::fs::remove_dir_all(root);
     }
