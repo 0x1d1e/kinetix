@@ -552,8 +552,10 @@ impl Drop for ProviderAttempt {
 pub fn qualifies(kind: FailureKind, status: Option<u16>) -> bool {
     match kind {
         FailureKind::ConnectionError | FailureKind::Timeout => true,
-        FailureKind::ServerError | FailureKind::MalformedUpstream => {
-            matches!(status, Some(502..=504))
+        FailureKind::ServerError => matches!(status, Some(502..=504)),
+        FailureKind::MalformedUpstream => {
+            // Adapter parse failures on successful responses have no origin HTTP status.
+            status.is_none() || matches!(status, Some(502..=504))
         }
         FailureKind::RateLimit
         | FailureKind::QuotaExhausted
@@ -904,13 +906,14 @@ mod tests {
     }
 
     #[test]
-    fn only_gateway_style_upstream_failures_qualify() {
+    fn provider_circuit_qualification_uses_failure_kind_and_status() {
         assert!(!qualifies(FailureKind::ServerError, Some(500)));
         assert!(qualifies(FailureKind::ServerError, Some(502)));
         assert!(qualifies(FailureKind::ServerError, Some(503)));
         assert!(qualifies(FailureKind::ServerError, Some(504)));
         assert!(qualifies(FailureKind::MalformedUpstream, Some(502)));
-        assert!(!qualifies(FailureKind::MalformedUpstream, None));
+        assert!(qualifies(FailureKind::MalformedUpstream, None));
+        assert!(!qualifies(FailureKind::MalformedUpstream, Some(500)));
         assert!(!qualifies(FailureKind::PluginFailure, Some(502)));
         assert!(!qualifies(FailureKind::ClientCancelled, None));
         assert!(qualifies(FailureKind::Timeout, None));
