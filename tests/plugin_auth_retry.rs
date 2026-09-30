@@ -592,11 +592,16 @@ async fn active_provider_work_backoff_does_not_block_inference_credential_resolu
         .await
         .expect("initial plugin resolution should prime the valid credential cache");
 
+    let work_identity = harness
+        .state
+        .registry
+        .provider_work_identity(&harness.provider_id, None)
+        .expect("test provider should have an active work identity");
     harness
         .state
         .provider_work
         .acquire(
-            &harness.provider_id,
+            work_identity,
             kinetix::provider_work::ProviderWorkClass::ModelDiscovery,
         )
         .await

@@ -519,10 +519,13 @@ pub fn spawn_background_tasks(state: AppState) {
                     let state = st.clone();
                     jobs.spawn(async move {
                         let refresh_plugin_id = plugin_id.clone();
+                        let identity = state
+                            .provider_work
+                            .auxiliary_identity(&format!("plugin:{plugin_id}"));
                         let result = state
                             .provider_work
                             .run(
-                                format!("plugin:{plugin_id}"),
+                                identity,
                                 crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
                                 Some("cached_snapshot".into()),
                                 move || async move {
@@ -779,6 +782,9 @@ async fn run_plugin_health_probes_for_provider(
         {
             continue;
         }
+        let Some(identity) = state.provider_work_identity(&provider.id, Some(&account.id)) else {
+            continue;
+        };
         let probe_plugin = pref.plugin_id.clone();
         let probe_provider = provider.id.clone();
         let probe_account = account.id.clone();
@@ -786,7 +792,7 @@ async fn run_plugin_health_probes_for_provider(
         let probe = match state
             .provider_work
             .run(
-                provider.id.clone(),
+                identity,
                 crate::provider_work::ProviderWorkClass::HealthProbe,
                 Some(format!("account:{}", account.id)),
                 move || async move {

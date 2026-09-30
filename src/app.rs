@@ -175,6 +175,9 @@ impl AppState {
         let sessions = Arc::new(crate::auth::Sessions::new(config.session_ttl_minutes));
         let plugin_auth_sessions = Arc::new(crate::auth::PluginAuthSessions::new());
         let target_telemetry = crate::target_telemetry::TargetTelemetry::new(pool.clone());
+        let provider_work = crate::provider_work::ProviderWorkCoordinator::with_lifecycle_lock(
+            registry.lifecycle_lock(),
+        );
         let (hook_tx, hook_rx) = tokio::sync::mpsc::channel::<HookJob>(HOOK_QUEUE_CAPACITY);
         spawn_hook_worker(hook_rx);
         AppState {
@@ -185,7 +188,7 @@ impl AppState {
             credentials,
             plugin_credentials: Arc::new(DashMap::new()),
             credential_refresh: crate::credential_refresh::RefreshCoordinator::default(),
-            provider_work: crate::provider_work::ProviderWorkCoordinator::default(),
+            provider_work,
             adapters: AdapterRegistry::new(),
             http,
             outbound_clients: Arc::new(DashMap::new()),
@@ -285,7 +288,8 @@ impl AppState {
 
     /// Release account-scoped credential cache and refresh state after deletion.
     pub fn forget_deleted_account(&self, provider_id: &str, account_id: &str) {
-        self.registry.forget_account(account_id);
+        self.provider_work
+            .forget_account_with(|| self.registry.forget_account_locked(account_id));
         self.credential_refresh.forget(provider_id, account_id);
         for strategy in self.plugin_credentials.iter() {
             strategy.value().forget_account(provider_id, account_id);
@@ -294,17 +298,31 @@ impl AppState {
 
     /// Release provider-scoped work and credential state after deletion.
     pub fn forget_deleted_provider(&self, provider_id: &str) {
-        self.registry.forget_provider(provider_id);
-        self.provider_work.forget_provider(provider_id);
+        self.provider_work.forget_provider_with(provider_id, || {
+            self.registry.forget_provider_locked(provider_id)
+        });
         self.credential_refresh.forget_provider(provider_id);
         for strategy in self.plugin_credentials.iter() {
             strategy.value().forget_provider(provider_id);
         }
     }
 
-    fn credential_identity_is_current(&self, provider_id: &str, account_id: &str) -> bool {
+    pub(crate) fn provider_work_identity(
+        &self,
+        provider_id: &str,
+        account_id: Option<&str>,
+    ) -> Option<crate::registry::ProviderWorkIdentity> {
         self.registry
-            .contains_provider_account(provider_id, account_id)
+            .provider_work_identity(provider_id, account_id)
+    }
+
+    pub(crate) fn account_work_identity(
+        &self,
+        provider_identity: &crate::registry::ProviderWorkIdentity,
+        account_id: &str,
+    ) -> Option<crate::registry::ProviderWorkIdentity> {
+        self.registry
+            .account_work_identity(provider_identity, account_id)
     }
 
     fn credential_state_evicted_error() -> CredentialRotationError {
@@ -324,9 +342,10 @@ impl AppState {
         account: &crate::db::AccountRow,
     ) -> std::result::Result<crate::credentials::ResolvedCredential, CredentialRotationError> {
         if let Some(r) = provider.credential_plugin_ref() {
-            if !self.credential_identity_is_current(&provider.id, &account.id) {
+            let Some(identity) = self.provider_work_identity(&provider.id, Some(&account.id))
+            else {
                 return Err(Self::credential_state_evicted_error());
-            }
+            };
             let Some(strategy) = self.plugin_credentials.get(&r.plugin_id) else {
                 return Err(CredentialRotationError::new(
                     "plugin_internal",
@@ -347,6 +366,9 @@ impl AppState {
                 .resolve_cached(&provider_id, Arc::clone(&strategy), &account)
                 .await?
             {
+                if !identity.is_current() {
+                    return Err(Self::credential_state_evicted_error());
+                }
                 return Ok(credential);
             }
 
@@ -355,7 +377,7 @@ impl AppState {
             let result = self
                 .provider_work
                 .run(
-                    provider_id.clone(),
+                    identity,
                     crate::provider_work::ProviderWorkClass::CredentialRefresh,
                     Some(format!("account:{}", account.id)),
                     move || async move { refresh.resolve(&provider_id, strategy, &account).await },
@@ -426,9 +448,9 @@ impl AppState {
         let Some(r) = provider.credential_plugin_ref() else {
             return Ok(false);
         };
-        if !self.credential_identity_is_current(&provider.id, &account.id) {
+        let Some(identity) = self.provider_work_identity(&provider.id, Some(&account.id)) else {
             return Err(Self::credential_state_evicted_error());
-        }
+        };
         let strategy = self
             .plugin_credentials
             .get(&r.plugin_id)
@@ -453,7 +475,7 @@ impl AppState {
         let result = self
             .provider_work
             .run(
-                provider_id.clone(),
+                identity,
                 crate::provider_work::ProviderWorkClass::CredentialRefresh,
                 None,
                 move || async move {
@@ -600,11 +622,11 @@ impl AppState {
                 return;
             }
         };
-        if !self.credential_identity_is_current(&provider.id, &account.id) {
+        let Some(identity) = self.provider_work_identity(&provider.id, Some(&account.id)) else {
             self.credential_refresh
                 .forget(&key.provider_id, &key.account_id);
             return;
-        }
+        };
         let Some(reference) = provider.credential_plugin_ref() else {
             self.credential_refresh
                 .forget(&key.provider_id, &key.account_id);
@@ -626,7 +648,7 @@ impl AppState {
         let result = self
             .provider_work
             .run(
-                provider_id.clone(),
+                identity,
                 crate::provider_work::ProviderWorkClass::CredentialRefresh,
                 None,
                 move || async move {

@@ -18,6 +18,7 @@ use tokio::time::Instant;
 use crate::credentials::CredentialRotationError;
 use crate::outbound::OutboundError;
 use crate::plugins::runtime::PluginFault;
+use crate::registry::ProviderWorkIdentity;
 use crate::types::{FailureCategory, FailureKind, UpstreamFailure};
 
 const MAX_CONCURRENT_PER_PROVIDER: usize = 2;
@@ -139,14 +140,8 @@ struct ProviderGate {
     rate: tokio::sync::Mutex<RateState>,
 }
 
-tokio::task_local! {
-    static PROVIDER_WORK_SCOPE: ProviderWorkScope;
-}
-
-#[derive(Clone)]
-struct ProviderWorkScope {
-    coordinator: Arc<()>,
-    provider_id: String,
+struct ProviderGateEntry {
+    generation: Arc<std::sync::atomic::AtomicBool>,
     gate: Arc<ProviderGate>,
 }
 
@@ -197,6 +192,12 @@ impl ProviderBackoffEvidence {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderWorkAcquireError {
+    BackedOff(Duration),
+    Aborted,
+}
+
 #[derive(Debug)]
 pub enum ProviderWorkError<E> {
     /// An upstream failure installed provider backoff. The work was not run.
@@ -214,37 +215,128 @@ pub enum ProviderWorkError<E> {
 /// with no high-cardinality provider/account/model labels.
 #[derive(Clone, Default)]
 pub struct ProviderWorkCoordinator {
-    providers: Arc<DashMap<String, Arc<ProviderGate>>>,
+    providers: Arc<DashMap<String, ProviderGateEntry>>,
     flights: Arc<DashMap<FlightKey, Arc<dyn Any + Send + Sync>>>,
     flight_registration: Arc<parking_lot::Mutex<()>>,
-    identity: Arc<()>,
+    lifecycle: Arc<parking_lot::Mutex<()>>,
     metrics: Arc<WorkMetrics>,
+    #[cfg(test)]
+    test_generations: Arc<DashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl ProviderWorkCoordinator {
-    fn gate(&self, provider_id: &str) -> Arc<ProviderGate> {
-        if let Some(gate) = PROVIDER_WORK_SCOPE
-            .try_with(|scope| {
-                (scope.provider_id == provider_id
-                    && Arc::ptr_eq(&scope.coordinator, &self.identity))
-                .then(|| scope.gate.clone())
-            })
-            .ok()
-            .flatten()
-        {
-            return gate;
+    pub(crate) fn with_lifecycle_lock(lifecycle: Arc<parking_lot::Mutex<()>>) -> Self {
+        Self {
+            lifecycle,
+            ..Self::default()
         }
-        self.providers
-            .entry(provider_id.to_string())
-            .or_insert_with(|| Arc::new(ProviderGate::default()))
-            .clone()
     }
 
-    /// Release provider-scoped budget state after provider deletion. Work that
-    /// already captured the gate may finish against it, but cannot recreate the
-    /// entry after eviction.
+    #[cfg(test)]
+    pub(crate) fn state_counts(&self) -> (usize, usize) {
+        (self.providers.len(), self.flights.len())
+    }
+
+    #[cfg(test)]
+    fn normalize_test_identity(&self, mut identity: ProviderWorkIdentity) -> ProviderWorkIdentity {
+        if identity.test_provider_id_only {
+            let generation = self
+                .providers
+                .get(&identity.provider_id)
+                .map(|entry| entry.generation.clone())
+                .unwrap_or_else(|| {
+                    self.test_generations
+                        .entry(identity.provider_id.clone())
+                        .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(true)))
+                        .clone()
+                });
+            self.test_generations
+                .insert(identity.provider_id.clone(), generation.clone());
+            identity.provider_generation = generation;
+            identity.test_provider_id_only = false;
+        }
+        identity
+    }
+
+    #[cfg(not(test))]
+    fn normalize_test_identity(&self, identity: ProviderWorkIdentity) -> ProviderWorkIdentity {
+        identity
+    }
+
+    /// Create an identity for coordinator-owned work that is not attached to a
+    /// configured Provider, such as plugin routing-fact refresh.
+    pub(crate) fn auxiliary_identity(&self, scope: &str) -> ProviderWorkIdentity {
+        let _lifecycle = self.lifecycle.lock();
+        let entry = self
+            .providers
+            .entry(scope.to_string())
+            .or_insert_with(|| ProviderGateEntry {
+                generation: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                gate: Arc::new(ProviderGate::default()),
+            });
+        ProviderWorkIdentity {
+            provider_id: scope.to_string(),
+            provider_generation: entry.generation.clone(),
+            account_generation: None,
+            #[cfg(test)]
+            test_provider_id_only: false,
+        }
+    }
+
+    fn gate_for_identity_locked(
+        &self,
+        identity: &ProviderWorkIdentity,
+    ) -> Option<Arc<ProviderGate>> {
+        if !identity.is_current() {
+            return None;
+        }
+        match self.providers.entry(identity.provider_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(entry)
+                if Arc::ptr_eq(&entry.get().generation, &identity.provider_generation) =>
+            {
+                Some(entry.get().gate.clone())
+            }
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let gate = Arc::new(ProviderGate::default());
+                entry.insert(ProviderGateEntry {
+                    generation: identity.provider_generation.clone(),
+                    gate: gate.clone(),
+                });
+                Some(gate)
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let gate = Arc::new(ProviderGate::default());
+                entry.insert(ProviderGateEntry {
+                    generation: identity.provider_generation.clone(),
+                    gate: gate.clone(),
+                });
+                Some(gate)
+            }
+        }
+    }
+
+    /// Release provider-scoped state atomically with invalidating its registry
+    /// identity. Stale work holding the previous identity cannot recreate the
+    /// gate after this transition.
+    pub fn forget_provider_with(&self, provider_id: &str, invalidate: impl FnOnce()) {
+        let _lifecycle = self.lifecycle.lock();
+        invalidate();
+        if let Some((_, entry)) = self.providers.remove(provider_id) {
+            entry
+                .generation
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Release provider-scoped budget state after provider deletion.
     pub fn forget_provider(&self, provider_id: &str) {
-        self.providers.remove(provider_id);
+        self.forget_provider_with(provider_id, || {});
+    }
+
+    /// Invalidate account work atomically with the registry's account removal.
+    pub fn forget_account_with(&self, invalidate: impl FnOnce()) {
+        let _lifecycle = self.lifecycle.lock();
+        invalidate();
     }
 
     pub fn metrics_snapshot(&self) -> ProviderWorkMetricsSnapshot {
@@ -266,13 +358,12 @@ impl ProviderWorkCoordinator {
         Duration::from_millis(rand::thread_rng().gen_range(0..=max_ms))
     }
 
-    /// Run provider work, optionally coalescing concurrent equivalent work.
-    /// `classify_failure` returns normalized upstream evidence that should
-    /// extend the provider-wide bounded backoff. Request/configuration failures
-    /// should return `None`.
+    /// Run provider work using the lifecycle identity captured from the active
+    /// registry snapshot. The coordinator rejects identities invalidated by
+    /// deletion before admitting work or registering a singleflight.
     pub async fn run<T, E, F, Fut, C>(
         &self,
-        provider_id: impl Into<String>,
+        identity: impl Into<ProviderWorkIdentity>,
         class: ProviderWorkClass,
         singleflight_key: Option<String>,
         work: F,
@@ -285,26 +376,46 @@ impl ProviderWorkCoordinator {
         Fut: Future<Output = Result<T, E>> + Send + 'static,
         C: Fn(&E) -> Option<ProviderBackoffEvidence> + Send + Sync + 'static,
     {
-        self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
-        let provider_id = provider_id.into();
-        let gate = self.gate(&provider_id);
+        let identity = self.normalize_test_identity(identity.into());
         if let Some(key) = singleflight_key {
-            let coordinator = self.clone();
-            let flight_gate = gate.clone();
-            self.singleflight(provider_id.clone(), class, key, gate, move || async move {
-                coordinator
-                    .execute(class, flight_gate, work, classify_failure)
-                    .await
-            })
+            let registration = {
+                let _lifecycle = self.lifecycle.lock();
+                let Some(gate) = self.gate_for_identity_locked(&identity) else {
+                    return Err(Arc::new(ProviderWorkError::Aborted));
+                };
+                self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
+                let coordinator = self.clone();
+                let flight_identity = identity.clone();
+                let flight_gate = gate;
+                let flight_key = FlightKey {
+                    provider_id: identity.provider_id.clone(),
+                    class,
+                    key,
+                    result_types: TypeId::of::<(T, E)>(),
+                };
+                self.register_singleflight(flight_key, move || async move {
+                    coordinator
+                        .execute(flight_identity, class, flight_gate, work, classify_failure)
+                        .await
+                })
+            };
+            self.wait_singleflight(
+                registration.0,
+                registration.1,
+                registration.2,
+                registration.3,
+            )
             .await
         } else {
-            let scope = ProviderWorkScope {
-                coordinator: self.identity.clone(),
-                provider_id,
-                gate: gate.clone(),
+            let gate = {
+                let _lifecycle = self.lifecycle.lock();
+                let Some(gate) = self.gate_for_identity_locked(&identity) else {
+                    return Err(Arc::new(ProviderWorkError::Aborted));
+                };
+                self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
+                gate
             };
-            PROVIDER_WORK_SCOPE
-                .scope(scope, self.execute(class, gate, work, classify_failure))
+            self.execute(identity, class, gate, work, classify_failure)
                 .await
         }
     }
@@ -314,7 +425,7 @@ impl ProviderWorkCoordinator {
     /// request it performs.
     pub async fn coalesce<T, E, F, Fut>(
         &self,
-        provider_id: impl Into<String>,
+        identity: impl Into<ProviderWorkIdentity>,
         class: ProviderWorkClass,
         key: String,
         work: F,
@@ -325,101 +436,102 @@ impl ProviderWorkCoordinator {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, E>> + Send + 'static,
     {
-        self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
-        let provider_id = provider_id.into();
-        let gate = self.gate(&provider_id);
-        let work = move || async move {
-            work()
-                .await
-                .map(Arc::new)
-                .map_err(|error| Arc::new(ProviderWorkError::Operation(error)))
+        let identity = self.normalize_test_identity(identity.into());
+        let flight_key = FlightKey {
+            provider_id: identity.provider_id.clone(),
+            class,
+            key,
+            result_types: TypeId::of::<(T, E)>(),
         };
-        self.singleflight(provider_id, class, key, gate, work).await
+        let registration = {
+            let _lifecycle = self.lifecycle.lock();
+            if self.gate_for_identity_locked(&identity).is_none() {
+                return Err(Arc::new(ProviderWorkError::Aborted));
+            }
+            self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
+            let work_identity = identity.clone();
+            self.register_singleflight(flight_key, move || async move {
+                if !work_identity.is_current() {
+                    return Err(Arc::new(ProviderWorkError::Aborted));
+                }
+                work()
+                    .await
+                    .map(Arc::new)
+                    .map_err(|error| Arc::new(ProviderWorkError::Operation(error)))
+            })
+        };
+        self.wait_singleflight(
+            registration.0,
+            registration.1,
+            registration.2,
+            registration.3,
+        )
+        .await
     }
 
-    async fn singleflight<T, E, F, Fut>(
+    fn register_singleflight<T, E, F, Fut>(
         &self,
-        provider_id: String,
-        class: ProviderWorkClass,
-        key: String,
-        gate: Arc<ProviderGate>,
+        flight_key: FlightKey,
         work: F,
-    ) -> WorkResult<T, E>
+    ) -> (FlightKey, Arc<dyn Any + Send + Sync>, bool, bool)
     where
         T: Send + Sync + 'static,
         E: Send + Sync + 'static,
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = WorkResult<T, E>> + Send + 'static,
     {
-        let flight_key = FlightKey {
-            provider_id,
-            class,
-            key,
-            result_types: TypeId::of::<(T, E)>(),
-        };
-        let mut work = Some(work);
-        // Serialize only registration. Existing keys are joined before the cap
-        // is considered, and concurrent unique insertions cannot exceed it.
-        let registration = {
-            let _registration = self.flight_registration.lock();
-            if let Some(existing) = self.flights.get(&flight_key) {
-                Some((existing.value().clone(), false))
-            } else if self.flights.len() >= MAX_SINGLEFLIGHTS {
-                None
-            } else {
-                let (tx, mut rx) = tokio::sync::watch::channel(None::<WorkResult<T, E>>);
-                let result = async move {
-                    loop {
-                        if let Some(result) = rx.borrow().clone() {
-                            return result;
-                        }
-                        if rx.changed().await.is_err() {
-                            return Err(Arc::new(ProviderWorkError::Aborted));
-                        }
-                    }
+        let _registration = self.flight_registration.lock();
+        if let Some(existing) = self.flights.get(&flight_key) {
+            return (flight_key, existing.value().clone(), false, true);
+        }
+
+        let tracked = self.flights.len() < MAX_SINGLEFLIGHTS;
+        let (tx, mut rx) = tokio::sync::watch::channel(None::<WorkResult<T, E>>);
+        let result = async move {
+            loop {
+                if let Some(result) = rx.borrow().clone() {
+                    return result;
                 }
-                .boxed()
-                .shared();
-                let flight = Arc::new(Flight {
-                    result: tokio::sync::Mutex::new(result),
-                });
-                let erased: Arc<dyn Any + Send + Sync> = flight.clone();
-                self.flights.insert(flight_key.clone(), erased.clone());
-
-                let coordinator = self.clone();
-                let cleanup_key = flight_key.clone();
-                let cleanup_flight = erased.clone();
-                let work = work.take().expect("singleflight work is consumed once");
-                let scope = ProviderWorkScope {
-                    coordinator: self.identity.clone(),
-                    provider_id: flight_key.provider_id.clone(),
-                    gate: gate.clone(),
-                };
-                tokio::spawn(async move {
-                    let output = PROVIDER_WORK_SCOPE.scope(scope, work()).await;
-                    let _ = tx.send(Some(output));
-                    coordinator.remove_flight(&cleanup_key, &cleanup_flight);
-                });
-                Some((erased, true))
+                if rx.changed().await.is_err() {
+                    return Err(Arc::new(ProviderWorkError::Aborted));
+                }
             }
-        };
-        let Some((flight_any, created)) = registration else {
-            let scope = ProviderWorkScope {
-                coordinator: self.identity.clone(),
-                provider_id: flight_key.provider_id.clone(),
-                gate,
-            };
-            return PROVIDER_WORK_SCOPE
-                .scope(
-                    scope,
-                    work.take().expect("fallback work is consumed once")(),
-                )
-                .await;
-        };
+        }
+        .boxed()
+        .shared();
+        let flight = Arc::new(Flight {
+            result: tokio::sync::Mutex::new(result),
+        });
+        let erased: Arc<dyn Any + Send + Sync> = flight.clone();
+        if tracked {
+            self.flights.insert(flight_key.clone(), erased.clone());
+        }
 
+        let coordinator = self.clone();
+        let cleanup_key = flight_key.clone();
+        let cleanup_flight = erased.clone();
+        tokio::spawn(async move {
+            let output = work().await;
+            let _ = tx.send(Some(output));
+            if tracked {
+                coordinator.remove_flight(&cleanup_key, &cleanup_flight);
+            }
+        });
+        (flight_key, erased, true, tracked)
+    }
+
+    async fn wait_singleflight<T, E>(
+        &self,
+        flight_key: FlightKey,
+        flight_any: Arc<dyn Any + Send + Sync>,
+        created: bool,
+        tracked: bool,
+    ) -> WorkResult<T, E>
+    where
+        T: Send + Sync + 'static,
+        E: Send + Sync + 'static,
+    {
         let Some(flight) = flight_any.clone().downcast::<Flight<T, E>>().ok() else {
-            // TypeId is part of the key, so this indicates an internal
-            // invariant violation. Fail closed without invoking duplicate work.
             return Err(Arc::new(ProviderWorkError::Aborted));
         };
         if !created {
@@ -427,13 +539,15 @@ impl ProviderWorkCoordinator {
         }
         let result_future = flight.result.lock().await.clone();
         let result = result_future.await;
-
-        self.remove_flight(&flight_key, &flight_any);
+        if tracked {
+            self.remove_flight(&flight_key, &flight_any);
+        }
         result
     }
 
     async fn execute<T, E, F, Fut, C>(
         &self,
+        identity: ProviderWorkIdentity,
         class: ProviderWorkClass,
         gate: Arc<ProviderGate>,
         work: F,
@@ -446,9 +560,14 @@ impl ProviderWorkCoordinator {
         Fut: Future<Output = Result<T, E>> + Send + 'static,
         C: Fn(&E) -> Option<ProviderBackoffEvidence> + Send + Sync + 'static,
     {
-        let permit = match self.acquire_with_gate(gate, class, false).await {
+        let permit = match self.acquire_with_gate(identity, gate, class).await {
             Ok(permit) => permit,
-            Err(wait) => return Err(Arc::new(ProviderWorkError::BackedOff(wait))),
+            Err(ProviderWorkAcquireError::BackedOff(wait)) => {
+                return Err(Arc::new(ProviderWorkError::BackedOff(wait)));
+            }
+            Err(ProviderWorkAcquireError::Aborted) => {
+                return Err(Arc::new(ProviderWorkError::Aborted));
+            }
         };
         match work().await {
             Ok(value) => {
@@ -466,46 +585,54 @@ impl ProviderWorkCoordinator {
     /// before it can classify the outcome (for example, an HTTP diagnostic).
     pub async fn acquire(
         &self,
-        provider_id: &str,
+        identity: impl Into<ProviderWorkIdentity>,
         class: ProviderWorkClass,
-    ) -> Result<ProviderWorkPermit, Duration> {
-        self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
-        self.acquire_inner(provider_id, class, false).await
-    }
-
-    async fn acquire_inner(
-        &self,
-        provider_id: &str,
-        class: ProviderWorkClass,
-        count_scheduled: bool,
-    ) -> Result<ProviderWorkPermit, Duration> {
-        let gate = self.gate(provider_id);
-        self.acquire_with_gate(gate, class, count_scheduled).await
+    ) -> Result<ProviderWorkPermit, ProviderWorkAcquireError> {
+        let identity = self.normalize_test_identity(identity.into());
+        let gate = {
+            let _lifecycle = self.lifecycle.lock();
+            let Some(gate) = self.gate_for_identity_locked(&identity) else {
+                return Err(ProviderWorkAcquireError::Aborted);
+            };
+            self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
+            gate
+        };
+        self.acquire_with_gate(identity, gate, class).await
     }
 
     async fn acquire_with_gate(
         &self,
+        identity: ProviderWorkIdentity,
         gate: Arc<ProviderGate>,
         class: ProviderWorkClass,
-        count_scheduled: bool,
-    ) -> Result<ProviderWorkPermit, Duration> {
-        if count_scheduled {
-            self.metrics.scheduled.fetch_add(1, Ordering::Relaxed);
-        }
+    ) -> Result<ProviderWorkPermit, ProviderWorkAcquireError> {
         loop {
+            if !identity.is_current() {
+                return Err(ProviderWorkAcquireError::Aborted);
+            }
             let slot = gate
                 .slots
                 .clone()
                 .acquire_owned()
                 .await
                 .expect("provider work semaphore is never closed");
+            if !identity.is_current() {
+                return Err(ProviderWorkAcquireError::Aborted);
+            }
             let mut rate = gate.rate.lock().await;
+            // Serialize the admission point with provider/account invalidation.
+            // This guard is acquired after async waits, so deletion either wins
+            // and aborts this attempt or observes it as already admitted.
+            let _lifecycle = self.lifecycle.lock();
+            if !identity.is_current() {
+                return Err(ProviderWorkAcquireError::Aborted);
+            }
             let now = Instant::now();
             if let Some(until) = rate.backed_off_until {
                 if until > now {
                     let wait = until.duration_since(now);
                     self.metrics.backed_off.fetch_add(1, Ordering::Relaxed);
-                    return Err(wait);
+                    return Err(ProviderWorkAcquireError::BackedOff(wait));
                 }
                 rate.backed_off_until = None;
             }
@@ -541,6 +668,7 @@ impl ProviderWorkCoordinator {
             if !wait.is_zero() {
                 self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
                 drop(rate);
+                drop(_lifecycle);
                 drop(slot);
                 tokio::time::sleep(wait).await;
                 continue;
@@ -551,6 +679,7 @@ impl ProviderWorkCoordinator {
             rate.last_by_class.insert(class, now);
             self.metrics.executed.fetch_add(1, Ordering::Relaxed);
             drop(rate);
+            drop(_lifecycle);
             return Ok(ProviderWorkPermit {
                 gate,
                 metrics: self.metrics.clone(),
@@ -786,6 +915,66 @@ mod tests {
 
         coordinator.forget_provider("deleted-provider");
         assert!(coordinator.providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validated_identity_cannot_enter_coordinator_after_provider_deletion() {
+        let coordinator = ProviderWorkCoordinator::default();
+        let identity = ProviderWorkIdentity::for_test("provider-a");
+        assert!(
+            identity.is_current(),
+            "identity represents completed validation"
+        );
+
+        // Model deletion after validation but before coordinator admission.
+        let invalidated_identity = identity.clone();
+        coordinator.forget_provider_with("provider-a", move || {
+            invalidated_identity
+                .provider_generation
+                .store(false, Ordering::Release);
+        });
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let run_executions = executions.clone();
+        let run = coordinator
+            .run(
+                identity.clone(),
+                ProviderWorkClass::HealthProbe,
+                Some("stale-probe".into()),
+                move || async move {
+                    run_executions.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, String>(())
+                },
+                |_| None,
+            )
+            .await
+            .expect_err("stale work must be rejected before admission");
+        assert!(matches!(run.as_ref(), ProviderWorkError::Aborted));
+
+        let coalesced = coordinator
+            .coalesce(
+                identity.clone(),
+                ProviderWorkClass::ModelDiscovery,
+                "stale-discovery".into(),
+                || async { Ok::<_, String>(()) },
+            )
+            .await
+            .expect_err("stale singleflight must not be registered");
+        assert!(matches!(coalesced.as_ref(), ProviderWorkError::Aborted));
+
+        assert!(matches!(
+            coordinator
+                .acquire(identity, ProviderWorkClass::HealthProbe)
+                .await,
+            Err(ProviderWorkAcquireError::Aborted)
+        ));
+        assert_eq!(executions.load(Ordering::Relaxed), 0);
+        assert!(coordinator.providers.is_empty(), "no gate may be recreated");
+        assert!(
+            coordinator.flights.is_empty(),
+            "no flight may be registered"
+        );
+        assert_eq!(coordinator.metrics_snapshot().scheduled, 0);
     }
 
     #[tokio::test]
@@ -1109,7 +1298,12 @@ mod tests {
             }))
             .await;
 
-        let gate = coordinator.gate("provider-a");
+        let gate = coordinator
+            .providers
+            .get("provider-a")
+            .expect("provider gate was admitted")
+            .gate
+            .clone();
         {
             let mut rate = gate.rate.lock().await;
             assert_eq!(rate.consecutive_failures, 1);
@@ -1175,7 +1369,16 @@ mod tests {
         started.notified().await;
         coordinator.forget_provider("deleted-provider");
         release.add_permits(1);
-        task.await.unwrap().unwrap();
+        let result = task.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(error)
+                if matches!(
+                    error.as_ref(),
+                    ProviderWorkError::Operation(message)
+                        if message == "unexpected backoff: Aborted"
+                )
+        ));
 
         assert!(!coordinator.providers.contains_key("deleted-provider"));
     }

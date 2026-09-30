@@ -553,6 +553,7 @@ impl RefreshCoordinator {
         }
     }
 
+    #[cfg(test)]
     fn record_failure(&self, key: &CredentialKey, error: &CredentialRotationError) {
         let gate = self.gate(key);
         self.record_failure_for_gate(key, &gate, error);

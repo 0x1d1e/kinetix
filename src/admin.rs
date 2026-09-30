@@ -58,6 +58,22 @@ impl ApiError {
     }
 }
 
+fn provider_work_acquire_error(error: crate::provider_work::ProviderWorkAcquireError) -> ApiError {
+    match error {
+        crate::provider_work::ProviderWorkAcquireError::BackedOff(wait) => ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "provider work is temporarily backed off; retry in {}s",
+                wait.as_secs().max(1)
+            ),
+            None,
+        ),
+        crate::provider_work::ProviderWorkAcquireError::Aborted => {
+            ApiError::not_found("provider not found")
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(json!({ "error": self.1 }))).into_response()
@@ -411,6 +427,9 @@ async fn run_model_lifecycle_lane(
     {
         return Err(ApiError::not_found("provider not found"));
     }
+    let identity = state
+        .provider_work_identity(provider_id, None)
+        .ok_or_else(|| ApiError::not_found("provider not found"))?;
     let state = state.clone();
     let provider_id = provider_id.to_string();
     let class = match lane {
@@ -423,16 +442,18 @@ async fn run_model_lifecycle_lane(
         ModelLifecycleLane::Reconciliation => {
             let lifecycle_state = state.clone();
             let lifecycle_provider_id = provider_id.clone();
+            let lifecycle_identity = identity.clone();
             state
                 .provider_work
                 .coalesce(
-                    provider_id.clone(),
+                    identity.clone(),
                     class,
                     lane.name().to_string(),
                     move || async move {
                         run_model_lifecycle_lane_inner(
                             &lifecycle_state,
                             &lifecycle_provider_id,
+                            lifecycle_identity,
                             lane,
                         )
                         .await
@@ -443,16 +464,18 @@ async fn run_model_lifecycle_lane(
         ModelLifecycleLane::PricingSync => {
             let lifecycle_state = state.clone();
             let lifecycle_provider_id = provider_id.clone();
+            let lifecycle_identity = identity.clone();
             state
                 .provider_work
                 .run(
-                    provider_id.clone(),
+                    identity,
                     class,
                     Some(lane.name().to_string()),
                     move || async move {
                         run_model_lifecycle_lane_inner(
                             &lifecycle_state,
                             &lifecycle_provider_id,
+                            lifecycle_identity,
                             lane,
                         )
                         .await
@@ -486,8 +509,12 @@ async fn run_model_lifecycle_lane(
 async fn run_model_lifecycle_lane_inner(
     state: &AppState,
     provider_id: &str,
+    identity: crate::registry::ProviderWorkIdentity,
     lane: ModelLifecycleLane,
 ) -> Result<Value, ApiError> {
+    if !identity.is_current() {
+        return Err(ApiError::not_found("provider not found"));
+    }
     let lane_name = lane.name();
     db::set_setting(
         &state.pool,
@@ -498,8 +525,12 @@ async fn run_model_lifecycle_lane_inner(
     .map_err(ApiError::internal)?;
 
     let result = match lane {
-        ModelLifecycleLane::Reconciliation => reconcile_provider_id(state, provider_id).await,
-        ModelLifecycleLane::PricingSync => sync_provider_pricing_id(state, provider_id).await,
+        ModelLifecycleLane::Reconciliation => {
+            reconcile_provider_id(state, provider_id, &identity).await
+        }
+        ModelLifecycleLane::PricingSync => {
+            sync_provider_pricing_id(state, provider_id, &identity).await
+        }
     };
 
     match result {
@@ -3616,13 +3647,21 @@ fn model_reconciliation_lock(provider_id: &str) -> std::sync::Arc<tokio::sync::M
 
 /// `POST /admin/api/providers/:id/discover` — fetch the upstream model list
 /// using the provider's credentials (FR-10.4).
-pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<Value, ApiError> {
+pub(crate) async fn reconcile_provider_id(
+    state: &AppState,
+    id: &str,
+    identity: &crate::registry::ProviderWorkIdentity,
+) -> Result<Value, ApiError> {
     // Manual discovery and scheduled reconciliation reuse this path. Serialize
     // work per provider so overlapping refreshes cannot race observation,
     // ignore, or pin state. Pricing sync shares the same provider lock but has
     // an independent state machine and never invokes reconciliation implicitly.
     let lock = model_reconciliation_lock(id);
     let _guard = lock.lock().await;
+    // Keep the existing missing-provider response for work invalidated by deletion.
+    if !identity.is_current() {
+        return Err(ApiError::not_found("provider not found"));
+    }
     let provider = db::get_provider(&state.pool, id)
         .await
         .map_err(ApiError::internal)?
@@ -3664,23 +3703,17 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
 
             let mut combined = Vec::new();
             for account in accounts {
+                let work_identity = state
+                    .account_work_identity(identity, &account.id)
+                    .ok_or_else(|| ApiError::not_found("account not found"))?;
                 let permit = state
                     .provider_work
                     .acquire(
-                        &provider.id,
+                        work_identity,
                         crate::provider_work::ProviderWorkClass::ModelDiscovery,
                     )
                     .await
-                    .map_err(|wait| {
-                        ApiError(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!(
-                                "provider work is temporarily backed off; retry in {}s",
-                                wait.as_secs().max(1)
-                            ),
-                            None,
-                        )
-                    })?;
+                    .map_err(provider_work_acquire_error)?;
                 let account_models = match manager
                     .account_model_discover(
                         &pref.plugin_id,
@@ -3716,20 +3749,11 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
             let permit = state
                 .provider_work
                 .acquire(
-                    &provider.id,
+                    identity.clone(),
                     crate::provider_work::ProviderWorkClass::ModelDiscovery,
                 )
                 .await
-                .map_err(|wait| {
-                    ApiError(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!(
-                            "provider work is temporarily backed off; retry in {}s",
-                            wait.as_secs().max(1)
-                        ),
-                        None,
-                    )
-                })?;
+                .map_err(provider_work_acquire_error)?;
             match manager
                 .model_discover(
                     &pref.plugin_id,
@@ -3795,7 +3819,7 @@ pub(crate) async fn reconcile_provider_id(state: &AppState, id: &str) -> Result<
             .collect();
         (discovered, models_dev_available)
     } else {
-        discover_models_native(state, &provider).await?
+        discover_models_native(state, &provider, identity).await?
     };
 
     // Mark which are already imported and record the observation (FR-10.5).
@@ -5107,9 +5131,14 @@ async fn apply_provider_pricing_sync(
 pub(crate) async fn sync_provider_pricing_id(
     state: &AppState,
     id: &str,
+    identity: &crate::registry::ProviderWorkIdentity,
 ) -> Result<Value, ApiError> {
     let lock = model_reconciliation_lock(id);
     let _guard = lock.lock().await;
+    // Keep the existing missing-provider response for work invalidated by deletion.
+    if !identity.is_current() {
+        return Err(ApiError::not_found("provider not found"));
+    }
 
     let provider = db::get_provider(&state.pool, id)
         .await
@@ -5180,6 +5209,7 @@ async fn credential_for_admin_action(
 async fn discover_models_native(
     state: &AppState,
     provider: &db::ProviderRow,
+    identity: &crate::registry::ProviderWorkIdentity,
 ) -> Result<(Vec<DiscoveredObservation>, bool), ApiError> {
     let accounts = db::accounts_for_provider(&state.pool, &provider.id)
         .await
@@ -5226,6 +5256,9 @@ async fn discover_models_native(
 
     let mut discovered = Vec::new();
     for account in accounts {
+        let work_identity = state
+            .account_work_identity(identity, &account.id)
+            .ok_or_else(|| ApiError::not_found("account not found"))?;
         let credential = credential_for_admin_action(
             state,
             provider,
@@ -5243,20 +5276,11 @@ async fn discover_models_native(
         let permit = state
             .provider_work
             .acquire(
-                &provider.id,
+                work_identity,
                 crate::provider_work::ProviderWorkClass::ModelDiscovery,
             )
             .await
-            .map_err(|wait| {
-                ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "provider work is temporarily backed off; retry in {}s",
-                        wait.as_secs().max(1)
-                    ),
-                    None,
-                )
-            })?;
+            .map_err(provider_work_acquire_error)?;
         let resp = match crate::outbound::send_provider_request(
             &state.outbound_clients,
             state.config.allow_private_upstreams,
@@ -5376,6 +5400,9 @@ pub async fn test_provider(
             .next()
             .ok_or_else(|| ApiError::bad("provider has no credentials to test with"))?
     };
+    let work_identity = state
+        .provider_work_identity(&provider.id, Some(&account.id))
+        .ok_or_else(|| ApiError::not_found("account not found"))?;
     let credential = credential_for_admin_action(
         &state,
         &provider,
@@ -5469,20 +5496,11 @@ pub async fn test_provider(
     let permit = state
         .provider_work
         .acquire(
-            &provider.id,
+            work_identity,
             crate::provider_work::ProviderWorkClass::HealthProbe,
         )
         .await
-        .map_err(|wait| {
-            ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "provider work is temporarily backed off; retry in {}s",
-                    wait.as_secs().max(1)
-                ),
-                None,
-            )
-        })?;
+        .map_err(provider_work_acquire_error)?;
     let started = std::time::Instant::now();
     match crate::outbound::send_provider_request(
         &state.outbound_clients,
@@ -7626,6 +7644,7 @@ async fn execute_capability_probe_request(
     provider: db::ProviderRow,
     execution_model: db::ModelRow,
     account_id: String,
+    identity: crate::registry::ProviderWorkIdentity,
     credential: String,
     adapter: std::sync::Arc<dyn crate::adapters::Adapter>,
     url: url::Url,
@@ -7634,20 +7653,11 @@ async fn execute_capability_probe_request(
     let permit = state
         .provider_work
         .acquire(
-            &provider.id,
+            identity,
             crate::provider_work::ProviderWorkClass::CapabilityProbe,
         )
         .await
-        .map_err(|wait| {
-            ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "provider work is temporarily backed off; retry in {}s",
-                    wait.as_secs().max(1)
-                ),
-                None,
-            )
-        })?;
+        .map_err(provider_work_acquire_error)?;
     let ctx = UpstreamContext {
         provider: &provider,
         model: &execution_model,
@@ -8023,6 +8033,9 @@ pub async fn probe_model_capability(
         &body.capability,
         probe_value.as_ref(),
     );
+    let work_identity = state
+        .provider_work_identity(&provider.id, Some(&account.id))
+        .ok_or_else(|| ApiError::not_found("account not found"))?;
     let work_state = state.clone();
     let work_provider = provider.clone();
     let work_model = execution_model.clone();
@@ -8034,7 +8047,7 @@ pub async fn probe_model_capability(
     let exchange = state
         .provider_work
         .coalesce(
-            provider.id.clone(),
+            work_identity.clone(),
             crate::provider_work::ProviderWorkClass::CapabilityProbe,
             singleflight_key,
             move || async move {
@@ -8043,6 +8056,7 @@ pub async fn probe_model_capability(
                     work_provider,
                     work_model,
                     work_account_id,
+                    work_identity,
                     work_credential,
                     work_adapter,
                     work_url,
@@ -18262,11 +18276,15 @@ mod credential_enrollment_regression_tests {
             .await
             .unwrap();
         }
+        state.registry.reload(&state.pool).await.unwrap();
         let provider = db::get_provider(&state.pool, &provider_id)
             .await
             .unwrap()
             .unwrap();
-        let error = discover_models_native(&state, &provider)
+        let identity = state
+            .provider_work_identity(&provider_id, None)
+            .expect("provider should have an active work identity");
+        let error = discover_models_native(&state, &provider, &identity)
             .await
             .expect_err("account A should be rate limited");
         assert!(error.1.contains("account 'account-a'"), "{error:?}");
@@ -18366,6 +18384,7 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
 
         let response = test_provider(
             State(state.clone()),
@@ -18391,6 +18410,12 @@ mod credential_enrollment_regression_tests {
             Ok(permit) => {
                 drop(permit);
                 panic!("the provider probe should install provider backoff");
+            }
+        };
+        let wait = match wait {
+            crate::provider_work::ProviderWorkAcquireError::BackedOff(wait) => wait,
+            crate::provider_work::ProviderWorkAcquireError::Aborted => {
+                panic!("provider identity unexpectedly invalidated")
             }
         };
         assert!(wait >= std::time::Duration::from_secs(100), "got {wait:?}");
@@ -18465,6 +18490,7 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
         (provider_id, account_id, model_id)
     }
 
@@ -18628,10 +18654,13 @@ mod credential_enrollment_regression_tests {
         let base_url = format!("http://{address}/v1");
         let (provider_id, account_id, model_id) =
             insert_capability_probe_target(&state, &base_url, "read-failure-provider").await;
+        let identity = state
+            .provider_work_identity(&provider_id, None)
+            .expect("provider should have an active work identity");
         state
             .provider_work
             .acquire(
-                &provider_id,
+                identity,
                 crate::provider_work::ProviderWorkClass::CapabilityProbe,
             )
             .await
@@ -18701,6 +18730,12 @@ mod credential_enrollment_regression_tests {
             Ok(permit) => {
                 drop(permit);
                 panic!("the second transient failure should extend provider backoff");
+            }
+        };
+        let wait = match wait {
+            crate::provider_work::ProviderWorkAcquireError::BackedOff(wait) => wait,
+            crate::provider_work::ProviderWorkAcquireError::Aborted => {
+                panic!("provider identity unexpectedly invalidated")
             }
         };
         assert!(wait >= std::time::Duration::from_secs(8), "got {wait:?}");
@@ -19087,6 +19122,78 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn deletion_between_validation_and_coordinator_admission_rejects_lifecycle_work() {
+        let (state, root) = test_state("delete-before-provider-work-admission").await;
+        let provider_id = insert_provider(
+            &state,
+            "delete-before-provider-work-admission",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        state.registry.reload(&state.pool).await.unwrap();
+
+        assert!(db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .is_some());
+        let identity = state
+            .provider_work_identity(&provider_id, None)
+            .expect("provider validation should capture its active generation");
+        let validated = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let work_state = state.clone();
+        let work_validated = validated.clone();
+        let work_resume = resume.clone();
+        let work = tokio::spawn(async move {
+            work_validated.wait().await;
+            work_resume.wait().await;
+            let executions = Arc::new(AtomicUsize::new(0));
+            let invoked = executions.clone();
+            let result = work_state
+                .provider_work
+                .coalesce(
+                    identity,
+                    crate::provider_work::ProviderWorkClass::ModelDiscovery,
+                    "reconciliation".into(),
+                    move || async move {
+                        invoked.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, String>(())
+                    },
+                )
+                .await;
+            (result, executions.load(Ordering::Relaxed))
+        });
+
+        validated.wait().await;
+        let _ = delete_provider(
+            axum::extract::State(state.clone()),
+            auth(),
+            Path(provider_id.clone()),
+        )
+        .await
+        .unwrap();
+        resume.wait().await;
+
+        let (result, executions) = work.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(error)
+                if matches!(
+                    error.as_ref(),
+                    crate::provider_work::ProviderWorkError::Aborted
+                )
+        ));
+        assert_eq!(executions, 0, "deleted lifecycle work must not start");
+        assert_eq!(state.provider_work.metrics_snapshot().scheduled, 0);
+        assert_eq!(state.provider_work.state_counts(), (0, 0));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn account_and_provider_deletion_evict_control_plane_state() {
         let (state, root) = test_state("delete-control-plane-state").await;
         let spy = Arc::new(CredentialEvictionSpy::default());
@@ -19220,14 +19327,16 @@ mod credential_enrollment_regression_tests {
             .next_attempt_at(&provider_id, &provider_account_id)
             .is_none());
         assert!(spy.providers.lock().contains(&provider_id));
-        assert!(state
-            .provider_work
-            .acquire(
-                &provider_id,
-                crate::provider_work::ProviderWorkClass::HealthProbe
-            )
-            .await
-            .is_ok());
+        assert!(matches!(
+            state
+                .provider_work
+                .acquire(
+                    &provider_id,
+                    crate::provider_work::ProviderWorkClass::HealthProbe
+                )
+                .await,
+            Err(crate::provider_work::ProviderWorkAcquireError::Aborted)
+        ));
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);
