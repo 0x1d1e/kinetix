@@ -30,6 +30,7 @@ use crate::passthrough;
 use crate::pool;
 use crate::predicate::{self, PluginFacts, RequestFacts, TargetFacts, TargetPredicate};
 use crate::registry::{Resolved, ResolvedTarget};
+use crate::stream_outcome::{CommitState, StreamOutcome, StreamTermination};
 use crate::trace::RouteTrace;
 use crate::types::{
     FailureKind, InternalRequest, ProxyError, StreamEvent, TokenUsage, UpstreamFailure,
@@ -82,6 +83,28 @@ fn cache_status_from_usage(usage: &TokenUsage) -> &'static str {
     }
 }
 
+struct PartialAttemptUsage {
+    usage: TokenUsage,
+    cost: Option<f64>,
+    row: db::UsageAttemptRow,
+}
+
+struct LastPrecommitFailure {
+    target: ResolvedTarget,
+    upstream_request_id: Option<String>,
+    failure: UpstreamFailure,
+    termination: StreamTermination,
+    attempts_done: usize,
+    client_error: ProxyError,
+}
+
+struct ActivePrecommitAttempt {
+    target: ResolvedTarget,
+    attempt_number: usize,
+    opaque_route_id: String,
+    upstream_request_id: Option<String>,
+}
+
 /// Request-scoped metadata carried into the usage log and Route Trace.
 pub struct RequestMeta {
     pub request_id: String,
@@ -95,12 +118,19 @@ pub struct RequestMeta {
     pub fallback_hops: i64,
     pub retry_count: i64,
     pub fallback_path: Vec<String>,
+    fallback_enabled: bool,
     pub cache_status: &'static str,
     pub commit_state: &'static str,
     pub session: Option<String>,
     /// Atomic RPM/TPM/budget reservation owned by this request. A disconnect
     /// after upstream dispatch reconciles it as incomplete instead of canceling it.
     pub admission: Option<crate::admission::AdmissionReservation>,
+    /// Usage and costs from failed precommit provider attempts. Persisted as
+    /// per-attempt rows and included in admission reconciliation.
+    partial_attempts: Vec<PartialAttemptUsage>,
+    active_precommit_attempt: Option<ActivePrecommitAttempt>,
+    log_queue: Option<crate::logqueue::UsageLogQueue>,
+    accounting_enqueued: AtomicBool,
     /// Bounded global, key, and Route in-flight admission; streaming transfers it to the response body.
     pub concurrency: Option<crate::admission::ConcurrencyReservation>,
     /// Set immediately before the inference request is handed to the HTTP client.
@@ -115,7 +145,12 @@ pub struct RequestMeta {
 }
 
 impl RequestMeta {
-    pub fn new(request_id: String, format: FrontendFormat, requested_model: String) -> Self {
+    pub fn new(
+        request_id: String,
+        format: FrontendFormat,
+        requested_model: String,
+        fallback_enabled: bool,
+    ) -> Self {
         RequestMeta {
             request_id,
             key_id: None,
@@ -128,11 +163,16 @@ impl RequestMeta {
             fallback_hops: 0,
             retry_count: 0,
             fallback_path: Vec::new(),
+            fallback_enabled,
             cache_status: "bypass",
             commit_state: "",
             session: None,
             admission: None,
             concurrency: None,
+            partial_attempts: Vec::new(),
+            active_precommit_attempt: None,
+            log_queue: None,
+            accounting_enqueued: AtomicBool::new(false),
             upstream_dispatched: AtomicBool::new(false),
             client_disconnect: None,
             disconnected: Arc::new(AtomicBool::new(false)),
@@ -149,10 +189,108 @@ impl Drop for RequestMeta {
                 .as_ref()
                 .is_some_and(crate::client_disconnect::ClientDisconnect::is_cancelled);
         if disconnected_after_dispatch {
+            self.record_cancelled_accounting();
             if let Some(admission) = self.admission.take() {
+                // The active dispatch may have incurred unreported usage. Earlier
+                // attempts cannot make this request's total exact.
                 admission.reconcile_incomplete();
             }
         }
+    }
+}
+
+impl RequestMeta {
+    fn record_cancelled_accounting(&mut self) {
+        if self.accounting_enqueued.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(active) = self.active_precommit_attempt.take() {
+            let termination = StreamTermination::new(
+                StreamOutcome::ClientCancelled,
+                CommitState::PreCommit,
+                None,
+                None,
+            );
+            let mut row = usage_attempt_row(
+                self,
+                &active.target,
+                None,
+                active.upstream_request_id.as_deref(),
+                active.attempt_number,
+                &TokenUsage::default(),
+                None,
+                None,
+                termination,
+                Some("client disconnected before response commit"),
+                &active.opaque_route_id,
+            );
+            row.key_id = self.key_id.clone();
+            row.key_name = self.key_name.clone();
+            self.partial_attempts.push(PartialAttemptUsage {
+                usage: TokenUsage::default(),
+                cost: None,
+                row,
+            });
+        }
+        let Some(log_queue) = self.log_queue.clone() else {
+            return;
+        };
+        let Some(last_attempt) = self.partial_attempts.last() else {
+            return;
+        };
+        let (usage, cost) = aggregate_request_accounting(self, None, None);
+        let request_row = UsageLogRow {
+            id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
+            request_id: self.request_id.clone(),
+            ts: db::now_iso(),
+            key_id: self.key_id.clone(),
+            key_name: self.key_name.clone(),
+            client_format: self.client_format.to_string(),
+            requested_model: self.requested_model.clone(),
+            effective_model: last_attempt.row.effective_model.clone(),
+            route_id: self.route_id.clone(),
+            route_name: self.route_name.clone(),
+            fallback_hops: self.partial_attempts.len().saturating_sub(1) as i64,
+            fallback_path: serde_json::to_string(&self.fallback_path)
+                .unwrap_or_else(|_| "[]".into()),
+            status: "client_disconnect".into(),
+            status_code: 499,
+            latency_ms: None,
+            ttft_ms: None,
+            input_tokens: usage.input.map(|value| value as i64),
+            output_tokens: usage.output.map(|value| value as i64),
+            cached_tokens: usage.cached.map(|value| value as i64),
+            cache_write_tokens: usage.cache_write.map(|value| value as i64),
+            thinking_tokens: usage.thinking.map(|value| value as i64),
+            cost_usd: cost,
+            cost_known: cost.is_some() as i64,
+            price_version_id: None,
+            cache_status: self.cache_status.to_string(),
+            serving_account_id: last_attempt.row.serving_account_id.clone(),
+            serving_account: last_attempt.row.serving_account.clone(),
+            serving_provider: last_attempt.row.serving_provider.clone(),
+            upstream_request_id: last_attempt.row.upstream_request_id.clone(),
+            flagged: 0,
+            error_message: Some("client disconnected before response commit".into()),
+            usage_confidence: if usage_has_reported_tokens(&usage) {
+                "provider_reported".into()
+            } else {
+                "unknown".into()
+            },
+            commit_state: CommitState::PreCommit.as_usage_str().to_string(),
+            retry_count: self.partial_attempts.len().saturating_sub(1) as i64,
+            route_trace_id: last_attempt.row.opaque_route_id.clone(),
+            opaque_route_id: last_attempt.row.opaque_route_id.clone(),
+        };
+        log_queue.enqueue_bundle(db::UsageAccountingBundle {
+            request: request_row,
+            attempts: self
+                .partial_attempts
+                .iter()
+                .map(|attempt| attempt.row.clone())
+                .collect(),
+        });
+        self.accounting_enqueued.store(true, Ordering::Release);
     }
 }
 
@@ -463,10 +601,13 @@ struct Attempt {
     passthrough: bool,
     /// Adaptive target-local permit held for the full upstream lifecycle.
     traffic_permit: Option<crate::upstream_traffic::TrafficPermit>,
-    /// Provider-wide breaker attempt.
+    /// Provider-wide breaker attempt. Half-open recovery/failure is committed
+    /// only when the stream reaches a terminal outcome.
     provider_attempt: crate::provider_circuit::ProviderAttempt,
-    /// Half-open recovery is committed at response validation, before stream completion.
+    /// First-event validation is recorded separately from terminal recovery.
     provider_circuit_transition: Option<crate::provider_circuit::ProviderCircuitTransition>,
+    /// Account recovery is committed only after a completed terminal outcome.
+    account_probe: bool,
     /// Target-attempt-local start, excluding routing and credential work.
     attempt_started: Instant,
 }
@@ -510,6 +651,7 @@ pub async fn run(
         session,
         protocol_headers,
         None,
+        None,
     )
     .await
 }
@@ -524,6 +666,7 @@ pub(crate) async fn run_with_disconnect(
     session: Option<String>,
     protocol_headers: Vec<(String, String)>,
     client_disconnect: Option<crate::client_disconnect::ClientDisconnect>,
+    cancellation_trace: Option<Arc<parking_lot::Mutex<Option<RouteTrace>>>>,
 ) -> Result<Response, ProxyError> {
     let started = Instant::now();
     let snap = state.registry.snapshot();
@@ -544,10 +687,22 @@ pub(crate) async fn run_with_disconnect(
         }
         None => None,
     };
-    let mut trace = RouteTrace::new(request_id.clone(), req.requested_model.clone());
-    let mut meta = RequestMeta::new(request_id.clone(), format, req.requested_model.clone());
+    let mut trace = cancellation_trace
+        .as_ref()
+        .and_then(|snapshot| snapshot.lock().clone())
+        .unwrap_or_else(|| RouteTrace::new(request_id.clone(), req.requested_model.clone()));
+    if let Some(snapshot) = cancellation_trace {
+        trace.attach_cancellation_snapshot(snapshot);
+    }
+    let mut meta = RequestMeta::new(
+        request_id.clone(),
+        format,
+        req.requested_model.clone(),
+        allow_fallback,
+    );
     meta.session = session.clone();
     meta.client_disconnect = client_disconnect;
+    meta.log_queue = Some(state.log_queue.clone());
     meta.admission = admission;
     meta.concurrency = Some(concurrency);
     if let Some(k) = &key {
@@ -666,6 +821,7 @@ pub(crate) async fn run_with_disconnect(
             meta.route_name = Some(route.name.clone());
             trace.route_id = Some(route.id.clone());
             trace.route_name = Some(route.name.clone());
+            trace.publish_cancellation_snapshot();
             // Retain route-wide producer provenance before request-specific
             // predicates and other eligibility filters remove candidates.
             let route_target_origins = targets
@@ -1024,6 +1180,7 @@ pub(crate) async fn run_with_disconnect(
     let mut skip_logical_target: Option<String> = None;
     let deadline = started + MAX_PRE_COMMIT_DEADLINE;
     let mut auth_retried_accounts = std::collections::HashSet::new();
+    let mut last_precommit_failure: Option<LastPrecommitFailure> = None;
 
     while let Some(target_owned) = pending_targets.pop_front() {
         let target = &target_owned;
@@ -1412,11 +1569,12 @@ pub(crate) async fn run_with_disconnect(
         let mut execution_model = target.model.clone();
         execution_model.thinking_map = serde_json::to_string(&profile.thinking_map)
             .expect("ThinkingMap serialization is infallible");
+        let session_context = meta.session.clone();
         let ctx = UpstreamContext {
             provider: &target.provider,
             model: &execution_model,
             account_id: Some(target.account.id.as_str()),
-            session_context: meta.session.as_deref(),
+            session_context: session_context.as_deref(),
             credential,
         };
 
@@ -1608,6 +1766,12 @@ pub(crate) async fn run_with_disconnect(
             ),
         );
 
+        meta.active_precommit_attempt = Some(ActivePrecommitAttempt {
+            target: target.clone(),
+            attempt_number: meta.partial_attempts.len() + 1,
+            opaque_route_id: trace.opaque_route_id.clone(),
+            upstream_request_id: None,
+        });
         let send_result = match tokio::time::timeout(
             send_budget,
             send_upstream(
@@ -1638,28 +1802,117 @@ pub(crate) async fn run_with_disconnect(
                 );
                 if resp.status().is_success() {
                     let upstream_request_id = extract_upstream_request_id(&resp);
+                    if let Some(active) = meta.active_precommit_attempt.as_mut() {
+                        active.upstream_request_id = upstream_request_id.clone();
+                    }
+                    let responses = if format == FrontendFormat::OpenAiResponses {
+                        match frontends::responses::response_fields_from_request(&target_req) {
+                            Ok(fields) => fields,
+                            Err(error) => {
+                                return Ok(crate::api::error_response(
+                                    format,
+                                    &meta.request_id,
+                                    error,
+                                ));
+                            }
+                        }
+                    } else {
+                        frontends::ResponsesResponseFields::default()
+                    };
+                    let encoder_ctx = EncoderCtx {
+                        model_name: target_req.requested_model.clone(),
+                        request_id: meta.request_id.clone(),
+                        created: chrono::Utc::now().timestamp(),
+                        responses,
+                    };
                     let first_event_remaining =
                         phase_deadline.saturating_duration_since(Instant::now());
+                    let is_sse = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .split(';')
+                        .next()
+                        .map(str::trim)
+                        == Some("text/event-stream");
+                    let aggregate_sse = !req.stream && is_sse;
                     let prepared_result = if first_event_remaining.is_zero() {
-                        Err(timeout_failure(
+                        Err(PreparedResponseFailure::from(timeout_failure(
                             "upstream timed out before first valid event",
-                        ))
+                        )))
+                    } else if aggregate_sse {
+                        prepare_success_response(
+                            resp,
+                            &adapter,
+                            true,
+                            format,
+                            use_passthrough,
+                            &encoder_ctx,
+                            first_event_remaining,
+                            provider_timeout,
+                        )
+                        .await
+                    } else if is_sse {
+                        prepare_success_response(
+                            resp,
+                            &adapter,
+                            false,
+                            format,
+                            use_passthrough,
+                            &encoder_ctx,
+                            first_event_remaining,
+                            provider_timeout,
+                        )
+                        .await
                     } else {
                         match tokio::time::timeout(
                             first_event_remaining,
-                            prepare_success_response(resp, &adapter),
+                            prepare_success_response(
+                                resp,
+                                &adapter,
+                                false,
+                                format,
+                                use_passthrough,
+                                &encoder_ctx,
+                                first_event_remaining,
+                                provider_timeout,
+                            ),
                         )
                         .await
                         {
                             Ok(result) => result,
-                            Err(_) => Err(timeout_failure(
+                            Err(_) => Err(PreparedResponseFailure::from(timeout_failure(
                                 "upstream timed out before first valid event",
-                            )),
+                            ))),
                         }
                     };
                     let prepared = match prepared_result {
                         Ok(prepared) => prepared,
-                        Err(failure) => {
+                        Err(prepared_failure) => {
+                            let PreparedResponseFailure {
+                                failure,
+                                outcome,
+                                precommit_usage,
+                            } = prepared_failure;
+                            let termination = StreamTermination::new(
+                                outcome,
+                                CommitState::PreCommit,
+                                Some(failure.kind),
+                                failure.status,
+                            );
+                            record_precommit_attempt_usage(
+                                state,
+                                &mut meta,
+                                target,
+                                key.as_ref(),
+                                &trace,
+                                upstream_request_id.as_deref(),
+                                precommit_usage,
+                                &failure,
+                                termination,
+                            )
+                            .await;
                             if let Some(permit) = traffic_permit.as_ref() {
                                 permit.finish(traffic_outcome_for_failure(failure.kind));
                             }
@@ -1671,8 +1924,10 @@ pub(crate) async fn run_with_disconnect(
                             );
                             handle_key_failure(state, target, &failure, &mut meta, &mut trace)
                                 .await;
-                            let can_fallback = allow_fallback
-                                && route_allows_fallback(route.as_ref(), failure.kind);
+                            let can_fallback = termination.fallback_allowed(|kind| {
+                                allow_fallback && route_allows_fallback(route.as_ref(), kind)
+                            });
+                            trace.stream_termination(termination, Some(can_fallback));
                             if failure.kind == FailureKind::QuotaExhausted {
                                 state.quota.observe_exhausted(
                                     &target.provider.id,
@@ -1711,13 +1966,38 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                     None,
                                 );
+                                reconcile_partial_attempts(&mut meta);
+                                let client_error = failure_to_error(&failure, target);
+                                record_precommit_request_log(
+                                    state,
+                                    &meta,
+                                    &req,
+                                    target,
+                                    key.as_ref(),
+                                    &trace,
+                                    upstream_request_id.as_deref(),
+                                    &failure,
+                                    &client_error,
+                                    termination,
+                                    started,
+                                    attempts_done,
+                                );
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
-                                return Err(failure_to_error(&failure, target));
+                                return Err(client_error);
                             }
+                            let client_error = failure_to_error(&failure, target);
+                            last_precommit_failure = Some(LastPrecommitFailure {
+                                target: (*target).clone(),
+                                upstream_request_id: upstream_request_id.clone(),
+                                failure: failure.clone(),
+                                termination,
+                                attempts_done,
+                                client_error: client_error.clone(),
+                            });
                             if failure.kind == FailureKind::TargetError {
                                 skip_logical_target = target.route_target_id.clone();
                             }
-                            last_error = Some(failure_to_error(&failure, target));
+                            last_error = Some(client_error);
                             continue;
                         }
                     };
@@ -1754,16 +2034,6 @@ pub(crate) async fn run_with_disconnect(
                         "upstream_validated",
                         if prepared.is_sse { "sse" } else { "json" },
                     );
-                    // A validated response may recover only the account state
-                    // version it observed; half-open probes explicitly authorize
-                    // clearing an open circuit.
-                    recover_successful_account(
-                        state,
-                        &target.account.id,
-                        target.account.account_state_version,
-                        probing,
-                    )
-                    .await;
                     let provider_circuit_transition =
                         mark_provider_probe_validated(&provider_attempt);
                     let attempt = Attempt {
@@ -1780,16 +2050,30 @@ pub(crate) async fn run_with_disconnect(
                         traffic_permit,
                         provider_attempt,
                         provider_circuit_transition,
+                        account_probe: probing,
                         attempt_started,
                     };
                     return Ok(stream_response(
-                        state, snap, format, meta, target_req, attempt, started, key, trace,
+                        state,
+                        snap,
+                        format,
+                        meta,
+                        target_req,
+                        attempt,
+                        encoder_ctx,
+                        started,
+                        key,
+                        trace,
                     )
                     .await);
                 }
 
                 // Classify and maybe fail over. Reading an error body is still
                 // part of the pre-commit phase and cannot outlive its budget.
+                let upstream_request_id = extract_upstream_request_id(&resp);
+                if let Some(active) = meta.active_precommit_attempt.as_mut() {
+                    active.upstream_request_id = upstream_request_id.clone();
+                }
                 let status = resp.status().as_u16();
                 let headers = resp.headers().clone();
                 let error_body_remaining = phase_deadline.saturating_duration_since(Instant::now());
@@ -1826,6 +2110,41 @@ pub(crate) async fn run_with_disconnect(
                     }
                 };
                 let failure = apply_header_reset_to_rate_limit(failure, quota_observation);
+                let termination = StreamTermination::new(
+                    stream_outcome_for_failure(failure.kind),
+                    CommitState::PreCommit,
+                    Some(failure.kind),
+                    failure.status,
+                );
+                let client_error = preserve_anthropic_error(
+                    failure_to_error(&failure, target),
+                    format,
+                    adapter.as_ref(),
+                    &failure,
+                    status,
+                    &headers,
+                    upstream_error_body.as_deref(),
+                );
+                record_precommit_attempt_usage(
+                    state,
+                    &mut meta,
+                    target,
+                    key.as_ref(),
+                    &trace,
+                    upstream_request_id.as_deref(),
+                    TokenUsage::default(),
+                    &failure,
+                    termination,
+                )
+                .await;
+                last_precommit_failure = Some(LastPrecommitFailure {
+                    target: (*target).clone(),
+                    upstream_request_id: upstream_request_id.clone(),
+                    failure: failure.clone(),
+                    termination,
+                    attempts_done,
+                    client_error: client_error.clone(),
+                });
                 if let Some(permit) = traffic_permit.as_ref() {
                     permit.finish(traffic_outcome_for_failure(failure.kind));
                 }
@@ -1958,8 +2277,12 @@ pub(crate) async fn run_with_disconnect(
                                 "credential refresh temporarily unavailable",
                                 Some(cooldown),
                             );
+                            if let Some(last_failure) = last_precommit_failure.as_mut() {
+                                last_failure.client_error = refresh_error.clone();
+                            }
                             let can_fallback = allow_fallback
                                 && route_allows_fallback(route.as_ref(), FailureKind::AuthError);
+                            trace.stream_termination(termination, Some(can_fallback));
                             record_target_telemetry(
                                 state,
                                 target,
@@ -1980,6 +2303,21 @@ pub(crate) async fn run_with_disconnect(
                                     None,
                                     None,
                                 );
+                                reconcile_partial_attempts(&mut meta);
+                                record_precommit_request_log(
+                                    state,
+                                    &meta,
+                                    &req,
+                                    target,
+                                    key.as_ref(),
+                                    &trace,
+                                    upstream_request_id.as_deref(),
+                                    &failure,
+                                    &refresh_error,
+                                    termination,
+                                    started,
+                                    attempts_done,
+                                );
                                 let _ = db::insert_route_trace(&state.pool, &trace).await;
                                 return Err(refresh_error);
                             }
@@ -1990,17 +2328,9 @@ pub(crate) async fn run_with_disconnect(
                 }
 
                 handle_key_failure(state, target, &failure, &mut meta, &mut trace).await;
-                let client_error = preserve_anthropic_error(
-                    failure_to_error(&failure, target),
-                    format,
-                    adapter.as_ref(),
-                    &failure,
-                    status,
-                    &headers,
-                    upstream_error_body.as_deref(),
-                );
                 let can_fallback =
                     allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
+                trace.stream_termination(termination, Some(can_fallback));
                 record_target_telemetry(
                     state,
                     target,
@@ -2026,6 +2356,21 @@ pub(crate) async fn run_with_disconnect(
                         None,
                         None,
                     );
+                    reconcile_partial_attempts(&mut meta);
+                    record_precommit_request_log(
+                        state,
+                        &meta,
+                        &req,
+                        target,
+                        key.as_ref(),
+                        &trace,
+                        upstream_request_id.as_deref(),
+                        &failure,
+                        &client_error,
+                        termination,
+                        started,
+                        attempts_done,
+                    );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
                     return Err(client_error);
                 }
@@ -2036,6 +2381,33 @@ pub(crate) async fn run_with_disconnect(
                 continue;
             }
             Err(failure) => {
+                let termination = StreamTermination::new(
+                    stream_outcome_for_failure(failure.kind),
+                    CommitState::PreCommit,
+                    Some(failure.kind),
+                    failure.status,
+                );
+                let client_error = failure_to_error(&failure, target);
+                record_precommit_attempt_usage(
+                    state,
+                    &mut meta,
+                    target,
+                    key.as_ref(),
+                    &trace,
+                    None,
+                    TokenUsage::default(),
+                    &failure,
+                    termination,
+                )
+                .await;
+                last_precommit_failure = Some(LastPrecommitFailure {
+                    target: (*target).clone(),
+                    upstream_request_id: None,
+                    failure: failure.clone(),
+                    termination,
+                    attempts_done,
+                    client_error: client_error.clone(),
+                });
                 if let Some(permit) = traffic_permit.as_ref() {
                     permit.finish(traffic_outcome_for_failure(failure.kind));
                 }
@@ -2058,6 +2430,7 @@ pub(crate) async fn run_with_disconnect(
                 handle_key_failure(state, target, &failure, &mut meta, &mut trace).await;
                 let can_fallback =
                     allow_fallback && route_allows_fallback(route.as_ref(), failure.kind);
+                trace.stream_termination(termination, Some(can_fallback));
                 record_target_telemetry(
                     state,
                     target,
@@ -2083,10 +2456,25 @@ pub(crate) async fn run_with_disconnect(
                         None,
                         None,
                     );
+                    reconcile_partial_attempts(&mut meta);
+                    record_precommit_request_log(
+                        state,
+                        &meta,
+                        &req,
+                        target,
+                        key.as_ref(),
+                        &trace,
+                        None,
+                        &failure,
+                        &client_error,
+                        termination,
+                        started,
+                        attempts_done,
+                    );
                     let _ = db::insert_route_trace(&state.pool, &trace).await;
-                    return Err(failure_to_error(&failure, target));
+                    return Err(client_error);
                 }
-                last_error = Some(failure_to_error(&failure, target));
+                last_error = Some(client_error);
                 continue;
             }
         }
@@ -2094,17 +2482,35 @@ pub(crate) async fn run_with_disconnect(
 
     // 4. Every target unavailable (FR-12.12).
     state.failures_pre_commit.fetch_add(1, Ordering::Relaxed);
+    reconcile_partial_attempts(&mut meta);
     let retry_after = pool::soonest_recovery(&all_accounts)
         .map(|t| ((t - chrono::Utc::now()).num_seconds().max(1)) as u64);
     let name = route
         .as_ref()
         .map(|c| format!("route '{}'", c.name))
         .unwrap_or_else(|| req.requested_model.clone());
-    let msg = last_error
+    let msg = last_precommit_failure
         .as_ref()
-        .map(|e| e.message.clone())
+        .map(|failure| failure.client_error.message.clone())
+        .or_else(|| last_error.as_ref().map(|error| error.message.clone()))
         .unwrap_or_else(|| format!("all targets of {name} are currently unavailable"));
     trace.finish("all_targets_unavailable");
+    if let Some(failure) = last_precommit_failure.as_ref() {
+        record_precommit_request_log(
+            state,
+            &meta,
+            &req,
+            &failure.target,
+            key.as_ref(),
+            &trace,
+            failure.upstream_request_id.as_deref(),
+            &failure.failure,
+            &failure.client_error,
+            failure.termination,
+            started,
+            failure.attempts_done,
+        );
+    }
     state.live.finish(
         &meta.request_id,
         "all_targets_unavailable",
@@ -2113,8 +2519,11 @@ pub(crate) async fn run_with_disconnect(
         None,
     );
     let _ = db::insert_route_trace(&state.pool, &trace).await;
-    // Preserve the actual upstream failure when we attempted a target. Routing
-    // exhaustion must not turn a useful 429/401/5xx into a generic 503.
+    // Preserve the actual dispatched failure and its client error together.
+    // Routing exhaustion must not turn a useful 429/401/5xx into a generic 503.
+    if let Some(failure) = last_precommit_failure {
+        return Err(failure.client_error);
+    }
     if let Some(error) = last_error {
         return Err(error);
     }
@@ -2423,11 +2832,12 @@ fn trace_provider_circuit_transition(
     transition: crate::provider_circuit::ProviderCircuitTransition,
 ) {
     if transition.opened {
-        trace.step(
-            "provider_circuit",
-            Some(provider_name.to_string()),
-            "provider circuit opened after a qualifying failure",
-        );
+        let detail = if transition.validated_first_event {
+            "provider circuit opened after a terminal failure following first-event validation"
+        } else {
+            "provider circuit opened after a qualifying failure"
+        };
+        trace.step("provider_circuit", Some(provider_name.to_string()), detail);
     }
 }
 
@@ -2787,6 +3197,39 @@ struct PreparedUpstream {
     is_sse: bool,
 }
 
+struct PreparedResponseFailure {
+    failure: UpstreamFailure,
+    outcome: StreamOutcome,
+    precommit_usage: TokenUsage,
+}
+
+impl PreparedResponseFailure {
+    fn new(failure: UpstreamFailure, outcome: StreamOutcome) -> Self {
+        Self {
+            failure,
+            outcome,
+            precommit_usage: TokenUsage::default(),
+        }
+    }
+
+    fn with_precommit_usage(mut self, usage: &TokenUsage) -> Self {
+        self.precommit_usage = usage.clone();
+        self
+    }
+}
+
+impl From<UpstreamFailure> for PreparedResponseFailure {
+    fn from(failure: UpstreamFailure) -> Self {
+        let outcome = match failure.kind {
+            FailureKind::Timeout => StreamOutcome::Timeout,
+            FailureKind::MalformedUpstream => StreamOutcome::ProtocolViolation,
+            FailureKind::ClientCancelled => StreamOutcome::ClientCancelled,
+            _ => StreamOutcome::UpstreamError,
+        };
+        Self::new(failure, outcome)
+    }
+}
+
 fn is_semantic_event(event: &StreamEvent) -> bool {
     !matches!(event, StreamEvent::Start { .. } | StreamEvent::Usage(_))
 }
@@ -2819,12 +3262,19 @@ fn payload_error_failure(adapter: &Arc<dyn Adapter>, payload: &str) -> Option<Up
 }
 
 /// Validate a successful HTTP response before the client response is committed.
-/// SSE stays retryable until the first semantic model event. Normal JSON is
-/// parsed completely through the adapter's full-response path.
+/// SSE stays retryable until the destination encoder produces client-visible
+/// bytes (or passthrough observes a semantic event). Normal JSON is parsed
+/// completely through the adapter's full-response path.
 async fn prepare_success_response(
     mut response: reqwest::Response,
     adapter: &Arc<dyn Adapter>,
-) -> Result<PreparedUpstream, UpstreamFailure> {
+    aggregate_sse: bool,
+    format: FrontendFormat,
+    passthrough: bool,
+    encoder_ctx: &EncoderCtx,
+    first_event_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<PreparedUpstream, PreparedResponseFailure> {
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -2832,6 +3282,10 @@ async fn prepare_success_response(
         .unwrap_or("")
         .to_ascii_lowercase();
     let is_sse = content_type.split(';').next().map(str::trim) == Some("text/event-stream");
+
+    if is_sse && aggregate_sse {
+        return prepare_aggregated_sse(response, adapter, first_event_timeout, idle_timeout).await;
+    }
 
     if !is_sse {
         if response
@@ -2845,7 +3299,8 @@ async fn prepare_success_response(
                 retry_after_secs: None,
                 message: "upstream JSON response exceeds size limit".into(),
                 quota_reset_at: None,
-            });
+            }
+            .into());
         }
         let body = response.bytes().await.map_err(|error| UpstreamFailure {
             kind: if error.is_timeout() {
@@ -2865,11 +3320,12 @@ async fn prepare_success_response(
                 retry_after_secs: None,
                 message: "upstream JSON response exceeds size limit".into(),
                 quota_reset_at: None,
-            });
+            }
+            .into());
         }
         let body_text = String::from_utf8_lossy(&body);
         if let Some(failure) = payload_error_failure(adapter, &body_text) {
-            return Err(failure);
+            return Err(failure.into());
         }
         let value: Value = serde_json::from_slice(&body).map_err(|error| UpstreamFailure {
             kind: FailureKind::MalformedUpstream,
@@ -2886,7 +3342,8 @@ async fn prepare_success_response(
                 retry_after_secs: None,
                 message: "upstream JSON response contained no model result".into(),
                 quota_reset_at: None,
-            });
+            }
+            .into());
         }
         let mut precommit_usage = TokenUsage::default();
         for event in &events {
@@ -2906,10 +3363,183 @@ async fn prepare_success_response(
     let mut framer = crate::sse::SseFramer::new();
     let mut prefetched = Vec::new();
     let mut precommit_usage = TokenUsage::default();
+    let mut visibility_encoder = (!passthrough).then(|| Encoder::new(format, encoder_ctx.clone()));
+    let first_event_deadline = tokio::time::Instant::now() + first_event_timeout;
     loop {
-        match response.chunk().await {
-            Ok(Some(bytes)) => {
+        let remaining = first_event_deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, response.chunk()).await {
+            Ok(Ok(Some(bytes))) => {
                 prefetched.push(bytes.clone());
+                let frames = framer.push(&bytes).map_err(|error| {
+                    PreparedResponseFailure::from(UpstreamFailure {
+                        kind: FailureKind::MalformedUpstream,
+                        status: Some(502),
+                        retry_after_secs: None,
+                        message: error.to_string(),
+                        quota_reset_at: None,
+                    })
+                    .with_precommit_usage(&precommit_usage)
+                })?;
+                for frame in frames {
+                    let Some(payload) = crate::sse::extract_data(&frame) else {
+                        continue;
+                    };
+                    if let Some(failure) = payload_error_failure(adapter, &payload) {
+                        return Err(PreparedResponseFailure::from(failure)
+                            .with_precommit_usage(&precommit_usage));
+                    }
+                    if payload.trim() == "[DONE]" {
+                        return Err(PreparedResponseFailure::from(UpstreamFailure {
+                            kind: FailureKind::MalformedUpstream,
+                            status: Some(502),
+                            retry_after_secs: None,
+                            message: "upstream SSE ended before any model event".into(),
+                            quota_reset_at: None,
+                        })
+                        .with_precommit_usage(&precommit_usage));
+                    }
+                    let events = adapter.parse_stream_chunk(&payload).map_err(|failure| {
+                        PreparedResponseFailure::from(failure)
+                            .with_precommit_usage(&precommit_usage)
+                    })?;
+                    for event in &events {
+                        if let StreamEvent::Usage(value) = event {
+                            precommit_usage.merge(value);
+                        }
+                    }
+                    let client_visible = if passthrough {
+                        events.iter().any(is_semantic_event)
+                    } else {
+                        events.iter().any(|event| {
+                            !visibility_encoder
+                                .as_mut()
+                                .expect("translated response has a visibility encoder")
+                                .encode(event.clone())
+                                .is_empty()
+                        })
+                    };
+                    if client_visible {
+                        return Ok(PreparedUpstream {
+                            stream: Some(response),
+                            prefetched,
+                            full_events: None,
+                            precommit_usage,
+                            is_sse: true,
+                        });
+                    }
+                }
+            }
+            Ok(Ok(None)) => {
+                let message = if framer.pending_bytes() > 0 {
+                    "upstream SSE ended with an incomplete frame"
+                } else {
+                    "upstream SSE ended before any model event"
+                };
+                let failure = UpstreamFailure {
+                    kind: FailureKind::MalformedUpstream,
+                    status: Some(502),
+                    retry_after_secs: None,
+                    message: message.into(),
+                    quota_reset_at: None,
+                };
+                let outcome = if framer.pending_bytes() > 0 {
+                    StreamOutcome::ProtocolViolation
+                } else {
+                    StreamOutcome::UpstreamCleanEof
+                };
+                return Err(PreparedResponseFailure::new(failure, outcome)
+                    .with_precommit_usage(&precommit_usage));
+            }
+            Ok(Err(error)) => {
+                return Err(PreparedResponseFailure::from(UpstreamFailure {
+                    kind: if error.is_timeout() {
+                        FailureKind::Timeout
+                    } else {
+                        FailureKind::ConnectionError
+                    },
+                    status: None,
+                    retry_after_secs: None,
+                    message: classify_reqwest(&error),
+                    quota_reset_at: None,
+                })
+                .with_precommit_usage(&precommit_usage));
+            }
+            Err(_) => {
+                return Err(PreparedResponseFailure::from(timeout_failure(
+                    "upstream timed out before first valid event",
+                ))
+                .with_precommit_usage(&precommit_usage));
+            }
+        }
+    }
+}
+
+async fn prepare_aggregated_sse(
+    response: reqwest::Response,
+    adapter: &Arc<dyn Adapter>,
+    first_event_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<PreparedUpstream, PreparedResponseFailure> {
+    let mut precommit_usage = TokenUsage::default();
+    let result = prepare_aggregated_sse_inner(
+        response,
+        adapter,
+        first_event_timeout,
+        idle_timeout,
+        &mut precommit_usage,
+    )
+    .await;
+    result.map_err(|mut failure| {
+        failure.precommit_usage = precommit_usage;
+        failure
+    })
+}
+
+async fn prepare_aggregated_sse_inner(
+    mut response: reqwest::Response,
+    adapter: &Arc<dyn Adapter>,
+    first_event_timeout: Duration,
+    idle_timeout: Duration,
+    precommit_usage: &mut TokenUsage,
+) -> Result<PreparedUpstream, PreparedResponseFailure> {
+    let first_event_deadline = Instant::now() + first_event_timeout;
+    let mut framer = crate::sse::SseFramer::new();
+    let mut events_out = Vec::new();
+    let mut semantic_seen = false;
+    let mut terminal_seen = false;
+
+    loop {
+        let timeout = if semantic_seen {
+            idle_timeout
+        } else {
+            first_event_deadline.saturating_duration_since(Instant::now())
+        };
+        match tokio::time::timeout(timeout, response.chunk()).await {
+            Err(_) => {
+                return Err(UpstreamFailure {
+                    kind: FailureKind::Timeout,
+                    status: None,
+                    retry_after_secs: None,
+                    message: "timeout waiting for upstream SSE response".into(),
+                    quota_reset_at: None,
+                }
+                .into());
+            }
+            Ok(Err(error)) => {
+                return Err(UpstreamFailure {
+                    kind: if error.is_timeout() {
+                        FailureKind::Timeout
+                    } else {
+                        FailureKind::ConnectionError
+                    },
+                    status: None,
+                    retry_after_secs: None,
+                    message: classify_reqwest(&error),
+                    quota_reset_at: None,
+                }
+                .into());
+            }
+            Ok(Ok(Some(bytes))) => {
                 let frames = framer.push(&bytes).map_err(|error| UpstreamFailure {
                     kind: FailureKind::MalformedUpstream,
                     status: Some(502),
@@ -2922,59 +3552,66 @@ async fn prepare_success_response(
                         continue;
                     };
                     if let Some(failure) = payload_error_failure(adapter, &payload) {
-                        return Err(failure);
+                        return Err(failure.into());
                     }
                     if payload.trim() == "[DONE]" {
-                        return Err(UpstreamFailure {
-                            kind: FailureKind::MalformedUpstream,
-                            status: Some(502),
-                            retry_after_secs: None,
-                            message: "upstream SSE ended before any model event".into(),
-                            quota_reset_at: None,
-                        });
+                        terminal_seen = true;
+                        continue;
                     }
                     let events = adapter.parse_stream_chunk(&payload)?;
+                    terminal_seen |= payload_is_terminal(&payload, &events);
+                    semantic_seen |= events.iter().any(is_semantic_event);
                     for event in &events {
                         if let StreamEvent::Usage(value) = event {
                             precommit_usage.merge(value);
                         }
                     }
-                    if events.iter().any(is_semantic_event) {
-                        return Ok(PreparedUpstream {
-                            stream: Some(response),
-                            prefetched,
-                            full_events: None,
-                            precommit_usage,
-                            is_sse: true,
-                        });
-                    }
+                    events_out.extend(events);
                 }
             }
-            Ok(None) => {
-                let message = if framer.pending_bytes() > 0 {
-                    "upstream SSE ended with an incomplete frame"
-                } else {
-                    "upstream SSE ended before any model event"
-                };
-                return Err(UpstreamFailure {
-                    kind: FailureKind::MalformedUpstream,
-                    status: Some(502),
-                    retry_after_secs: None,
-                    message: message.into(),
-                    quota_reset_at: None,
-                });
-            }
-            Err(error) => {
-                return Err(UpstreamFailure {
-                    kind: if error.is_timeout() {
-                        FailureKind::Timeout
-                    } else {
-                        FailureKind::ConnectionError
-                    },
-                    status: None,
-                    retry_after_secs: None,
-                    message: classify_reqwest(&error),
-                    quota_reset_at: None,
+            Ok(Ok(None)) => {
+                if framer.pending_bytes() > 0 {
+                    return Err(PreparedResponseFailure::new(
+                        UpstreamFailure {
+                            kind: FailureKind::MalformedUpstream,
+                            status: Some(502),
+                            retry_after_secs: None,
+                            message: "upstream SSE ended with an incomplete frame".into(),
+                            quota_reset_at: None,
+                        },
+                        StreamOutcome::ProtocolViolation,
+                    ));
+                }
+                if !terminal_seen {
+                    return Err(PreparedResponseFailure::new(
+                        UpstreamFailure {
+                            kind: FailureKind::MalformedUpstream,
+                            status: Some(502),
+                            retry_after_secs: None,
+                            message: "upstream SSE ended without a terminal event".into(),
+                            quota_reset_at: None,
+                        },
+                        StreamOutcome::UpstreamCleanEof,
+                    ));
+                }
+                if !semantic_seen {
+                    return Err(PreparedResponseFailure::new(
+                        UpstreamFailure {
+                            kind: FailureKind::MalformedUpstream,
+                            status: Some(502),
+                            retry_after_secs: None,
+                            message: "upstream SSE ended before any model event".into(),
+                            quota_reset_at: None,
+                        },
+                        StreamOutcome::ProtocolViolation,
+                    ));
+                }
+                return Ok(PreparedUpstream {
+                    stream: None,
+                    prefetched: Vec::new(),
+                    full_events: Some(events_out),
+                    precommit_usage: precommit_usage.clone(),
+                    is_sse: true,
                 });
             }
         }
@@ -4638,6 +5275,7 @@ async fn stream_response(
     mut meta: RequestMeta,
     req: InternalRequest,
     attempt: Attempt,
+    encoder_ctx: EncoderCtx,
     started: Instant,
     key: Option<db::VirtualKeyRow>,
     trace: RouteTrace,
@@ -4648,20 +5286,6 @@ async fn stream_response(
 
     let model_display = attempt.target.model.display_name.clone();
     let request_id = meta.request_id.clone();
-    let responses = if format == FrontendFormat::OpenAiResponses {
-        match frontends::responses::response_fields_from_request(&req) {
-            Ok(fields) => fields,
-            Err(error) => return crate::api::error_response(format, &request_id, error),
-        }
-    } else {
-        frontends::ResponsesResponseFields::default()
-    };
-    let encoder_ctx = EncoderCtx {
-        model_name: req.requested_model.clone(),
-        request_id: request_id.clone(),
-        created: chrono::Utc::now().timestamp(),
-        responses,
-    };
 
     // Anthropic message_start usage is normally available during pre-commit
     // validation, so expose the best cache status known without delaying the stream.
@@ -5107,8 +5731,7 @@ async fn drive_stream(
     let mut tool_stream = ToolStreamState::new(&meta.request_id);
     let mut usage = TokenUsage::default();
     let mut ttft_ms: Option<i64> = None;
-    let mut status = "success";
-    let mut status_code = 200i64;
+    let mut stream_outcome = StreamOutcome::Completed;
     let mut error_message: Option<String> = None;
     let mut provider_failure: Option<(FailureKind, Option<u16>)> = None;
     let mut committed = false;
@@ -5141,15 +5764,11 @@ async fn drive_stream(
         )
         .await
         {
-            record_cancel(&state, &meta, started);
-            status = "client_disconnect";
-            status_code = 499;
+            stream_outcome = output_abort_outcome(&state, &meta, started);
         } else {
             for frame in encoder.finalize() {
                 if tx.send(Ok(frame)).await.is_err() {
-                    record_cancel(&state, &meta, started);
-                    status = "client_disconnect";
-                    status_code = 499;
+                    stream_outcome = output_abort_outcome(&state, &meta, started);
                     break;
                 }
             }
@@ -5164,14 +5783,11 @@ async fn drive_stream(
             &model_display,
             started,
             ttft_ms,
-            status,
-            status_code,
+            stream_termination(stream_outcome, committed, provider_failure),
             usage,
             error_message,
             key,
             trace,
-            provider_failure,
-            committed,
         )
         .await;
         return;
@@ -5192,30 +5808,25 @@ async fn drive_stream(
     'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
             record_cancel(&state, &meta, started);
-            status = "client_disconnect";
-            status_code = 499;
+            stream_outcome = StreamOutcome::ClientCancelled;
             break;
         }
         tokio::select! {
             _ = notify.notified() => {
                 if meta.disconnected.load(Ordering::Relaxed) {
                     record_cancel(&state, &meta, started);
-                    status = "client_disconnect";
-                    status_code = 499;
+                    stream_outcome = StreamOutcome::ClientCancelled;
                     break;
                 }
             }
             _ = keepalive.tick() => {
                 if tx.send(Ok(frontends::sse_comment("keepalive"))).await.is_err() {
-                    record_cancel(&state, &meta, started);
-                    status = "client_disconnect";
-                    status_code = 499;
+                    stream_outcome = output_abort_outcome(&state, &meta, started);
                     break;
                 }
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
-                status = "stream_error";
-                status_code = 504;
+                stream_outcome = StreamOutcome::Timeout;
                 provider_failure = Some((FailureKind::Timeout, None));
                 error_message = Some("upstream stream idle timeout".into());
                 break 'outer;
@@ -5227,8 +5838,8 @@ async fn drive_stream(
                         let frames = match framer.push(&bytes) {
                             Ok(frames) => frames,
                             Err(error) => {
-                                status = "stream_error";
-                                status_code = 502;
+                                stream_outcome = StreamOutcome::ProtocolViolation;
+                                provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
                                 error_message = Some(error.to_string());
                                 break 'outer;
                             }
@@ -5242,8 +5853,7 @@ async fn drive_stream(
                                 continue;
                             }
                             if let Some(failure) = payload_error_failure(&adapter, &payload) {
-                                status = "stream_error";
-                                status_code = 502;
+                                stream_outcome = stream_outcome_for_failure(failure.kind);
                                 provider_failure = Some((failure.kind, failure.status));
                                 error_message = Some(failure.message.clone());
                                 for out in encoder.error_frame(&failure.message) {
@@ -5254,8 +5864,8 @@ async fn drive_stream(
                             let events = match adapter.parse_stream_chunk(&payload) {
                                 Ok(events) => events,
                                 Err(failure) => {
-                                    status = "stream_error";
-                                    status_code = 502;
+                                    stream_outcome = StreamOutcome::ProtocolViolation;
+                                    provider_failure = Some((failure.kind, failure.status));
                                     error_message = Some(failure.message.clone());
                                     for out in encoder.error_frame(&failure.message) {
                                         let _ = tx.send(Ok(out)).await;
@@ -5287,21 +5897,18 @@ async fn drive_stream(
                             )
                             .await
                             {
-                                record_cancel(&state, &meta, started);
-                                status = "client_disconnect";
-                                status_code = 499;
+                                stream_outcome = output_abort_outcome(&state, &meta, started);
                                 break 'outer;
                             }
                         }
                     }
                     Some(Err(error)) => {
-                        status = "stream_error";
-                        status_code = 502;
                         let kind = if error.is_timeout() {
                             FailureKind::Timeout
                         } else {
                             FailureKind::ConnectionError
                         };
+                        stream_outcome = stream_outcome_for_failure(kind);
                         provider_failure = Some((kind, None));
                         error_message = Some(classify_reqwest(&error));
                         break;
@@ -5312,17 +5919,17 @@ async fn drive_stream(
         }
     }
 
-    if status == "success" && framer.pending_bytes() > 0 {
-        status = "stream_error";
-        status_code = 502;
+    if stream_outcome == StreamOutcome::Completed && framer.pending_bytes() > 0 {
+        stream_outcome = StreamOutcome::ProtocolViolation;
+        provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
         error_message = Some("upstream SSE ended with an incomplete frame".into());
-    } else if status == "success" && !terminal_seen {
-        status = "stream_error";
-        status_code = 502;
+    } else if stream_outcome == StreamOutcome::Completed && !terminal_seen {
+        stream_outcome = StreamOutcome::UpstreamCleanEof;
+        provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
         error_message = Some("upstream SSE ended before a terminal event".into());
     }
 
-    if status == "stream_error" {
+    if stream_outcome.is_upstream_failure() {
         if committed {
             state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
         }
@@ -5332,12 +5939,10 @@ async fn drive_stream(
         for frame in encoder.error_frame(message) {
             let _ = tx.send(Ok(frame)).await;
         }
-    } else if status == "success" {
+    } else if stream_outcome == StreamOutcome::Completed {
         for frame in encoder.finalize() {
             if tx.send(Ok(frame)).await.is_err() {
-                record_cancel(&state, &meta, started);
-                status = "client_disconnect";
-                status_code = 499;
+                stream_outcome = output_abort_outcome(&state, &meta, started);
                 break;
             }
         }
@@ -5352,14 +5957,11 @@ async fn drive_stream(
         &model_display,
         started,
         ttft_ms,
-        status,
-        status_code,
+        stream_termination(stream_outcome, committed, provider_failure),
         usage,
         error_message,
         key,
         trace,
-        provider_failure,
-        committed,
     )
     .await;
 }
@@ -5386,8 +5988,7 @@ async fn drive_stream_passthrough(
 ) {
     let mut usage = TokenUsage::default();
     let mut ttft_ms: Option<i64> = None;
-    let mut status = "success";
-    let mut status_code = 200i64;
+    let mut stream_outcome = StreamOutcome::Completed;
     let mut error_message: Option<String> = None;
     let mut provider_failure: Option<(FailureKind, Option<u16>)> = None;
     let mut committed = false;
@@ -5411,30 +6012,25 @@ async fn drive_stream_passthrough(
     'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
             record_cancel(&state, &meta, started);
-            status = "client_disconnect";
-            status_code = 499;
+            stream_outcome = StreamOutcome::ClientCancelled;
             break;
         }
         tokio::select! {
             _ = notify.notified() => {
                 if meta.disconnected.load(Ordering::Relaxed) {
                     record_cancel(&state, &meta, started);
-                    status = "client_disconnect";
-                    status_code = 499;
+                    stream_outcome = StreamOutcome::ClientCancelled;
                     break;
                 }
             }
             _ = keepalive.tick(), if committed => {
                 if tx.send(Ok(frontends::sse_comment("keepalive"))).await.is_err() {
-                    record_cancel(&state, &meta, started);
-                    status = "client_disconnect";
-                    status_code = 499;
+                    stream_outcome = output_abort_outcome(&state, &meta, started);
                     break;
                 }
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
-                status = "stream_error";
-                status_code = 504;
+                stream_outcome = StreamOutcome::Timeout;
                 provider_failure = Some((FailureKind::Timeout, None));
                 error_message = Some("upstream stream idle timeout".into());
                 break 'outer;
@@ -5446,8 +6042,8 @@ async fn drive_stream_passthrough(
                         let frames = match framer.push(&bytes) {
                             Ok(frames) => frames,
                             Err(error) => {
-                                status = "stream_error";
-                                status_code = 502;
+                                stream_outcome = StreamOutcome::ProtocolViolation;
+                                provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
                                 error_message = Some(error.to_string());
                                 break 'outer;
                             }
@@ -5460,8 +6056,7 @@ async fn drive_stream_passthrough(
                                     terminal_seen = true;
                                 } else {
                                     if let Some(failure) = payload_error_failure(&adapter, payload) {
-                                        status = "stream_error";
-                                        status_code = 502;
+                                        stream_outcome = stream_outcome_for_failure(failure.kind);
                                         provider_failure = Some((failure.kind, failure.status));
                                         error_message = Some(failure.message);
                                         break 'outer;
@@ -5510,8 +6105,8 @@ async fn drive_stream_passthrough(
                                             }
                                         }
                                         Err(failure) => {
-                                            status = "stream_error";
-                                            status_code = 502;
+                                            stream_outcome = StreamOutcome::ProtocolViolation;
+                                            provider_failure = Some((failure.kind, failure.status));
                                             error_message = Some(failure.message);
                                             break 'outer;
                                         }
@@ -5542,9 +6137,7 @@ async fn drive_stream_passthrough(
                                         .await
                                         .is_err()
                                     {
-                                        record_cancel(&state, &meta, started);
-                                        status = "client_disconnect";
-                                        status_code = 499;
+                                        stream_outcome = output_abort_outcome(&state, &meta, started);
                                         break 'outer;
                                     }
                                 }
@@ -5553,21 +6146,18 @@ async fn drive_stream_passthrough(
                                 .await
                                 .is_err()
                             {
-                                record_cancel(&state, &meta, started);
-                                status = "client_disconnect";
-                                status_code = 499;
+                                stream_outcome = output_abort_outcome(&state, &meta, started);
                                 break 'outer;
                             }
                         }
                     }
                     Some(Err(error)) => {
-                        status = "stream_error";
-                        status_code = 502;
                         let kind = if error.is_timeout() {
                             FailureKind::Timeout
                         } else {
                             FailureKind::ConnectionError
                         };
+                        stream_outcome = stream_outcome_for_failure(kind);
                         provider_failure = Some((kind, None));
                         error_message = Some(classify_reqwest(&error));
                         break;
@@ -5578,17 +6168,17 @@ async fn drive_stream_passthrough(
         }
     }
 
-    if status == "success" && framer.pending_bytes() > 0 {
-        status = "stream_error";
-        status_code = 502;
+    if stream_outcome == StreamOutcome::Completed && framer.pending_bytes() > 0 {
+        stream_outcome = StreamOutcome::ProtocolViolation;
+        provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
         error_message = Some("upstream SSE ended with an incomplete frame".into());
-    } else if status == "success" && !terminal_seen {
-        status = "stream_error";
-        status_code = 502;
+    } else if stream_outcome == StreamOutcome::Completed && !terminal_seen {
+        stream_outcome = StreamOutcome::UpstreamCleanEof;
+        provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
         error_message = Some("upstream SSE ended before a terminal event".into());
     }
 
-    if status == "stream_error" && committed {
+    if stream_outcome.is_upstream_failure() && committed {
         state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
         let message = error_message
             .as_deref()
@@ -5625,14 +6215,11 @@ async fn drive_stream_passthrough(
         &model_display,
         started,
         ttft_ms,
-        status,
-        status_code,
+        stream_termination(stream_outcome, committed, provider_failure),
         usage,
         error_message,
         key,
         trace,
-        provider_failure,
-        committed,
     )
     .await;
 }
@@ -5651,6 +6238,41 @@ impl Drop for DisconnectGuard {
         *self.at.lock() = Some(Instant::now());
         self.flag.store(true, Ordering::Relaxed);
         self.notify.notify_waiters();
+    }
+}
+
+fn stream_outcome_for_failure(kind: FailureKind) -> StreamOutcome {
+    match kind {
+        FailureKind::ClientCancelled => StreamOutcome::ClientCancelled,
+        FailureKind::Timeout => StreamOutcome::Timeout,
+        FailureKind::MalformedUpstream => StreamOutcome::ProtocolViolation,
+        _ => StreamOutcome::UpstreamError,
+    }
+}
+
+fn stream_termination(
+    outcome: StreamOutcome,
+    committed: bool,
+    failure: Option<(FailureKind, Option<u16>)>,
+) -> StreamTermination {
+    StreamTermination::new(
+        outcome,
+        if committed {
+            CommitState::PostCommit
+        } else {
+            CommitState::PreCommit
+        },
+        failure.map(|(kind, _)| kind),
+        failure.and_then(|(_, status)| status),
+    )
+}
+
+fn output_abort_outcome(state: &AppState, meta: &RequestMeta, started: Instant) -> StreamOutcome {
+    if meta.disconnected.load(Ordering::Relaxed) {
+        record_cancel(state, meta, started);
+        StreamOutcome::ClientCancelled
+    } else {
+        StreamOutcome::GatewayAbort
     }
 }
 
@@ -5701,6 +6323,7 @@ async fn drive_aggregate(
     let mut usage = TokenUsage::default();
     let mut status = "success";
     let mut status_code = 200i64;
+    let mut stream_outcome = StreamOutcome::Completed;
     let mut error_message: Option<String> = None;
     let mut provider_failure: Option<(FailureKind, Option<u16>)> = None;
     let mut committed = false;
@@ -5732,6 +6355,7 @@ async fn drive_aggregate(
             let next = match tokio::time::timeout(attempt.idle_timeout, chunks.next()).await {
                 Ok(next) => next,
                 Err(_) => {
+                    stream_outcome = StreamOutcome::Timeout;
                     status = "stream_error";
                     status_code = 504;
                     provider_failure = Some((FailureKind::Timeout, None));
@@ -5747,8 +6371,10 @@ async fn drive_aggregate(
                     let frames = match framer.push(&bytes) {
                         Ok(frames) => frames,
                         Err(error) => {
+                            stream_outcome = StreamOutcome::ProtocolViolation;
                             status = "stream_error";
                             status_code = 502;
+                            provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
                             error_message = Some(error.to_string());
                             break;
                         }
@@ -5762,6 +6388,7 @@ async fn drive_aggregate(
                             continue;
                         }
                         if let Some(failure) = payload_error_failure(&adapter, &payload) {
+                            stream_outcome = stream_outcome_for_failure(failure.kind);
                             status = "stream_error";
                             status_code = 502;
                             provider_failure = Some((failure.kind, failure.status));
@@ -5785,8 +6412,10 @@ async fn drive_aggregate(
                                 }
                             }
                             Err(failure) => {
+                                stream_outcome = StreamOutcome::ProtocolViolation;
                                 status = "stream_error";
                                 status_code = 502;
+                                provider_failure = Some((failure.kind, failure.status));
                                 error_message = Some(failure.message);
                                 break 'outer;
                             }
@@ -5794,12 +6423,17 @@ async fn drive_aggregate(
                     }
                 }
                 Err(error) => {
-                    status = "stream_error";
-                    status_code = 502;
                     let kind = if error.is_timeout() {
                         FailureKind::Timeout
                     } else {
                         FailureKind::ConnectionError
+                    };
+                    stream_outcome = stream_outcome_for_failure(kind);
+                    status = "stream_error";
+                    status_code = if kind == FailureKind::Timeout {
+                        504
+                    } else {
+                        502
                     };
                     provider_failure = Some((kind, None));
                     error_message = Some(classify_reqwest(&error));
@@ -5809,12 +6443,16 @@ async fn drive_aggregate(
         }
 
         if status == "success" && framer.pending_bytes() > 0 {
+            stream_outcome = StreamOutcome::ProtocolViolation;
             status = "stream_error";
             status_code = 502;
+            provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
             error_message = Some("upstream SSE ended with an incomplete frame".into());
         } else if status == "success" && !terminal_seen {
+            stream_outcome = StreamOutcome::UpstreamCleanEof;
             status = "stream_error";
             status_code = 502;
+            provider_failure = Some((FailureKind::MalformedUpstream, Some(502)));
             error_message = Some("upstream SSE ended before a terminal event".into());
         }
 
@@ -5826,6 +6464,7 @@ async fn drive_aggregate(
         }
     }
 
+    let termination = stream_termination(stream_outcome, committed, provider_failure);
     finalize_log(
         &state,
         &snap,
@@ -5835,14 +6474,11 @@ async fn drive_aggregate(
         &model_name,
         started,
         None,
-        status,
-        status_code,
+        termination,
         usage.clone(),
         error_message.clone(),
         key.clone(),
         trace,
-        provider_failure,
-        committed,
     )
     .await;
 
@@ -5897,6 +6533,287 @@ fn persisted_request_timing(
     (duration_ms, persisted_ttft_ms(is_sse, ttft_ms))
 }
 
+fn usage_has_reported_tokens(usage: &TokenUsage) -> bool {
+    usage.input.is_some()
+        || usage.output.is_some()
+        || usage.cached.is_some()
+        || usage.cache_write.is_some()
+        || usage.thinking.is_some()
+}
+
+fn aggregate_request_accounting(
+    meta: &RequestMeta,
+    current_usage: Option<&TokenUsage>,
+    current_cost: Option<f64>,
+) -> (TokenUsage, Option<f64>) {
+    let mut usages = meta
+        .partial_attempts
+        .iter()
+        .map(|attempt| &attempt.usage)
+        .collect::<Vec<_>>();
+    if let Some(usage) = current_usage {
+        usages.push(usage);
+    }
+    let sum_field = |field: fn(&TokenUsage) -> Option<u64>| {
+        if usages.is_empty() {
+            return None;
+        }
+        usages.iter().try_fold(0_u64, |total, usage| {
+            field(usage).map(|value| total.saturating_add(value))
+        })
+    };
+    let usage = TokenUsage {
+        input: sum_field(|usage| usage.input),
+        output: sum_field(|usage| usage.output),
+        cached: sum_field(|usage| usage.cached),
+        cache_write: sum_field(|usage| usage.cache_write),
+        thinking: sum_field(|usage| usage.thinking),
+    };
+
+    let cost = if usages.is_empty() {
+        None
+    } else {
+        meta.partial_attempts
+            .iter()
+            .try_fold(0.0, |total, attempt| attempt.cost.map(|cost| total + cost))
+            .and_then(|total| {
+                if current_usage.is_some() {
+                    current_cost.map(|cost| total + cost)
+                } else {
+                    Some(total)
+                }
+            })
+    };
+    (usage, cost)
+}
+
+fn aggregate_admission_accounting(
+    meta: &RequestMeta,
+    current_usage: Option<&TokenUsage>,
+    current_cost: Option<f64>,
+) -> (TokenUsage, Option<f64>) {
+    let (usage, cost) = aggregate_request_accounting(meta, current_usage, current_cost);
+    (
+        TokenUsage {
+            input: usage.input,
+            output: usage.output,
+            ..TokenUsage::default()
+        },
+        cost,
+    )
+}
+
+fn reconcile_partial_attempts(meta: &mut RequestMeta) {
+    if meta.partial_attempts.is_empty() {
+        return;
+    }
+    if let Some(admission) = meta.admission.take() {
+        let (usage, cost) = aggregate_admission_accounting(meta, None, None);
+        admission.reconcile(&usage, cost);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_precommit_attempt_usage(
+    state: &AppState,
+    meta: &mut RequestMeta,
+    target: &ResolvedTarget,
+    key: Option<&db::VirtualKeyRow>,
+    trace: &RouteTrace,
+    upstream_request_id: Option<&str>,
+    usage: TokenUsage,
+    failure: &UpstreamFailure,
+    termination: StreamTermination,
+) {
+    let computed_cost = (usage.input.is_some() && usage.output.is_some())
+        .then(|| cost::compute_cost(&target.model.prices(), &usage))
+        .flatten();
+    let attempt_number = meta.partial_attempts.len() + 1;
+    let row = usage_attempt_row(
+        meta,
+        target,
+        key,
+        upstream_request_id,
+        attempt_number,
+        &usage,
+        None,
+        None,
+        termination,
+        Some(&failure.message),
+        &trace.opaque_route_id,
+    );
+    let staged_attempt_index = meta.partial_attempts.len();
+    meta.partial_attempts.push(PartialAttemptUsage {
+        usage,
+        cost: None,
+        row,
+    });
+    meta.active_precommit_attempt = None;
+
+    if let Some(computed_cost) = computed_cost {
+        let prices = target.model.prices();
+        let (source, source_metadata) = target.model.price_provenance();
+        match db::ensure_price_version(
+            &state.pool,
+            &target.model.id,
+            &prices,
+            &source,
+            &source_metadata,
+        )
+        .await
+        {
+            Ok(Some(version_id)) => {
+                let staged = &mut meta.partial_attempts[staged_attempt_index];
+                staged.cost = Some(computed_cost);
+                staged.row.cost_usd = Some(computed_cost);
+                staged.row.cost_known = 1;
+                staged.row.price_version_id = Some(version_id);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                model = %target.model.id,
+                %error,
+                "failed to resolve price version for failed precommit attempt"
+            ),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn usage_attempt_row(
+    meta: &RequestMeta,
+    target: &ResolvedTarget,
+    key: Option<&db::VirtualKeyRow>,
+    upstream_request_id: Option<&str>,
+    attempt_number: usize,
+    usage: &TokenUsage,
+    cost: Option<f64>,
+    price_version_id: Option<&str>,
+    termination: StreamTermination,
+    error_message: Option<&str>,
+    opaque_route_id: &str,
+) -> db::UsageAttemptRow {
+    db::UsageAttemptRow {
+        id: format!("usage_attempt_{}", uuid::Uuid::new_v4().simple()),
+        request_id: meta.request_id.clone(),
+        attempt_number: attempt_number as i64,
+        ts: db::now_iso(),
+        key_id: key.map(|key| key.id.clone()),
+        key_name: key.map(|key| key.name.clone()),
+        effective_model: Some(target.model.display_name.clone()),
+        route_id: meta.route_id.clone(),
+        route_name: meta.route_name.clone(),
+        serving_account_id: Some(target.account.id.clone()),
+        serving_account: Some(target.account.label.clone()),
+        serving_provider: Some(target.provider.name.clone()),
+        upstream_request_id: upstream_request_id.map(str::to_owned),
+        status: termination.request_status().to_string(),
+        status_code: termination.status_code(),
+        input_tokens: usage.input.map(|value| value as i64),
+        output_tokens: usage.output.map(|value| value as i64),
+        cached_tokens: usage.cached.map(|value| value as i64),
+        cache_write_tokens: usage.cache_write.map(|value| value as i64),
+        thinking_tokens: usage.thinking.map(|value| value as i64),
+        cost_usd: cost,
+        cost_known: cost.is_some() as i64,
+        price_version_id: price_version_id.map(str::to_owned),
+        usage_confidence: if usage_has_reported_tokens(usage) {
+            "provider_reported".to_string()
+        } else {
+            "unknown".to_string()
+        },
+        commit_state: termination.commit_state.as_usage_str().to_string(),
+        error_message: error_message.map(str::to_owned),
+        opaque_route_id: Some(opaque_route_id.to_string()),
+    }
+}
+
+fn precommit_request_status(failure: &UpstreamFailure) -> &'static str {
+    match failure.kind {
+        FailureKind::RateLimit => "rate_limited",
+        FailureKind::QuotaExhausted => "quota_exhausted",
+        FailureKind::BadRequest | FailureKind::PolicyRejected | FailureKind::TargetError => {
+            "client_error"
+        }
+        FailureKind::Timeout | FailureKind::MalformedUpstream => "stream_error",
+        FailureKind::ClientCancelled => "client_disconnect",
+        FailureKind::AuthError
+        | FailureKind::ServerError
+        | FailureKind::ConnectionError
+        | FailureKind::PluginFailure => "upstream_error",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_precommit_request_log(
+    state: &AppState,
+    meta: &RequestMeta,
+    req: &InternalRequest,
+    target: &ResolvedTarget,
+    key: Option<&db::VirtualKeyRow>,
+    trace: &RouteTrace,
+    upstream_request_id: Option<&str>,
+    failure: &UpstreamFailure,
+    client_error: &ProxyError,
+    termination: StreamTermination,
+    started: Instant,
+    attempts_done: usize,
+) {
+    let (usage, cost) = aggregate_request_accounting(meta, None, None);
+    let usage_confidence = if usage_has_reported_tokens(&usage) {
+        "provider_reported"
+    } else {
+        "unknown"
+    };
+    let row = UsageLogRow {
+        id: format!("usage_{}", uuid::Uuid::new_v4().simple()),
+        request_id: meta.request_id.clone(),
+        ts: db::now_iso(),
+        key_id: key.map(|key| key.id.clone()),
+        key_name: key.map(|key| key.name.clone()),
+        client_format: meta.client_format.to_string(),
+        requested_model: req.requested_model.clone(),
+        effective_model: Some(target.model.display_name.clone()),
+        route_id: meta.route_id.clone(),
+        route_name: meta.route_name.clone(),
+        fallback_hops: attempts_done.saturating_sub(1) as i64,
+        fallback_path: serde_json::to_string(&meta.fallback_path).unwrap_or_else(|_| "[]".into()),
+        status: precommit_request_status(failure).to_string(),
+        status_code: client_error.http_status() as i64,
+        latency_ms: Some(started.elapsed().as_millis() as i64),
+        ttft_ms: None,
+        input_tokens: usage.input.map(|value| value as i64),
+        output_tokens: usage.output.map(|value| value as i64),
+        cached_tokens: usage.cached.map(|value| value as i64),
+        cache_write_tokens: usage.cache_write.map(|value| value as i64),
+        thinking_tokens: usage.thinking.map(|value| value as i64),
+        cost_usd: cost,
+        cost_known: cost.is_some() as i64,
+        price_version_id: None,
+        cache_status: cache_status_from_usage(&usage).to_string(),
+        serving_account_id: Some(target.account.id.clone()),
+        serving_account: Some(target.account.label.clone()),
+        serving_provider: Some(target.provider.name.clone()),
+        upstream_request_id: upstream_request_id.map(str::to_owned),
+        flagged: 0,
+        error_message: Some(failure.message.clone()),
+        usage_confidence: usage_confidence.to_string(),
+        commit_state: termination.commit_state.as_usage_str().to_string(),
+        retry_count: attempts_done.saturating_sub(1) as i64,
+        route_trace_id: Some(trace.opaque_route_id.clone()),
+        opaque_route_id: Some(trace.opaque_route_id.clone()),
+    };
+    state.log_queue.enqueue_bundle(db::UsageAccountingBundle {
+        request: row,
+        attempts: meta
+            .partial_attempts
+            .iter()
+            .map(|attempt| attempt.row.clone())
+            .collect(),
+    });
+    meta.accounting_enqueued.store(true, Ordering::Release);
+}
+
 /// Compute cost and enqueue the usage row (never blocks the request path),
 /// persist the Route Trace, and record the flight-recorder terminal event.
 #[allow(clippy::too_many_arguments)]
@@ -5909,46 +6826,61 @@ async fn finalize_log(
     model_display: &str,
     started: Instant,
     ttft_ms: Option<i64>,
-    status: &str,
-    status_code: i64,
+    termination: StreamTermination,
     usage: TokenUsage,
     error_message: Option<String>,
     key: Option<db::VirtualKeyRow>,
     mut trace: RouteTrace,
-    provider_failure: Option<(FailureKind, Option<u16>)>,
-    committed: bool,
 ) {
+    let status = termination.request_status();
+    let status_code = termination.status_code();
+    if termination.outcome == StreamOutcome::Completed {
+        recover_successful_account(
+            state,
+            &attempt.target.account.id,
+            attempt.target.account.account_state_version,
+            attempt.account_probe,
+        )
+        .await;
+    }
+    let provider_failure = termination
+        .outcome
+        .is_upstream_failure()
+        .then_some(termination.failure_kind)
+        .flatten()
+        .map(|kind| (kind, termination.upstream_status));
+
     if let Some(permit) = attempt.traffic_permit.as_ref() {
-        let outcome = match (status, status_code) {
-            ("success", _) => crate::upstream_traffic::TrafficOutcome::Success,
-            ("client_disconnect", _) => crate::upstream_traffic::TrafficOutcome::Cancelled,
-            (_, 504) => crate::upstream_traffic::TrafficOutcome::Timeout,
+        let outcome = match termination.outcome {
+            StreamOutcome::Completed => crate::upstream_traffic::TrafficOutcome::Success,
+            StreamOutcome::ClientCancelled => crate::upstream_traffic::TrafficOutcome::Cancelled,
+            StreamOutcome::GatewayAbort => crate::upstream_traffic::TrafficOutcome::Neutral,
+            StreamOutcome::Timeout => crate::upstream_traffic::TrafficOutcome::Timeout,
             _ => crate::upstream_traffic::TrafficOutcome::Error,
         };
         permit.finish(outcome);
     }
 
-    let telemetry_outcome = if status == "success" {
-        crate::target_telemetry::TelemetryOutcome::Success
-    } else if status == "client_disconnect" {
-        crate::target_telemetry::TelemetryOutcome::Cancelled
-    } else if let Some((kind, _)) = provider_failure {
-        telemetry_outcome_for_failure(kind)
-    } else {
-        // Framing/adapter/local stream-controller errors remain visible as
-        // terminal target failures but are not provider-outage evidence.
-        crate::target_telemetry::TelemetryOutcome::TargetError
+    let telemetry_outcome = match termination.outcome {
+        StreamOutcome::Completed => crate::target_telemetry::TelemetryOutcome::Success,
+        StreamOutcome::ClientCancelled => crate::target_telemetry::TelemetryOutcome::Cancelled,
+        StreamOutcome::GatewayAbort => crate::target_telemetry::TelemetryOutcome::Neutral,
+        _ => provider_failure
+            .map(|(kind, _)| telemetry_outcome_for_failure(kind))
+            .unwrap_or(crate::target_telemetry::TelemetryOutcome::Neutral),
     };
-    let terminal_circuit_transition = if status == "success" {
-        attempt.provider_attempt.finish_success()
-    } else if status == "client_disconnect" {
-        attempt.provider_attempt.finish_neutral()
-    } else if let Some((kind, upstream_status)) = provider_failure {
-        attempt
-            .provider_attempt
-            .finish_failure(kind, upstream_status)
-    } else {
-        attempt.provider_attempt.finish_neutral()
+    let terminal_circuit_transition = match termination.outcome {
+        StreamOutcome::Completed => attempt.provider_attempt.finish_success(),
+        StreamOutcome::ClientCancelled | StreamOutcome::GatewayAbort => {
+            attempt.provider_attempt.finish_neutral()
+        }
+        _ => provider_failure
+            .map(|(kind, upstream_status)| {
+                attempt
+                    .provider_attempt
+                    .finish_failure(kind, upstream_status)
+            })
+            .unwrap_or_else(|| attempt.provider_attempt.finish_neutral()),
     };
     let circuit_transition = attempt
         .provider_circuit_transition
@@ -5961,17 +6893,51 @@ async fn finalize_log(
     let target_ttft_ms = persisted_ttft_ms(attempt.is_sse, ttft_ms)
         .and_then(|value| value.checked_sub(attempt_offset_ms))
         .map(|value| value.max(0) as u64);
-    record_target_telemetry(
-        state,
-        &attempt.target,
-        telemetry_outcome,
-        attempt.attempt_started,
-        target_ttft_ms,
-        meta.fallback_hops > 0,
-        false,
-        circuit_transition,
-        &mut trace,
-    );
+    if termination.outcome == StreamOutcome::GatewayAbort {
+        trace_provider_circuit_transition(
+            &mut trace,
+            &attempt.target.provider.name,
+            circuit_transition,
+        );
+    } else {
+        record_target_telemetry(
+            state,
+            &attempt.target,
+            telemetry_outcome,
+            attempt.attempt_started,
+            target_ttft_ms,
+            meta.fallback_hops > 0,
+            false,
+            circuit_transition,
+            &mut trace,
+        );
+    }
+
+    if let Some((kind, upstream_status)) = provider_failure {
+        let failure = UpstreamFailure {
+            kind,
+            status: upstream_status,
+            retry_after_secs: None,
+            message: error_message
+                .clone()
+                .unwrap_or_else(|| "upstream stream failed".into()),
+            quota_reset_at: None,
+        };
+        handle_key_failure(state, &attempt.target, &failure, meta, &mut trace).await;
+    }
+    let route = meta
+        .route_id
+        .as_ref()
+        .and_then(|route_id| snap.routes.get(route_id));
+    let fallback_allowed =
+        match termination.outcome {
+            StreamOutcome::Completed => None,
+            StreamOutcome::ClientCancelled | StreamOutcome::GatewayAbort => Some(false),
+            _ => Some(termination.fallback_allowed(|kind| {
+                meta.fallback_enabled && route_allows_fallback(route, kind)
+            })),
+        };
+    trace.stream_termination(termination, fallback_allowed);
 
     let prices = attempt.target.model.prices();
     let computed_cost = cost::compute_cost(&prices, &usage);
@@ -6003,17 +6969,32 @@ async fn finalize_log(
     } else {
         (None, None)
     };
-    let cost_known = cost.is_some();
+    let attempt_number = meta.partial_attempts.len() + 1;
+    let attempt_row = usage_attempt_row(
+        meta,
+        &attempt.target,
+        key.as_ref(),
+        attempt.upstream_request_id.as_deref(),
+        attempt_number,
+        &usage,
+        cost,
+        price_version_id.as_deref(),
+        termination,
+        error_message.as_deref(),
+        &trace.opaque_route_id,
+    );
+    let (request_usage, request_cost) = aggregate_request_accounting(meta, Some(&usage), cost);
 
-    // Reconcile only when both canonical token totals are complete. The
-    // reservation object keeps its conservative estimate for partial/unknown
-    // streams and cancels itself if the request exits before finalization.
+    // Reconcile against every provider attempt, not only the final fallback
+    // target. Incomplete fields retain the conservative reservation estimate.
     if let Some(admission) = meta.admission.take() {
-        admission.reconcile(&usage, cost);
+        let (admission_usage, admission_cost) =
+            aggregate_admission_accounting(meta, Some(&usage), cost);
+        admission.reconcile(&admission_usage, admission_cost);
     }
 
     // Accounting truthfulness (FR-6.8): provider-reported vs unknown.
-    let usage_confidence = if usage.input.is_some() || usage.output.is_some() {
+    let usage_confidence = if request_usage.input.is_some() || request_usage.output.is_some() {
         "provider_reported"
     } else {
         "unknown"
@@ -6038,11 +7019,7 @@ async fn finalize_log(
         }
     }
 
-    meta.commit_state = if committed {
-        "post_commit"
-    } else {
-        "pre_commit"
-    };
+    meta.commit_state = termination.commit_state.as_usage_str();
     if status != "success" && status != "client_disconnect" {
         if let Some((kind, upstream_status)) = provider_failure {
             trace.failure(
@@ -6081,20 +7058,26 @@ async fn finalize_log(
         status_code,
         latency_ms: Some(latency_ms),
         ttft_ms,
-        input_tokens: usage.input.map(|v| v as i64),
-        output_tokens: usage.output.map(|v| v as i64),
-        cached_tokens: usage.cached.map(|v| v as i64),
-        cache_write_tokens: usage.cache_write.map(|v| v as i64),
-        thinking_tokens: usage.thinking.map(|v| v as i64),
-        cost_usd: cost,
-        cost_known: cost_known as i64,
-        price_version_id,
+        input_tokens: request_usage.input.map(|v| v as i64),
+        output_tokens: request_usage.output.map(|v| v as i64),
+        cached_tokens: request_usage.cached.map(|v| v as i64),
+        cache_write_tokens: request_usage.cache_write.map(|v| v as i64),
+        thinking_tokens: request_usage.thinking.map(|v| v as i64),
+        cost_usd: request_cost,
+        cost_known: request_cost.is_some() as i64,
+        // A request that spans provider models/rates has no single pricing
+        // version. Its auditable per-attempt versions live in usage_attempts.
+        price_version_id: if meta.partial_attempts.is_empty() {
+            price_version_id
+        } else {
+            None
+        },
         cache_status: meta.cache_status.to_string(),
         serving_account_id: Some(attempt.target.account.id.clone()),
         serving_account: Some(attempt.target.account.label.clone()),
         serving_provider: Some(attempt.target.provider.name.clone()),
         upstream_request_id: attempt.upstream_request_id.clone(),
-        flagged: (usage.input.is_none() && status == "success") as i64,
+        flagged: (request_usage.input.is_none() && status == "success") as i64,
         error_message,
         usage_confidence: usage_confidence.to_string(),
         commit_state: meta.commit_state.to_string(),
@@ -6102,7 +7085,17 @@ async fn finalize_log(
         route_trace_id: Some(trace.opaque_route_id.clone()),
         opaque_route_id: Some(trace.opaque_route_id.clone()),
     };
-    state.log_queue.enqueue(row);
+    let mut attempt_rows = meta
+        .partial_attempts
+        .iter()
+        .map(|attempt| attempt.row.clone())
+        .collect::<Vec<_>>();
+    attempt_rows.push(attempt_row);
+    state.log_queue.enqueue_bundle(db::UsageAccountingBundle {
+        request: row,
+        attempts: attempt_rows,
+    });
+    meta.accounting_enqueued.store(true, Ordering::Release);
 
     // Read-only usage hook (§6.6): fire-and-forget on the bounded async queue,
     // after accounting is recorded, so it can never block or fail the request.
@@ -6116,12 +7109,12 @@ async fn finalize_log(
             "status": status,
             "commit_state": meta.commit_state,
             "retry_count": meta.retry_count,
-            "input_tokens": usage.input,
-            "output_tokens": usage.output,
-            "cached_tokens": usage.cached,
-            "cache_write_tokens": usage.cache_write,
-            "thinking_tokens": usage.thinking,
-            "cost_usd": cost,
+            "input_tokens": request_usage.input,
+            "output_tokens": request_usage.output,
+            "cached_tokens": request_usage.cached,
+            "cache_write_tokens": request_usage.cache_write,
+            "thinking_tokens": request_usage.thinking,
+            "cost_usd": request_cost,
             "latency_ms": started.elapsed().as_millis() as i64,
         })
         .to_string();
@@ -6800,6 +7793,49 @@ mod route_policy_tests {
         assert_eq!(trace.steps[0].stage, "provider_circuit");
         assert_eq!(trace.steps[0].target.as_deref(), Some("provider-a"));
         assert!(trace.steps[0].detail.contains("opened"));
+    }
+
+    #[test]
+    fn partial_precommit_usage_is_added_to_admission_accounting() {
+        let mut meta = RequestMeta::new(
+            "req_partial_usage".into(),
+            FrontendFormat::OpenAiResponses,
+            "route".into(),
+            true,
+        );
+        meta.partial_attempts.push(PartialAttemptUsage {
+            usage: TokenUsage {
+                input: Some(13),
+                output: Some(7),
+                ..TokenUsage::default()
+            },
+            cost: Some(0.000067),
+            row: db::UsageAttemptRow::default(),
+        });
+        let final_usage = TokenUsage {
+            input: Some(1),
+            output: Some(2),
+            ..TokenUsage::default()
+        };
+        let (usage, cost) =
+            aggregate_admission_accounting(&meta, Some(&final_usage), Some(0.000003));
+        assert_eq!((usage.input, usage.output), (Some(14), Some(9)));
+        assert!((cost.unwrap() - 0.00007).abs() < 1e-12);
+
+        let (failed_usage, failed_cost) = aggregate_admission_accounting(&meta, None, None);
+        assert_eq!(
+            (failed_usage.input, failed_usage.output),
+            (Some(13), Some(7))
+        );
+        assert_eq!(failed_cost, Some(0.000067));
+
+        meta.partial_attempts[0].usage.output = None;
+        meta.partial_attempts[0].cost = None;
+        let (incomplete_usage, incomplete_cost) =
+            aggregate_admission_accounting(&meta, Some(&final_usage), Some(0.000003));
+        assert_eq!(incomplete_usage.input, Some(14));
+        assert_eq!(incomplete_usage.output, None);
+        assert_eq!(incomplete_cost, None);
     }
 
     #[test]
@@ -8131,7 +9167,7 @@ mod route_policy_tests {
         .await
         .expect("primary upstream attempt should start");
         sqlx::query(
-            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, ?)",
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, cost_known, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, 1, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(uuid::Uuid::new_v4().to_string())
@@ -8184,7 +9220,7 @@ mod route_policy_tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, ?)",
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, cost_known, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, 1, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(uuid::Uuid::new_v4().to_string())
@@ -8241,7 +9277,7 @@ mod route_policy_tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, ?)",
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, cost_known, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, 1, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(uuid::Uuid::new_v4().to_string())
@@ -8430,7 +9466,7 @@ mod route_policy_tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, ?)",
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, cost_known, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, 1, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(uuid::Uuid::new_v4().to_string())
@@ -8669,7 +9705,7 @@ mod route_policy_tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-provider/adaptive-model', 'success', 200, 1.0, ?)",
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, cost_known, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-provider/adaptive-model', 'success', 200, 1.0, 1, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(uuid::Uuid::new_v4().to_string())

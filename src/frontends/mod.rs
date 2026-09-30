@@ -114,6 +114,7 @@ impl Default for ResponsesResponseFields {
 }
 
 /// Context passed to an encoder for a single response.
+#[derive(Clone)]
 pub struct EncoderCtx {
     pub model_name: String,
     pub request_id: String,

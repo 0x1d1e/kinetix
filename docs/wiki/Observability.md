@@ -111,7 +111,10 @@ before response commit.
 
 Every request produces a Route Trace: candidate enumeration, predicate/capability
 results, skip reasons, the selected account/model (internally), attempt outcomes,
-fallback causes, the commit point, and the final result.
+fallback causes, the commit point, and the final result. Terminal stream fields
+separately report `stream_outcome`, `terminal_failure_kind`, and
+`fallback_allowed`; the existing commit values remain `not_committed` and
+`committed`. Historical traces may omit the new fields.
 
 - Retrieve by request: `GET /admin/api/requests/{id}/route-trace`.
 - Retrieve by the client's opaque id: `GET /admin/api/route-traces/{krt_…}`.

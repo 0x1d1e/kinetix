@@ -10067,6 +10067,9 @@ fn route_trace_json(t: &db::RouteTraceRow) -> Value {
         "final_target": t.final_target,
         "commit_state": t.commit_state,
         "outcome": t.outcome,
+        "stream_outcome": t.stream_outcome,
+        "terminal_failure_kind": t.terminal_failure_kind,
+        "fallback_allowed": t.fallback_allowed.map(|allowed| allowed != 0),
         "steps": serde_json::from_str::<Value>(&t.steps).unwrap_or(json!([])),
         "warnings": serde_json::from_str::<Value>(&t.warnings).unwrap_or(json!([])),
     })

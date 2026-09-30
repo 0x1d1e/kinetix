@@ -75,6 +75,7 @@ pub struct ProviderCircuitTransition {
     pub opened: bool,
     pub recovered: bool,
     pub half_open_probe: bool,
+    pub validated_first_event: bool,
 }
 
 impl ProviderCircuitTransition {
@@ -83,6 +84,7 @@ impl ProviderCircuitTransition {
             opened: self.opened || later.opened,
             recovered: self.recovered || later.recovered,
             half_open_probe: self.half_open_probe || later.half_open_probe,
+            validated_first_event: self.validated_first_event || later.validated_first_event,
         }
     }
 }
@@ -385,8 +387,8 @@ impl ProviderAttempt {
         self.half_open_probe
     }
 
-    /// Record that a half-open probe produced a validated response without
-    /// consuming its lease; the stream may still fail before termination.
+    /// Record first-event validation provisionally. Circuit recovery remains
+    /// pending until `finish_success`; a later failure still owns this probe.
     pub fn mark_validated_success(&self) -> ProviderCircuitTransition {
         if !self.half_open_probe
             || self.finished.load(Ordering::Acquire)
@@ -394,23 +396,9 @@ impl ProviderAttempt {
         {
             return ProviderCircuitTransition::default();
         }
-
-        let now = Utc::now();
-        let mut state = self.circuit.lock();
-        let recovered =
-            state.generation == self.generation && state.state == ProviderCircuitState::HalfOpen;
-        if recovered {
-            state.half_open_inflight = 0;
-            state.state = ProviderCircuitState::Closed;
-            state.opened_at = None;
-            state.retry_at = None;
-            state.failures.clear();
-            state.last_successful_probe = Some(now);
-            state.recoveries = state.recoveries.saturating_add(1);
-        }
         ProviderCircuitTransition {
-            recovered,
             half_open_probe: true,
+            validated_first_event: true,
             ..Default::default()
         }
     }
@@ -419,13 +407,6 @@ impl ProviderAttempt {
         if self.finished.swap(true, Ordering::AcqRel) {
             return ProviderCircuitTransition::default();
         }
-        if self.half_open_probe && self.validated_success.load(Ordering::Acquire) {
-            return ProviderCircuitTransition {
-                half_open_probe: true,
-                ..Default::default()
-            };
-        }
-
         let now = Utc::now();
         let mut state = self.circuit.lock();
         let mut recovered = false;
@@ -449,6 +430,7 @@ impl ProviderAttempt {
         ProviderCircuitTransition {
             recovered,
             half_open_probe: self.half_open_probe,
+            validated_first_event: self.validated_success.load(Ordering::Acquire),
             ..Default::default()
         }
     }
@@ -466,14 +448,13 @@ impl ProviderAttempt {
         let attempt_owns_state = state.generation == self.generation
             && if self.half_open_probe {
                 state.state == ProviderCircuitState::HalfOpen
-                    || (self.validated_success.load(Ordering::Acquire)
-                        && state.state == ProviderCircuitState::Closed)
             } else {
                 state.state == ProviderCircuitState::Closed
             };
         if !attempt_owns_state {
             return ProviderCircuitTransition {
                 half_open_probe: self.half_open_probe,
+                validated_first_event: self.validated_success.load(Ordering::Acquire),
                 ..Default::default()
             };
         }
@@ -484,6 +465,7 @@ impl ProviderAttempt {
             }
             return ProviderCircuitTransition {
                 half_open_probe: self.half_open_probe,
+                validated_first_event: self.validated_success.load(Ordering::Acquire),
                 ..Default::default()
             };
         }
@@ -519,9 +501,7 @@ impl ProviderAttempt {
                 distinct_targets >= MIN_DISTINCT_TARGETS
             }
         };
-        let validated_success = self.validated_success.load(Ordering::Acquire);
-        let unvalidated_probe_failure = self.half_open_probe && !validated_success;
-        let opened = if unvalidated_probe_failure || correlated {
+        let opened = if self.half_open_probe || correlated {
             let changed = state.open(now);
             if changed {
                 state.generation = state.generation.wrapping_add(1);
@@ -534,6 +514,7 @@ impl ProviderAttempt {
         ProviderCircuitTransition {
             opened,
             half_open_probe: self.half_open_probe,
+            validated_first_event: self.validated_success.load(Ordering::Acquire),
             ..Default::default()
         }
     }
@@ -549,6 +530,7 @@ impl ProviderAttempt {
         }
         ProviderCircuitTransition {
             half_open_probe: self.half_open_probe,
+            validated_first_event: self.validated_success.load(Ordering::Acquire),
             ..Default::default()
         }
     }
@@ -684,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn half_open_probe_recovers_at_validated_success_boundary() {
+    fn half_open_probe_recovers_only_at_terminal_success() {
         let circuits = ProviderCircuits::default();
         circuits
             .begin_attempt("p", "a", "route-a")
@@ -705,60 +687,58 @@ mod tests {
         assert!(probe.is_half_open_probe());
         assert!(circuits.begin_attempt("p", "b", "route-b").is_err());
 
-        // The validated response recovers before stream completion without
-        // consuming the attempt's lease.
-        let transition = probe.mark_validated_success();
-        assert!(transition.recovered);
+        // A valid first event is provisional; recovery waits for completion.
+        let validation = probe.mark_validated_success();
+        assert!(validation.validated_first_event);
+        assert!(!validation.recovered);
+        assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::HalfOpen);
+        assert_eq!(circuits.snapshot("p").recoveries, 0);
+        let terminal = probe.finish_success();
+        assert!(terminal.recovered);
+        let transition = validation.merge(terminal);
+        assert!(transition.validated_first_event);
         assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Closed);
-        assert!(!probe.finish_success().recovered);
+        assert_eq!(circuits.snapshot("p").recoveries, 1);
     }
 
     #[test]
-    fn validated_probe_stream_failure_obeys_closed_correlation_threshold() {
-        let circuits = ProviderCircuits::default();
-        circuits
-            .begin_attempt("p", "a", "route-a")
-            .unwrap()
-            .finish_failure(FailureKind::ServerError, Some(503));
-        circuits
-            .begin_attempt("p", "b", "route-b")
-            .unwrap()
-            .finish_failure(FailureKind::ServerError, Some(503));
-
-        {
-            let circuit = circuits.circuit("p");
-            let mut state = circuit.lock();
-            state.retry_at = Some(Utc::now() - ChronoDuration::seconds(1));
-        }
-
-        let probe = circuits.begin_attempt("p", "a", "route-a").unwrap();
-        let validation = probe.mark_validated_success();
-        assert!(validation.recovered);
-        assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Closed);
-
-        for account in ["c", "d", "e"] {
+    fn validated_probe_terminal_failure_reopens_circuit() {
+        for (kind, status) in [
+            (FailureKind::Timeout, None),
+            (FailureKind::MalformedUpstream, Some(502)),
+        ] {
+            let circuits = ProviderCircuits::default();
             circuits
-                .begin_attempt("p", account, "route-normal")
+                .begin_attempt("p", "a", "route-a")
                 .unwrap()
-                .finish_success();
+                .finish_failure(FailureKind::ServerError, Some(503));
+            circuits
+                .begin_attempt("p", "b", "route-b")
+                .unwrap()
+                .finish_failure(FailureKind::ServerError, Some(503));
+
+            {
+                let circuit = circuits.circuit("p");
+                let mut state = circuit.lock();
+                state.retry_at = Some(Utc::now() - ChronoDuration::seconds(1));
+            }
+
+            let probe = circuits.begin_attempt("p", "a", "route-a").unwrap();
+            assert!(probe.is_half_open_probe());
+            let validation = probe.mark_validated_success();
+            assert!(validation.validated_first_event);
+            assert!(!validation.recovered);
+            // First-event validation does not recover the provider circuit.
+            assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::HalfOpen);
+            assert_eq!(circuits.snapshot("p").recoveries, 0);
+
+            let terminal = probe.finish_failure(kind, status);
+            assert!(terminal.validated_first_event);
+            assert!(terminal.opened, "kind={kind:?}");
+            let snapshot = circuits.snapshot("p");
+            assert_eq!(snapshot.state, ProviderCircuitState::Open, "kind={kind:?}");
+            assert_eq!(snapshot.recoveries, 0, "kind={kind:?}");
         }
-
-        let terminal = probe.finish_failure(FailureKind::Timeout, None);
-        assert!(!terminal.opened);
-        let snapshot = circuits.snapshot("p");
-        assert_eq!(snapshot.state, ProviderCircuitState::Closed);
-        assert_eq!(snapshot.recent_qualifying_failures, 1);
-        assert_eq!(snapshot.recent_failures[0].account_id, "a");
-
-        let second = circuits
-            .begin_attempt("p", "b", "route-b")
-            .unwrap()
-            .finish_failure(FailureKind::ServerError, Some(503));
-        assert!(second.opened);
-        assert_eq!(circuits.snapshot("p").state, ProviderCircuitState::Open);
-        let combined = validation.merge(terminal);
-        assert!(combined.recovered);
-        assert!(!combined.opened);
     }
 
     #[test]

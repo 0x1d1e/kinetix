@@ -71,7 +71,10 @@ struct PreCommitRequestGuard {
     request_id: String,
     started: std::time::Instant,
     disconnect: Option<ClientDisconnect>,
+    cancellation_trace:
+        Option<std::sync::Arc<parking_lot::Mutex<Option<crate::trace::RouteTrace>>>>,
     finished: bool,
+    trace_persisted: bool,
 }
 
 impl PreCommitRequestGuard {
@@ -80,18 +83,24 @@ impl PreCommitRequestGuard {
         request_id: String,
         started: std::time::Instant,
         disconnect: Option<ClientDisconnect>,
+        cancellation_trace: Option<
+            std::sync::Arc<parking_lot::Mutex<Option<crate::trace::RouteTrace>>>,
+        >,
     ) -> Self {
         Self {
             state,
             request_id,
             started,
             disconnect,
+            cancellation_trace,
             finished: false,
+            trace_persisted: false,
         }
     }
 
     fn finish(&mut self) {
         self.finished = true;
+        self.trace_persisted = true;
     }
 
     fn record_cancellation(&mut self) {
@@ -125,7 +134,41 @@ impl PreCommitRequestGuard {
 
 impl Drop for PreCommitRequestGuard {
     fn drop(&mut self) {
-        self.record_cancellation();
+        if !self.finished {
+            self.record_cancellation();
+        }
+        if !self.trace_persisted {
+            if let Some(snapshot) = self.cancellation_trace.clone() {
+                let state = self.state.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        persist_client_cancelled_trace(&state, &snapshot).await;
+                    });
+                }
+            }
+        }
+    }
+}
+
+async fn persist_client_cancelled_trace(
+    state: &AppState,
+    snapshot: &std::sync::Arc<parking_lot::Mutex<Option<crate::trace::RouteTrace>>>,
+) {
+    let Some(mut trace) = snapshot.lock().clone() else {
+        return;
+    };
+    trace.stream_termination(
+        crate::stream_outcome::StreamTermination::new(
+            crate::stream_outcome::StreamOutcome::ClientCancelled,
+            crate::stream_outcome::CommitState::PreCommit,
+            None,
+            None,
+        ),
+        Some(false),
+    );
+    trace.finish("cancelled");
+    if let Err(error) = crate::db::insert_route_trace(&state.pool, &trace).await {
+        tracing::warn!(request_id = %trace.request_id, %error, "failed to persist precommit cancellation trace");
     }
 }
 
@@ -187,13 +230,19 @@ async fn handle(
     if let Some(disconnect) = client_disconnect.as_ref() {
         disconnect.start_monitor();
     }
+    let cancellation_trace = client_disconnect.as_ref().map(|_| {
+        std::sync::Arc::new(parking_lot::Mutex::new(Some(
+            crate::trace::RouteTrace::new(request_id.clone(), req.requested_model.clone()),
+        )))
+    });
     let mut request_guard = PreCommitRequestGuard::new(
         state.clone(),
         request_id.clone(),
         request_started,
         client_disconnect.clone(),
+        cancellation_trace.clone(),
     );
-    let pipeline_run = pipeline::run_with_disconnect(
+    let mut pipeline_run = Box::pin(pipeline::run_with_disconnect(
         &state,
         format,
         Some(key),
@@ -203,19 +252,24 @@ async fn handle(
         session,
         protocol_headers,
         client_disconnect.clone(),
-    );
+        cancellation_trace.clone(),
+    ));
     let pipeline_result = if let Some(disconnect) = client_disconnect {
         tokio::select! {
             biased;
             _ = disconnect.cancelled() => {
                 request_guard.record_cancellation();
+                if let Some(snapshot) = cancellation_trace.as_ref() {
+                    persist_client_cancelled_trace(&state, snapshot).await;
+                }
                 Err(ProxyError::internal("client disconnected"))
             }
-            result = pipeline_run => result,
+            result = &mut pipeline_run => result,
         }
     } else {
-        pipeline_run.await
+        (&mut pipeline_run).await
     };
+    drop(pipeline_run);
     request_guard.finish();
     match pipeline_result {
         Ok(resp) => resp,

@@ -3783,6 +3783,11 @@ pub struct UsageLogRow {
 }
 
 pub async fn insert_usage_log(pool: &Pool, u: &UsageLogRow) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    insert_usage_log_on(&mut conn, u).await
+}
+
+async fn insert_usage_log_on(conn: &mut sqlx::SqliteConnection, u: &UsageLogRow) -> Result<()> {
     sqlx::query(
         "INSERT INTO usage_logs
         (id, request_id, ts, key_id, key_name, client_format, requested_model, effective_model, route_id,
@@ -3828,25 +3833,121 @@ pub async fn insert_usage_log(pool: &Pool, u: &UsageLogRow) -> Result<()> {
     .bind(u.retry_count)
     .bind(&u.route_trace_id)
     .bind(&u.opaque_route_id)
-    .execute(pool)
+    .execute(conn)
     .await?;
     Ok(())
 }
 
-pub async fn recent_usage(pool: &Pool, limit: i64) -> Result<Vec<UsageLogRow>> {
-    Ok(
-        sqlx::query_as::<_, UsageLogRow>("SELECT * FROM usage_logs ORDER BY ts DESC LIMIT ?")
-            .bind(limit)
-            .fetch_all(pool)
-            .await?,
+#[derive(Debug, Clone, Default, FromRow, Serialize, Deserialize)]
+pub struct UsageAttemptRow {
+    pub id: String,
+    pub request_id: String,
+    pub attempt_number: i64,
+    pub ts: String,
+    pub key_id: Option<String>,
+    pub key_name: Option<String>,
+    pub effective_model: Option<String>,
+    pub route_id: Option<String>,
+    pub route_name: Option<String>,
+    pub serving_account_id: Option<String>,
+    pub serving_account: Option<String>,
+    pub serving_provider: Option<String>,
+    pub upstream_request_id: Option<String>,
+    pub status: String,
+    pub status_code: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cached_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub thinking_tokens: Option<i64>,
+    pub cost_usd: Option<f64>,
+    pub cost_known: i64,
+    pub price_version_id: Option<String>,
+    pub usage_confidence: String,
+    pub commit_state: String,
+    pub error_message: Option<String>,
+    pub opaque_route_id: Option<String>,
+}
+
+pub async fn insert_usage_attempt(pool: &Pool, attempt: &UsageAttemptRow) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    insert_usage_attempt_on(&mut conn, attempt).await
+}
+
+async fn insert_usage_attempt_on(
+    conn: &mut sqlx::SqliteConnection,
+    attempt: &UsageAttemptRow,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO usage_attempts
+         (id, request_id, attempt_number, ts, key_id, key_name, effective_model, route_id, route_name,
+          serving_account_id, serving_account, serving_provider, upstream_request_id, status, status_code,
+          input_tokens, output_tokens, cached_tokens, cache_write_tokens, thinking_tokens, cost_usd,
+          cost_known, price_version_id, usage_confidence, commit_state, error_message, opaque_route_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
+    .bind(&attempt.id)
+    .bind(&attempt.request_id)
+    .bind(attempt.attempt_number)
+    .bind(&attempt.ts)
+    .bind(&attempt.key_id)
+    .bind(&attempt.key_name)
+    .bind(&attempt.effective_model)
+    .bind(&attempt.route_id)
+    .bind(&attempt.route_name)
+    .bind(&attempt.serving_account_id)
+    .bind(&attempt.serving_account)
+    .bind(&attempt.serving_provider)
+    .bind(&attempt.upstream_request_id)
+    .bind(&attempt.status)
+    .bind(attempt.status_code)
+    .bind(attempt.input_tokens)
+    .bind(attempt.output_tokens)
+    .bind(attempt.cached_tokens)
+    .bind(attempt.cache_write_tokens)
+    .bind(attempt.thinking_tokens)
+    .bind(attempt.cost_usd)
+    .bind(attempt.cost_known)
+    .bind(&attempt.price_version_id)
+    .bind(&attempt.usage_confidence)
+    .bind(&attempt.commit_state)
+    .bind(&attempt.error_message)
+    .bind(&attempt.opaque_route_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageAccountingBundle {
+    pub request: UsageLogRow,
+    pub attempts: Vec<UsageAttemptRow>,
+}
+
+pub async fn insert_usage_bundle(pool: &Pool, bundle: &UsageAccountingBundle) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for attempt in &bundle.attempts {
+        insert_usage_attempt_on(&mut *tx, attempt).await?;
+    }
+    insert_usage_log_on(&mut *tx, &bundle.request).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn recent_usage(pool: &Pool, limit: i64) -> Result<Vec<UsageLogRow>> {
+    Ok(sqlx::query_as::<_, UsageLogRow>(
+        "SELECT * FROM usage_request_logs ORDER BY ts DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
 }
 
 /// All usage rows whose `ts` falls in the half-open interval `[from, to)`,
 /// oldest first. Used by the per-day export job and the manual export endpoint.
 pub async fn usage_between(pool: &Pool, from_iso: &str, to_iso: &str) -> Result<Vec<UsageLogRow>> {
     Ok(sqlx::query_as::<_, UsageLogRow>(
-        "SELECT * FROM usage_logs WHERE ts >= ? AND ts < ? ORDER BY ts ASC",
+        "SELECT * FROM usage_request_logs WHERE ts >= ? AND ts < ? ORDER BY ts ASC",
     )
     .bind(from_iso)
     .bind(to_iso)
@@ -3858,7 +3959,11 @@ pub async fn usage_between(pool: &Pool, from_iso: &str, to_iso: &str) -> Result<
 /// token totals. Drives the usage retention/export view (today/24h/7d/30d).
 pub async fn usage_days(pool: &Pool) -> Result<Vec<(String, i64, i64)>> {
     let rows = sqlx::query(
-        "SELECT substr(ts,1,10) AS day,\n                COUNT(*) AS requests,\n                COALESCE(SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)),0) AS tokens\n         FROM usage_logs GROUP BY day ORDER BY day DESC",
+        "SELECT substr(r.ts,1,10) AS day, COUNT(*) AS requests,
+                COALESCE(SUM(COALESCE(a.reported_input_tokens,0) + COALESCE(a.reported_output_tokens,0)),0) AS tokens
+         FROM usage_request_logs r
+         LEFT JOIN usage_request_accounting a ON a.request_id = r.request_id
+         GROUP BY day ORDER BY day DESC",
     )
     .fetch_all(pool)
     .await?;
@@ -3878,20 +3983,21 @@ pub async fn usage_summary(pool: &Pool) -> Result<Value> {
     let row = sqlx::query(
         "SELECT
             COUNT(*) as requests,
-            COALESCE(SUM(input_tokens),0) as input_tokens,
-            COALESCE(SUM(output_tokens),0) as output_tokens,
-            COALESCE(SUM(cached_tokens),0) as cached_tokens,
-            COALESCE(SUM(cache_write_tokens),0) as cache_write_tokens,
-            COALESCE(SUM(thinking_tokens),0) as thinking_tokens,
-            COALESCE(SUM(CASE WHEN cost_known != 0 THEN cost_usd ELSE 0.0 END),0.0) as cost_usd,
-            COALESCE(SUM(CASE WHEN cost_known = 0 THEN 1 ELSE 0 END),0) as unknown_cost_rows,
-            COALESCE(SUM(CASE WHEN usage_confidence = 'unknown' THEN 1 ELSE 0 END),0) as unknown_usage_rows,
-            COALESCE(SUM(CASE WHEN usage_confidence = 'estimated' THEN 1 ELSE 0 END),0) as estimated_usage_rows,
-            COALESCE(SUM(CASE WHEN status IN ('upstream_error','stream_error','rate_limited','quota_exhausted','client_error') THEN 1 ELSE 0 END),0) as error_rows,
-            COALESCE(SUM(fallback_hops),0) as fallback_hops,
-            COALESCE(AVG(latency_ms),0.0) as avg_latency,
-            COALESCE(AVG(ttft_ms),0.0) as avg_ttft
-         FROM usage_logs",
+            COALESCE(SUM(a.reported_input_tokens),0) as input_tokens,
+            COALESCE(SUM(a.reported_output_tokens),0) as output_tokens,
+            COALESCE(SUM(a.reported_cached_tokens),0) as cached_tokens,
+            COALESCE(SUM(a.reported_cache_write_tokens),0) as cache_write_tokens,
+            COALESCE(SUM(a.reported_thinking_tokens),0) as thinking_tokens,
+            COALESCE(SUM(a.known_cost_usd),0.0) as cost_usd,
+            COALESCE(SUM(CASE WHEN r.cost_known = 0 THEN 1 ELSE 0 END),0) as unknown_cost_rows,
+            COALESCE(SUM(CASE WHEN r.usage_confidence = 'unknown' THEN 1 ELSE 0 END),0) as unknown_usage_rows,
+            COALESCE(SUM(CASE WHEN r.usage_confidence = 'estimated' THEN 1 ELSE 0 END),0) as estimated_usage_rows,
+            COALESCE(SUM(CASE WHEN r.status IN ('upstream_error','stream_error','rate_limited','quota_exhausted','client_error') THEN 1 ELSE 0 END),0) as error_rows,
+            COALESCE(SUM(r.fallback_hops),0) as fallback_hops,
+            COALESCE(AVG(r.latency_ms),0.0) as avg_latency,
+            COALESCE(AVG(r.ttft_ms),0.0) as avg_ttft
+         FROM usage_request_logs r
+         LEFT JOIN usage_request_accounting a ON a.request_id = r.request_id",
     )
     .fetch_one(pool)
     .await?;
@@ -3926,12 +4032,14 @@ pub async fn key_budget_status(
 ) -> Result<Vec<(String, String, f64, Option<f64>)>> {
     let rows = sqlx::query(
         "SELECT k.id as id, k.name as name,
-                COALESCE(SUM(u.cost_usd),0.0) as spend,
+                COALESCE(u.spend,0.0) as spend,
                 k.monthly_budget as monthly_budget
          FROM virtual_keys k
-         LEFT JOIN usage_logs u ON u.key_id = k.id AND u.ts >= ?
-         GROUP BY k.id
-         HAVING k.monthly_budget IS NOT NULL",
+         LEFT JOIN (
+             SELECT key_id, SUM(CASE WHEN cost_known != 0 THEN cost_usd ELSE 0.0 END) AS spend
+             FROM usage_accounting_rows WHERE ts >= ? GROUP BY key_id
+         ) u ON u.key_id = k.id
+         WHERE k.monthly_budget IS NOT NULL",
     )
     .bind(since_iso)
     .fetch_all(pool)
@@ -3952,7 +4060,8 @@ pub async fn key_budget_status(
 /// Sum of cost for a key within a time window (ISO timestamp lower bound).
 pub async fn key_spend_since(pool: &Pool, key_id: &str, since_iso: &str) -> Result<f64> {
     let row = sqlx::query(
-        "SELECT COALESCE(SUM(cost_usd),0.0) as total FROM usage_logs WHERE key_id = ? AND ts >= ?",
+        "SELECT COALESCE(SUM(CASE WHEN cost_known != 0 THEN cost_usd ELSE 0.0 END),0.0) as total
+         FROM usage_accounting_rows WHERE key_id = ? AND ts >= ?",
     )
     .bind(key_id)
     .bind(since_iso)
@@ -3964,7 +4073,8 @@ pub async fn key_spend_since(pool: &Pool, key_id: &str, since_iso: &str) -> Resu
 /// Sum of cost for an account within a time window (for soft quotas).
 pub async fn account_spend_since(pool: &Pool, account_id: &str, since_iso: &str) -> Result<f64> {
     let row = sqlx::query(
-        "SELECT COALESCE(SUM(cost_usd),0.0) as total FROM usage_logs WHERE serving_account_id = ? AND ts >= ?",
+        "SELECT COALESCE(SUM(CASE WHEN cost_known != 0 THEN cost_usd ELSE 0.0 END),0.0) as total
+         FROM usage_accounting_rows WHERE serving_account_id = ? AND ts >= ?",
     )
     .bind(account_id)
     .bind(since_iso)
@@ -3980,11 +4090,12 @@ pub async fn key_usage_entries_since(
     since_iso: &str,
 ) -> Result<Vec<(String, i64)>> {
     let rows = sqlx::query(
-        "SELECT ts,
-                COALESCE(input_tokens,0) + COALESCE(output_tokens,0) AS tokens
-         FROM usage_logs
-         WHERE key_id = ? AND ts >= ?
-         ORDER BY ts ASC",
+        "SELECT r.ts,
+                COALESCE(a.reported_input_tokens,0) + COALESCE(a.reported_output_tokens,0) AS tokens
+         FROM usage_request_logs r
+         LEFT JOIN usage_request_accounting a ON a.request_id = r.request_id
+         WHERE r.key_id = ? AND r.ts >= ?
+         ORDER BY r.ts ASC",
     )
     .bind(key_id)
     .bind(since_iso)
@@ -3999,8 +4110,11 @@ pub async fn key_usage_entries_since(
 
 pub async fn key_usage_since(pool: &Pool, key_id: &str, since_iso: &str) -> Result<(i64, i64)> {
     let row = sqlx::query(
-        "SELECT COUNT(*) as n, COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) as t
-         FROM usage_logs WHERE key_id = ? AND ts >= ?",
+        "SELECT COUNT(*) as n,
+                COALESCE(SUM(COALESCE(a.reported_input_tokens,0) + COALESCE(a.reported_output_tokens,0)),0) as t
+         FROM usage_request_logs r
+         LEFT JOIN usage_request_accounting a ON a.request_id = r.request_id
+         WHERE r.key_id = ? AND r.ts >= ?",
     )
     .bind(key_id)
     .bind(since_iso)
@@ -4019,8 +4133,11 @@ pub async fn lifetime_totals(
 ) -> Result<(HashMap<String, (i64, i64)>, HashMap<String, (i64, i64)>)> {
     let mut by_key: HashMap<String, (i64, i64)> = HashMap::new();
     let rows = sqlx::query(
-        "SELECT key_id, COUNT(*) as n, COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) as t
-         FROM usage_logs WHERE key_id IS NOT NULL GROUP BY key_id",
+        "SELECT r.key_id, COUNT(*) as n,
+                COALESCE(SUM(COALESCE(a.reported_input_tokens,0) + COALESCE(a.reported_output_tokens,0)),0) as t
+         FROM usage_request_logs r
+         LEFT JOIN usage_request_accounting a ON a.request_id = r.request_id
+         WHERE r.key_id IS NOT NULL GROUP BY r.key_id",
     )
     .fetch_all(pool)
     .await?;
@@ -4033,8 +4150,10 @@ pub async fn lifetime_totals(
 
     let mut by_account: HashMap<String, (i64, i64)> = HashMap::new();
     let rows = sqlx::query(
-        "SELECT serving_account_id, COUNT(*) as n, COALESCE(SUM(COALESCE(input_tokens,0)+COALESCE(output_tokens,0)),0) as t
-         FROM usage_logs WHERE serving_account_id IS NOT NULL GROUP BY serving_account_id",
+        "SELECT serving_account_id, COUNT(DISTINCT request_id) as n,
+                COALESCE(SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)),0) as t
+         FROM usage_accounting_rows WHERE serving_account_id IS NOT NULL
+         GROUP BY serving_account_id",
     )
     .fetch_all(pool)
     .await?;
@@ -4052,7 +4171,7 @@ pub async fn lifetime_totals(
 pub async fn request_counts_by_key(pool: &Pool) -> Result<HashMap<String, i64>> {
     let mut out: HashMap<String, i64> = HashMap::new();
     let rows = sqlx::query(
-        "SELECT key_id, COUNT(*) as n FROM usage_logs WHERE key_id IS NOT NULL GROUP BY key_id",
+        "SELECT key_id, COUNT(*) as n FROM usage_request_logs WHERE key_id IS NOT NULL GROUP BY key_id",
     )
     .fetch_all(pool)
     .await?;
@@ -4201,8 +4320,23 @@ pub async fn insert_route_trace(pool: &Pool, t: &crate::trace::RouteTrace) -> Re
     sqlx::query(
         "INSERT INTO route_traces
          (id, request_id, opaque_route_id, ts, requested_model, route_id, route_name, final_target,
-          commit_state, outcome, steps, warnings)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+          commit_state, outcome, steps, warnings, stream_outcome, terminal_failure_kind, fallback_allowed)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET
+           request_id=excluded.request_id,
+           opaque_route_id=excluded.opaque_route_id,
+           ts=excluded.ts,
+           requested_model=excluded.requested_model,
+           route_id=excluded.route_id,
+           route_name=excluded.route_name,
+           final_target=excluded.final_target,
+           commit_state=excluded.commit_state,
+           outcome=excluded.outcome,
+           steps=excluded.steps,
+           warnings=excluded.warnings,
+           stream_outcome=excluded.stream_outcome,
+           terminal_failure_kind=excluded.terminal_failure_kind,
+           fallback_allowed=excluded.fallback_allowed",
     )
     .bind(&t.opaque_route_id)
     .bind(&t.request_id)
@@ -4216,6 +4350,9 @@ pub async fn insert_route_trace(pool: &Pool, t: &crate::trace::RouteTrace) -> Re
     .bind(&t.outcome)
     .bind(t.steps_json())
     .bind(t.warnings_json())
+    .bind(&t.stream_outcome)
+    .bind(&t.terminal_failure_kind)
+    .bind(t.fallback_allowed.map(i64::from))
     .execute(pool)
     .await?;
     Ok(())
@@ -4235,6 +4372,9 @@ pub struct RouteTraceRow {
     pub outcome: String,
     pub steps: String,
     pub warnings: String,
+    pub stream_outcome: Option<String>,
+    pub terminal_failure_kind: Option<String>,
+    pub fallback_allowed: Option<i64>,
 }
 
 pub async fn get_route_trace_by_request(
@@ -5507,5 +5647,285 @@ mod pending_marker_publication_tests {
         assert_eq!(tokio::fs::read(&temporary).await.unwrap(), b"replacement");
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod usage_request_log_tests {
+    use super::*;
+
+    fn request_row(
+        id: &str,
+        ts: &str,
+        status: &str,
+        status_code: i64,
+        input_tokens: i64,
+        output_tokens: i64,
+        cost_usd: f64,
+        fallback_hops: i64,
+        serving_account_id: &str,
+    ) -> UsageLogRow {
+        UsageLogRow {
+            id: id.to_string(),
+            request_id: "request-with-fallback".to_string(),
+            ts: ts.to_string(),
+            key_id: Some("usage-view-key".to_string()),
+            key_name: Some("Usage view key".to_string()),
+            client_format: "openai".to_string(),
+            requested_model: "route".to_string(),
+            effective_model: Some("model".to_string()),
+            route_id: Some("route-id".to_string()),
+            route_name: Some("route".to_string()),
+            fallback_hops,
+            fallback_path: "[]".to_string(),
+            status: status.to_string(),
+            status_code,
+            latency_ms: Some(100),
+            ttft_ms: Some(10),
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            cached_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            thinking_tokens: Some(0),
+            cost_usd: Some(cost_usd),
+            cost_known: 1,
+            price_version_id: None,
+            cache_status: "bypass".to_string(),
+            serving_account_id: Some(serving_account_id.to_string()),
+            serving_account: Some(serving_account_id.to_string()),
+            serving_provider: Some("provider".to_string()),
+            upstream_request_id: None,
+            flagged: 0,
+            error_message: (status != "success").then(|| "attempt failed".to_string()),
+            usage_confidence: "provider_reported".to_string(),
+            commit_state: "pre_commit".to_string(),
+            retry_count: fallback_hops,
+            route_trace_id: None,
+            opaque_route_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_bundle_rolls_back_attempts_if_any_write_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-usage-bundle-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO virtual_keys (id, key_hash, name, owner, created_at, monthly_budget)
+             VALUES ('usage-view-key', 'usage-bundle-hash', 'Usage bundle key', 'test', '2026-01-01T00:00:00Z', 1.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let attempt = UsageAttemptRow {
+            id: "bundle-attempt-1".into(),
+            request_id: "request-with-fallback".into(),
+            attempt_number: 1,
+            ts: "2026-01-02T10:00:00Z".into(),
+            status: "stream_error".into(),
+            status_code: 502,
+            usage_confidence: "unknown".into(),
+            commit_state: "pre_commit".into(),
+            ..UsageAttemptRow::default()
+        };
+        let duplicate_attempt = UsageAttemptRow {
+            id: "bundle-attempt-2".into(),
+            ..attempt.clone()
+        };
+        let bundle = UsageAccountingBundle {
+            request: request_row(
+                "bundle-request",
+                "2026-01-02T10:00:00Z",
+                "stream_error",
+                502,
+                0,
+                0,
+                0.0,
+                0,
+                "bundle-account",
+            ),
+            attempts: vec![attempt, duplicate_attempt],
+        };
+
+        assert!(insert_usage_bundle(&pool, &bundle).await.is_err());
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_attempts WHERE request_id = 'request-with-fallback'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let requests: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM usage_logs WHERE request_id = 'request-with-fallback'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 0, "failed bundles must not leave orphan attempts");
+        assert_eq!(requests, 0, "failed bundles must not leave orphan requests");
+
+        pool.close().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_attempt_rows_backfill_and_report_as_one_request() {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-usage-request-view-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+            .await
+            .unwrap();
+        migrate(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO virtual_keys (id, key_hash, name, owner, created_at, monthly_budget)
+             VALUES ('usage-view-key', 'usage-view-hash', 'Usage view key', 'test', '2026-01-01T00:00:00Z', 1.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for view in [
+            "usage_request_logs",
+            "usage_request_accounting",
+            "usage_accounting_rows",
+        ] {
+            sqlx::query(&format!("DROP VIEW {view}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DROP TABLE usage_attempts")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        insert_usage_log(
+            &pool,
+            &request_row(
+                "legacy-failed-attempt",
+                "2026-01-02T10:00:00Z",
+                "stream_error",
+                502,
+                13,
+                7,
+                0.000067,
+                0,
+                "usage-view-account-a",
+            ),
+        )
+        .await
+        .unwrap();
+        insert_usage_log(
+            &pool,
+            &request_row(
+                "legacy-successful-attempt",
+                "2026-01-02T10:00:01Z",
+                "success",
+                200,
+                1,
+                2,
+                0.000003,
+                1,
+                "usage-view-account-b",
+            ),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/20260930130000_usage_attempt_accounting.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let attempts: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT attempt_number, status FROM usage_attempts WHERE request_id = ? ORDER BY attempt_number",
+        )
+        .bind("request-with-fallback")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            attempts,
+            vec![(1, "stream_error".into()), (2, "success".into())]
+        );
+
+        let recent = recent_usage(&pool, 20).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].status, "success");
+        assert_eq!(recent[0].fallback_hops, 1);
+        assert_eq!(
+            (recent[0].input_tokens, recent[0].output_tokens),
+            (Some(14), Some(9))
+        );
+        assert!((recent[0].cost_usd.unwrap() - 0.00007).abs() < 1e-12);
+
+        let exported = usage_between(&pool, "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(
+            usage_days(&pool).await.unwrap(),
+            vec![("2026-01-02".into(), 1, 23)]
+        );
+        let summary = usage_summary(&pool).await.unwrap();
+        assert_eq!(summary["requests"], 1);
+        assert_eq!(summary["error_requests"], 0);
+        assert_eq!(summary["fallback_hops"], 1);
+        assert_eq!(summary["input_tokens"], 14);
+        assert_eq!(summary["output_tokens"], 9);
+        assert!((summary["cost_usd"].as_f64().unwrap() - 0.00007).abs() < 1e-12);
+
+        let entries = key_usage_entries_since(&pool, "usage-view-key", "2026-01-02T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, 23);
+        assert_eq!(
+            key_usage_since(&pool, "usage-view-key", "2026-01-02T00:00:00Z")
+                .await
+                .unwrap(),
+            (1, 23)
+        );
+        assert_eq!(
+            request_counts_by_key(&pool).await.unwrap()["usage-view-key"],
+            1
+        );
+        let (by_key, by_account) = lifetime_totals(&pool).await.unwrap();
+        assert_eq!(by_key["usage-view-key"], (1, 23));
+        assert_eq!(by_account["usage-view-account-a"], (1, 20));
+        assert_eq!(by_account["usage-view-account-b"], (1, 3));
+
+        let since = "2026-01-02T00:00:00Z";
+        assert!(
+            (key_spend_since(&pool, "usage-view-key", since)
+                .await
+                .unwrap()
+                - 0.00007)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (account_spend_since(&pool, "usage-view-account-a", since)
+                .await
+                .unwrap()
+                - 0.000067)
+                .abs()
+                < 1e-12
+        );
+        let budgets = key_budget_status(&pool, since).await.unwrap();
+        assert_eq!(budgets.len(), 1);
+        assert!((budgets[0].2 - 0.00007).abs() < 1e-12);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 }

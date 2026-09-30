@@ -1,7 +1,7 @@
 //! Per-day usage/log export to disk (JSONL logs + CSV summaries).
 //!
-//! Every request that finishes is recorded in the `usage_logs` table. To make
-//! that history durable and inspectable outside the database, a background job
+//! Every request that finishes is recorded in the request-level usage view. To
+//! make that history durable and inspectable outside the database, a background job
 //! exports each UTC day's rows once the day has closed:
 //!
 //! - `<data_dir>/exports/usage-YYYY-MM-DD.jsonl` — one JSON object per request

@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -89,6 +90,12 @@ pub struct RouteTrace {
     pub commit_state: String,
     /// success | failed | cancelled
     pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_failure_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_allowed: Option<bool>,
     pub steps: Vec<TraceStep>,
     /// Client-visible warnings (e.g. strip_with_warning portability actions).
     pub warnings: Vec<String>,
@@ -100,6 +107,8 @@ pub struct RouteTrace {
     pub plugin_fact_failures: Vec<PluginFactFailureTrace>,
     #[serde(skip)]
     started: Instant,
+    #[serde(skip)]
+    cancellation_snapshot: Option<Arc<Mutex<Option<RouteTrace>>>>,
 }
 
 impl RouteTrace {
@@ -113,12 +122,32 @@ impl RouteTrace {
             final_target: None,
             commit_state: "not_committed".into(),
             outcome: "failed".into(),
+            stream_outcome: None,
+            terminal_failure_kind: None,
+            fallback_allowed: None,
             steps: Vec::new(),
             warnings: Vec::new(),
             plugin_facts: Vec::new(),
             plugin_fact_failures: Vec::new(),
             started: Instant::now(),
+            cancellation_snapshot: None,
         }
+    }
+
+    /// Mirror routing progress for the API cancellation path, which may drop
+    /// the pipeline future before it can persist its local trace.
+    pub fn attach_cancellation_snapshot(&mut self, snapshot: Arc<Mutex<Option<RouteTrace>>>) {
+        self.cancellation_snapshot = Some(snapshot);
+        self.publish_cancellation_snapshot();
+    }
+
+    pub(crate) fn publish_cancellation_snapshot(&self) {
+        let Some(snapshot) = &self.cancellation_snapshot else {
+            return;
+        };
+        let mut published = self.clone();
+        published.cancellation_snapshot = None;
+        *snapshot.lock() = Some(published);
     }
 
     pub fn step(&mut self, stage: &str, target: Option<String>, detail: impl Into<String>) {
@@ -138,6 +167,7 @@ impl RouteTrace {
             retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
+        self.publish_cancellation_snapshot();
     }
 
     pub fn resolved_transport(&mut self, target: impl Into<String>, transport: &str) {
@@ -157,6 +187,7 @@ impl RouteTrace {
             retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
+        self.publish_cancellation_snapshot();
     }
 
     pub fn candidate(
@@ -182,6 +213,7 @@ impl RouteTrace {
             retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
+        self.publish_cancellation_snapshot();
     }
 
     pub fn warn(&mut self, warning: impl Into<String>) {
@@ -215,6 +247,29 @@ impl RouteTrace {
         self.step("result", None, format!("outcome={outcome}"));
     }
 
+    /// Record the canonical stream terminal state and its routing effects.
+    pub fn stream_termination(
+        &mut self,
+        termination: crate::stream_outcome::StreamTermination,
+        fallback_allowed: Option<bool>,
+    ) {
+        self.stream_outcome = Some(termination.outcome.as_str().to_string());
+        self.terminal_failure_kind = termination
+            .failure_kind
+            .map(|kind| kind.as_str().to_string());
+        self.fallback_allowed = fallback_allowed;
+        let detail = format!(
+            "stream_outcome={} commit_state={} terminal_failure_kind={} fallback_allowed={}",
+            termination.outcome.as_str(),
+            termination.commit_state.as_trace_str(),
+            self.terminal_failure_kind.as_deref().unwrap_or("none"),
+            fallback_allowed
+                .map(|allowed| allowed.to_string())
+                .unwrap_or_else(|| "n/a".into()),
+        );
+        self.step("stream_termination", None, detail);
+    }
+
     pub fn plugin_fact(
         &mut self,
         name: &str,
@@ -242,6 +297,7 @@ impl RouteTrace {
             retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
+        self.publish_cancellation_snapshot();
     }
 
     /// Record a classified upstream failure and its shared policy effects.
@@ -269,6 +325,7 @@ impl RouteTrace {
             retry_hint: Some(policy.retry_hint.as_str().into()),
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
+        self.publish_cancellation_snapshot();
     }
 
     /// Record a routing-fact provider failure as `unknown` with a reason.
@@ -293,6 +350,7 @@ impl RouteTrace {
             retry_hint: None,
             elapsed_ms: self.started.elapsed().as_millis() as u64,
         });
+        self.publish_cancellation_snapshot();
     }
 
     pub fn steps_json(&self) -> String {

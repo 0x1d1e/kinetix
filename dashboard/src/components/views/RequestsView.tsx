@@ -414,7 +414,12 @@ export const RequestsView: React.FC<RequestsViewProps> = ({ requests, liveReques
               {panel === 'trace' && trace && (
                 <div className="mt-4 border-t-2 border-dashed border-[var(--ink)]/20 pt-4">
                   <div className="text-sm font-bold text-[var(--pen-blue)] mb-2">
-                    Route Trace · outcome: {trace.outcome} · commit: {trace.commit_state}
+                    <div>Route Trace · outcome: {trace.outcome} · commit: {trace.commit_state}</div>
+                    <div className="mt-1 text-xs font-normal text-[var(--ink)]/60">
+                      stream: {trace.stream_outcome ?? 'unknown'} · failure:{' '}
+                      {trace.terminal_failure_kind ?? (trace.stream_outcome ? 'none' : 'unknown')} · fallback:{' '}
+                      {trace.fallback_allowed == null ? 'unknown' : trace.fallback_allowed ? 'allowed' : 'blocked'}
+                    </div>
                   </div>
                   <div className="font-mono text-xs space-y-1">
                     {(trace.steps || []).map((s: any, i: number) => (

@@ -39,6 +39,7 @@ pub enum TelemetryOutcome {
     TargetError,
     BadRequest,
     Cancelled,
+    Neutral,
     AdaptiveSaturation,
     ProviderCircuitReject,
 }
