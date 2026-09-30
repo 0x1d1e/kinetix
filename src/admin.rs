@@ -13370,10 +13370,22 @@ pub(crate) async fn register_enabled_plugin_capabilities(state: &AppState, id: &
     let crypto = state.crypto.clone();
     let pool = state.pool.clone();
     // `enable` has already succeeded, so the row exists and is enabled.
-    let provides = match manager.get(id).await {
-        Ok(Some(row)) => row.manifest().map(|m| m.provides).unwrap_or_default(),
+    let (provides, cached_routing_facts) = match manager.get(id).await {
+        Ok(Some(row)) if row.status().is_enabled() => {
+            let Some(manifest) = row.manifest() else {
+                return;
+            };
+            let cached_routing_facts = manifest.routing_facts_mode == "cached"
+                && !manifest.provides.routing_facts.is_empty();
+            (manifest.provides, cached_routing_facts)
+        }
         _ => return,
     };
+    if cached_routing_facts {
+        state
+            .provider_work
+            .activate_auxiliary_scope(&format!("plugin:{id}"));
+    }
     if !provides.credential_strategies.is_empty() {
         let strategy: std::sync::Arc<dyn crate::credentials::CredentialStrategy> =
             std::sync::Arc::new(crate::plugins::credential::PluginCredentialStrategy::new(
@@ -17977,7 +17989,7 @@ mod credential_enrollment_regression_tests {
         let (state, root) = test_state("plugin-routing-work-unregister").await;
         let plugin_id = "routing-plugin";
         let scope = format!("plugin:{plugin_id}");
-        let old_identity = state.provider_work.auxiliary_identity(&scope);
+        let old_identity = state.provider_work.activate_auxiliary_scope(&scope);
         let old_started = Arc::new(Notify::new());
         let release_old = Arc::new(Semaphore::new(0));
         let old_coordinator = state.provider_work.clone();
@@ -18030,7 +18042,7 @@ mod credential_enrollment_regression_tests {
         state.unregister_plugin_capabilities(plugin_id);
         let state_after_unregister = state.provider_work.state_counts();
         let old_generation_invalidated = !old_identity.is_current();
-        let new_identity = state.provider_work.auxiliary_identity(&scope);
+        let new_identity = state.provider_work.activate_auxiliary_scope(&scope);
         let generation_changed = !Arc::ptr_eq(
             &old_identity.provider_generation,
             &new_identity.provider_generation,
@@ -18097,6 +18109,64 @@ mod credential_enrollment_regression_tests {
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn queued_plugin_routing_refresh_cannot_recreate_scope_after_unregister() {
+        let (state, root) = test_state("queued-plugin-routing-work-unregister").await;
+        let plugin_id = "queued-routing-plugin";
+        let scope = format!("plugin:{plugin_id}");
+        state.provider_work.activate_auxiliary_scope(&scope);
+
+        let queued_coordinator = state.provider_work.clone();
+        let queued_scope = scope.clone();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let queued_executions = executions.clone();
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let queued_job = tokio::spawn(async move {
+            let _ = queued_tx.send(());
+            resume_rx.await.unwrap();
+            let Some(identity) = queued_coordinator.auxiliary_identity(&queued_scope) else {
+                return Err(Arc::new(crate::provider_work::ProviderWorkError::Aborted));
+            };
+            queued_coordinator
+                .run(
+                    identity,
+                    crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+                    Some("cached_snapshot".into()),
+                    move || async move {
+                        queued_executions.fetch_add(1, Ordering::Relaxed);
+                        Err::<(), _>("plugin was disabled before refresh started".to_owned())
+                    },
+                    |_| None,
+                )
+                .await
+        });
+        queued_rx.await.unwrap();
+
+        state.unregister_plugin_capabilities(plugin_id);
+        assert_eq!(state.provider_work.state_counts(), (0, 0));
+        resume_tx.send(()).unwrap();
+        let result = queued_job.await.unwrap();
+
+        assert!(
+            matches!(
+                result,
+                Err(error)
+                    if matches!(
+                        error.as_ref(),
+                        crate::provider_work::ProviderWorkError::Aborted
+                    )
+            ),
+            "queued refresh must not acquire a new identity after unregister"
+        );
+        assert_eq!(executions.load(Ordering::Relaxed), 0);
+        assert_eq!(state.provider_work.state_counts(), (0, 0));
+        assert_eq!(state.provider_work.metrics_snapshot().scheduled, 0);
+
+        drop(state);
         let _ = std::fs::remove_dir_all(root);
     }
 

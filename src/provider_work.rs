@@ -263,9 +263,9 @@ impl ProviderWorkCoordinator {
         identity
     }
 
-    /// Create an identity for coordinator-owned work that is not attached to a
+    /// Start a lifecycle for coordinator-owned work that is not attached to a
     /// configured Provider, such as plugin routing-fact refresh.
-    pub(crate) fn auxiliary_identity(&self, scope: &str) -> ProviderWorkIdentity {
+    pub(crate) fn activate_auxiliary_scope(&self, scope: &str) -> ProviderWorkIdentity {
         let _lifecycle = self.lifecycle.lock();
         let entry = self
             .providers
@@ -281,6 +281,23 @@ impl ProviderWorkCoordinator {
             #[cfg(test)]
             test_provider_id_only: false,
         }
+    }
+
+    /// Read the active identity for an auxiliary scope. Lookup never creates a
+    /// gate: delayed work cannot resurrect a scope after lifecycle teardown.
+    pub(crate) fn auxiliary_identity(&self, scope: &str) -> Option<ProviderWorkIdentity> {
+        let _lifecycle = self.lifecycle.lock();
+        let entry = self.providers.get(scope)?;
+        if !entry.generation.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        Some(ProviderWorkIdentity {
+            provider_id: scope.to_string(),
+            provider_generation: entry.generation.clone(),
+            account_generation: None,
+            #[cfg(test)]
+            test_provider_id_only: false,
+        })
     }
 
     fn gate_for_identity_locked(

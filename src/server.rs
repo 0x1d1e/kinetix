@@ -501,6 +501,12 @@ pub fn spawn_background_tasks(state: AppState) {
                     if deadline > now {
                         continue;
                     }
+                    let Some(identity) = st
+                        .provider_work
+                        .auxiliary_identity(&format!("plugin:{}", row.id))
+                    else {
+                        continue;
+                    };
 
                     next_due.insert(
                         row.id.clone(),
@@ -508,20 +514,17 @@ pub fn spawn_background_tasks(state: AppState) {
                             + st.provider_work
                                 .scheduler_jitter(cadence.min(Duration::from_secs(30))),
                     );
-                    due.push(row.id);
+                    due.push((row.id, identity));
                 }
 
                 next_due.retain(|plugin_id, _| active.contains(plugin_id));
 
                 let mut jobs = tokio::task::JoinSet::new();
-                for plugin_id in due {
+                for (plugin_id, identity) in due {
                     let manager = manager.clone();
                     let state = st.clone();
                     jobs.spawn(async move {
                         let refresh_plugin_id = plugin_id.clone();
-                        let identity = state
-                            .provider_work
-                            .auxiliary_identity(&format!("plugin:{plugin_id}"));
                         let result = state
                             .provider_work
                             .run(
