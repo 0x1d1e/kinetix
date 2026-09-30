@@ -563,21 +563,6 @@ async fn client_usage_for_key(
     let now_iso = now.to_rfc3339();
     let daily_from = daily_start.to_rfc3339();
     let monthly_from = monthly_start.to_rfc3339();
-    let (daily, monthly) = match tokio::try_join!(
-        db::client_usage_summary(&state.pool, &key.id, &daily_from, &now_iso),
-        db::client_usage_summary(&state.pool, &key.id, &monthly_from, &now_iso),
-    ) {
-        Ok(summaries) => summaries,
-        Err(error) => {
-            tracing::error!(%error, "client usage query failed");
-            return error_response(
-                format,
-                &request_id,
-                ProxyError::unavailable("usage temporarily unavailable"),
-            );
-        }
-    };
-
     let budget = match state
         .admission
         .budget_snapshot_at(&state.pool, &key.id, now, std::time::Instant::now())
@@ -593,6 +578,22 @@ async fn client_usage_for_key(
             );
         }
     };
+
+    let (daily, monthly) = match tokio::try_join!(
+        db::client_usage_summary(&state.pool, &key.id, &daily_from, &now_iso),
+        db::client_usage_summary(&state.pool, &key.id, &monthly_from, &now_iso),
+    ) {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            tracing::error!(%error, "client usage query failed");
+            return error_response(
+                format,
+                &request_id,
+                ProxyError::unavailable("usage temporarily unavailable"),
+            );
+        }
+    };
+
     let remaining =
         |limit: Option<f64>,
          summary: &db::ClientUsageSummary,

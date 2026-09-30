@@ -592,13 +592,13 @@ impl AdmissionController {
 impl KeyLedger {
     fn roll_periods(&mut self, now: chrono::DateTime<Utc>) {
         let day = now.date_naive();
-        if self.daily_day != Some(day) {
+        if self.daily_day.map_or(true, |current| day > current) {
             self.daily_day = Some(day);
             self.daily_spend = 0.0;
             self.daily_has_unknown_settled_cost = false;
         }
         let month = (now.year(), now.month());
-        if self.monthly_key != Some(month) {
+        if self.monthly_key.map_or(true, |current| month > current) {
             self.monthly_key = Some(month);
             self.monthly_spend = 0.0;
             self.monthly_has_unknown_settled_cost = false;
@@ -1197,6 +1197,27 @@ mod tests {
         assert!(ledger
             .reserve(
                 3,
+                &key,
+                AdmissionEstimate {
+                    tokens: 1,
+                    cost: Some(0.3),
+                },
+                after_midnight,
+                after_instant,
+            )
+            .is_err());
+
+        let stale_snapshot = ledger.budget_snapshot(before_midnight, before_instant);
+        assert_eq!(stale_snapshot.daily.settled_spend_usd, 0.8);
+        assert_eq!(stale_snapshot.monthly.settled_spend_usd, 0.8);
+        assert_eq!(ledger.daily_day, Some(after_midnight.date_naive()));
+        assert_eq!(
+            ledger.monthly_key,
+            Some((after_midnight.year(), after_midnight.month()))
+        );
+        assert!(ledger
+            .reserve(
+                4,
                 &key,
                 AdmissionEstimate {
                     tokens: 1,
