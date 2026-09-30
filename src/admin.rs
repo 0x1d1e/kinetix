@@ -4813,7 +4813,7 @@ pub async fn update_model_reconciliation(
                 validate_effective_model_transport_candidate(
                     &provider,
                     &json!({ "transport": { "format": transport } }),
-                    None,
+                    Some(transport),
                 )?;
                 Some(validate_model_transport_override(
                     &provider,
@@ -13306,7 +13306,11 @@ async fn import_config_apply(
                 )),
             }
         }
-        if let Some(transport) = m["transport_override"].as_str() {
+        if let Some(transport) = m["transport_override"]
+            .as_str()
+            .map(str::trim)
+            .filter(|transport| !transport.is_empty())
+        {
             let configured_binding = providers
                 .iter()
                 .find(|candidate| candidate["name"].as_str() == Some(provider))
@@ -13319,15 +13323,7 @@ async fn import_config_apply(
                 })
                 .unwrap_or("");
             let provider_plugin = crate::plugins::PluginRef::parse(configured_binding);
-            if matches!(
-                crate::adapters::TargetTransport::parse(transport),
-                Some(crate::adapters::TargetTransport::Plugin(_))
-            ) && provider_plugin.is_none()
-            {
-                problems.push(format!(
-                    "model '{model_key}' plugin transport requires an explicit provider adapter binding"
-                ));
-            } else if let Some(reference) = provider_plugin {
+            if let Some(reference) = provider_plugin {
                 let expected = crate::adapters::TargetTransport::Plugin(reference.to_string_ref());
                 if crate::adapters::TargetTransport::parse(transport) != Some(expected) {
                     problems.push(format!(
@@ -19024,7 +19020,7 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
-        let error = update_model_reconciliation(
+        let _ = update_model_reconciliation(
             State(state.clone()),
             AdminAuth {
                 actor: "admin".into(),
@@ -19037,15 +19033,25 @@ mod credential_enrollment_regression_tests {
             }),
         )
         .await
-        .unwrap_err();
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        .unwrap();
         let reconciliation_model = db::get_model(&state.pool, &reconciliation_model_id)
             .await
             .unwrap()
             .unwrap();
-        assert!(discovery_object(&reconciliation_model)
-            .get("configured_transport")
-            .is_none());
+        assert_eq!(
+            discovery_object(&reconciliation_model)["configured_transport"],
+            "plugin:other/adapter"
+        );
+        let snapshot = state.registry.snapshot();
+        assert_eq!(
+            crate::adapters::resolve_execution_profile(
+                snapshot.providers.get(&provider_id).unwrap(),
+                snapshot.models.get(&reconciliation_model_id).unwrap()
+            )
+            .unwrap()
+            .transport,
+            crate::adapters::TargetTransport::Plugin("plugin:other/adapter".into())
+        );
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);
@@ -25683,6 +25689,118 @@ mod credential_enrollment_regression_tests {
             ""
         );
 
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn config_export_import_round_trips_native_provider_plugin_transport_override() {
+        let (source, source_root) = test_state("plugin-transport-export-source").await;
+        let provider_id = insert_provider(
+            &source,
+            "native-plugin-transport",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let source_model_id = db::insert_model(
+            &source.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "plugin-transport-model",
+                display_name: "Plugin Transport Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        db::set_model_transport_override(
+            &source.pool,
+            &source_model_id,
+            Some("plugin:test/adapter"),
+        )
+        .await
+        .unwrap();
+
+        let exported = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            exported["models"][0]["transport_override"],
+            "plugin:test/adapter"
+        );
+
+        let (target, target_root) = test_state("plugin-transport-export-target").await;
+        let dry_run = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true, "problems: {}", dry_run["problems"]);
+
+        let _ = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let imported_provider = db::list_providers(&target.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "native-plugin-transport")
+            .unwrap();
+        let imported_model = db::find_model_by_upstream(
+            &target.pool,
+            &imported_provider.id,
+            "plugin-transport-model",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            discovery_object(&imported_model)["configured_transport"],
+            "plugin:test/adapter"
+        );
+        let snapshot = target.registry.snapshot();
+        assert_eq!(
+            crate::adapters::resolve_execution_profile(
+                snapshot.providers.get(&imported_provider.id).unwrap(),
+                snapshot.models.get(&imported_model.id).unwrap()
+            )
+            .unwrap()
+            .transport,
+            crate::adapters::TargetTransport::Plugin("plugin:test/adapter".into())
+        );
+
+        drop(source);
+        drop(target);
         let _ = std::fs::remove_dir_all(source_root);
         let _ = std::fs::remove_dir_all(target_root);
     }
