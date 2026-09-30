@@ -32,6 +32,7 @@ pub mod client_disconnect;
 pub mod client_profiles;
 pub mod config;
 pub mod cost;
+pub mod credential_interchange;
 pub mod credential_refresh;
 pub mod credentials;
 pub mod crypto;
