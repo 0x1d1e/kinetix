@@ -960,6 +960,10 @@ pub(crate) async fn run_with_disconnect(
         .iter()
         .map(|record| (record.candidate_id.clone(), record.clone()))
         .collect();
+    let dispatch_facts_by_id: std::collections::HashMap<_, _> = dispatch_candidates
+        .iter()
+        .map(|candidate| (candidate.id.clone(), candidate.facts))
+        .collect();
     let mut targets_by_id: std::collections::HashMap<_, _> = targets
         .into_iter()
         .map(|target| (adaptive_candidate_key(&target), target))
@@ -1072,9 +1076,25 @@ pub(crate) async fn run_with_disconnect(
             );
         }
 
-        // The dispatch plan has already evaluated account quota before the
-        // provider circuit. Execute its quota decision before transport checks.
-        match dispatch_record.decision {
+        // Keep the dispatch plan's ordering and explanations, but refresh
+        // mutable account quota at the execution gate before transport checks.
+        // The canonical planner still evaluates quota before provider circuit.
+        let planning_facts = *dispatch_facts_by_id
+            .get(&candidate_id)
+            .expect("runtime candidate has dispatch facts");
+        let live_decision =
+            plan_runtime_candidate(&state.pool, &target.account, planning_facts).await;
+        if live_decision != dispatch_record.decision {
+            trace.step(
+                "candidate",
+                Some(target.account.label.clone()),
+                format!(
+                    "dispatch plan refreshed decision={live_decision:?} (planned={:?})",
+                    dispatch_record.decision
+                ),
+            );
+        }
+        match live_decision {
             crate::pre_dispatch::PreDispatchDecision::SkipAfterQuota
             | crate::pre_dispatch::PreDispatchDecision::RateLimited => {
                 let reset_at = (chrono::Utc::now()
@@ -2438,6 +2458,19 @@ fn record_target_telemetry(
     state.target_telemetry.record(event);
 }
 
+async fn plan_runtime_candidate(
+    pool: &db::Pool,
+    account: &db::AccountRow,
+    mut facts: crate::pre_dispatch::PreDispatchFacts,
+) -> crate::pre_dispatch::PreDispatchDecision {
+    facts.account_quota_reached = Some(
+        pool::soft_quota_reached(pool, account)
+            .await
+            .unwrap_or(false),
+    );
+    crate::pre_dispatch::plan_candidate(facts)
+}
+
 fn route_allows_fallback(route: Option<&db::RouteRow>, kind: FailureKind) -> bool {
     if !kind.is_retryable() {
         return false;
@@ -3579,7 +3612,7 @@ fn order_accounts_for_simulation(
         for index in start..end {
             let total: u64 = accounts[index..end]
                 .iter()
-                .map(|account| account.weight.max(1) as u64)
+                .map(|account| crate::pre_dispatch::normalized_weight(account.weight))
                 .sum();
             let identity = accounts[index..end]
                 .iter()
@@ -3590,7 +3623,7 @@ fn order_accounts_for_simulation(
             let mut cumulative = 0;
             let mut selected = index;
             for (offset, account) in accounts[index..end].iter().enumerate() {
-                cumulative += account.weight.max(1) as u64;
+                cumulative += crate::pre_dispatch::normalized_weight(account.weight);
                 if pick < cumulative {
                     selected = index + offset;
                     break;
@@ -3735,7 +3768,7 @@ async fn order_route_targets_inner(
             let total: u64 = groups
                 .iter()
                 .filter_map(|group| group.first())
-                .map(|target| target.weight.max(1) as u64)
+                .map(|target| crate::pre_dispatch::normalized_weight(target.weight))
                 .sum();
             if total > 0 {
                 let mut pick = simulation_seed
@@ -3745,7 +3778,7 @@ async fn order_route_targets_inner(
                 for (i, group) in groups.iter().enumerate() {
                     let weight = group
                         .first()
-                        .map(|target| target.weight.max(1) as u64)
+                        .map(|target| crate::pre_dispatch::normalized_weight(target.weight))
                         .unwrap_or(1);
                     if pick < weight {
                         index = i;
@@ -6566,6 +6599,56 @@ pub async fn dry_run(
 #[cfg(test)]
 mod route_policy_tests {
     use super::*;
+    use axum::response::IntoResponse;
+
+    #[derive(Clone)]
+    struct QuotaRaceUpstream {
+        request_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        primary_started: std::sync::Arc<tokio::sync::Notify>,
+        release_primary: std::sync::Arc<tokio::sync::Notify>,
+        credentials: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    async fn quota_race_chat_completions(
+        axum::extract::State(upstream): axum::extract::State<QuotaRaceUpstream>,
+        headers: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        let credential = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        upstream.credentials.lock().await.push(credential);
+        let request_index = upstream
+            .request_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if request_index == 0 {
+            upstream.primary_started.notify_one();
+            upstream.release_primary.notified().await;
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "error": {"message": "temporary upstream failure", "type": "server_error"}
+                })),
+            )
+                .into_response()
+        } else {
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                })),
+            )
+                .into_response()
+        }
+    }
 
     #[test]
     fn capability_eligibility_preserves_unknown_and_unsupported_states() {
@@ -7857,6 +7940,21 @@ mod route_policy_tests {
             assert_eq!(first, second, "{strategy} dry runs must be repeatable");
             assert_eq!(state.rr_counter_snapshot(&route_id), cursor_before);
             if strategy == "weighted" {
+                sqlx::query(
+                    "UPDATE route_targets SET weight=CASE WHEN priority=1 THEN 1 ELSE 0 END WHERE route_id=?",
+                )
+                .bind(&route_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+                state.registry.reload(&state.pool).await.unwrap();
+                let zero_weight_result =
+                    dry_run(&state, "adaptive-dry-run", &DryRunRequest::default())
+                        .await
+                        .unwrap();
+                assert_eq!(zero_weight_result["selection_mode"], "stochastic");
+                assert_eq!(zero_weight_result["outcome"], "stochastic");
+                assert!(zero_weight_result["would_select"].is_null());
                 assert_eq!(first["selection_mode"], "stochastic");
                 assert_eq!(first["outcome"], "stochastic");
                 assert!(first["would_select"].is_null());
@@ -7896,6 +7994,153 @@ mod route_policy_tests {
             }));
 
         drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn runtime_refreshes_fallback_quota_after_dispatch_plan_creation() {
+        let (state, root, provider_id, _, account_ids) = adaptive_dry_run_state().await;
+        let upstream = QuotaRaceUpstream {
+            request_count: std::sync::Arc::default(),
+            primary_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release_primary: std::sync::Arc::new(tokio::sync::Notify::new()),
+            credentials: std::sync::Arc::default(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream_app = axum::Router::new()
+            .route(
+                "/chat/completions",
+                axum::routing::post(quota_race_chat_completions),
+            )
+            .with_state(upstream.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream_app).await.unwrap();
+        });
+
+        let route_id = state
+            .registry
+            .snapshot()
+            .routes
+            .values()
+            .find(|route| route.name == "adaptive-dry-run")
+            .unwrap()
+            .id
+            .clone();
+        sqlx::query("UPDATE providers SET base_url=? WHERE id=?")
+            .bind(format!("http://{addr}"))
+            .bind(&provider_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE routes SET strategy='priority', max_attempts=2, fallback_triggers='{}' WHERE id=?",
+        )
+        .bind(&route_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        for (account_id, key) in [
+            (&account_ids[0], "primary-key"),
+            (&account_ids[1], "fallback-key"),
+        ] {
+            sqlx::query("UPDATE accounts SET secret_enc=?, key_mask=? WHERE id=?")
+                .bind(state.crypto.encrypt(key).unwrap())
+                .bind(key)
+                .bind(account_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE accounts SET soft_quota_usd=0.5, quota_type='daily' WHERE id=?")
+            .bind(&account_ids[1])
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        assert!(!pool::soft_quota_reached(
+            &state.pool,
+            &state.registry.account(&account_ids[1]).unwrap()
+        )
+        .await
+        .unwrap());
+
+        let pool = state.pool.clone();
+        let runtime = tokio::spawn(async move {
+            let request = InternalRequest {
+                requested_model: "adaptive-dry-run".into(),
+                system: Vec::new(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+                tool_choice: None,
+                tool_choice_name: None,
+                params: crate::types::SamplingParams::default(),
+                stream: false,
+                include_usage: false,
+                thinking: None,
+                extra: serde_json::Map::new(),
+                raw_body: None,
+            };
+            run(
+                &state,
+                FrontendFormat::OpenAi,
+                None,
+                request,
+                "quota-live-refresh-runtime".into(),
+                true,
+                None,
+                Vec::new(),
+            )
+            .await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            upstream.primary_started.notified(),
+        )
+        .await
+        .expect("primary upstream attempt should start");
+        sqlx::query(
+            "INSERT INTO usage_logs (id, request_id, ts, client_format, requested_model, status, status_code, cost_usd, serving_account_id) VALUES (?, ?, ?, 'openai', 'adaptive-dry-run', 'success', 200, 1.0, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(db::now_iso())
+        .bind(&account_ids[1])
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(pool::soft_quota_reached(
+            &pool,
+            &db::get_account(&pool, &account_ids[1])
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .await
+        .unwrap());
+        upstream.release_primary.notify_one();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), runtime)
+            .await
+            .expect("runtime request should finish")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "exhausted fallback account must not dispatch"
+        );
+        assert_eq!(
+            upstream
+                .request_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            upstream.credentials.lock().await.as_slice(),
+            ["Bearer primary-key"]
+        );
+
+        server.abort();
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -87,6 +87,12 @@ pub(crate) struct DispatchPlan {
     pub stochastic_selection: bool,
 }
 
+/// Normalize configured weights with the same semantics used by runtime
+/// selection. Non-positive weights still receive a non-zero share.
+pub(crate) fn normalized_weight(weight: i64) -> u64 {
+    weight.max(1) as u64
+}
+
 /// Apply the same ordered gates for an individual candidate in runtime and
 /// dry-run. Quota is intentionally checked before provider-circuit availability.
 pub(crate) fn plan_candidate(facts: PreDispatchFacts) -> PreDispatchDecision {
@@ -346,10 +352,11 @@ fn stochastic_frontier(
             let Some(group) = groups.get(group_id) else {
                 continue;
             };
-            if group
+            let group_weight = group
                 .first()
-                .is_some_and(|index| candidates[*index].weight <= 0)
-            {
+                .map(|index| normalized_weight(candidates[*index].weight))
+                .unwrap_or(0);
+            if group_weight == 0 {
                 continue;
             }
             let tier = first_account_tier(group, candidates, decisions);
