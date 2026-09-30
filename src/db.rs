@@ -1469,7 +1469,6 @@ pub(crate) async fn update_provider_in_transaction(
     if pricing_scope == "integration" || catalog_identity_changed {
         revoke_external_catalog_effective_pricing_in_transaction(tx, id).await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 

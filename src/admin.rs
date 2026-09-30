@@ -10780,7 +10780,7 @@ pub async fn import_config(
             } else {
                 let features = match imported_integration_features(
                     p.get("integration_features"),
-                    existing_provider.as_ref(),
+                    existing_provider,
                 ) {
                     Ok(features) => features,
                     Err(problem) => {
@@ -10792,7 +10792,7 @@ pub async fn import_config(
                 };
                 let protocols = match imported_integration_protocols(
                     p.get("integration_protocols"),
-                    existing_provider.as_ref(),
+                    existing_provider,
                 ) {
                     Ok(protocols) => protocols,
                     Err(problem) => {
