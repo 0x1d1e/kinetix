@@ -149,6 +149,10 @@ pub fn validate_model(
     })
 }
 
+pub(crate) fn credential_is_nonempty(secret: &str) -> bool {
+    !secret.trim().is_empty()
+}
+
 /// Schema validation of a proposed account (FR-8.6).
 pub fn validate_account(label: &str, api_key: Option<&str>, quota_type: &str) -> Vec<String> {
     let mut problems = Vec::new();
@@ -156,7 +160,7 @@ pub fn validate_account(label: &str, api_key: Option<&str>, quota_type: &str) ->
         problems.push("account label is required".into());
     }
     match api_key {
-        Some(k) if !k.trim().is_empty() => {}
+        Some(k) if credential_is_nonempty(k) => {}
         _ => problems.push("an api_key is required to create an account".into()),
     }
     if !matches!(quota_type, "none" | "daily" | "monthly" | "rolling") {

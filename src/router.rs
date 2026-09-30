@@ -151,6 +151,14 @@ pub fn build(state: AppState) -> Router {
         .route("/validate/account", post(admin::validate_account_edit))
         .route("/config/export", get(admin::export_config))
         .route("/config/import", post(admin::import_config))
+        .route(
+            "/credential-interchange/export",
+            post(admin::export_credentials),
+        )
+        .route(
+            "/credential-interchange/import",
+            post(admin::import_credentials),
+        )
         // aliases
         .route(
             "/aliases",

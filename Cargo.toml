@@ -67,6 +67,8 @@ wasmtime = { version = "48.0.3", features = ["component-model", "async", "cranel
 tar = "0.4.46"
 ed25519-dalek = "3.0.0"
 semver = "1.0"
+pbkdf2 = "0.12.2"
+serde_jcs = "0.2.0"
 
 [dev-dependencies]
 wat = "1"

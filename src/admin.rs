@@ -1911,6 +1911,14 @@ fn normalize_provider_endpoint_identity(base_url: &str) -> Option<String> {
     Some(url.to_string().trim_end_matches('/').to_string())
 }
 
+fn normalize_credential_endpoint_identity(base_url: &str) -> Option<String> {
+    let mut url = url::Url::parse(base_url).ok()?;
+    url.set_fragment(None);
+    let trimmed = url.path().trim_end_matches('/').to_string();
+    url.set_path(&trimmed);
+    Some(url.to_string().trim_end_matches('/').to_string())
+}
+
 fn validate_direct_api_integration_endpoint(
     name: &str,
     base_url: &str,
@@ -4802,6 +4810,11 @@ pub async fn update_model_reconciliation(
                     .await
                     .map_err(ApiError::internal)?
                     .ok_or_else(|| ApiError::not_found("provider not found"))?;
+                validate_effective_model_transport_candidate(
+                    &provider,
+                    &json!({ "transport": { "format": transport } }),
+                    Some(transport),
+                )?;
                 Some(validate_model_transport_override(
                     &provider,
                     Some(transport),
@@ -8468,6 +8481,54 @@ fn validate_model_transport_override(
     Ok(Some(parsed.as_str().to_string()))
 }
 
+fn validate_effective_model_transport_candidate(
+    provider: &db::ProviderRow,
+    discovery: &Value,
+    transport_override: Option<&str>,
+) -> Result<(), ApiError> {
+    let mut effective_discovery = discovery
+        .as_object()
+        .cloned()
+        .map(Value::Object)
+        .unwrap_or_else(|| json!({}));
+    let object = effective_discovery
+        .as_object_mut()
+        .expect("effective discovery is an object");
+    object.remove("configured_transport");
+    if let Some(transport) = transport_override {
+        object.insert("configured_transport".into(), json!(transport));
+    }
+
+    let candidate = db::ModelRow {
+        id: "transport-validation".into(),
+        provider_id: provider.id.clone(),
+        upstream_id: String::new(),
+        display_name: String::new(),
+        enabled: 1,
+        context_window: None,
+        max_output_tokens: None,
+        capabilities: "{}".into(),
+        prices: "{}".into(),
+        parameters: "{}".into(),
+        thinking_map: "{}".into(),
+        extra_request: "{}".into(),
+        discovery: effective_discovery.to_string(),
+        created_at: String::new(),
+        opaque_state_plugin: String::new(),
+    };
+    let transport = crate::adapters::resolve_model_transport(provider, &candidate)
+        .map_err(|error| ApiError::bad(error.message))?;
+    if transport_override.is_none()
+        && matches!(transport, crate::adapters::TargetTransport::Plugin(_))
+        && provider.wire_plugin_ref().is_none()
+    {
+        return Err(ApiError::bad(
+            "discovered plugin model transport requires a provider wire_plugin binding; use an explicit transport_override for a model-level plugin transport",
+        ));
+    }
+    Ok(())
+}
+
 fn default_true() -> bool {
     true
 }
@@ -8655,6 +8716,11 @@ pub async fn create_model(
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     validate_thinking_map(&body.thinking_map)?;
     validate_discovery_execution(&body.discovery)?;
+    validate_effective_model_transport_candidate(
+        &provider,
+        &body.discovery,
+        transport_override.as_deref(),
+    )?;
     let thinking_map =
         serde_json::to_value(&body.thinking_map).expect("ThinkingMap serialization is infallible");
     let thinking_map_configured = !body.thinking_map.levels.is_empty()
@@ -8847,6 +8913,11 @@ pub async fn update_model(
     let caps = normalize_model_capabilities(&body.capabilities);
     let prices: Prices = serde_json::from_value(body.prices.clone()).unwrap_or_default();
     let existing_discovery = discovery_object(&model);
+    validate_effective_model_transport_candidate(
+        &provider,
+        &existing_discovery,
+        transport_override.as_deref(),
+    )?;
     let previous_prices = model.prices();
     let mut price_fields = effective_price_fields(&existing_discovery, &previous_prices);
     for field in PRICE_FIELDS {
@@ -10989,6 +11060,947 @@ fn filter_imported_ownership_pricing_for_scope(
 }
 
 #[derive(Deserialize)]
+pub struct CredentialExportBody {
+    #[serde(default)]
+    pub include_secrets: bool,
+    pub passphrase: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CredentialImportBody {
+    pub bundle: Value,
+    pub passphrase: Option<String>,
+    #[serde(default)]
+    pub apply: bool,
+    #[serde(default)]
+    pub replace_existing: bool,
+}
+
+fn no_store_json(value: Value) -> Response {
+    let mut response = Json(value).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+fn portable_credential_delivery_metadata(
+    provider: &db::ProviderRow,
+) -> serde_json::Map<String, Value> {
+    let mut credential_hosts = provider
+        .credential_hosts()
+        .into_iter()
+        .map(|host| host.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    credential_hosts.sort_unstable();
+    credential_hosts.dedup();
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("wire_format".into(), json!(provider.wire_format));
+    metadata.insert("wire_plugin".into(), json!(provider.wire_plugin));
+    metadata.insert("allow_insecure_tls".into(), json!(provider.insecure_tls()));
+    metadata.insert(
+        "effective_allow_insecure_tls".into(),
+        json!(provider.insecure_tls()),
+    );
+    metadata.insert("credential_hosts".into(), json!(credential_hosts));
+    metadata.insert(
+        "follow_redirects".into(),
+        json!(provider.follows_redirects()),
+    );
+    metadata.insert(
+        "custom_header_name".into(),
+        json!(provider.custom_header_name),
+    );
+    metadata.insert(
+        "custom_param_name".into(),
+        json!(provider.custom_param_name),
+    );
+    metadata
+}
+
+fn portable_credential_descriptor_for_state(
+    state: &AppState,
+    provider: &db::ProviderRow,
+    label: &str,
+    kind: crate::credential_interchange::CredentialKind,
+) -> Result<crate::credential_interchange::CredentialDescriptor, String> {
+    let mut descriptor = portable_credential_descriptor(provider, label, kind)?;
+    let extension = descriptor
+        .metadata
+        .pointer_mut("/extensions/org.prightcord.kinetix")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "missing Kinetix credential provider metadata".to_string())?;
+    extension.insert(
+        "effective_allow_insecure_tls".into(),
+        json!(state.config.allow_insecure_tls || provider.insecure_tls()),
+    );
+    Ok(descriptor)
+}
+
+fn portable_credential_descriptor(
+    provider: &db::ProviderRow,
+    label: &str,
+    kind: crate::credential_interchange::CredentialKind,
+) -> Result<crate::credential_interchange::CredentialDescriptor, String> {
+    let base_url = normalize_credential_endpoint_identity(&provider.base_url)
+        .ok_or_else(|| format!("provider '{}' has an invalid endpoint URL", provider.name))?;
+    let mut kinetix = serde_json::Map::new();
+    kinetix.insert("auth_scheme".into(), json!(provider.auth_scheme));
+    kinetix.insert("base_url".into(), json!(base_url));
+    kinetix.insert(
+        "credential_plugin".into(),
+        json!(provider.credential_plugin),
+    );
+    kinetix.insert("source_plugin_id".into(), json!(provider.source_plugin_id));
+    kinetix.insert(
+        "source_integration_id".into(),
+        json!(provider.source_integration_id),
+    );
+    kinetix.extend(portable_credential_delivery_metadata(provider));
+    let mut extensions = serde_json::Map::new();
+    extensions.insert(
+        crate::credential_interchange::KINETIX_EXTENSION.into(),
+        Value::Object(kinetix),
+    );
+    Ok(crate::credential_interchange::CredentialDescriptor {
+        schema: crate::credential_interchange::DESCRIPTOR_SCHEMA.into(),
+        kind,
+        provider: provider.name.clone(),
+        label: label.into(),
+        metadata: json!({
+            "credential_mode": provider.credential_mode,
+            "extensions": extensions,
+        }),
+        extensions: serde_json::Map::new(),
+    })
+}
+
+fn validate_portable_credential_export_identities(
+    providers: &[db::ProviderRow],
+    accounts: &[db::AccountRow],
+) -> Result<(), ApiError> {
+    let mut exported_provider_ids = providers
+        .iter()
+        .filter(|provider| provider.credential_mode == "none")
+        .map(|provider| provider.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for account in accounts
+        .iter()
+        .filter(|account| account.label != "__kinetix_noauth__")
+    {
+        exported_provider_ids.insert(account.provider_id.clone());
+    }
+
+    let mut provider_name_counts = std::collections::HashMap::<&str, usize>::new();
+    for provider in providers {
+        *provider_name_counts
+            .entry(provider.name.as_str())
+            .or_default() += 1;
+    }
+    for provider_id in exported_provider_ids {
+        let provider = providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| ApiError::internal("credential references a missing provider"))?;
+        if provider_name_counts
+            .get(provider.name.as_str())
+            .copied()
+            .unwrap_or_default()
+            > 1
+        {
+            return Err(ApiError::bad(format!(
+                "credential export cannot represent ambiguous provider name '{}'",
+                provider.name
+            )));
+        }
+    }
+
+    let mut account_identities = std::collections::HashSet::new();
+    for account in accounts
+        .iter()
+        .filter(|account| account.label != "__kinetix_noauth__")
+    {
+        if !account_identities.insert((account.provider_id.as_str(), account.label.as_str())) {
+            let provider = providers
+                .iter()
+                .find(|provider| provider.id == account.provider_id)
+                .ok_or_else(|| ApiError::internal("account references a missing provider"))?;
+            return Err(ApiError::bad(format!(
+                "credential export cannot represent duplicate account label '{}' for provider '{}'",
+                account.label, provider.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub async fn export_credentials(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Json(body): Json<CredentialExportBody>,
+) -> Result<Response, ApiError> {
+    if body.include_secrets && body.passphrase.as_deref().is_none_or(str::is_empty) {
+        return Err(ApiError::bad(
+            "secret-inclusive export requires a passphrase",
+        ));
+    }
+    if !body.include_secrets && body.passphrase.is_some() {
+        return Err(ApiError::bad(
+            "passphrase is only accepted when include_secrets is true",
+        ));
+    }
+    if body.include_secrets
+        && body.passphrase.as_deref().is_none_or(|passphrase| {
+            passphrase.trim().chars().count()
+                < crate::credential_interchange::MIN_EXPORT_PASSPHRASE_CHARS
+        })
+    {
+        return Err(ApiError::bad(format!(
+            "secret-inclusive export requires a passphrase of at least {} characters",
+            crate::credential_interchange::MIN_EXPORT_PASSPHRASE_CHARS
+        )));
+    }
+
+    let snapshot = db::config_export_snapshot_with_hook(&state.pool, || async {})
+        .await
+        .map_err(ApiError::internal)?;
+    validate_portable_credential_export_identities(&snapshot.providers, &snapshot.accounts)?;
+    let mut records = Vec::new();
+    let mut descriptors = Vec::new();
+    let mut secrets = Vec::new();
+    let mut checked_transport_providers = std::collections::HashSet::new();
+
+    for provider in &snapshot.providers {
+        if provider.credential_mode == "none" {
+            records.push(crate::credential_interchange::CredentialRecord {
+                descriptor: portable_credential_descriptor_for_state(
+                    &state,
+                    provider,
+                    "default",
+                    crate::credential_interchange::CredentialKind::None,
+                )
+                .map_err(ApiError::internal)?,
+                secret_envelope: None,
+                extensions: serde_json::Map::new(),
+            });
+        } else if !matches!(provider.credential_mode.as_str(), "manual" | "auth_flow") {
+            return Err(ApiError::internal(
+                "provider has an invalid credential mode",
+            ));
+        }
+    }
+
+    for account in snapshot
+        .accounts
+        .iter()
+        .filter(|account| account.label != "__kinetix_noauth__")
+    {
+        let provider = snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.id == account.provider_id)
+            .ok_or_else(|| ApiError::internal("account references a missing provider"))?;
+        let kind = match provider.credential_mode.as_str() {
+            "manual" => crate::credential_interchange::CredentialKind::ApiKey,
+            "auth_flow" if account.key_mask.starts_with("oauth:") => {
+                crate::credential_interchange::CredentialKind::OAuth
+            }
+            "auth_flow" => crate::credential_interchange::CredentialKind::Custom,
+            _ => return Err(ApiError::internal("account has an invalid credential mode")),
+        };
+        if body.include_secrets && provider.credential_mode == "auth_flow" {
+            return Err(ApiError::bad(
+                "secret-inclusive export of auth-flow credentials is unavailable until the credential plugin supports authoritative snapshot and restore",
+            ));
+        }
+        if body.include_secrets
+            && provider.credential_mode == "manual"
+            && checked_transport_providers.insert(provider.id.clone())
+        {
+            validate_portable_credential_model_transports(
+                provider,
+                snapshot
+                    .models
+                    .iter()
+                    .filter(|model| model.provider_id == provider.id),
+            )
+            .map_err(ApiError::bad)?;
+        }
+        let descriptor =
+            portable_credential_descriptor_for_state(&state, provider, &account.label, kind)
+                .map_err(ApiError::internal)?;
+        let secret = if body.include_secrets {
+            Some(
+                state
+                    .crypto
+                    .decrypt(&account.secret_enc)
+                    .map_err(|_| ApiError::internal("could not decrypt stored credential"))?,
+            )
+        } else {
+            None
+        };
+        descriptors.push(descriptor.clone());
+        secrets.push(secret);
+        records.push(crate::credential_interchange::CredentialRecord {
+            descriptor,
+            secret_envelope: None,
+            extensions: serde_json::Map::new(),
+        });
+    }
+
+    let mut bundle = crate::credential_interchange::CredentialBundle {
+        schema: crate::credential_interchange::BUNDLE_SCHEMA.into(),
+        encryption: None,
+        credentials: records,
+        extensions: serde_json::Map::new(),
+    };
+    bundle.validate().map_err(ApiError::bad)?;
+    if body.include_secrets {
+        let passphrase = body.passphrase.expect("checked above");
+        let encrypted = tokio::task::spawn_blocking(move || {
+            crate::credential_interchange::encrypt_secrets(&passphrase, &descriptors, &secrets)
+        })
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::bad)?;
+        bundle.encryption = Some(encrypted.0);
+        let mut envelopes = encrypted.1.into_iter();
+        for record in &mut bundle.credentials {
+            if record.descriptor.kind != crate::credential_interchange::CredentialKind::None {
+                record.secret_envelope = envelopes.next().flatten();
+            }
+        }
+    }
+    bundle.validate().map_err(ApiError::bad)?;
+
+    Ok(no_store_json(
+        serde_json::to_value(bundle).map_err(ApiError::internal)?,
+    ))
+}
+
+struct PortableCredentialImportPlan {
+    response: Value,
+    writes: Vec<PortableCredentialWrite>,
+}
+
+struct PortableCredentialWrite {
+    provider_id: String,
+    label: String,
+    kind: crate::credential_interchange::CredentialKind,
+    secret: String,
+    action: PortableCredentialWriteAction,
+}
+
+enum PortableCredentialWriteAction {
+    Create,
+    Replace(String),
+}
+
+fn validate_portable_credential_secret(mode: &str, secret: &str) -> Result<(), &'static str> {
+    match mode {
+        "manual" if !crate::validate::credential_is_nonempty(secret) => {
+            Err("manual credential must not be empty")
+        }
+        "manual" => Ok(()),
+        "auth_flow" if secret.len() > 256 * 1024 => Err("auth-flow credential exceeds 256 KiB"),
+        "auth_flow" => {
+            let value: Value = serde_json::from_str(secret)
+                .map_err(|_| "auth-flow credential is not valid JSON")?;
+            if !value.is_object() {
+                return Err("auth-flow credential must be a JSON object");
+            }
+            Ok(())
+        }
+        _ => Err("credential has an unsupported credential mode"),
+    }
+}
+
+async fn build_portable_credential_import_plan(
+    state: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    bundle: &crate::credential_interchange::CredentialBundle,
+    secrets: &[Option<String>],
+    replace_existing: bool,
+) -> Result<PortableCredentialImportPlan, ApiError> {
+    let providers = sqlx::query_as::<_, db::ProviderRow>("SELECT * FROM providers")
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
+    let accounts = sqlx::query_as::<_, db::AccountRow>("SELECT * FROM accounts")
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut providers_by_name = std::collections::HashMap::<&str, Vec<&db::ProviderRow>>::new();
+    for provider in &providers {
+        providers_by_name
+            .entry(provider.name.as_str())
+            .or_default()
+            .push(provider);
+    }
+    let mut problems = Vec::<String>::new();
+    let mut conflicts = Vec::<Value>::new();
+    let mut warnings = Vec::<String>::new();
+    let mut missing_resources = Vec::<Value>::new();
+    let mut plan = Vec::<Value>::new();
+    let mut writes = Vec::<PortableCredentialWrite>::new();
+    let mut seen = std::collections::HashSet::<(String, String)>::new();
+    let mut checked_model_transports = std::collections::HashSet::<String>::new();
+
+    for (index, record) in bundle.credentials.iter().enumerate() {
+        let descriptor = &record.descriptor;
+        let provider_name = descriptor.provider.as_str();
+        let label = descriptor.label.as_str();
+        let mode = descriptor.metadata["credential_mode"]
+            .as_str()
+            .expect("bundle validation requires credential_mode");
+        if label == "__kinetix_noauth__" {
+            problems.push(format!(
+                "credential '{provider_name}/{label}' uses a reserved internal account label"
+            ));
+            continue;
+        }
+        let key = (provider_name.to_owned(), label.to_owned());
+        if !seen.insert(key) {
+            conflicts.push(json!({
+                "kind": "credential",
+                "provider": provider_name,
+                "label": label,
+                "reason": "duplicate provider and label in bundle",
+            }));
+            problems.push(format!(
+                "credential '{provider_name}/{label}' appears more than once"
+            ));
+            continue;
+        }
+
+        let provider = match providers_by_name.get(provider_name).map(Vec::as_slice) {
+            Some([provider]) => *provider,
+            Some(matches) => {
+                conflicts.push(json!({
+                    "kind": "provider",
+                    "name": provider_name,
+                    "reason": "ambiguous provider name",
+                    "matches": matches.len(),
+                }));
+                problems.push(format!(
+                    "credential references ambiguous provider '{provider_name}'"
+                ));
+                continue;
+            }
+            None => {
+                missing_resources.push(json!({ "kind": "provider", "name": provider_name }));
+                problems.push(format!(
+                    "credential references missing provider '{provider_name}'"
+                ));
+                continue;
+            }
+        };
+        let secret = secrets.get(index).cloned().flatten();
+        if provider.credential_mode != mode {
+            problems.push(format!(
+                "credential '{provider_name}/{label}' uses credential_mode '{mode}', but the target provider uses '{}'",
+                provider.credential_mode
+            ));
+            continue;
+        }
+        match validate_portable_credential_provider(state, provider, descriptor, secret.is_some())
+            .await
+        {
+            Ok(Some(resource)) => {
+                warnings.push(format!(
+                    "credential '{provider_name}/{label}' targets an unavailable plugin integration"
+                ));
+                missing_resources.push(resource);
+            }
+            Ok(None) => {}
+            Err(problem) => {
+                problems.push(problem);
+                continue;
+            }
+        }
+        if secret.is_some() && checked_model_transports.insert(provider.id.clone()) {
+            if let Err(problem) = validate_portable_credential_target_transports(tx, provider).await
+            {
+                problems.push(format!("credential '{provider_name}/{label}' {problem}"));
+                continue;
+            }
+        }
+
+        let matching_accounts = accounts
+            .iter()
+            .filter(|account| {
+                account.provider_id == provider.id
+                    && account.label == label
+                    && account.label != "__kinetix_noauth__"
+            })
+            .collect::<Vec<_>>();
+        if matching_accounts.len() > 1 {
+            conflicts.push(json!({
+                "kind": "credential",
+                "provider": provider_name,
+                "label": label,
+                "reason": "ambiguous existing account label",
+                "existing_matches": matching_accounts.len(),
+            }));
+            problems.push(format!(
+                "credential '{provider_name}/{label}' matches multiple existing accounts"
+            ));
+            continue;
+        }
+
+        if mode == "none" {
+            plan.push(json!({
+                "provider": provider_name,
+                "label": label,
+                "kind": descriptor.kind.as_str(),
+                "credential_mode": mode,
+                "action": "verified_no_auth",
+                "secret_included": false,
+            }));
+            continue;
+        }
+
+        if secret.is_some()
+            && mode == "manual"
+            && descriptor.kind != crate::credential_interchange::CredentialKind::ApiKey
+        {
+            warnings.push(format!(
+                "manual credential '{provider_name}/{label}' kind '{}' maps to Kinetix api_key storage",
+                descriptor.kind.as_str()
+            ));
+        }
+        let Some(secret) = secret else {
+            warnings.push(format!(
+                "credential '{provider_name}/{label}' has no secret envelope; no credential material will be imported"
+            ));
+            plan.push(json!({
+                "provider": provider_name,
+                "label": label,
+                "kind": descriptor.kind.as_str(),
+                "credential_mode": mode,
+                "action": if matching_accounts.is_empty() { "descriptor_only" } else { "unchanged" },
+                "secret_included": false,
+            }));
+            continue;
+        };
+        if let Err(problem) = validate_portable_credential_secret(mode, &secret) {
+            problems.push(format!("credential '{provider_name}/{label}' {problem}"));
+            continue;
+        }
+
+        if mode == "auth_flow" && replace_existing && !matching_accounts.is_empty() {
+            conflicts.push(json!({
+                "kind": "credential",
+                "provider": provider_name,
+                "label": label,
+                "reason": "auth-flow replacement is unsupported until plugin credential state can be restored safely",
+            }));
+            problems.push(format!(
+                "auth-flow credential '{provider_name}/{label}' cannot be replaced safely"
+            ));
+            continue;
+        }
+
+        let action = match matching_accounts.as_slice() {
+            [] => {
+                writes.push(PortableCredentialWrite {
+                    provider_id: provider.id.clone(),
+                    label: label.to_owned(),
+                    kind: descriptor.kind,
+                    secret,
+                    action: PortableCredentialWriteAction::Create,
+                });
+                "create"
+            }
+            [account] if replace_existing => {
+                conflicts.push(json!({
+                    "kind": "credential",
+                    "provider": provider_name,
+                    "label": label,
+                    "reason": "existing credential will be replaced",
+                }));
+                writes.push(PortableCredentialWrite {
+                    provider_id: provider.id.clone(),
+                    label: label.to_owned(),
+                    kind: descriptor.kind,
+                    secret,
+                    action: PortableCredentialWriteAction::Replace(account.id.clone()),
+                });
+                "replace"
+            }
+            [_] => {
+                conflicts.push(json!({
+                    "kind": "credential",
+                    "provider": provider_name,
+                    "label": label,
+                    "reason": "existing credential retained; set replace_existing to overwrite",
+                }));
+                "skip_existing"
+            }
+            _ => unreachable!("ambiguous account matches were rejected above"),
+        };
+        plan.push(json!({
+            "provider": provider_name,
+            "label": label,
+            "kind": descriptor.kind.as_str(),
+            "credential_mode": mode,
+            "action": action,
+            "secret_included": true,
+        }));
+    }
+
+    let valid = problems.is_empty();
+    Ok(PortableCredentialImportPlan {
+        response: json!({
+            "valid": valid,
+            "plan": plan,
+            "problems": problems,
+            "conflicts": conflicts,
+            "warnings": warnings,
+            "missing_resources": missing_resources,
+        }),
+        writes,
+    })
+}
+
+fn validate_portable_credential_model_transports<'a>(
+    provider: &db::ProviderRow,
+    models: impl IntoIterator<Item = &'a db::ModelRow>,
+) -> Result<(), String> {
+    for model in models {
+        let transport =
+            crate::adapters::resolve_model_transport(provider, model).map_err(|error| {
+                format!(
+                    "target model '{}' has an incompatible transport: {}",
+                    model.display_name, error.message
+                )
+            })?;
+        if let crate::adapters::TargetTransport::Plugin(plugin) = transport {
+            let provider_plugin = provider
+                .wire_plugin_ref()
+                .map(|reference| reference.to_string_ref());
+            if provider_plugin.as_deref() != Some(plugin.as_str()) {
+                return Err(format!(
+                    "target model '{}' selects plugin transport '{plugin}' without matching provider wire_plugin binding",
+                    model.display_name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn validate_portable_credential_target_transports(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    provider: &db::ProviderRow,
+) -> Result<(), String> {
+    let models = sqlx::query_as::<_, db::ModelRow>("SELECT * FROM models WHERE provider_id = ?")
+        .bind(&provider.id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| format!("could not inspect target model transports: {error}"))?;
+    validate_portable_credential_model_transports(provider, models.iter())
+}
+
+async fn validate_portable_credential_provider(
+    state: &AppState,
+    provider: &db::ProviderRow,
+    descriptor: &crate::credential_interchange::CredentialDescriptor,
+    require_endpoint_identity: bool,
+) -> Result<Option<Value>, String> {
+    let mode = provider.credential_mode.as_str();
+    let extension = descriptor
+        .metadata
+        .get("extensions")
+        .and_then(Value::as_object)
+        .and_then(|extensions| extensions.get(crate::credential_interchange::KINETIX_EXTENSION));
+    if mode == "auth_flow" && extension.is_none() {
+        return Err(format!(
+            "credential '{} / {}' requires Kinetix integration metadata to verify auth-flow compatibility",
+            descriptor.provider, descriptor.label
+        ));
+    }
+    if require_endpoint_identity && extension.is_none() {
+        return Err(format!(
+            "credential '{} / {}' has no Kinetix endpoint identity",
+            descriptor.provider, descriptor.label
+        ));
+    }
+    if let Some(extension) = extension {
+        let Some(extension) = extension.as_object() else {
+            return Err(format!(
+                "credential '{} / {}' has malformed Kinetix provider metadata",
+                descriptor.provider, descriptor.label
+            ));
+        };
+        let auth_scheme = extension.get("auth_scheme").and_then(Value::as_str);
+        let credential_plugin = extension.get("credential_plugin").and_then(Value::as_str);
+        let source_plugin_id = extension.get("source_plugin_id").and_then(Value::as_str);
+        let source_integration_id = extension
+            .get("source_integration_id")
+            .and_then(Value::as_str);
+        let source_plugin_matches = extension
+            .get("source_plugin_id")
+            .is_some_and(|value| value.as_str() == provider.source_plugin_id.as_deref());
+        let source_integration_matches = extension
+            .get("source_integration_id")
+            .is_some_and(|value| value.as_str() == provider.source_integration_id.as_deref());
+        if auth_scheme != Some(provider.auth_scheme.as_str())
+            || credential_plugin != Some(provider.credential_plugin.as_str())
+            || !source_plugin_matches
+            || !source_integration_matches
+        {
+            return Err(format!(
+                "credential '{} / {}' provider metadata does not match the configured provider",
+                descriptor.provider, descriptor.label
+            ));
+        }
+        let source_base_url = extension
+            .get("base_url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "credential '{} / {}' is missing its endpoint identity",
+                    descriptor.provider, descriptor.label
+                )
+            })?;
+        let source_endpoint =
+            normalize_credential_endpoint_identity(source_base_url).ok_or_else(|| {
+                format!(
+                    "credential '{} / {}' has an invalid endpoint identity",
+                    descriptor.provider, descriptor.label
+                )
+            })?;
+        let target_endpoint = normalize_credential_endpoint_identity(&provider.base_url)
+            .ok_or_else(|| {
+                format!(
+                    "credential '{} / {}' targets a provider with an invalid endpoint URL",
+                    descriptor.provider, descriptor.label
+                )
+            })?;
+        if source_endpoint != target_endpoint {
+            return Err(format!(
+                "credential '{} / {}' endpoint identity does not match the configured provider",
+                descriptor.provider, descriptor.label
+            ));
+        }
+        let source_allows_insecure_tls = extension
+            .get("effective_allow_insecure_tls")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                format!(
+                    "credential '{} / {}' is missing effective TLS delivery identity",
+                    descriptor.provider, descriptor.label
+                )
+            })?;
+        if !source_allows_insecure_tls
+            && (state.config.allow_insecure_tls || provider.insecure_tls())
+        {
+            return Err(format!(
+                "credential '{} / {}' effective_allow_insecure_tls target weakens the exported TLS policy",
+                descriptor.provider, descriptor.label
+            ));
+        }
+        let mut expected_delivery = portable_credential_delivery_metadata(provider);
+        expected_delivery.remove("effective_allow_insecure_tls");
+        for (field, expected) in expected_delivery {
+            if extension.get(&field) != Some(&expected) {
+                return Err(format!(
+                    "credential '{} / {}' delivery identity field '{}' does not match the configured provider",
+                    descriptor.provider, descriptor.label, field
+                ));
+            }
+        }
+        if mode == "auth_flow" {
+            let plugin_id = source_plugin_id
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "auth-flow provider is missing its source plugin".to_string())?;
+            let integration_id = source_integration_id
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    "auth-flow provider is missing its source integration".to_string()
+                })?;
+            let installed = match state.plugin_manager() {
+                Some(manager) => manager
+                    .get(plugin_id)
+                    .await
+                    .map_err(|error| format!("provider '{}': {error}", provider.name))?,
+                None => None,
+            };
+            if installed.is_none() {
+                return Ok(Some(json!({
+                    "kind": "integration",
+                    "plugin": plugin_id,
+                    "name": integration_id,
+                })));
+            }
+            let credential_mode = crate::plugins::CredentialMode::parse(mode)
+                .ok_or_else(|| "target provider has an invalid credential mode".to_string())?;
+            validate_imported_provider_credential_semantics(
+                state,
+                &provider.name,
+                credential_mode,
+                &provider.credential_plugin,
+                source_plugin_id,
+                source_integration_id,
+            )
+            .await?;
+        }
+    }
+    Ok(None)
+}
+
+pub async fn import_credentials(
+    State(state): State<AppState>,
+    auth: AdminAuth,
+    Json(body): Json<CredentialImportBody>,
+) -> Result<Response, ApiError> {
+    let bundle = crate::credential_interchange::CredentialBundle::from_value(body.bundle)
+        .map_err(ApiError::bad)?;
+    let bundle_for_decryption = bundle.clone();
+    let passphrase = body.passphrase.clone();
+    let secrets = tokio::task::spawn_blocking(move || {
+        crate::credential_interchange::decrypt_secrets(
+            &bundle_for_decryption,
+            passphrase.as_deref(),
+        )
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::bad)?;
+
+    let _import_guard = if body.apply {
+        Some(state.registry.config_import_lock().await)
+    } else {
+        None
+    };
+    let publication = if body.apply {
+        Some(state.registry.publication().await)
+    } else {
+        None
+    };
+    let mut tx = if body.apply {
+        state
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(ApiError::internal)?
+    } else {
+        state.pool.begin().await.map_err(ApiError::internal)?
+    };
+    let import_plan = build_portable_credential_import_plan(
+        &state,
+        &mut tx,
+        &bundle,
+        &secrets,
+        body.replace_existing,
+    )
+    .await?;
+    if import_plan.response["valid"].as_bool() != Some(true) {
+        let _ = tx.rollback().await;
+        if !body.apply {
+            return Ok(no_store_json(import_plan.response));
+        }
+        let problems = import_plan.response["problems"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::bad(format!(
+            "credential import validation failed: {problems}"
+        )));
+    }
+    if !body.apply {
+        tx.rollback().await.map_err(ApiError::internal)?;
+        return Ok(no_store_json(import_plan.response));
+    }
+
+    let created = import_plan
+        .writes
+        .iter()
+        .filter(|write| matches!(write.action, PortableCredentialWriteAction::Create))
+        .count();
+    let replaced = import_plan.writes.len() - created;
+    for write in &import_plan.writes {
+        let encrypted = state
+            .crypto
+            .encrypt(&write.secret)
+            .map_err(ApiError::internal)?;
+        let key_mask = if write.kind == crate::credential_interchange::CredentialKind::OAuth {
+            "oauth:****".to_string()
+        } else {
+            crypto::mask_secret(&write.secret)
+        };
+        match &write.action {
+            PortableCredentialWriteAction::Create => {
+                let max_priority: Option<i64> =
+                    sqlx::query_scalar("SELECT MAX(priority) FROM accounts WHERE provider_id=?")
+                        .bind(&write.provider_id)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(ApiError::internal)?;
+                db::insert_account_in_transaction(
+                    &mut tx,
+                    &write.provider_id,
+                    &write.label,
+                    &encrypted,
+                    &key_mask,
+                    max_priority.unwrap_or(0).saturating_add(1),
+                    1,
+                    None,
+                    "none",
+                    None,
+                    true,
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            }
+            PortableCredentialWriteAction::Replace(account_id) => {
+                db::replace_account_secret_in_transaction(
+                    &mut tx, account_id, &encrypted, &key_mask,
+                )
+                .await
+                .map_err(ApiError::internal)?;
+            }
+        }
+    }
+    let next_registry = if created + replaced > 0 {
+        Some(
+            crate::registry::Registry::build_snapshot_in_transaction(&mut tx)
+                .await
+                .map_err(ApiError::internal)?,
+        )
+    } else {
+        None
+    };
+    tx.commit().await.map_err(ApiError::internal)?;
+
+    if let Some(next_registry) = next_registry {
+        publication
+            .expect("apply imports hold the registry publication lock")
+            .activate(next_registry);
+        let detail = format!("created={created}, replaced={replaced}");
+        let _ = db::insert_audit(
+            &state.pool,
+            &auth.actor,
+            "credentials_imported",
+            "credential_bundle",
+            "portable",
+            "",
+            &detail,
+        )
+        .await;
+    }
+    let mut response = import_plan.response;
+    response["applied"] = json!(true);
+    Ok(no_store_json(response))
+}
+
+#[derive(Deserialize)]
 pub struct ExportQuery {
     /// Include encrypted credential blobs (still ciphertext, still keyed by the
     /// master key). Off by default so exports are safe to share.
@@ -11910,6 +12922,20 @@ async fn import_config_apply(
     let models = cfg["models"].as_array().unwrap_or(&empty);
     let routes = cfg["routes"].as_array().unwrap_or(&empty);
     let aliases = cfg["aliases"].as_array().unwrap_or(&empty);
+    // Match Apply's wire_plugin semantics: imported entries use their supplied string or "",
+    // while providers absent from the import retain the current persisted binding.
+    let mut effective_provider_wire_plugins = existing_providers
+        .iter()
+        .map(|provider| (provider.name.clone(), provider.wire_plugin.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    for provider in providers {
+        if let Some(name) = provider["name"].as_str() {
+            effective_provider_wire_plugins.insert(
+                name.to_string(),
+                provider["wire_plugin"].as_str().unwrap_or("").to_string(),
+            );
+        }
+    }
     for key in ["providers", "accounts", "models", "routes", "aliases"] {
         if cfg.get(key).is_some_and(|value| !value.is_array()) {
             problems.push(format!("config field '{key}' must be an array"));
@@ -12058,7 +13084,10 @@ async fn import_config_apply(
                 };
                 (features, protocols)
             };
-        let wire_plugin = p["wire_plugin"].as_str().unwrap_or("");
+        let wire_plugin = effective_provider_wire_plugins
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or("");
         let credential_plugin = p["credential_plugin"].as_str().unwrap_or("");
         let model_source_plugin = p["model_source_plugin"].as_str().unwrap_or("");
         let source_bindings_valid = if let Some(plugin_id) = source_plugin_id {
@@ -12377,19 +13406,17 @@ async fn import_config_apply(
                 )),
             }
         }
-        if let Some(transport) = m["transport_override"].as_str() {
-            let configured_binding = providers
-                .iter()
-                .find(|candidate| candidate["name"].as_str() == Some(provider))
-                .and_then(|candidate| candidate["wire_plugin"].as_str())
-                .or_else(|| {
-                    existing_providers
-                        .iter()
-                        .find(|candidate| candidate.name == provider)
-                        .map(|candidate| candidate.wire_plugin.as_str())
-                })
+        if let Some(transport) = m["transport_override"]
+            .as_str()
+            .map(str::trim)
+            .filter(|transport| !transport.is_empty())
+        {
+            let configured_binding = effective_provider_wire_plugins
+                .get(provider)
+                .map(String::as_str)
                 .unwrap_or("");
-            if let Some(reference) = crate::plugins::PluginRef::parse(configured_binding) {
+            let provider_plugin = crate::plugins::PluginRef::parse(configured_binding);
+            if let Some(reference) = provider_plugin {
                 let expected = crate::adapters::TargetTransport::Plugin(reference.to_string_ref());
                 if crate::adapters::TargetTransport::parse(transport) != Some(expected) {
                     problems.push(format!(
@@ -12982,7 +14009,10 @@ async fn import_config_apply(
                 follow_redirects,
                 credential_hosts,
                 allow_insecure_tls,
-                wire_plugin: p["wire_plugin"].as_str().unwrap_or(""),
+                wire_plugin: effective_provider_wire_plugins
+                    .get(name)
+                    .map(String::as_str)
+                    .unwrap_or(""),
                 credential_plugin: p["credential_plugin"].as_str().unwrap_or(""),
                 model_source_plugin: p["model_source_plugin"].as_str().unwrap_or(""),
                 credential_mode: credential_mode.as_str(),
@@ -13039,7 +14069,10 @@ async fn import_config_apply(
                 follow_redirects,
                 credential_hosts,
                 allow_insecure_tls,
-                wire_plugin: p["wire_plugin"].as_str().unwrap_or(""),
+                wire_plugin: effective_provider_wire_plugins
+                    .get(name)
+                    .map(String::as_str)
+                    .unwrap_or(""),
                 credential_plugin: p["credential_plugin"].as_str().unwrap_or(""),
                 model_source_plugin: p["model_source_plugin"].as_str().unwrap_or(""),
                 credential_mode: credential_mode.as_str(),
@@ -13276,10 +14309,15 @@ async fn import_config_apply(
         let existing = existing_models
             .iter()
             .find(|model| model.provider_id == *pid && model.upstream_id == upstream);
+        let existing_discovery = existing.map(discovery_object).unwrap_or_else(|| json!({}));
+        validate_effective_model_transport_candidate(
+            &provider_row,
+            &existing_discovery,
+            transport_override.as_deref(),
+        )?;
         if let Some(existing) = existing {
             let existing_id = existing.id.clone();
             model_ids.insert(model_key.clone(), existing_id.clone());
-            let existing_discovery = discovery_object(existing);
             let previous_prices = existing.prices();
             let (price_source, price_metadata, discovery_patch) = if let Some(ownership) =
                 imported_ownership.as_ref()
@@ -17867,6 +18905,40 @@ mod credential_enrollment_regression_tests {
     }
 
     async fn test_state(tag: &str) -> (AppState, std::path::PathBuf) {
+        test_state_with_allow_insecure_tls(tag, true).await
+    }
+
+    async fn insert_transport_test_model(
+        state: &AppState,
+        provider_id: &str,
+        upstream_id: &str,
+        discovery: Value,
+    ) -> String {
+        db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id,
+                upstream_id,
+                display_name: upstream_id,
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn test_state_with_allow_insecure_tls(
+        tag: &str,
+        allow_insecure_tls: bool,
+    ) -> (AppState, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "kinetix-credential-enrollment-{tag}-{}",
             uuid::Uuid::new_v4().simple()
@@ -17892,7 +18964,7 @@ mod credential_enrollment_regression_tests {
             log_json: false,
             bootstrap_file: None,
             allow_private_upstreams: true,
-            allow_insecure_tls: true,
+            allow_insecure_tls,
             data_dir: paths.data_dir.clone(),
             shutdown_grace_secs: 1,
             max_inflight_inferences: crate::config::DEFAULT_MAX_INFLIGHT_INFERENCES,
@@ -17920,6 +18992,168 @@ mod credential_enrollment_regression_tests {
             0,
         );
         (state, root)
+    }
+
+    #[tokio::test]
+    async fn unbound_plugin_discovery_import_is_rejected_but_explicit_model_override_remains_supported(
+    ) {
+        let (state, root) = test_state("plugin-discovery-transport").await;
+        let provider_id = insert_provider(
+            &state,
+            "native-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let legacy_model_id = insert_transport_test_model(
+            &state,
+            &provider_id,
+            "legacy-plugin-model",
+            json!({ "configured_transport": "plugin:legacy/adapter" }),
+        )
+        .await;
+        state.registry.reload(&state.pool).await.unwrap();
+        let snapshot = state.registry.snapshot();
+        assert_eq!(
+            crate::adapters::resolve_execution_profile(
+                snapshot.providers.get(&provider_id).unwrap(),
+                snapshot.models.get(&legacy_model_id).unwrap()
+            )
+            .unwrap()
+            .transport,
+            crate::adapters::TargetTransport::Plugin("plugin:legacy/adapter".into())
+        );
+
+        let error = create_model(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(provider_id.clone()),
+            Json(ModelBody {
+                upstream_id: "discovered-plugin-model".into(),
+                display_name: None,
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({
+                    "imported_from_discovery": true,
+                    "execution_supported": true,
+                    "transport": { "format": "plugin:other/adapter" }
+                }),
+                transport_override: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("discovered plugin model transport"));
+        let models = db::models_for_provider(&state.pool, &provider_id)
+            .await
+            .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].upstream_id, "legacy-plugin-model");
+
+        let created = create_model(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(provider_id.clone()),
+            Json(ModelBody {
+                upstream_id: "explicit-plugin-model".into(),
+                display_name: None,
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: ThinkingMap::default(),
+                extra_request: json!({}),
+                discovery: json!({
+                    "imported_from_discovery": true,
+                    "execution_supported": true
+                }),
+                transport_override: Some("plugin:other/adapter".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let model_id = created.0["id"].as_str().unwrap();
+        let snapshot = state.registry.snapshot();
+        assert_eq!(
+            crate::adapters::resolve_execution_profile(
+                snapshot.providers.get(&provider_id).unwrap(),
+                snapshot.models.get(model_id).unwrap()
+            )
+            .unwrap()
+            .transport,
+            crate::adapters::TargetTransport::Plugin("plugin:other/adapter".into())
+        );
+
+        let reconciliation_model_id = insert_transport_test_model(
+            &state,
+            &provider_id,
+            "reconciliation-plugin-model",
+            json!({}),
+        )
+        .await;
+        db::merge_model_discovery(
+            &state.pool,
+            &reconciliation_model_id,
+            &json!({
+                "latest_observation": {
+                    "transport": { "format": "plugin:other/adapter" }
+                },
+                "reconciliation": { "diff": [{ "field": "transport" }] }
+            }),
+        )
+        .await
+        .unwrap();
+        let _ = update_model_reconciliation(
+            State(state.clone()),
+            AdminAuth {
+                actor: "admin".into(),
+                token: "test".into(),
+            },
+            Path(reconciliation_model_id.clone()),
+            Json(ReconciliationActionBody {
+                action: "accept".into(),
+                fields: vec!["transport".into()],
+            }),
+        )
+        .await
+        .unwrap();
+        let reconciliation_model = db::get_model(&state.pool, &reconciliation_model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            discovery_object(&reconciliation_model)["configured_transport"],
+            "plugin:other/adapter"
+        );
+        let snapshot = state.registry.snapshot();
+        assert_eq!(
+            crate::adapters::resolve_execution_profile(
+                snapshot.providers.get(&provider_id).unwrap(),
+                snapshot.models.get(&reconciliation_model_id).unwrap()
+            )
+            .unwrap()
+            .transport,
+            crate::adapters::TargetTransport::Plugin("plugin:other/adapter".into())
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -24559,6 +25793,223 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn config_export_import_round_trips_native_provider_plugin_transport_override() {
+        let (source, source_root) = test_state("plugin-transport-export-source").await;
+        let provider_id = insert_provider(
+            &source,
+            "native-plugin-transport",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let source_model_id = db::insert_model(
+            &source.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "plugin-transport-model",
+                display_name: "Plugin Transport Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        db::set_model_transport_override(
+            &source.pool,
+            &source_model_id,
+            Some("plugin:test/adapter"),
+        )
+        .await
+        .unwrap();
+
+        let exported = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            exported["models"][0]["transport_override"],
+            "plugin:test/adapter"
+        );
+
+        let (target, target_root) = test_state("plugin-transport-export-target").await;
+        let dry_run = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true, "problems: {}", dry_run["problems"]);
+
+        let _ = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let imported_provider = db::list_providers(&target.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.name == "native-plugin-transport")
+            .unwrap();
+        let imported_model = db::find_model_by_upstream(
+            &target.pool,
+            &imported_provider.id,
+            "plugin-transport-model",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            discovery_object(&imported_model)["configured_transport"],
+            "plugin:test/adapter"
+        );
+        let snapshot = target.registry.snapshot();
+        assert_eq!(
+            crate::adapters::resolve_execution_profile(
+                snapshot.providers.get(&imported_provider.id).unwrap(),
+                snapshot.models.get(&imported_model.id).unwrap()
+            )
+            .unwrap()
+            .transport,
+            crate::adapters::TargetTransport::Plugin("plugin:test/adapter".into())
+        );
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
+    async fn config_import_uses_proposed_wire_plugin_for_validation_and_apply() {
+        let (source, source_root) = test_state("config-clear-plugin-binding-source").await;
+        let source_provider_id = insert_provider(
+            &source,
+            "clear-plugin-binding",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let source_model_id = db::insert_model(
+            &source.pool,
+            &db::NewModel {
+                provider_id: &source_provider_id,
+                upstream_id: "explicit-transport",
+                display_name: "Explicit Transport",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: None,
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        db::set_model_transport_override(&source.pool, &source_model_id, Some("openai"))
+            .await
+            .unwrap();
+        let mut exported = export_config(
+            State(source.clone()),
+            auth(),
+            Query(ExportQuery {
+                include_secrets: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        exported["providers"][0]["wire_plugin"] = Value::Null;
+
+        let (target, target_root) = test_state("config-clear-plugin-binding-target").await;
+        let target_provider_id = insert_provider(
+            &target,
+            "clear-plugin-binding",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        sqlx::query("UPDATE providers SET wire_plugin = ? WHERE id = ?")
+            .bind("plugin:test/adapter")
+            .bind(&target_provider_id)
+            .execute(&target.pool)
+            .await
+            .unwrap();
+
+        let dry_run = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported.clone(),
+                apply: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dry_run["valid"], true, "problems: {}", dry_run["problems"]);
+
+        let _ = import_config(
+            State(target.clone()),
+            auth(),
+            Json(ImportBody {
+                config: exported,
+                apply: true,
+            }),
+        )
+        .await
+        .unwrap();
+        let imported_provider = db::get_provider(&target.pool, &target_provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(imported_provider.wire_plugin.is_empty());
+        let imported_model =
+            db::find_model_by_upstream(&target.pool, &target_provider_id, "explicit-transport")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            discovery_object(&imported_model)["configured_transport"],
+            "openai"
+        );
+
+        drop(source);
+        drop(target);
+        let _ = std::fs::remove_dir_all(source_root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    #[tokio::test]
     async fn config_export_import_preserves_pinned_disabled_account_for_fresh_install() {
         let (source, source_root) = test_state("pinned-account-export-source").await;
         let provider_id = db::insert_provider(
@@ -27173,5 +28624,2053 @@ storage = "2MiB"
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    mod portable_credential_interchange_tests {
+        use super::*;
+        use axum::http::header::CACHE_CONTROL;
+
+        const EXPORT_PASSPHRASE: &str = "a correct horse battery staple";
+
+        async fn add_account(
+            state: &AppState,
+            provider_id: &str,
+            label: &str,
+            secret: &str,
+            key_mask: &str,
+            priority: i64,
+        ) {
+            let encrypted = state.crypto.encrypt(secret).unwrap();
+            let mut tx = state.pool.begin().await.unwrap();
+            db::insert_account_in_transaction(
+                &mut tx,
+                provider_id,
+                label,
+                &encrypted,
+                key_mask,
+                priority,
+                1,
+                None,
+                "none",
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        async fn response_json(response: Response) -> Value {
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        fn import_body(bundle: Value, apply: bool) -> CredentialImportBody {
+            CredentialImportBody {
+                bundle,
+                passphrase: Some(EXPORT_PASSPHRASE.into()),
+                apply,
+                replace_existing: false,
+            }
+        }
+
+        async fn set_provider_delivery_profile(
+            state: &AppState,
+            provider_id: &str,
+            wire_format: &str,
+            wire_plugin: &str,
+            auth_scheme: &str,
+            custom_header_name: Option<&str>,
+            custom_param_name: Option<&str>,
+            follow_redirects: bool,
+            credential_hosts: &str,
+            allow_insecure_tls: bool,
+        ) {
+            sqlx::query(
+                "UPDATE providers SET base_url = ?, wire_format = ?, wire_plugin = ?, auth_scheme = ?, \
+                 custom_header_name = ?, custom_param_name = ?, follow_redirects = ?, \
+                 credential_hosts = ?, allow_insecure_tls = ? WHERE id = ?",
+            )
+            .bind("https://api.example.com")
+            .bind(wire_format)
+            .bind(wire_plugin)
+            .bind(auth_scheme)
+            .bind(custom_header_name)
+            .bind(custom_param_name)
+            .bind(follow_redirects as i64)
+            .bind(credential_hosts)
+            .bind(allow_insecure_tls as i64)
+            .bind(provider_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        async fn add_model_transport_override(
+            state: &AppState,
+            provider_id: &str,
+            transport: &str,
+        ) {
+            let model_id = db::insert_model(
+                &state.pool,
+                &db::NewModel {
+                    provider_id,
+                    upstream_id: "delivery-boundary-model",
+                    display_name: "Delivery Boundary Model",
+                    enabled: true,
+                    context_window: None,
+                    max_output_tokens: None,
+                    capabilities: json!({}),
+                    prices: json!({}),
+                    parameters: json!({}),
+                    thinking_map: json!({}),
+                    extra_request: json!({}),
+                    discovery: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+            db::set_model_transport_override(&state.pool, &model_id, Some(transport))
+                .await
+                .unwrap();
+        }
+
+        fn encrypted_import_bundle(
+            entries: Vec<(crate::credential_interchange::CredentialDescriptor, String)>,
+        ) -> Value {
+            let (descriptors, secrets): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+            let secrets = secrets.into_iter().map(Some).collect::<Vec<_>>();
+            let (encryption, envelopes) = crate::credential_interchange::encrypt_secrets(
+                EXPORT_PASSPHRASE,
+                &descriptors,
+                &secrets,
+            )
+            .unwrap();
+            let credentials = descriptors
+                .into_iter()
+                .zip(envelopes)
+                .map(|(descriptor, secret_envelope)| {
+                    crate::credential_interchange::CredentialRecord {
+                        descriptor,
+                        secret_envelope,
+                        extensions: serde_json::Map::new(),
+                    }
+                })
+                .collect();
+            serde_json::to_value(crate::credential_interchange::CredentialBundle {
+                schema: crate::credential_interchange::BUNDLE_SCHEMA.into(),
+                encryption: Some(encryption),
+                credentials,
+                extensions: serde_json::Map::new(),
+            })
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn credential_export_rejects_names_outside_bundle_schema() {
+            let (state, root) = test_state("portable-export-invalid-identity").await;
+            let provider_id = insert_provider(
+                &state,
+                "valid-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &state,
+                &provider_id,
+                "valid-label",
+                "secret",
+                &crypto::mask_secret("secret"),
+                1,
+            )
+            .await;
+
+            let too_long_label = "x".repeat(257);
+            for invalid_label in ["", " \t", too_long_label.as_str()] {
+                sqlx::query("UPDATE accounts SET label = ? WHERE provider_id = ?")
+                    .bind(invalid_label)
+                    .bind(&provider_id)
+                    .execute(&state.pool)
+                    .await
+                    .unwrap();
+                for include_secrets in [false, true] {
+                    let error = export_credentials(
+                        State(state.clone()),
+                        auth(),
+                        Json(CredentialExportBody {
+                            include_secrets,
+                            passphrase: include_secrets.then(|| EXPORT_PASSPHRASE.to_string()),
+                        }),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+                    assert!(error
+                        .1
+                        .contains("credential descriptor label must be 1-256 bytes"));
+                }
+            }
+
+            sqlx::query("UPDATE accounts SET label = 'valid-label' WHERE provider_id = ?")
+                .bind(&provider_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            let too_long_provider_name = "x".repeat(257);
+            for invalid_provider_name in ["", " \t", too_long_provider_name.as_str()] {
+                sqlx::query("UPDATE providers SET name = ? WHERE id = ?")
+                    .bind(invalid_provider_name)
+                    .bind(&provider_id)
+                    .execute(&state.pool)
+                    .await
+                    .unwrap();
+                for include_secrets in [false, true] {
+                    let error = export_credentials(
+                        State(state.clone()),
+                        auth(),
+                        Json(CredentialExportBody {
+                            include_secrets,
+                            passphrase: include_secrets.then(|| EXPORT_PASSPHRASE.to_string()),
+                        }),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+                    assert!(error
+                        .1
+                        .contains("credential descriptor provider must be 1-256 bytes"));
+                }
+            }
+
+            drop(state);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[tokio::test]
+        async fn secret_export_rejects_duplicate_provider_names() {
+            let (source, source_root) = test_state("portable-export-duplicate-providers").await;
+            let first_provider_id = insert_provider(
+                &source,
+                "duplicate-name",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let second_provider_id = insert_provider(
+                &source,
+                "duplicate-name",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &source,
+                &first_provider_id,
+                "work-a",
+                "secret-a",
+                &crypto::mask_secret("secret-a"),
+                1,
+            )
+            .await;
+            add_account(
+                &source,
+                &second_provider_id,
+                "work-b",
+                "secret-b",
+                &crypto::mask_secret("secret-b"),
+                1,
+            )
+            .await;
+
+            let error = export_credentials(
+                State(source.clone()),
+                auth(),
+                Json(CredentialExportBody {
+                    include_secrets: false,
+                    passphrase: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error.1.contains("ambiguous provider name"));
+
+            drop(source);
+            let _ = std::fs::remove_dir_all(source_root);
+        }
+
+        #[tokio::test]
+        async fn secret_export_rejects_duplicate_account_labels() {
+            let (source, source_root) = test_state("portable-export-duplicate-labels").await;
+            let provider_id = insert_provider(
+                &source,
+                "duplicate-label-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &source,
+                &provider_id,
+                "work",
+                "secret-a",
+                &crypto::mask_secret("secret-a"),
+                1,
+            )
+            .await;
+            add_account(
+                &source,
+                &provider_id,
+                "work",
+                "secret-b",
+                &crypto::mask_secret("secret-b"),
+                2,
+            )
+            .await;
+
+            let error = export_credentials(
+                State(source.clone()),
+                auth(),
+                Json(CredentialExportBody {
+                    include_secrets: false,
+                    passphrase: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error.1.contains("duplicate account label"));
+
+            drop(source);
+            let _ = std::fs::remove_dir_all(source_root);
+        }
+
+        #[tokio::test]
+        async fn secret_export_rejects_unbound_plugin_model_transport() {
+            let (source, source_root) = test_state("portable-export-unbound-transport").await;
+            let provider_id = insert_provider(
+                &source,
+                "native-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &source,
+                &provider_id,
+                "work",
+                "manual-secret",
+                &crypto::mask_secret("manual-secret"),
+                1,
+            )
+            .await;
+            add_model_transport_override(&source, &provider_id, "plugin:test/adapter").await;
+
+            let error = export_credentials(
+                State(source.clone()),
+                auth(),
+                Json(CredentialExportBody {
+                    include_secrets: true,
+                    passphrase: Some(EXPORT_PASSPHRASE.into()),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error
+                .1
+                .contains("without matching provider wire_plugin binding"));
+
+            drop(source);
+            let _ = std::fs::remove_dir_all(source_root);
+        }
+
+        #[tokio::test]
+        async fn exports_descriptors_by_default_and_imports_encrypted_credentials() {
+            let (source, source_root) = test_state("portable-export-source").await;
+            let (mut target, target_root) = test_state("portable-export-target").await;
+            target.crypto = Arc::new(crate::crypto::Crypto::new(&[43_u8; 32]));
+
+            let source_manual = insert_provider(
+                &source,
+                "anthropic",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let source_oauth = insert_provider(
+                &source,
+                "oauth-provider",
+                crate::plugins::CredentialMode::AuthFlow,
+                Some("plugin.oauth"),
+                Some("oauth"),
+            )
+            .await;
+            insert_provider(
+                &source,
+                "no-auth-provider",
+                crate::plugins::CredentialMode::None,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &source,
+                &source_manual,
+                "work",
+                "fixture-manual-value",
+                &crypto::mask_secret("fixture-manual-value"),
+                1,
+            )
+            .await;
+            let oauth_secret = json!({
+                "access_token": "fixture-access-value",
+                "refresh_token": "fixture-refresh-value",
+            })
+            .to_string();
+            add_account(
+                &source,
+                &source_oauth,
+                "oauth-work",
+                &oauth_secret,
+                "oauth:****",
+                1,
+            )
+            .await;
+            let rotated_oauth_secret = json!({
+                "access_token": "rotated-access-value",
+                "refresh_token": "rotated-refresh-value",
+            })
+            .to_string();
+            let now = db::now_iso();
+            sqlx::query(
+                "INSERT INTO plugins (id, version, plugin_api_major, package_sha256, enabled, signature, manifest_json, component, installed_at, updated_at) VALUES ('plugin.oauth', '0.0.0', 1, 'fixture', 1, 'unsigned', '{}', X'', ?, ?)",
+            )
+            .bind(&now)
+            .bind(&now)
+            .execute(&source.pool)
+            .await
+            .unwrap();
+            crate::plugins::store::kv_put(
+                &source.pool,
+                &source.crypto,
+                "plugin.oauth",
+                "cred:oauth-work",
+                rotated_oauth_secret.as_bytes(),
+            )
+            .await
+            .unwrap();
+
+            let default_response = export_credentials(
+                State(source.clone()),
+                auth(),
+                Json(CredentialExportBody {
+                    include_secrets: false,
+                    passphrase: None,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                default_response
+                    .headers()
+                    .get(CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store")
+            );
+            let default_bundle = response_json(default_response).await;
+            assert_eq!(default_bundle["credentials"].as_array().unwrap().len(), 3);
+            assert!(default_bundle["credentials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|record| record.get("secret_envelope").is_none()));
+
+            let oauth_export_error = export_credentials(
+                State(source.clone()),
+                auth(),
+                Json(CredentialExportBody {
+                    include_secrets: true,
+                    passphrase: Some(EXPORT_PASSPHRASE.into()),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(oauth_export_error.0, StatusCode::BAD_REQUEST);
+            assert!(oauth_export_error
+                .1
+                .contains("authoritative snapshot and restore"));
+
+            sqlx::query("DELETE FROM accounts WHERE provider_id=? AND label='oauth-work'")
+                .bind(&source_oauth)
+                .execute(&source.pool)
+                .await
+                .unwrap();
+            let encrypted_bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            let encrypted_text = encrypted_bundle.to_string();
+            assert!(!encrypted_text.contains("fixture-manual-value"));
+            assert!(!encrypted_text.contains("fixture-access-value"));
+            assert!(!encrypted_text.contains("rotated-access-value"));
+            assert!(!encrypted_text.contains("rotated-refresh-value"));
+            assert!(encrypted_bundle["credentials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|record| record["descriptor"]["kind"] != "none")
+                .all(|record| record.get("secret_envelope").is_some()));
+
+            let target_manual = insert_provider(
+                &target,
+                "anthropic",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_oauth = insert_provider(
+                &target,
+                "oauth-provider",
+                crate::plugins::CredentialMode::AuthFlow,
+                Some("plugin.oauth"),
+                Some("oauth"),
+            )
+            .await;
+            insert_provider(
+                &target,
+                "no-auth-provider",
+                crate::plugins::CredentialMode::None,
+                None,
+                None,
+            )
+            .await;
+
+            let dry_run = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(default_bundle, false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], true);
+            assert_eq!(dry_run["applied"], Value::Null);
+            assert_eq!(dry_run["missing_resources"][0]["kind"], "integration");
+            assert!(dry_run["plan"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["action"] == "descriptor_only"));
+            assert!(dry_run["plan"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["action"] == "verified_no_auth"));
+            assert!(db::list_accounts(&target.pool).await.unwrap().is_empty());
+
+            let applied = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(encrypted_bundle, true)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(applied["valid"], true);
+            assert_eq!(applied["applied"], true);
+            assert_eq!(applied["plan"].as_array().unwrap().len(), 2);
+            let manual = db::list_accounts_for_provider(&target.pool, &target_manual)
+                .await
+                .unwrap();
+            assert_eq!(manual.len(), 1);
+            assert!(target
+                .crypto
+                .decrypt(&manual[0].secret_enc)
+                .is_ok_and(|value| value == "fixture-manual-value"));
+            assert!(source.crypto.decrypt(&manual[0].secret_enc).is_err());
+            let oauth = db::list_accounts_for_provider(&target.pool, &target_oauth)
+                .await
+                .unwrap();
+            assert!(oauth.is_empty());
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn rejects_unsupported_schema_and_reports_missing_provider_and_integration() {
+            let (source, source_root) = test_state("portable-validation-source").await;
+            let (target, target_root) = test_state("portable-validation-target").await;
+            let source_provider = insert_provider(
+                &source,
+                "portable-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &source,
+                &source_provider,
+                "work",
+                "fixture-validation-value",
+                &crypto::mask_secret("fixture-validation-value"),
+                1,
+            )
+            .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: false,
+                        passphrase: None,
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            let mut unsupported = bundle.clone();
+            unsupported["schema"] = json!("llm-credential-bundle/v99");
+            assert!(import_credentials(
+                State(target.clone()),
+                auth(),
+                Json(CredentialImportBody {
+                    bundle: unsupported,
+                    passphrase: None,
+                    apply: false,
+                    replace_existing: false,
+                }),
+            )
+            .await
+            .is_err());
+
+            let missing_provider = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(CredentialImportBody {
+                        bundle,
+                        passphrase: None,
+                        apply: false,
+                        replace_existing: false,
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(missing_provider["valid"], false);
+            assert_eq!(missing_provider["missing_resources"][0]["kind"], "provider");
+
+            let source_oauth = insert_provider(
+                &source,
+                "oauth-portable",
+                crate::plugins::CredentialMode::AuthFlow,
+                Some("plugin.source"),
+                Some("source-integration"),
+            )
+            .await;
+            let target_oauth = insert_provider(
+                &target,
+                "oauth-portable",
+                crate::plugins::CredentialMode::AuthFlow,
+                Some("plugin.target"),
+                Some("target-integration"),
+            )
+            .await;
+            let oauth_descriptor = portable_credential_descriptor(
+                &db::get_provider(&source.pool, &source_oauth)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "oauth-work",
+                crate::credential_interchange::CredentialKind::OAuth,
+            )
+            .unwrap();
+            let oauth_bundle = crate::credential_interchange::CredentialBundle {
+                schema: crate::credential_interchange::BUNDLE_SCHEMA.into(),
+                encryption: None,
+                credentials: vec![crate::credential_interchange::CredentialRecord {
+                    descriptor: oauth_descriptor,
+                    secret_envelope: None,
+                    extensions: serde_json::Map::new(),
+                }],
+                extensions: serde_json::Map::new(),
+            };
+            let oauth_invalid = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(CredentialImportBody {
+                        bundle: serde_json::to_value(oauth_bundle).unwrap(),
+                        passphrase: None,
+                        apply: false,
+                        replace_existing: false,
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(oauth_invalid["valid"], false);
+            assert!(oauth_invalid["problems"][0]
+                .as_str()
+                .unwrap()
+                .contains("does not match the configured provider"));
+            assert!(db::list_accounts_for_provider(&target.pool, &target_oauth)
+                .await
+                .unwrap()
+                .is_empty());
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn rejects_ambiguous_provider_names_without_writing_credentials() {
+            let (state, root) = test_state("portable-duplicate-provider").await;
+            let first_id = insert_provider(
+                &state,
+                "duplicate-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let second_id = insert_provider(
+                &state,
+                "duplicate-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let provider = db::get_provider(&state.pool, &first_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let bundle = encrypted_import_bundle(vec![(
+                portable_credential_descriptor(
+                    &provider,
+                    "work",
+                    crate::credential_interchange::CredentialKind::ApiKey,
+                )
+                .unwrap(),
+                "must-not-be-imported".into(),
+            )]);
+
+            let dry_run = response_json(
+                import_credentials(
+                    State(state.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], false);
+            assert!(dry_run["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|problem| problem.contains("ambiguous provider")));
+            assert!(dry_run["conflicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|conflict| {
+                    conflict["kind"] == "provider"
+                        && conflict["reason"] == "ambiguous provider name"
+                }));
+
+            let apply_error = import_credentials(
+                State(state.clone()),
+                auth(),
+                Json(import_body(bundle, true)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+            assert!(db::list_accounts_for_provider(&state.pool, &first_id)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(db::list_accounts_for_provider(&state.pool, &second_id)
+                .await
+                .unwrap()
+                .is_empty());
+
+            drop(state);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[tokio::test]
+        async fn rejects_credentials_for_a_different_normalized_provider_endpoint() {
+            let (source, source_root) = test_state("portable-endpoint-source").await;
+            let (target, target_root) = test_state("portable-endpoint-target").await;
+            let source_provider_id = insert_provider(
+                &source,
+                "anthropic",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_provider_id = insert_provider(
+                &target,
+                "anthropic",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            sqlx::query("UPDATE providers SET base_url = ? WHERE id = ?")
+                .bind("https://api.anthropic.com")
+                .bind(&source_provider_id)
+                .execute(&source.pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE providers SET base_url = ? WHERE id = ?")
+                .bind("https://api.anthropic.com/")
+                .bind(&target_provider_id)
+                .execute(&target.pool)
+                .await
+                .unwrap();
+            add_account(
+                &source,
+                &source_provider_id,
+                "work",
+                "source-anthropic-key",
+                &crypto::mask_secret("source-anthropic-key"),
+                1,
+            )
+            .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+
+            assert_eq!(
+                bundle["credentials"][0]["descriptor"]["metadata"]["extensions"]
+                    [crate::credential_interchange::KINETIX_EXTENSION]["base_url"],
+                "https://api.anthropic.com"
+            );
+            let same_endpoint = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(same_endpoint["valid"], true);
+            assert!(
+                db::list_accounts_for_provider(&target.pool, &target_provider_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let mut legacy_descriptor: crate::credential_interchange::CredentialDescriptor =
+                serde_json::from_value(bundle["credentials"][0]["descriptor"].clone()).unwrap();
+            legacy_descriptor.metadata["extensions"]
+                [crate::credential_interchange::KINETIX_EXTENSION]
+                .as_object_mut()
+                .unwrap()
+                .remove("base_url");
+            let legacy_bundle =
+                encrypted_import_bundle(vec![(legacy_descriptor, "source-anthropic-key".into())]);
+            let legacy_plan = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(legacy_bundle, false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(legacy_plan["valid"], false);
+            assert!(legacy_plan["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|problem| problem.contains("missing its endpoint identity")));
+
+            sqlx::query("UPDATE providers SET base_url = ? WHERE id = ?")
+                .bind("https://attacker.example")
+                .bind(&target_provider_id)
+                .execute(&target.pool)
+                .await
+                .unwrap();
+            let dry_run = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], false);
+            assert!(dry_run["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|problem| problem.contains("endpoint identity")));
+
+            let apply_error = import_credentials(
+                State(target.clone()),
+                auth(),
+                Json(import_body(bundle, true)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+            assert!(
+                db::list_accounts_for_provider(&target.pool, &target_provider_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn rejects_credentials_with_a_different_delivery_boundary() {
+            let (source, source_root) =
+                test_state_with_allow_insecure_tls("portable-delivery-source", false).await;
+            let (target, target_root) =
+                test_state_with_allow_insecure_tls("portable-delivery-target", false).await;
+            let source_provider_id = insert_provider(
+                &source,
+                "shared-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_provider_id = insert_provider(
+                &target,
+                "shared-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            set_provider_delivery_profile(
+                &source,
+                &source_provider_id,
+                "openai",
+                "",
+                "custom_header",
+                Some("x-api-key"),
+                None,
+                false,
+                "",
+                false,
+            )
+            .await;
+            set_provider_delivery_profile(
+                &target,
+                &target_provider_id,
+                "openai",
+                "",
+                "custom_header",
+                Some("x-api-key"),
+                None,
+                false,
+                "",
+                false,
+            )
+            .await;
+            add_account(
+                &source,
+                &source_provider_id,
+                "work",
+                "source-credential",
+                &crypto::mask_secret("source-credential"),
+                1,
+            )
+            .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            let compatible = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(compatible["valid"], true);
+
+            let delivery_mismatches = [
+                (
+                    "wire_format",
+                    "plugin",
+                    "plugin:other/adapter",
+                    "custom_header",
+                    Some("x-api-key"),
+                    None,
+                    false,
+                    "",
+                    false,
+                ),
+                (
+                    "wire_plugin",
+                    "openai",
+                    "plugin:other/adapter",
+                    "custom_header",
+                    Some("x-api-key"),
+                    None,
+                    false,
+                    "",
+                    false,
+                ),
+                (
+                    "allow_insecure_tls",
+                    "openai",
+                    "",
+                    "custom_header",
+                    Some("x-api-key"),
+                    None,
+                    false,
+                    "",
+                    true,
+                ),
+                (
+                    "credential_hosts",
+                    "openai",
+                    "",
+                    "custom_header",
+                    Some("x-api-key"),
+                    None,
+                    false,
+                    "other.example",
+                    false,
+                ),
+                (
+                    "follow_redirects",
+                    "openai",
+                    "",
+                    "custom_header",
+                    Some("x-api-key"),
+                    None,
+                    true,
+                    "",
+                    false,
+                ),
+                (
+                    "custom_header_name",
+                    "openai",
+                    "",
+                    "custom_header",
+                    Some("x-other-key"),
+                    None,
+                    false,
+                    "",
+                    false,
+                ),
+            ];
+            for (
+                changed_field,
+                wire_format,
+                wire_plugin,
+                auth_scheme,
+                custom_header_name,
+                custom_param_name,
+                follow_redirects,
+                credential_hosts,
+                allow_insecure_tls,
+            ) in delivery_mismatches
+            {
+                set_provider_delivery_profile(
+                    &target,
+                    &target_provider_id,
+                    wire_format,
+                    wire_plugin,
+                    auth_scheme,
+                    custom_header_name,
+                    custom_param_name,
+                    follow_redirects,
+                    credential_hosts,
+                    allow_insecure_tls,
+                )
+                .await;
+                let dry_run = response_json(
+                    import_credentials(
+                        State(target.clone()),
+                        auth(),
+                        Json(import_body(bundle.clone(), false)),
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .await;
+                assert_eq!(dry_run["valid"], false, "{changed_field} mismatch accepted");
+                assert!(dry_run["problems"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|problem| problem.contains(changed_field)));
+                assert!(
+                    db::list_accounts_for_provider(&target.pool, &target_provider_id)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+
+            set_provider_delivery_profile(
+                &source,
+                &source_provider_id,
+                "openai",
+                "",
+                "query_param",
+                None,
+                Some("api_key"),
+                false,
+                "",
+                false,
+            )
+            .await;
+            set_provider_delivery_profile(
+                &target,
+                &target_provider_id,
+                "openai",
+                "",
+                "query_param",
+                None,
+                Some("api_key"),
+                false,
+                "",
+                false,
+            )
+            .await;
+            let query_param_bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            set_provider_delivery_profile(
+                &target,
+                &target_provider_id,
+                "openai",
+                "",
+                "query_param",
+                None,
+                Some("access_token"),
+                false,
+                "",
+                false,
+            )
+            .await;
+            let query_param_mismatch = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(query_param_bundle, false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(query_param_mismatch["valid"], false);
+            assert!(query_param_mismatch["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|problem| problem.contains("custom_param_name")));
+            assert!(
+                db::list_accounts_for_provider(&target.pool, &target_provider_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn rejects_import_when_a_target_model_selects_an_unbound_plugin_transport() {
+            let (source, source_root) =
+                test_state_with_allow_insecure_tls("portable-model-transport-source", false).await;
+            let (target, target_root) =
+                test_state_with_allow_insecure_tls("portable-model-transport-target", false).await;
+            let source_provider_id = insert_provider(
+                &source,
+                "model-transport-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_provider_id = insert_provider(
+                &target,
+                "model-transport-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            for (state, provider_id) in [
+                (&source, &source_provider_id),
+                (&target, &target_provider_id),
+            ] {
+                set_provider_delivery_profile(
+                    state,
+                    provider_id,
+                    "openai",
+                    "",
+                    "bearer",
+                    None,
+                    None,
+                    false,
+                    "",
+                    false,
+                )
+                .await;
+            }
+            add_account(
+                &source,
+                &source_provider_id,
+                "work",
+                "source-credential",
+                &crypto::mask_secret("source-credential"),
+                1,
+            )
+            .await;
+            add_model_transport_override(&target, &target_provider_id, "plugin:other/adapter")
+                .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            let dry_run = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(bundle, false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], false);
+            assert!(dry_run["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|problem| problem.contains("without matching provider wire_plugin binding")));
+            assert!(
+                db::list_accounts_for_provider(&target.pool, &target_provider_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn rejects_import_when_global_tls_policy_weakens_verification() {
+            let (source, source_root) =
+                test_state_with_allow_insecure_tls("portable-global-tls-source", false).await;
+            let (target, target_root) =
+                test_state_with_allow_insecure_tls("portable-global-tls-target", true).await;
+            let source_provider_id = insert_provider(
+                &source,
+                "global-tls-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_provider_id = insert_provider(
+                &target,
+                "global-tls-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            for (state, provider_id) in [
+                (&source, &source_provider_id),
+                (&target, &target_provider_id),
+            ] {
+                set_provider_delivery_profile(
+                    state,
+                    provider_id,
+                    "openai",
+                    "",
+                    "bearer",
+                    None,
+                    None,
+                    false,
+                    "",
+                    false,
+                )
+                .await;
+            }
+            add_account(
+                &source,
+                &source_provider_id,
+                "work",
+                "source-credential",
+                &crypto::mask_secret("source-credential"),
+                1,
+            )
+            .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            let dry_run = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(bundle, false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], false);
+            assert!(dry_run["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|problem| problem.contains("effective_allow_insecure_tls")));
+            assert!(
+                db::list_accounts_for_provider(&target.pool, &target_provider_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn rejects_invalid_imported_secret_contents_for_dry_run_and_apply() {
+            let (state, root) = test_state("portable-secret-validation").await;
+            let manual_id = insert_provider(
+                &state,
+                "manual-validation-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let auth_flow_id = insert_provider(
+                &state,
+                "auth-flow-validation-provider",
+                crate::plugins::CredentialMode::AuthFlow,
+                Some("missing.oauth.plugin"),
+                Some("oauth"),
+            )
+            .await;
+            let manual = db::get_provider(&state.pool, &manual_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let auth_flow = db::get_provider(&state.pool, &auth_flow_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let oversized = format!(r#"{{"token":"{}"}}"#, "x".repeat(256 * 1024));
+            assert!(oversized.len() > 256 * 1024);
+            let bundle = encrypted_import_bundle(vec![
+                (
+                    portable_credential_descriptor(
+                        &manual,
+                        "empty",
+                        crate::credential_interchange::CredentialKind::ApiKey,
+                    )
+                    .unwrap(),
+                    String::new(),
+                ),
+                (
+                    portable_credential_descriptor(
+                        &manual,
+                        "whitespace",
+                        crate::credential_interchange::CredentialKind::ApiKey,
+                    )
+                    .unwrap(),
+                    " \t\n".into(),
+                ),
+                (
+                    portable_credential_descriptor(
+                        &auth_flow,
+                        "invalid-json",
+                        crate::credential_interchange::CredentialKind::OAuth,
+                    )
+                    .unwrap(),
+                    "not json".into(),
+                ),
+                (
+                    portable_credential_descriptor(
+                        &auth_flow,
+                        "non-object-json",
+                        crate::credential_interchange::CredentialKind::OAuth,
+                    )
+                    .unwrap(),
+                    "[]".into(),
+                ),
+                (
+                    portable_credential_descriptor(
+                        &auth_flow,
+                        "oversized",
+                        crate::credential_interchange::CredentialKind::OAuth,
+                    )
+                    .unwrap(),
+                    oversized,
+                ),
+            ]);
+
+            let dry_run = response_json(
+                import_credentials(
+                    State(state.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], false);
+            let problems = dry_run["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            assert!(problems
+                .iter()
+                .any(|problem| problem.contains("manual credential must not be empty")));
+            assert!(problems
+                .iter()
+                .any(|problem| problem.contains("auth-flow credential is not valid JSON")));
+            assert!(problems
+                .iter()
+                .any(|problem| problem.contains("auth-flow credential must be a JSON object")));
+            assert!(problems
+                .iter()
+                .any(|problem| problem.contains("auth-flow credential exceeds 256 KiB")));
+
+            let apply_error = import_credentials(
+                State(state.clone()),
+                auth(),
+                Json(import_body(bundle, true)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+            assert!(db::list_accounts_for_provider(&state.pool, &manual_id)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(db::list_accounts_for_provider(&state.pool, &auth_flow_id)
+                .await
+                .unwrap()
+                .is_empty());
+
+            drop(state);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[tokio::test]
+        async fn imports_a_valid_auth_flow_credential_for_a_new_account() {
+            let (state, root) = test_state("portable-auth-flow-create").await;
+            let provider_id = insert_provider(
+                &state,
+                "auth-flow-create-provider",
+                crate::plugins::CredentialMode::AuthFlow,
+                Some("missing.oauth.plugin"),
+                Some("oauth"),
+            )
+            .await;
+            let provider = db::get_provider(&state.pool, &provider_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let secret = json!({
+                "access_token": "initial-access",
+                "refresh_token": "initial-refresh",
+            })
+            .to_string();
+            let bundle = encrypted_import_bundle(vec![(
+                portable_credential_descriptor(
+                    &provider,
+                    "work",
+                    crate::credential_interchange::CredentialKind::OAuth,
+                )
+                .unwrap(),
+                secret.clone(),
+            )]);
+
+            let dry_run = response_json(
+                import_credentials(
+                    State(state.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], true);
+            assert_eq!(dry_run["plan"][0]["action"], "create");
+            assert_eq!(dry_run["missing_resources"][0]["kind"], "integration");
+            assert!(db::list_accounts_for_provider(&state.pool, &provider_id)
+                .await
+                .unwrap()
+                .is_empty());
+
+            let applied = response_json(
+                import_credentials(
+                    State(state.clone()),
+                    auth(),
+                    Json(import_body(bundle, true)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(applied["valid"], true);
+            assert_eq!(applied["applied"], true);
+            let accounts = db::list_accounts_for_provider(&state.pool, &provider_id)
+                .await
+                .unwrap();
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(accounts[0].key_mask, "oauth:****");
+            assert_eq!(
+                state.crypto.decrypt(&accounts[0].secret_enc).unwrap(),
+                secret
+            );
+            let active_account = state
+                .registry
+                .snapshot()
+                .accounts
+                .get(&accounts[0].id)
+                .cloned()
+                .expect("successful import publishes the account to the registry");
+            assert_eq!(
+                state.crypto.decrypt(&active_account.secret_enc).unwrap(),
+                secret
+            );
+
+            drop(state);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[tokio::test]
+        async fn auth_flow_replacement_is_rejected_until_plugin_state_can_be_restored() {
+            let (target, target_root) = test_state("portable-oauth-replace").await;
+            let provider_id = insert_provider(
+                &target,
+                "oauth-replacement-provider",
+                crate::plugins::CredentialMode::AuthFlow,
+                Some("plugin.oauth"),
+                Some("oauth"),
+            )
+            .await;
+            let old_secret =
+                json!({"access_token": "old", "refresh_token": "old-refresh"}).to_string();
+            add_account(&target, &provider_id, "work", &old_secret, "oauth:****", 1).await;
+            let provider = db::get_provider(&target.pool, &provider_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let descriptor = portable_credential_descriptor(
+                &provider,
+                "work",
+                crate::credential_interchange::CredentialKind::OAuth,
+            )
+            .unwrap();
+            let new_secret =
+                json!({"access_token": "new", "refresh_token": "new-refresh"}).to_string();
+            let (encryption, mut envelopes) = crate::credential_interchange::encrypt_secrets(
+                EXPORT_PASSPHRASE,
+                std::slice::from_ref(&descriptor),
+                &[Some(new_secret)],
+            )
+            .unwrap();
+            let bundle = serde_json::to_value(crate::credential_interchange::CredentialBundle {
+                schema: crate::credential_interchange::BUNDLE_SCHEMA.into(),
+                encryption: Some(encryption),
+                credentials: vec![crate::credential_interchange::CredentialRecord {
+                    descriptor,
+                    secret_envelope: envelopes.pop().unwrap(),
+                    extensions: serde_json::Map::new(),
+                }],
+                extensions: serde_json::Map::new(),
+            })
+            .unwrap();
+            let plan = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(CredentialImportBody {
+                        bundle: bundle.clone(),
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                        apply: false,
+                        replace_existing: true,
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(plan["valid"], false);
+            assert!(plan["problems"][0]
+                .as_str()
+                .unwrap()
+                .contains("cannot be replaced safely"));
+            assert!(plan["conflicts"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("plugin credential state can be restored safely"));
+            let apply_error = import_credentials(
+                State(target.clone()),
+                auth(),
+                Json(CredentialImportBody {
+                    bundle,
+                    passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    apply: true,
+                    replace_existing: true,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+            let account = db::list_accounts_for_provider(&target.pool, &provider_id)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                target.crypto.decrypt(&account.secret_enc).unwrap(),
+                old_secret
+            );
+
+            drop(target);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn replacement_is_explicit_and_preserves_account_policy() {
+            let (source, source_root) = test_state("portable-replace-source").await;
+            let (target, target_root) = test_state("portable-replace-target").await;
+            let source_provider = insert_provider(
+                &source,
+                "replacement-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_provider = insert_provider(
+                &target,
+                "replacement-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &source,
+                &source_provider,
+                "work",
+                "fixture-new-secret",
+                &crypto::mask_secret("fixture-new-secret"),
+                1,
+            )
+            .await;
+            add_account(
+                &target,
+                &target_provider,
+                "work",
+                "fixture-old-secret",
+                &crypto::mask_secret("fixture-old-secret"),
+                7,
+            )
+            .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+
+            let unchanged = db::list_accounts_for_provider(&target.pool, &target_provider)
+                .await
+                .unwrap()
+                .remove(0);
+            let skipped = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), true)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(skipped["plan"][0]["action"], "skip_existing");
+            let after_skip = db::list_accounts_for_provider(&target.pool, &target_provider)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                target.crypto.decrypt(&after_skip.secret_enc).unwrap(),
+                "fixture-old-secret"
+            );
+
+            let replaced = response_json(
+                import_credentials(
+                    State(target.clone()),
+                    auth(),
+                    Json(CredentialImportBody {
+                        bundle,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                        apply: true,
+                        replace_existing: true,
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(replaced["plan"][0]["action"], "replace");
+            let after_replace = db::list_accounts_for_provider(&target.pool, &target_provider)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                target.crypto.decrypt(&after_replace.secret_enc).unwrap(),
+                "fixture-new-secret"
+            );
+            assert_eq!(after_replace.priority, unchanged.priority);
+            assert_eq!(after_replace.status, unchanged.status);
+            assert_eq!(
+                after_replace.account_state_version,
+                unchanged.account_state_version + 1
+            );
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn snapshot_build_failure_rolls_back_credential_import_and_keeps_runtime_snapshot() {
+            let (source, source_root) = test_state("portable-snapshot-source").await;
+            let (target, target_root) = test_state("portable-snapshot-target").await;
+            let source_provider = insert_provider(
+                &source,
+                "snapshot-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_provider = insert_provider(
+                &target,
+                "snapshot-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &source,
+                &source_provider,
+                "work",
+                "new-snapshot-secret",
+                &crypto::mask_secret("new-snapshot-secret"),
+                1,
+            )
+            .await;
+            add_account(
+                &target,
+                &target_provider,
+                "work",
+                "old-snapshot-secret",
+                &crypto::mask_secret("old-snapshot-secret"),
+                1,
+            )
+            .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            db::insert_route(
+                &target.pool,
+                &db::NewRoute {
+                    name: "snapshot-failure-route",
+                    description: "",
+                    strategy: "priority",
+                    fallback_triggers: json!({}),
+                    portability_policy: "strip_with_warning",
+                    sticky_routing: false,
+                    cache_affinity: false,
+                    max_attempts: None,
+                    max_concurrent_requests: None,
+                },
+            )
+            .await
+            .unwrap();
+            target.registry.reload(&target.pool).await.unwrap();
+            let before = db::list_accounts_for_provider(&target.pool, &target_provider)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                target.crypto.decrypt(&before.secret_enc).unwrap(),
+                "old-snapshot-secret"
+            );
+
+            sqlx::query("DROP TABLE route_targets")
+                .execute(&target.pool)
+                .await
+                .unwrap();
+            let error = import_credentials(
+                State(target.clone()),
+                auth(),
+                Json(CredentialImportBody {
+                    bundle,
+                    passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    apply: true,
+                    replace_existing: true,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+
+            let after = db::list_accounts_for_provider(&target.pool, &target_provider)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                target.crypto.decrypt(&after.secret_enc).unwrap(),
+                "old-snapshot-secret"
+            );
+            let active = target
+                .registry
+                .snapshot()
+                .accounts
+                .get(&before.id)
+                .cloned()
+                .expect("failed import leaves the active account published");
+            assert_eq!(
+                target.crypto.decrypt(&active.secret_enc).unwrap(),
+                "old-snapshot-secret"
+            );
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn rolls_back_prior_writes_when_a_late_account_insert_fails() {
+            let (source, source_root) = test_state("portable-transaction-source").await;
+            let (target, target_root) = test_state("portable-transaction-target").await;
+            let source_provider = insert_provider(
+                &source,
+                "transaction-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_provider = insert_provider(
+                &target,
+                "transaction-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &source,
+                &source_provider,
+                "first",
+                "fixture-first-value",
+                &crypto::mask_secret("fixture-first-value"),
+                1,
+            )
+            .await;
+            add_account(
+                &source,
+                &source_provider,
+                "second",
+                "fixture-second-value",
+                &crypto::mask_secret("fixture-second-value"),
+                2,
+            )
+            .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            sqlx::query(
+                "CREATE TRIGGER reject_second_import BEFORE INSERT ON accounts
+                 WHEN NEW.label = 'second' BEGIN SELECT RAISE(FAIL, 'test failure'); END",
+            )
+            .execute(&target.pool)
+            .await
+            .unwrap();
+            assert!(import_credentials(
+                State(target.clone()),
+                auth(),
+                Json(import_body(bundle, true)),
+            )
+            .await
+            .is_err());
+            assert!(
+                db::list_accounts_for_provider(&target.pool, &target_provider)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
     }
 }

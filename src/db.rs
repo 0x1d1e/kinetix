@@ -1973,6 +1973,27 @@ pub(crate) async fn insert_account_in_transaction(
     Ok(id)
 }
 
+/// Replace only credential material, preserving operator policy and runtime health.
+pub(crate) async fn replace_account_secret_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    secret_enc: &str,
+    key_mask: &str,
+) -> Result<()> {
+    let result = sqlx::query(
+        "UPDATE accounts SET secret_enc=?, key_mask=?, account_state_version=account_state_version + 1 WHERE id=?",
+    )
+    .bind(secret_enc)
+    .bind(key_mask)
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        anyhow::bail!("account {id} disappeared during credential import");
+    }
+    Ok(())
+}
+
 /// Apply imported operator-owned account policy without replacing credentials.
 /// Runtime health remains intact unless policy changes the account's enabled state.
 pub(crate) async fn update_account_policy_in_transaction(
@@ -5875,7 +5896,20 @@ mod usage_request_log_tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let pool = connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+        // Keep schema changes on one connection so per-connection SQLite metadata stays coherent.
+        let options = SqliteConnectOptions::from_str(&format!(
+            "sqlite://{}",
+            root.join("kinetix.db").display()
+        ))
+        .unwrap()
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
             .await
             .unwrap();
         migrate(&pool).await.unwrap();
