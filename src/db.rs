@@ -5896,7 +5896,20 @@ mod usage_request_log_tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let pool = connect(&format!("sqlite://{}", root.join("kinetix.db").display()))
+        // Keep schema changes on one connection so per-connection SQLite metadata stays coherent.
+        let options = SqliteConnectOptions::from_str(&format!(
+            "sqlite://{}",
+            root.join("kinetix.db").display()
+        ))
+        .unwrap()
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
             .await
             .unwrap();
         migrate(&pool).await.unwrap();

@@ -11189,6 +11189,25 @@ enum PortableCredentialWriteAction {
     Replace(String),
 }
 
+fn validate_portable_credential_secret(mode: &str, secret: &str) -> Result<(), &'static str> {
+    match mode {
+        "manual" if !crate::validate::credential_is_nonempty(secret) => {
+            Err("manual credential must not be empty")
+        }
+        "manual" => Ok(()),
+        "auth_flow" if secret.len() > 256 * 1024 => Err("auth-flow credential exceeds 256 KiB"),
+        "auth_flow" => {
+            let value: Value = serde_json::from_str(secret)
+                .map_err(|_| "auth-flow credential is not valid JSON")?;
+            if !value.is_object() {
+                return Err("auth-flow credential must be a JSON object");
+            }
+            Ok(())
+        }
+        _ => Err("credential has an unsupported credential mode"),
+    }
+}
+
 async fn build_portable_credential_import_plan(
     state: &AppState,
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -11329,6 +11348,10 @@ async fn build_portable_credential_import_plan(
             }));
             continue;
         };
+        if let Err(problem) = validate_portable_credential_secret(mode, &secret) {
+            problems.push(format!("credential '{provider_name}/{label}' {problem}"));
+            continue;
+        }
 
         if mode == "auth_flow" && replace_existing && !matching_accounts.is_empty() {
             conflicts.push(json!({
@@ -11514,6 +11537,11 @@ pub async fn import_credentials(
     } else {
         None
     };
+    let publication = if body.apply {
+        Some(state.registry.publication().await)
+    } else {
+        None
+    };
     let mut tx = if body.apply {
         state
             .pool
@@ -11601,14 +11629,21 @@ pub async fn import_credentials(
             }
         }
     }
+    let next_registry = if created + replaced > 0 {
+        Some(
+            crate::registry::Registry::build_snapshot_in_transaction(&mut tx)
+                .await
+                .map_err(ApiError::internal)?,
+        )
+    } else {
+        None
+    };
     tx.commit().await.map_err(ApiError::internal)?;
 
-    if created + replaced > 0 {
-        state
-            .registry
-            .reload(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
+    if let Some(next_registry) = next_registry {
+        publication
+            .expect("apply imports hold the registry publication lock")
+            .activate(next_registry);
         let detail = format!("created={created}, replaced={replaced}");
         let _ = db::insert_audit(
             &state.pool,
@@ -27864,6 +27899,37 @@ storage = "2MiB"
             }
         }
 
+        fn encrypted_import_bundle(
+            entries: Vec<(crate::credential_interchange::CredentialDescriptor, String)>,
+        ) -> Value {
+            let (descriptors, secrets): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+            let secrets = secrets.into_iter().map(Some).collect::<Vec<_>>();
+            let (encryption, envelopes) = crate::credential_interchange::encrypt_secrets(
+                EXPORT_PASSPHRASE,
+                &descriptors,
+                &secrets,
+            )
+            .unwrap();
+            let credentials = descriptors
+                .into_iter()
+                .zip(envelopes)
+                .map(|(descriptor, secret_envelope)| {
+                    crate::credential_interchange::CredentialRecord {
+                        descriptor,
+                        secret_envelope,
+                        extensions: serde_json::Map::new(),
+                    }
+                })
+                .collect();
+            serde_json::to_value(crate::credential_interchange::CredentialBundle {
+                schema: crate::credential_interchange::BUNDLE_SCHEMA.into(),
+                encryption: Some(encryption),
+                credentials,
+                extensions: serde_json::Map::new(),
+            })
+            .unwrap()
+        }
+
         #[tokio::test]
         async fn exports_descriptors_by_default_and_imports_encrypted_credentials() {
             let (source, source_root) = test_state("portable-export-source").await;
@@ -28227,6 +28293,213 @@ storage = "2MiB"
         }
 
         #[tokio::test]
+        async fn rejects_invalid_imported_secret_contents_for_dry_run_and_apply() {
+            let (state, root) = test_state("portable-secret-validation").await;
+            let manual_id = insert_provider(
+                &state,
+                "manual-validation-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let auth_flow_id = insert_provider(
+                &state,
+                "auth-flow-validation-provider",
+                crate::plugins::CredentialMode::AuthFlow,
+                Some("missing.oauth.plugin"),
+                Some("oauth"),
+            )
+            .await;
+            let manual = db::get_provider(&state.pool, &manual_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let auth_flow = db::get_provider(&state.pool, &auth_flow_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let oversized = format!(r#"{{"token":"{}"}}"#, "x".repeat(256 * 1024));
+            assert!(oversized.len() > 256 * 1024);
+            let bundle = encrypted_import_bundle(vec![
+                (
+                    portable_credential_descriptor(
+                        &manual,
+                        "empty",
+                        crate::credential_interchange::CredentialKind::ApiKey,
+                    ),
+                    String::new(),
+                ),
+                (
+                    portable_credential_descriptor(
+                        &manual,
+                        "whitespace",
+                        crate::credential_interchange::CredentialKind::ApiKey,
+                    ),
+                    " \t\n".into(),
+                ),
+                (
+                    portable_credential_descriptor(
+                        &auth_flow,
+                        "invalid-json",
+                        crate::credential_interchange::CredentialKind::OAuth,
+                    ),
+                    "not json".into(),
+                ),
+                (
+                    portable_credential_descriptor(
+                        &auth_flow,
+                        "non-object-json",
+                        crate::credential_interchange::CredentialKind::OAuth,
+                    ),
+                    "[]".into(),
+                ),
+                (
+                    portable_credential_descriptor(
+                        &auth_flow,
+                        "oversized",
+                        crate::credential_interchange::CredentialKind::OAuth,
+                    ),
+                    oversized,
+                ),
+            ]);
+
+            let dry_run = response_json(
+                import_credentials(
+                    State(state.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], false);
+            let problems = dry_run["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            assert!(problems
+                .iter()
+                .any(|problem| problem.contains("manual credential must not be empty")));
+            assert!(problems
+                .iter()
+                .any(|problem| problem.contains("auth-flow credential is not valid JSON")));
+            assert!(problems
+                .iter()
+                .any(|problem| problem.contains("auth-flow credential must be a JSON object")));
+            assert!(problems
+                .iter()
+                .any(|problem| problem.contains("auth-flow credential exceeds 256 KiB")));
+
+            let apply_error = import_credentials(
+                State(state.clone()),
+                auth(),
+                Json(import_body(bundle, true)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(apply_error.0, StatusCode::BAD_REQUEST);
+            assert!(db::list_accounts_for_provider(&state.pool, &manual_id)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(db::list_accounts_for_provider(&state.pool, &auth_flow_id)
+                .await
+                .unwrap()
+                .is_empty());
+
+            drop(state);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[tokio::test]
+        async fn imports_a_valid_auth_flow_credential_for_a_new_account() {
+            let (state, root) = test_state("portable-auth-flow-create").await;
+            let provider_id = insert_provider(
+                &state,
+                "auth-flow-create-provider",
+                crate::plugins::CredentialMode::AuthFlow,
+                Some("missing.oauth.plugin"),
+                Some("oauth"),
+            )
+            .await;
+            let provider = db::get_provider(&state.pool, &provider_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let secret = json!({
+                "access_token": "initial-access",
+                "refresh_token": "initial-refresh",
+            })
+            .to_string();
+            let bundle = encrypted_import_bundle(vec![(
+                portable_credential_descriptor(
+                    &provider,
+                    "work",
+                    crate::credential_interchange::CredentialKind::OAuth,
+                ),
+                secret.clone(),
+            )]);
+
+            let dry_run = response_json(
+                import_credentials(
+                    State(state.clone()),
+                    auth(),
+                    Json(import_body(bundle.clone(), false)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(dry_run["valid"], true);
+            assert_eq!(dry_run["plan"][0]["action"], "create");
+            assert_eq!(dry_run["missing_resources"][0]["kind"], "integration");
+            assert!(db::list_accounts_for_provider(&state.pool, &provider_id)
+                .await
+                .unwrap()
+                .is_empty());
+
+            let applied = response_json(
+                import_credentials(
+                    State(state.clone()),
+                    auth(),
+                    Json(import_body(bundle, true)),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(applied["valid"], true);
+            assert_eq!(applied["applied"], true);
+            let accounts = db::list_accounts_for_provider(&state.pool, &provider_id)
+                .await
+                .unwrap();
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(accounts[0].key_mask, "oauth:****");
+            assert_eq!(
+                state.crypto.decrypt(&accounts[0].secret_enc).unwrap(),
+                secret
+            );
+            let active_account = state
+                .registry
+                .snapshot()
+                .accounts
+                .get(&accounts[0].id)
+                .cloned()
+                .expect("successful import publishes the account to the registry");
+            assert_eq!(
+                state.crypto.decrypt(&active_account.secret_enc).unwrap(),
+                secret
+            );
+
+            drop(state);
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[tokio::test]
         async fn auth_flow_replacement_is_rejected_until_plugin_state_can_be_restored() {
             let (target, target_root) = test_state("portable-oauth-replace").await;
             let provider_id = insert_provider(
@@ -28423,6 +28696,127 @@ storage = "2MiB"
             assert_eq!(
                 after_replace.account_state_version,
                 unchanged.account_state_version + 1
+            );
+
+            drop(source);
+            drop(target);
+            let _ = std::fs::remove_dir_all(source_root);
+            let _ = std::fs::remove_dir_all(target_root);
+        }
+
+        #[tokio::test]
+        async fn snapshot_build_failure_rolls_back_credential_import_and_keeps_runtime_snapshot() {
+            let (source, source_root) = test_state("portable-snapshot-source").await;
+            let (target, target_root) = test_state("portable-snapshot-target").await;
+            let source_provider = insert_provider(
+                &source,
+                "snapshot-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            let target_provider = insert_provider(
+                &target,
+                "snapshot-provider",
+                crate::plugins::CredentialMode::Manual,
+                None,
+                None,
+            )
+            .await;
+            add_account(
+                &source,
+                &source_provider,
+                "work",
+                "new-snapshot-secret",
+                &crypto::mask_secret("new-snapshot-secret"),
+                1,
+            )
+            .await;
+            add_account(
+                &target,
+                &target_provider,
+                "work",
+                "old-snapshot-secret",
+                &crypto::mask_secret("old-snapshot-secret"),
+                1,
+            )
+            .await;
+            let bundle = response_json(
+                export_credentials(
+                    State(source.clone()),
+                    auth(),
+                    Json(CredentialExportBody {
+                        include_secrets: true,
+                        passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    }),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            db::insert_route(
+                &target.pool,
+                &db::NewRoute {
+                    name: "snapshot-failure-route",
+                    description: "",
+                    strategy: "priority",
+                    fallback_triggers: json!({}),
+                    portability_policy: "strip_with_warning",
+                    sticky_routing: false,
+                    cache_affinity: false,
+                    max_attempts: None,
+                    max_concurrent_requests: None,
+                },
+            )
+            .await
+            .unwrap();
+            target.registry.reload(&target.pool).await.unwrap();
+            let before = db::list_accounts_for_provider(&target.pool, &target_provider)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                target.crypto.decrypt(&before.secret_enc).unwrap(),
+                "old-snapshot-secret"
+            );
+
+            sqlx::query("DROP TABLE route_targets")
+                .execute(&target.pool)
+                .await
+                .unwrap();
+            let error = import_credentials(
+                State(target.clone()),
+                auth(),
+                Json(CredentialImportBody {
+                    bundle,
+                    passphrase: Some(EXPORT_PASSPHRASE.into()),
+                    apply: true,
+                    replace_existing: true,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+
+            let after = db::list_accounts_for_provider(&target.pool, &target_provider)
+                .await
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                target.crypto.decrypt(&after.secret_enc).unwrap(),
+                "old-snapshot-secret"
+            );
+            let active = target
+                .registry
+                .snapshot()
+                .accounts
+                .get(&before.id)
+                .cloned()
+                .expect("failed import leaves the active account published");
+            assert_eq!(
+                target.crypto.decrypt(&active.secret_enc).unwrap(),
+                "old-snapshot-secret"
             );
 
             drop(source);
