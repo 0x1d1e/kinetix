@@ -1,0 +1,304 @@
+{
+  "cases": [
+    {
+      "baseline_valid": true,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n",
+      "name": "native-anonymous-host-defaults",
+      "plan_valid": true,
+      "valid": true
+    },
+    {
+      "baseline_valid": true,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/accounts/{account_id}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 32\n",
+      "name": "native-public-identifier",
+      "plan_valid": true,
+      "valid": true
+    },
+    {
+      "baseline_valid": true,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[provides]\n\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n",
+      "name": "native-explicit-empty-provides",
+      "plan_valid": true,
+      "valid": true
+    },
+    {
+      "baseline_valid": true,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"manual\"\n[integrations.provider]\nbase_url = \"https://api.example.com/v1\"\nwire_format = \"openai\"\nauth_scheme = \"bearer\"\nmodels_path = \"/models\"\n",
+      "name": "legacy-manual-without-install-metadata",
+      "plan_valid": false,
+      "valid": true
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.opencode-free\"\nname = \"OpenCode Free\"\nversion = \"0.1.10\"\nplugin_api = \"2\"\n\n[provides]\nmodel_sources = [\"opencode-free-models\"]\nprovider_adapters = [\"opencode-free\"]\n\n[[integrations]]\nid = \"opencode-free\"\nname = \"OpenCode Free\"\ndescription = \"Use OpenCode's anonymous free-tier models with dynamic model discovery.\"\nprovider_adapter = \"opencode-free\"\nmodel_source = \"opencode-free-models\"\ncredential_mode = \"none\"\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = false\nreasoning = true\nstructured_output = false\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"plugin-native\"]\n\n[integrations.provider]\nbase_url = \"https://opencode.ai\"\nwire_format = \"plugin\"\nauth_scheme = \"bearer\"\nmodels_path = \"/zen/v1/models\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"opencode.ai\"]\ncredential_scopes = []\ncredential_read = false\n\n[limits]\nmemory = \"64MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"big-pickle\"\n",
+      "name": "proposed-opencode-free",
+      "plan_valid": true,
+      "valid": true
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.antigravity-oauth\"\nname = \"Antigravity OAuth\"\nversion = \"0.1.14\"\nplugin_api = \"3\"\n\n# Antigravity accounts are provisioned by a host-managed refresh-token exchange\n# (\u00a76.1). The plugin reads the account's OAuth JSON, refreshes the access token\n# against Google, and returns an opaque lease; the live token is written to the\n# plugin's encrypted KV and injected host-side at send time.\n\n[provides]\ncredential_strategies = [\"antigravity-oauth\"]\nauth_flows = [\"antigravity\"]\naccount_model_sources = [\"antigravity-models\"]\nprovider_adapters = [\"antigravity\"]\nhealth_probes = [\"antigravity-oauth\"]\nthinking_translation = true\n\n[[integrations]]\nid = \"antigravity\"\nname = \"Google Antigravity\"\ndescription = \"Connect a Google Antigravity account and use the v1internal model API.\"\nprovider_adapter = \"antigravity\"\ncredential_strategy = \"antigravity-oauth\"\nauth_flow = \"antigravity\"\ncredential_mode = \"auth_flow\"\nmodel_source = \"antigravity-models\"\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = false\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"plugin-native\"]\n\n[integrations.provider]\nbase_url = \"https://daily-cloudcode-pa.googleapis.com\"\nwire_format = \"plugin\"\nauth_scheme = \"bearer\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[[ui.settings]]\nkey = \"login_hint\"\nlabel = \"Google account hint\"\nkind = \"text\"\ndescription = \"Optional email address shown as Google's login hint during account authorization.\"\n\n[[ui.actions]]\nid = \"connect-account\"\nlabel = \"Connect account\"\nkind = \"auth\"\nintegration = \"antigravity\"\ndescription = \"Sign in with Google and add an Antigravity account to a bound provider.\"\n\n[permissions]\n# Browser authorization is host-validated; token exchange and userinfo are\n# performed through host-mediated buffered HTTP.\nnetwork_hosts = [\"accounts.google.com\", \"oauth2.googleapis.com\", \"www.googleapis.com\", \"cloudcode-pa.googleapis.com\", \"daily-cloudcode-pa.googleapis.com\"]\ncredential_scopes = [\"credential_strategy:antigravity-oauth\"]\n# The refresh_token exchange puts the secret in a POST body, which the opaque\n# handle model cannot express, so this plugin requires plaintext credential\n# read (\u00a78.2). It is a materially higher-risk grant and is flagged on install.\ncredential_read = true\n\n[limits]\nmemory = \"64MiB\"\nwall_time_ms = 30000\nmax_outbound_requests = 6\nmax_http_body = \"1MiB\"\nstorage = \"1MiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gemini-2.5-pro\"\n",
+      "name": "proposed-antigravity-oauth",
+      "plan_valid": true,
+      "valid": true
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"manual\"\n\n[integrations.manual_credential]\nkind = \"api_key\"\nrequirements = [\"api_key\"]\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gemini-2.5-flash\"\n",
+      "name": "proposed-ai-studio",
+      "plan_valid": true,
+      "valid": true
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.b-ai\"\nname = \"B.AI\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"b-ai-models\"]\n\n[[integrations]]\nid = \"b-ai\"\nname = \"B.AI\"\ndescription = \"Use B.AI's OpenAI-compatible API with live model discovery.\"\nmodel_source = \"b-ai-models\"\ncredential_mode = \"manual\"\n\n[integrations.manual_credential]\nkind = \"api_key\"\nrequirements = [\"api_key\"]\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"openai-chat\"]\n\n[integrations.provider]\nbase_url = \"https://api.b.ai/v1\"\nwire_format = \"openai\"\nauth_scheme = \"bearer\"\nmodels_path = \"/models\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"api.b.ai\"]\ncredential_scopes = [\"*\"]\ncredential_read = false\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gpt-4o\"\n",
+      "name": "proposed-b-ai",
+      "plan_valid": true,
+      "valid": true
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n",
+      "name": "empty-capabilityless-package",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\ncustom_header_name = \"x-api-key\"\nmodels_path = \"/models\"\n",
+      "name": "anonymous-auth-header",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n\n[integrations.provider.extra_headers]\nAuthorization = \"not-a-secret\"\n",
+      "name": "anonymous-extra-auth-header",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"manual\"\n[integrations.provider]\nbase_url = \"https://api.example.com/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n",
+      "name": "anonymous-manual-mode",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/accounts/{unknown}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 32\n",
+      "name": "undeclared-template",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/{unknown}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n",
+      "name": "undeclared-template-without-parameters",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://{account_id}.example.com/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 32\n",
+      "name": "origin-template",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/accounts/prefix-{account_id}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 32\n",
+      "name": "partial-path-template",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/../{account_id}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 32\n",
+      "name": "traversal-template",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/%2e%2e/{account_id}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 32\n",
+      "name": "encoded-path",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/accounts/{account_id}/v1?q=x\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 32\n",
+      "name": "parameter-query",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/accounts/{account_id}/v1#x\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 32\n",
+      "name": "parameter-fragment",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = []\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/accounts/{account_id}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 32\n",
+      "name": "parameter-missing-network-hosts",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://other.example.com/accounts/{account_id}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 32\n",
+      "name": "parameter-destination-outside-hosts",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/accounts/{account_id}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 257\n",
+      "name": "parameter-oversized",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/accounts/{account_id}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 33\nmax_length = 32\n",
+      "name": "parameter-inverted-bounds",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/accounts/{account_id}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 32\nvalue = \"not-a-secret\"\n",
+      "name": "parameter-value-in-declaration",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/accounts/{account_id}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"/models\"\n[integrations.provider.parameters.account_id]\ntype = \"secret\"\nmin_length = 1\nmax_length = 32\n",
+      "name": "parameter-wrong-type",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "\nmanifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.anonymous\"\nname = \"Anonymous\"\nversion = \"0.1.0\"\n[permissions]\nnetwork_hosts = [\"api.example.com\"]\ncredential_read = false\n[[integrations]]\nid = \"anonymous\"\nname = \"Anonymous\"\ncredential_mode = \"none\"\n[integrations.provider]\nbase_url = \"https://api.example.com/accounts/{account_id}/v1\"\nwire_format = \"openai\"\nauth_scheme = \"none\"\nmodels_path = \"//other.example.com/x\"\n[integrations.provider.parameters.account_id]\ntype = \"identifier\"\nmin_length = 1\nmax_length = 32\n",
+      "name": "parameter-models-path-authority",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"manual\"\n\n[integrations.manual_credential]\nkind = \"api_key\"\nrequirements = [\"api_key\"]\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gemini-2.5-flash\"\naccount = \"initial\"\n",
+      "name": "install-implicit-account-pin",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"manual\"\n\n[integrations.manual_credential]\nkind = \"api_key\"\nvalue = \"not-a-secret\"\nrequirements = [\"api_key\"]\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gemini-2.5-flash\"\n",
+      "name": "manual-secret-in-metadata",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"manual\"\n\n[integrations.manual_credential]\nkind = \"api_key\"\nrequirements = []\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gemini-2.5-flash\"\n",
+      "name": "manual-empty-requirements",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"manual\"\n\n[integrations.manual_credential]\nkind = \"api_key\"\nrequirements = [\"api_key\"]\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \" \"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gemini-2.5-flash\"\n",
+      "name": "install-blank-account",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"manual\"\n\n[integrations.manual_credential]\nkind = \"api_key\"\nrequirements = [\"api_key\"]\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gemini-2.5-flash\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"other-model\"\n",
+      "name": "install-duplicate-route",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"manual\"\n\n[integrations.manual_credential]\nkind = \"API KEY\"\nrequirements = [\"api_key\"]\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gemini-2.5-flash\"\n",
+      "name": "manual-invalid-kind",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"manual\"\n\n[integrations.manual_credential]\nkind = \"api_key\"\nrequirements = [\"api_key\", \"api_key\"]\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gemini-2.5-flash\"\n",
+      "name": "manual-duplicate-requirement",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"manual\"\n\n[integrations.manual_credential]\nkind = \"api_key\"\nrequirements = [\"API KEY\"]\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gemini-2.5-flash\"\n",
+      "name": "manual-invalid-requirement",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"none\"\n\n[integrations.manual_credential]\nkind = \"api_key\"\nrequirements = [\"api_key\"]\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gemini-2.5-flash\"\n",
+      "name": "manual-metadata-wrong-mode",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"manual\"\n\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"gemini-2.5-flash\"\n",
+      "name": "manual-install-missing-requirements",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.opencode-free\"\nname = \"OpenCode Free\"\nversion = \"0.1.10\"\nplugin_api = \"2\"\n\n[provides]\nmodel_sources = [\"opencode-free-models\"]\nprovider_adapters = [\"opencode-free\"]\n\n[[integrations]]\nid = \"opencode-free\"\nname = \"OpenCode Free\"\ndescription = \"Use OpenCode's anonymous free-tier models with dynamic model discovery.\"\nprovider_adapter = \"opencode-free\"\nmodel_source = \"opencode-free-models\"\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = false\nreasoning = true\nstructured_output = false\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"plugin-native\"]\n\n[integrations.provider]\nbase_url = \"https://opencode.ai\"\nwire_format = \"plugin\"\nauth_scheme = \"bearer\"\nmodels_path = \"/zen/v1/models\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"opencode.ai\"]\ncredential_scopes = []\ncredential_read = false\n\n[limits]\nmemory = \"64MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"big-pickle\"\n",
+      "name": "install-missing-mode",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.opencode-free\"\nname = \"OpenCode Free\"\nversion = \"0.1.10\"\nplugin_api = \"2\"\n\n[provides]\nmodel_sources = [\"opencode-free-models\"]\nprovider_adapters = [\"opencode-free\"]\n\n[[integrations]]\nid = \"opencode-free\"\nname = \"OpenCode Free\"\ndescription = \"Use OpenCode's anonymous free-tier models with dynamic model discovery.\"\nprovider_adapter = \"opencode-free\"\nmodel_source = \"opencode-free-models\"\ncredential_mode = \"none\"\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = false\nreasoning = true\nstructured_output = false\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"plugin-native\"]\n\n[permissions]\nnetwork_hosts = [\"opencode.ai\"]\ncredential_scopes = []\ncredential_read = false\n\n[limits]\nmemory = \"64MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"big-pickle\"\n",
+      "name": "install-missing-provider",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.opencode-free\"\nname = \"OpenCode Free\"\nversion = \"0.1.10\"\nplugin_api = \"2\"\n\n[provides]\nmodel_sources = [\"opencode-free-models\"]\nprovider_adapters = [\"opencode-free\"]\n\n[[integrations]]\nid = \"opencode-free\"\nname = \"OpenCode Free\"\ndescription = \"Use OpenCode's anonymous free-tier models with dynamic model discovery.\"\nprovider_adapter = \"opencode-free\"\nmodel_source = \"opencode-free-models\"\ncredential_mode = \"none\"\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = false\nreasoning = true\nstructured_output = false\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"plugin-native\"]\n\n[integrations.provider]\nbase_url = \"https://opencode.ai\"\nwire_format = \"plugin\"\nauth_scheme = \"bearer\"\nmodels_path = \"/zen/v1/models\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"opencode.ai\"]\ncredential_scopes = []\ncredential_read = false\n\n[limits]\nmemory = \"64MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \"big-pickle\"\n\n[integrations.install.account]\nname = \"Example account\"\n",
+      "name": "anonymous-account-proposal",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"manual\"\n\n[integrations.manual_credential]\nkind = \"api_key\"\nrequirements = [\"api_key\"]\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"example\"\nmodel = \" \"\n",
+      "name": "install-blank-model",
+      "plan_valid": false,
+      "valid": false
+    },
+    {
+      "baseline_valid": false,
+      "manifest": "manifest_version = 1\nid = \"dev.kinetix.ai-studio\"\nname = \"Google AI Studio\"\nversion = \"0.1.2\"\nplugin_api = \"1\"\n\n[provides]\naccount_model_sources = [\"ai-studio-models\"]\n\n[[integrations]]\nid = \"ai-studio\"\nname = \"Google AI Studio\"\ndescription = \"Use Google AI Studio with native Gemini transport and live model discovery.\"\nmodel_source = \"ai-studio-models\"\ncredential_mode = \"manual\"\n\n[integrations.manual_credential]\nkind = \"api_key\"\nrequirements = [\"api_key\"]\n\n[integrations.features]\nschema_version = 1\nstreaming = true\ntools = true\nparallel_tools = true\nvision = true\nreasoning = true\nstructured_output = true\nmodel_discovery = true\nquota_probe = false\nhealth_probe = false\n\n[integrations.protocols]\ninput = [\"openai-chat\", \"openai-responses\", \"anthropic\"]\nupstream = [\"gemini\"]\n\n[integrations.provider]\nbase_url = \"https://generativelanguage.googleapis.com/v1beta\"\nwire_format = \"gemini\"\nauth_scheme = \"custom_header\"\ncustom_header_name = \"x-goog-api-key\"\nmodels_path = \"/models?pageSize=1000\"\ntimeout_ms = 120000\ncapability_mode = \"permissive\"\nfollow_redirects = false\n\n[permissions]\nnetwork_hosts = [\"generativelanguage.googleapis.com\"]\ncredential_scopes = [\"*\"]\ncredential_read = true\n\n[limits]\nmemory = \"32MiB\"\nwall_time_ms = 10000\nmax_outbound_requests = 2\nmax_http_body = \"2MiB\"\nstorage = \"64KiB\"\n\n[integrations.install.account]\nname = \"Example account\"\n\n[[integrations.install.routes]]\nid = \"route/id\"\nmodel = \"gemini-2.5-flash\"\n",
+      "name": "install-invalid-route-id",
+      "plan_valid": false,
+      "valid": false
+    }
+  ],
+  "host_baseline": {
+    "includes_pr": 186,
+    "repository": "PrightCord/kinetix",
+    "revision": "2225239638b01417c2bf33f415f5d87d6812d382"
+  },
+  "schema_version": 1
+}
