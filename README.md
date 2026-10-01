@@ -286,6 +286,11 @@ Kinetix includes an embedded React admin dashboard for managing and inspecting:
 
 The dashboard is served directly by the Kinetix binary.
 
+The supported [Admin API](docs/admin-api.md) supplies structured errors, bounded
+collection pagination, and a generated machine-readable reference at
+`GET /admin/api/reference` or `kinetix api-reference`. Use `kinetix api` for the
+same HTTP contracts from the CLI.
+
 ## Security
 
 Kinetix handles upstream credentials and client API keys.

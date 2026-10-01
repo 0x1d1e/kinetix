@@ -188,7 +188,7 @@ async fn account_probe_uses_registered_plugin_adapter() {
             token: "test-admin".into(),
         },
         Path(account_id.clone()),
-        Json(TestBody {
+        kinetix::admin_contract::Json(TestBody {
             model: Some("probe-model".into()),
             account_id: None,
         }),

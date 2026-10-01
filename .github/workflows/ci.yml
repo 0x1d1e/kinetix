@@ -49,6 +49,9 @@ jobs:
       - name: Install
         run: npm ci
 
+      - name: Admin API client contract tests
+        run: npm test
+
       - name: Typecheck
         run: npx tsc --noEmit
 

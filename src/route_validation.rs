@@ -40,6 +40,7 @@ pub struct RouteValidationIssue {
     pub severity: &'static str,
     pub code: String,
     pub message: String,
+    pub field: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_index: Option<usize>,
 }
@@ -67,9 +68,11 @@ impl RouteValidation {
         target: Option<usize>,
     ) {
         self.valid = false;
+        let code = code.into();
         self.issues.push(RouteValidationIssue {
             severity: "error",
-            code: code.into(),
+            field: issue_field(&code, target),
+            code,
             message: message.into(),
             target_index: target,
         });
@@ -81,12 +84,42 @@ impl RouteValidation {
         message: impl Into<String>,
         target: Option<usize>,
     ) {
+        let code = code.into();
         self.issues.push(RouteValidationIssue {
             severity: "warning",
-            code: code.into(),
+            field: issue_field(&code, target),
+            code,
             message: message.into(),
             target_index: target,
         });
+    }
+}
+
+fn issue_field(code: &str, target: Option<usize>) -> String {
+    let field = match code {
+        "missing_route_name" | "duplicate_route_name" | "route_name_shadowed_by_alias" => "name",
+        "disabled_route" => "enabled",
+        "empty_route" => "targets",
+        "invalid_strategy" => "strategy",
+        "invalid_portability_policy" => "portability_policy",
+        "invalid_max_attempts" => "max_attempts",
+        "invalid_concurrency" => "max_concurrent_requests",
+        "invalid_fallback_trigger" | "invalid_fallback_triggers" => "fallback_triggers",
+        "invalid_param_overrides" => "param_overrides",
+        "invalid_predicate" | "unreachable_predicate" => "predicate",
+        "non_positive_weight" => "weight",
+        "missing_model" | "disabled_model" | "missing_provider" | "disabled_provider" => "model_id",
+        "missing_account"
+        | "account_provider_mismatch"
+        | "disabled_account"
+        | "account_temporarily_unavailable" => "account_id",
+        _ => "",
+    };
+    match target {
+        Some(index) if !field.is_empty() => format!("targets[{index}].{field}"),
+        Some(index) => format!("targets[{index}]"),
+        None if field.is_empty() => "$".into(),
+        None => field.into(),
     }
 }
 
@@ -745,6 +778,24 @@ mod tests {
             &mut result,
         );
         result
+    }
+
+    #[test]
+    fn validation_fields_identify_route_and_indexed_target_inputs() {
+        assert_eq!(issue_field("missing_route_name", None), "name");
+        assert_eq!(issue_field("invalid_strategy", None), "strategy");
+        assert_eq!(issue_field("missing_model", Some(2)), "targets[2].model_id");
+        assert_eq!(
+            issue_field("account_provider_mismatch", Some(1)),
+            "targets[1].account_id"
+        );
+        assert_eq!(
+            issue_field("unreachable_predicate", Some(0)),
+            "targets[0].predicate"
+        );
+        assert_eq!(issue_field("duplicate_target", Some(0)), "targets[0]");
+        assert_eq!(issue_field("empty_route", None), "targets");
+        assert_eq!(issue_field("alias_cycle", None), "$");
     }
 
     #[test]

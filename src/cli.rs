@@ -48,6 +48,10 @@ pub struct Cli {
 pub enum Command {
     /// Run the proxy server.
     Serve(ServeArgs),
+    /// Print the generated Admin API reference (no server or database required).
+    ApiReference,
+    /// Call the supported Admin API; prints its JSON contract unchanged.
+    Api(AdminApiArgs),
     /// First-run setup: create directories and print generated secrets.
     Init,
     /// Print configuration, paths, and control-plane counts.
@@ -78,6 +82,23 @@ pub enum Command {
     Backup(BackupArgs),
     /// Remove Kinetix state (config, database, exports, backups, logs).
     Uninstall(UninstallArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AdminApiArgs {
+    /// Admin API base URL, e.g. http://127.0.0.1:8080.
+    #[arg(long, env = "KINETIX_ADMIN_URL")]
+    pub url: String,
+    /// Admin password or session token (prefer the environment variable).
+    #[arg(long, env = "KINETIX_ADMIN_TOKEN", hide_env_values = true)]
+    pub token: String,
+    /// Path relative to /admin/api, including optional query parameters.
+    pub path: String,
+    #[arg(long, default_value = "GET", value_parser = ["GET", "POST", "PUT", "DELETE"])]
+    pub method: String,
+    /// JSON request body file.
+    #[arg(long)]
+    pub body: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -515,6 +536,14 @@ pub async fn run(cli: Cli) -> Result<()> {
     let bind = cli.bind.clone();
     let database_url = cli.database_url.clone();
     match cli.command.clone() {
+        Command::ApiReference => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::router::admin_routes().reference())?
+            );
+            Ok(())
+        }
+        Command::Api(args) => cmd_admin_api(args).await,
         Command::Serve(args) => {
             serve(ServeOpts {
                 home,
@@ -543,6 +572,56 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Backup(a) => cmd_backup(&cli, a).await,
         Command::Uninstall(a) => cmd_uninstall(&cli, a).await,
     }
+}
+
+async fn cmd_admin_api(args: AdminApiArgs) -> Result<()> {
+    let mut url = url::Url::parse(&args.url).context("invalid Admin API base URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("Admin API URL must use http/https without credentials, query, or fragment");
+    }
+    let path = args.path.trim_start_matches('/');
+    if path.contains('#') || path.starts_with("admin/api/") {
+        bail!("path must be relative to /admin/api without a fragment");
+    }
+    let (path, query) = path
+        .split_once('?')
+        .map_or((path, None), |(p, q)| (p, Some(q)));
+    url.set_path(&format!("/admin/api/{path}"));
+    url.set_query(query);
+    if !url.path().starts_with("/admin/api/") {
+        bail!("path must remain within /admin/api");
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let method = args.method.parse::<reqwest::Method>()?;
+    let mut request = client
+        .request(method, url)
+        .header("x-kinetix-admin-token", args.token);
+    if let Some(path) = args.body {
+        let bytes = tokio::fs::read(path)
+            .await
+            .context("reading JSON request body")?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).context("invalid JSON request body")?;
+        request = request.json(&body);
+    }
+    let response = request.send().await.context("Admin API request failed")?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        let error: crate::admin_contract::ErrorBody = serde_json::from_str(&text)
+            .context("server returned an unsupported Admin API error contract")?;
+        println!("{}", serde_json::to_string_pretty(&error)?);
+        bail!("Admin API request failed (HTTP {})", status.as_u16());
+    }
+    println!("{text}");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

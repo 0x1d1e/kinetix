@@ -10,7 +10,9 @@ use serde_json::{json, Value};
 const KEY_ENV: &str = "KINETIX_API_KEY";
 const KEY_PLACEHOLDER: &str = "sk-kinetix-<paste-your-key>";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientApp {
     Pi,

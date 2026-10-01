@@ -3,10 +3,10 @@
 
 use std::sync::atomic::Ordering;
 
-use axum::extract::{Path, Query, State};
+use crate::admin_contract::{FieldError, Json, ListQuery, Query};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::Json;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -32,22 +32,61 @@ use crate::types::{AuthScheme, Prices, ThinkingMap, WireFormat};
 
 type ApiResult = Result<Json<Value>, ApiError>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApiError(
     StatusCode,
     String,
     Option<crate::provider_work::ProviderBackoffEvidence>,
+    Vec<FieldError>,
 );
 
 impl ApiError {
+    fn new(
+        status: StatusCode,
+        message: String,
+        evidence: Option<crate::provider_work::ProviderBackoffEvidence>,
+    ) -> Self {
+        Self(status, message, evidence, vec![])
+    }
+
+    pub(crate) fn field(field: &str, message: &str) -> Self {
+        Self(
+            StatusCode::BAD_REQUEST,
+            "validation failed".into(),
+            None,
+            vec![crate::admin_contract::field(
+                field,
+                "invalid_value",
+                message,
+            )],
+        )
+    }
+
+    fn on_field(mut self, field: &str) -> Self {
+        self.3.push(crate::admin_contract::field(
+            field,
+            "invalid_value",
+            &self.1,
+        ));
+        self
+    }
+
+    fn fields(message: String, fields: Vec<FieldError>) -> Self {
+        Self(StatusCode::BAD_REQUEST, message, None, fields)
+    }
     fn bad(msg: impl Into<String>) -> Self {
-        ApiError(StatusCode::BAD_REQUEST, msg.into(), None)
+        ApiError::new(StatusCode::BAD_REQUEST, msg.into(), None)
     }
     fn not_found(msg: impl Into<String>) -> Self {
-        ApiError(StatusCode::NOT_FOUND, msg.into(), None)
+        ApiError::new(StatusCode::NOT_FOUND, msg.into(), None)
     }
-    fn internal(e: impl std::fmt::Display) -> Self {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), None)
+    pub(crate) fn internal(e: impl std::fmt::Display) -> Self {
+        tracing::error!(error = %crypto::redact(&e.to_string()), "Admin API operation failed");
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal server error".into(),
+            None,
+        )
     }
 
     fn with_provider_backoff(
@@ -61,7 +100,7 @@ impl ApiError {
 
 fn provider_work_acquire_error(error: crate::provider_work::ProviderWorkAcquireError) -> ApiError {
     match error {
-        crate::provider_work::ProviderWorkAcquireError::BackedOff(wait) => ApiError(
+        crate::provider_work::ProviderWorkAcquireError::BackedOff(wait) => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "provider work is temporarily backed off; retry in {}s",
@@ -77,7 +116,7 @@ fn provider_work_acquire_error(error: crate::provider_work::ProviderWorkAcquireE
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        crate::admin_contract::error_response(self.0, crypto::redact(&self.1), self.3)
     }
 }
 
@@ -85,7 +124,7 @@ impl IntoResponse for ApiError {
 // Auth / session
 // ===========================================================================
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct LoginBody {
     pub username: Option<String>,
     pub password: String,
@@ -99,7 +138,7 @@ pub async fn login(
     // Admin authentication is a control-plane action: if the store is
     // unavailable it must fail closed, not fall through (NFR-2.7).
     if !db_healthy(&state).await {
-        return Err(ApiError(
+        return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "admin authentication unavailable: control plane degraded".into(),
             None,
@@ -116,7 +155,7 @@ pub async fn login(
             "Rejected an admin login with an incorrect password.",
         )
         .await;
-        return Err(ApiError(
+        return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid admin password".into(),
             None,
@@ -165,7 +204,7 @@ pub async fn logout(State(state): State<AppState>, jar: CookieJar) -> (CookieJar
 /// `POST /admin/api/password` — change the dashboard password. Requires the
 /// current password (so a hijacked session cannot silently rotate it), stores a
 /// hash, and revokes every session including the caller's.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct PasswordBody {
     current_password: String,
     new_password: String,
@@ -187,17 +226,16 @@ pub async fn change_password(
             "Rejected a password change: current password incorrect.",
         )
         .await;
-        return Err(ApiError(
+        return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "current password is incorrect".into(),
             None,
         ));
     }
     if body.new_password.trim().len() < 8 {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "new password must be at least 8 characters".into(),
-            None,
+        return Err(ApiError::field(
+            "new_password",
+            "must be at least 8 characters",
         ));
     }
     auth::set_admin_password(&state, &body.new_password)
@@ -253,7 +291,7 @@ async fn effective_public_base_url(state: &AppState) -> Result<String, ApiError>
         .unwrap_or_else(|| state.config.public_base_url.clone()))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct PublicBaseUrlBody {
     pub public_base_url: String,
 }
@@ -489,7 +527,7 @@ async fn run_model_lifecycle_lane(
     match result {
         Ok(payload) => Ok(payload.as_ref().clone()),
         Err(error) => match error.as_ref() {
-            crate::provider_work::ProviderWorkError::BackedOff(wait) => Err(ApiError(
+            crate::provider_work::ProviderWorkError::BackedOff(wait) => Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
                     "provider work is temporarily backed off; retry in {}s",
@@ -497,9 +535,7 @@ async fn run_model_lifecycle_lane(
                 ),
                 None,
             )),
-            crate::provider_work::ProviderWorkError::Operation(error) => {
-                Err(ApiError(error.0, error.1.clone(), error.2))
-            }
+            crate::provider_work::ProviderWorkError::Operation(error) => Err(error.clone()),
             crate::provider_work::ProviderWorkError::Aborted => Err(ApiError::internal(
                 "provider work coordinator stopped before completion",
             )),
@@ -606,7 +642,7 @@ async fn model_lifecycle_settings(state: &AppState) -> Result<ModelLifecycleSett
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ModelLifecycleSettingsBody {
     #[serde(default)]
     pub reconciliation_interval_secs: Option<u64>,
@@ -928,7 +964,7 @@ pub async fn test_stream(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct TestStreamBody {
     pub key_id: String,
     pub model: String,
@@ -999,7 +1035,7 @@ pub async fn overview(State(state): State<AppState>, _auth: AdminAuth) -> ApiRes
     })))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RuntimeHealthQuery {
     pub window: Option<String>,
 }
@@ -1117,10 +1153,17 @@ pub async fn runtime_health(
 // Virtual keys
 // ===========================================================================
 
-pub async fn list_keys(State(state): State<AppState>, _auth: AdminAuth) -> ApiResult {
-    let keys = db::list_virtual_keys(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+pub async fn list_keys(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Query(query): Query<ListQuery>,
+) -> ApiResult {
+    let (keys, page) = crate::admin_contract::storage::page::<db::VirtualKeyRow>(
+        &state.pool,
+        crate::admin_contract::storage::Collection::Keys,
+        &query,
+    )
+    .await?;
     let (by_key, _) = db::lifetime_totals(&state.pool)
         .await
         .map_err(ApiError::internal)?;
@@ -1130,7 +1173,7 @@ pub async fn list_keys(State(state): State<AppState>, _auth: AdminAuth) -> ApiRe
         let (requests, tokens) = by_key.get(&k.id).copied().unwrap_or((0, 0));
         out.push(key_json(&k, daily, monthly, requests, tokens));
     }
-    Ok(Json(json!({ "keys": out })))
+    Ok(Json(json!({ "keys": out, "page": page })))
 }
 
 fn key_json(
@@ -1177,7 +1220,7 @@ async fn key_for_client_profile(state: &AppState, id: &str) -> Result<db::Virtua
 }
 
 fn profile_policy_error(error: crate::types::ProxyError) -> ApiError {
-    ApiError(
+    ApiError::new(
         StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
         error.message,
         None,
@@ -1199,7 +1242,7 @@ pub async fn client_profile_models(
     Ok(Json(json!({ "models": models })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct GenerateClientProfileBody {
     pub key_id: String,
     pub client: crate::client_profiles::ClientApp,
@@ -1223,7 +1266,7 @@ pub async fn generate_client_profile(
         .into_iter()
         .find(|model| model.id == body.model)
         .ok_or_else(|| {
-            ApiError(
+            ApiError::new(
                 StatusCode::FORBIDDEN,
                 "selected model or Route is not currently available to this key".into(),
                 None,
@@ -1265,7 +1308,7 @@ pub async fn generate_client_profile(
     Ok(response)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct CreateKeyBody {
     pub name: String,
     pub owner: String,
@@ -1293,8 +1336,9 @@ pub async fn create_key(
     Json(body): Json<CreateKeyBody>,
 ) -> ApiResult {
     if body.max_concurrent_requests.is_some_and(|limit| limit < 0) {
-        return Err(ApiError::bad(
-            "max_concurrent_requests must be positive or zero for unlimited",
+        return Err(ApiError::field(
+            "max_concurrent_requests",
+            "must be positive or zero for unlimited",
         ));
     }
     let full_key = crypto::generate_virtual_key();
@@ -1344,7 +1388,7 @@ pub async fn create_key(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct UpdateKeyBody {
     pub status: Option<String>,
     pub name: Option<String>,
@@ -1370,8 +1414,9 @@ pub async fn update_key(
     Json(body): Json<UpdateKeyBody>,
 ) -> ApiResult {
     if body.max_concurrent_requests.is_some_and(|limit| limit < 0) {
-        return Err(ApiError::bad(
-            "max_concurrent_requests must be positive or zero for unlimited",
+        return Err(ApiError::field(
+            "max_concurrent_requests",
+            "must be positive or zero for unlimited",
         ));
     }
     if let Some(status) = &body.status {
@@ -1493,10 +1538,17 @@ pub async fn get_provider(
     Ok(Json(provider_json_with_enrollment(&state, &p).await))
 }
 
-pub async fn list_providers(State(state): State<AppState>, _auth: AdminAuth) -> ApiResult {
-    let providers = db::list_providers(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+pub async fn list_providers(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Query(query): Query<ListQuery>,
+) -> ApiResult {
+    let (providers, page) = crate::admin_contract::storage::page::<db::ProviderRow>(
+        &state.pool,
+        crate::admin_contract::storage::Collection::Providers,
+        &query,
+    )
+    .await?;
     let accounts = db::list_accounts(&state.pool)
         .await
         .map_err(ApiError::internal)?;
@@ -1517,7 +1569,7 @@ pub async fn list_providers(State(state): State<AppState>, _auth: AdminAuth) -> 
         v["healthy_accounts"] = json!(healthy_accounts);
         out.push(v);
     }
-    Ok(Json(json!({ "providers": out })))
+    Ok(Json(json!({ "providers": out, "page": page })))
 }
 
 /// Full provider configuration (used by both the list and single-provider
@@ -1537,7 +1589,7 @@ fn provider_json(p: &db::ProviderRow) -> Value {
         "auth_scheme": p.auth_scheme,
         "custom_header_name": p.custom_header_name,
         "custom_param_name": p.custom_param_name,
-        "extra_headers": p.extra_headers_map(),
+        "extra_headers": crate::admin_contract::redact_headers(&p.extra_headers_map()),
         "timeout_ms": p.timeout_ms,
         "capability_mode": p.capability_mode,
         "models_path": p.models_path,
@@ -1602,7 +1654,7 @@ async fn provider_json_with_enrollment(state: &AppState, p: &db::ProviderRow) ->
     value
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ProviderBody {
     pub name: String,
     pub base_url: String,
@@ -1612,7 +1664,7 @@ pub struct ProviderBody {
     pub custom_header_name: Option<String>,
     pub custom_param_name: Option<String>,
     #[serde(default)]
-    pub extra_headers: serde_json::Map<String, Value>,
+    pub extra_headers: std::collections::BTreeMap<String, String>,
     #[serde(default = "default_timeout")]
     pub timeout_ms: i64,
     #[serde(default = "default_permissive")]
@@ -1648,6 +1700,37 @@ pub struct ProviderBody {
 fn default_bearer() -> String {
     "bearer".into()
 }
+fn restore_redacted_headers(
+    headers: &mut std::collections::BTreeMap<String, String>,
+    existing: Option<&db::ProviderRow>,
+) -> Result<(), ApiError> {
+    let stored = existing
+        .map(db::ProviderRow::extra_headers_map)
+        .unwrap_or_default();
+    for (name, value) in headers.iter_mut() {
+        if value == crate::admin_contract::REDACTED {
+            let secret = stored.get(name).ok_or_else(|| {
+                ApiError::field("extra_headers", "redacted placeholder has no stored value")
+            })?;
+            *value = secret.clone();
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_fields(body: &ProviderBody) -> Result<(), ApiError> {
+    if WireFormat::parse(&body.wire_format).is_none() {
+        return Err(ApiError::field("wire_format", "unsupported wire format"));
+    }
+    if AuthScheme::parse(&body.auth_scheme).is_none() {
+        return Err(ApiError::field(
+            "auth_scheme",
+            "unsupported authentication scheme",
+        ));
+    }
+    Ok(())
+}
+
 fn default_timeout() -> i64 {
     120_000
 }
@@ -1732,9 +1815,11 @@ async fn provider_plugin_binding_problems(state: &AppState, body: &ProviderBody)
 pub async fn create_provider(
     State(state): State<AppState>,
     _auth: AdminAuth,
-    Json(body): Json<ProviderBody>,
+    Json(mut body): Json<ProviderBody>,
 ) -> ApiResult {
-    validate_outbound_url(&state, &body.base_url)?;
+    restore_redacted_headers(&mut body.extra_headers, None)?;
+    validate_provider_fields(&body)?;
+    validate_outbound_url(&state, &body.base_url).map_err(|error| error.on_field("base_url"))?;
     let binding_problems = provider_plugin_binding_problems(&state, &body).await;
     if !binding_problems.is_empty() {
         return Err(ApiError::bad(binding_problems.join("; ")));
@@ -1778,7 +1863,7 @@ pub async fn create_provider(
             auth_scheme: auth,
             custom_header_name: body.custom_header_name.as_deref(),
             custom_param_name: body.custom_param_name.as_deref(),
-            extra_headers: Value::Object(body.extra_headers),
+            extra_headers: json!(body.extra_headers),
             timeout_ms: body.timeout_ms,
             capability_mode: &body.capability_mode,
             models_path: body.models_path.as_deref(),
@@ -1998,15 +2083,17 @@ pub async fn update_provider(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Path(id): Path<String>,
-    Json(body): Json<ProviderBody>,
+    Json(mut body): Json<ProviderBody>,
 ) -> ApiResult {
-    validate_outbound_url(&state, &body.base_url)?;
+    validate_provider_fields(&body)?;
+    validate_outbound_url(&state, &body.base_url).map_err(|error| error.on_field("base_url"))?;
     let lock = model_reconciliation_lock(&id);
     let _guard = lock.lock().await;
     let existing = db::get_provider(&state.pool, &id)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
+    restore_redacted_headers(&mut body.extra_headers, Some(&existing))?;
     if body
         .api_key
         .as_deref()
@@ -2114,7 +2201,7 @@ pub async fn update_provider(
         auth_scheme: auth,
         custom_header_name: body.custom_header_name.as_deref(),
         custom_param_name: body.custom_param_name.as_deref(),
-        extra_headers: Value::Object(body.extra_headers),
+        extra_headers: json!(body.extra_headers),
         timeout_ms: body.timeout_ms,
         capability_mode: &body.capability_mode,
         models_path: body.models_path.as_deref(),
@@ -4029,7 +4116,7 @@ pub async fn reconcile_models(
         .map(Json)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ReconciliationActionBody {
     pub action: String,
     #[serde(default)]
@@ -5658,14 +5745,14 @@ async fn read_probe_preview(resp: reqwest::Response, sse: bool) -> String {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct TestBody {
     pub model: Option<String>,
     #[serde(default)]
     pub account_id: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct CapabilityProbeBody {
     #[serde(default)]
     pub account_id: Option<String>,
@@ -8084,10 +8171,10 @@ pub async fn probe_model_capability(
         Ok(exchange) => exchange,
         Err(error) => match error.as_ref() {
             crate::provider_work::ProviderWorkError::Operation(error) => {
-                return Err(ApiError(error.0, error.1.clone(), error.2));
+                return Err(error.clone());
             }
             crate::provider_work::ProviderWorkError::BackedOff(wait) => {
-                return Err(ApiError(
+                return Err(ApiError::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!(
                         "provider work is temporarily backed off; retry in {}s",
@@ -8308,18 +8395,25 @@ pub async fn test_account(
 // Models
 // ===========================================================================
 
-pub async fn list_models(State(state): State<AppState>, _auth: AdminAuth) -> ApiResult {
-    let models = db::list_models(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+pub async fn list_models(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Query(query): Query<ListQuery>,
+) -> ApiResult {
+    let (models, page) = crate::admin_contract::storage::page::<db::ModelRow>(
+        &state.pool,
+        crate::admin_contract::storage::Collection::Models,
+        &query,
+    )
+    .await?;
     let providers = db::list_providers(&state.pool)
         .await
         .map_err(ApiError::internal)?;
     let out: Vec<Value> = models.iter().map(|m| model_json(m, &providers)).collect();
-    Ok(Json(json!({ "models": out })))
+    Ok(Json(json!({ "models": out, "page": page })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ModelObservationsQuery {
     pub limit: Option<i64>,
     pub cursor: Option<String>,
@@ -8434,7 +8528,7 @@ fn model_json(m: &db::ModelRow, providers: &[db::ProviderRow]) -> Value {
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ModelBody {
     pub upstream_id: String,
     pub display_name: Option<String>,
@@ -9046,25 +9140,19 @@ pub async fn delete_model(
 // Accounts
 // ===========================================================================
 
-#[derive(Deserialize)]
-pub struct AccountListQuery {
-    pub provider_id: Option<String>,
-}
+pub type AccountListQuery = ListQuery;
 
 pub async fn list_accounts(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Query(query): Query<AccountListQuery>,
 ) -> ApiResult {
-    let accounts = if let Some(provider_id) = query.provider_id.as_deref() {
-        db::list_accounts_for_provider(&state.pool, provider_id)
-            .await
-            .map_err(ApiError::internal)?
-    } else {
-        db::list_accounts(&state.pool)
-            .await
-            .map_err(ApiError::internal)?
-    };
+    let (accounts, page) = crate::admin_contract::storage::page::<db::AccountRow>(
+        &state.pool,
+        crate::admin_contract::storage::Collection::Accounts,
+        &query,
+    )
+    .await?;
     let providers = db::list_providers(&state.pool)
         .await
         .map_err(ApiError::internal)?;
@@ -9073,19 +9161,12 @@ pub async fn list_accounts(
         .map_err(ApiError::internal)?;
     let out: Vec<Value> = accounts
         .iter()
-        .filter(|a| {
-            providers
-                .iter()
-                .find(|p| p.id == a.provider_id)
-                .map(|p| !(p.credential_mode == "none" && a.label == "__kinetix_noauth__"))
-                .unwrap_or(true)
-        })
         .map(|a| {
             let (requests, tokens) = by_account.get(&a.id).copied().unwrap_or((0, 0));
             account_json(a, &providers, requests, tokens)
         })
         .collect();
-    Ok(Json(json!({ "accounts": out })))
+    Ok(Json(json!({ "accounts": out, "page": page })))
 }
 
 fn account_json(
@@ -9123,7 +9204,7 @@ fn account_json(
     })
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct AccountBody {
     pub provider_id: String,
     pub label: String,
@@ -9170,7 +9251,7 @@ pub async fn create_account(
         .api_key
         .clone()
         .filter(|k| !k.trim().is_empty())
-        .ok_or_else(|| ApiError::bad("api_key is required"))?;
+        .ok_or_else(|| ApiError::field("api_key", "is required"))?;
     let enc = state.crypto.encrypt(&api_key).map_err(ApiError::internal)?;
     let id = db::insert_account(
         &state.pool,
@@ -9214,8 +9295,9 @@ pub async fn update_account(
         .as_deref()
         .is_some_and(|status| !matches!(status, "healthy" | "disabled"))
     {
-        return Err(ApiError::bad(
-            "account status must be either healthy or disabled",
+        return Err(ApiError::field(
+            "status",
+            "must be either healthy or disabled",
         ));
     }
     // Validate and prepare credential rotation before applying any account
@@ -9335,10 +9417,17 @@ pub async fn delete_account(
 // Routes
 // ===========================================================================
 
-pub async fn list_routes(State(state): State<AppState>, _auth: AdminAuth) -> ApiResult {
-    let routes = db::list_routes(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+pub async fn list_routes(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Query(query): Query<ListQuery>,
+) -> ApiResult {
+    let (routes, page) = crate::admin_contract::storage::page::<db::RouteRow>(
+        &state.pool,
+        crate::admin_contract::storage::Collection::Routes,
+        &query,
+    )
+    .await?;
     let accounts = db::list_accounts(&state.pool)
         .await
         .map_err(ApiError::internal)?;
@@ -9384,10 +9473,10 @@ pub async fn list_routes(State(state): State<AppState>, _auth: AdminAuth) -> Api
             "targets": targets_json,
         }));
     }
-    Ok(Json(json!({ "routes": out })))
+    Ok(Json(json!({ "routes": out, "page": page })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct RouteBody {
     pub name: String,
     #[serde(default)]
@@ -9442,17 +9531,29 @@ fn route_validation_config(body: &RouteBody, id: Option<&str>) -> route_validati
     }
 }
 
-fn validate_route_structure(body: &RouteBody) -> Result<(), ApiError> {
-    let validation = route_validation::validate_structure(&route_validation_config(body, None));
-    if !validation.valid {
-        let errors = validation
+fn route_validation_error(validation: &route_validation::RouteValidation) -> ApiError {
+    let errors = validation
+        .issues
+        .iter()
+        .filter(|issue| issue.severity == "error")
+        .map(|issue| format!("{}: {}", issue.code, issue.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    ApiError::fields(
+        format!("Route validation failed: {errors}"),
+        validation
             .issues
             .iter()
             .filter(|issue| issue.severity == "error")
-            .map(|issue| format!("{}: {}", issue.code, issue.message))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(ApiError::bad(format!("Route validation failed: {errors}")));
+            .map(|issue| crate::admin_contract::field(&issue.field, &issue.code, &issue.message))
+            .collect(),
+    )
+}
+
+fn validate_route_structure(body: &RouteBody) -> Result<(), ApiError> {
+    let validation = route_validation::validate_structure(&route_validation_config(body, None));
+    if !validation.valid {
+        return Err(route_validation_error(&validation));
     }
     Ok(())
 }
@@ -9466,19 +9567,12 @@ async fn validate_route_body(
         .await
         .map_err(ApiError::internal)?;
     if !validation.valid {
-        let errors = validation
-            .issues
-            .iter()
-            .filter(|issue| issue.severity == "error")
-            .map(|issue| format!("{}: {}", issue.code, issue.message))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(ApiError::bad(format!("Route validation failed: {errors}")));
+        return Err(route_validation_error(&validation));
     }
     Ok(validation)
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, schemars::JsonSchema)]
 pub struct RouteTargetBody {
     pub account_id: Option<String>,
     pub model_id: String,
@@ -9642,7 +9736,7 @@ pub async fn delete_route(
 
 /// `POST /admin/api/routes/validate`: validate proposed Route configuration
 /// against persisted provider, account, model, plugin, and alias metadata.
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ProposedRouteBody {
     /// Existing Route id to exclude from duplicate-name checks during updates.
     #[serde(default)]
@@ -9667,7 +9761,7 @@ pub async fn validate_route_config(
 
 /// `POST /admin/api/routes/dry-run` (FR-8.7): evaluate routing for a
 /// representative request descriptor without mutating anything.
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct DryRunBody {
     pub model: String,
     #[serde(flatten, default)]
@@ -9688,7 +9782,7 @@ pub async fn dry_run_route(
 /// `POST /admin/api/validate` (FR-8.6): validate a provider endpoint (schema,
 /// TLS/SSRF, credential-host binding) and, optionally, connectivity + resolved
 /// IP/ASN. Never mutates production state.
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ValidateBody {
     pub base_url: String,
     #[serde(default)]
@@ -9721,7 +9815,7 @@ pub async fn validate_provider(
     } else {
         match validate_outbound_url(&state, &body.base_url) {
             Ok(()) => security = Value::String("passed".into()),
-            Err(ApiError(_, msg, _)) => problems.push(msg),
+            Err(ApiError(_, msg, _, _)) => problems.push(msg),
         }
     }
     if body.wire_format == "anthropic"
@@ -9876,10 +9970,17 @@ pub async fn validate_endpoint(
 // Aliases
 // ===========================================================================
 
-pub async fn list_aliases(State(state): State<AppState>, _auth: AdminAuth) -> ApiResult {
-    let aliases = db::list_aliases(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+pub async fn list_aliases(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Query(query): Query<ListQuery>,
+) -> ApiResult {
+    let (aliases, page) = crate::admin_contract::storage::page::<db::AliasRow>(
+        &state.pool,
+        crate::admin_contract::storage::Collection::Aliases,
+        &query,
+    )
+    .await?;
     let models = db::list_models(&state.pool)
         .await
         .map_err(ApiError::internal)?;
@@ -9910,10 +10011,10 @@ pub async fn list_aliases(State(state): State<AppState>, _auth: AdminAuth) -> Ap
             })
         })
         .collect();
-    Ok(Json(json!({ "aliases": out })))
+    Ok(Json(json!({ "aliases": out, "page": page })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct AliasBody {
     pub alias: String,
     pub target_type: String,
@@ -9974,29 +10075,26 @@ pub async fn delete_alias(
 // Usage / requests / audit
 // ===========================================================================
 
-#[derive(Deserialize)]
-pub struct LimitQuery {
-    #[serde(default = "default_limit")]
-    pub limit: i64,
-}
-
-fn default_limit() -> i64 {
-    200
-}
+pub type LimitQuery = ListQuery;
 
 pub async fn usage(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Query(q): Query<LimitQuery>,
 ) -> ApiResult {
-    let rows = db::recent_usage(&state.pool, q.limit.min(2000))
-        .await
-        .map_err(ApiError::internal)?;
+    let (rows, page) = crate::admin_contract::storage::page::<db::UsageLogRow>(
+        &state.pool,
+        crate::admin_contract::storage::Collection::Usage,
+        &q,
+    )
+    .await?;
     let summary = db::usage_summary(&state.pool)
         .await
         .map_err(ApiError::internal)?;
     let out: Vec<Value> = rows.iter().map(usage_json).collect();
-    Ok(Json(json!({ "usage": out, "summary": summary })))
+    Ok(Json(
+        json!({ "usage": out, "summary": summary, "page": page }),
+    ))
 }
 
 fn usage_json(u: &db::UsageLogRow) -> Value {
@@ -10167,7 +10265,7 @@ pub async fn list_exports(State(state): State<AppState>, _auth: AdminAuth) -> Ap
     })))
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub struct ExportDayBody {
     /// `YYYY-MM-DD`; defaults to yesterday (UTC) when omitted.
     #[serde(default)]
@@ -10233,9 +10331,12 @@ pub async fn audit(
     _auth: AdminAuth,
     Query(q): Query<LimitQuery>,
 ) -> ApiResult {
-    let rows = db::recent_audit(&state.pool, q.limit.min(2000))
-        .await
-        .map_err(ApiError::internal)?;
+    let (rows, page) = crate::admin_contract::storage::page::<db::AuditLogRow>(
+        &state.pool,
+        crate::admin_contract::storage::Collection::Audit,
+        &q,
+    )
+    .await?;
     let out: Vec<Value> = rows
         .iter()
         .map(|a| {
@@ -10251,7 +10352,7 @@ pub async fn audit(
             })
         })
         .collect();
-    Ok(Json(json!({ "audit": out })))
+    Ok(Json(json!({ "audit": out, "page": page })))
 }
 
 /// Prometheus-format metrics (NFR-4.2).
@@ -11059,14 +11160,14 @@ fn filter_imported_ownership_pricing_for_scope(
     (effective, filtered, suppressed)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct CredentialExportBody {
     #[serde(default)]
     pub include_secrets: bool,
     pub passphrase: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct CredentialImportBody {
     pub bundle: Value,
     pub passphrase: Option<String>,
@@ -12000,7 +12101,7 @@ pub async fn import_credentials(
     Ok(no_store_json(response))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ExportQuery {
     /// Include encrypted credential blobs (still ciphertext, still keyed by the
     /// master key). Off by default so exports are safe to share.
@@ -12089,7 +12190,7 @@ where
             "auth_scheme": p.auth_scheme,
             "custom_header_name": p.custom_header_name,
             "custom_param_name": p.custom_param_name,
-            "extra_headers": serde_json::from_str::<Value>(&p.extra_headers).unwrap_or(json!({})),
+            "extra_headers": if include_secrets { serde_json::from_str::<Value>(&p.extra_headers).unwrap_or(json!({})) } else { crate::admin_contract::redact_headers(&p.extra_headers_map()) },
             "timeout_ms": p.timeout_ms,
             "capability_mode": p.capability_mode,
             "models_path": p.models_path,
@@ -12724,7 +12825,7 @@ fn validate_imported_integration_bindings(
     Ok(())
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, schemars::JsonSchema)]
 pub struct ImportBody {
     pub config: Value,
     /// When false (default) only plan the changes and return them.
@@ -13023,6 +13124,23 @@ async fn import_config_apply(
         let existing_provider = existing_providers
             .iter()
             .find(|provider| provider.name == name);
+        if p["extra_headers"].is_object() {
+            match serde_json::from_value::<std::collections::BTreeMap<String, String>>(
+                p["extra_headers"].clone(),
+            ) {
+                Ok(mut headers) => {
+                    if let Err(error) = restore_redacted_headers(&mut headers, existing_provider) {
+                        problems.push(format!(
+                            "provider '{name}': extra_headers: {}",
+                            error.3[0].message
+                        ));
+                    }
+                }
+                Err(_) => problems.push(format!(
+                    "provider '{name}': extra_headers values must be strings"
+                )),
+            }
+        }
         let source_plugin_id = if p.get("source_plugin_id").is_some() {
             p["source_plugin_id"].as_str()
         } else {
@@ -13961,7 +14079,18 @@ async fn import_config_apply(
             .ok_or_else(|| ApiError::bad("invalid wire_format"))?;
         let auth = AuthScheme::parse(p["auth_scheme"].as_str().unwrap_or("bearer"))
             .unwrap_or(AuthScheme::Bearer);
-        let extra_headers = p["extra_headers"].clone();
+        let mut extra_headers = p["extra_headers"].clone();
+        if extra_headers.is_object() {
+            let mut headers = serde_json::from_value(extra_headers)
+                .map_err(|_| ApiError::field("extra_headers", "values must be strings"))?;
+            restore_redacted_headers(
+                &mut headers,
+                existing_providers
+                    .iter()
+                    .find(|provider| provider.name == name),
+            )?;
+            extra_headers = json!(headers);
+        }
         let rate_limit_rules = p["rate_limit_rules"].clone();
         let timeout_ms = p["timeout_ms"].as_i64().unwrap_or(120_000);
         let capability_mode = p["capability_mode"].as_str().unwrap_or("permissive");
@@ -14681,7 +14810,7 @@ async fn import_config_apply(
 // Plugins
 // ===========================================================================
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct PluginInstallBody {
     /// Base64-encoded `.kxp` package (dashboard/API upload).
     #[serde(default)]
@@ -14711,7 +14840,7 @@ fn plugin_manager(
     state: &AppState,
 ) -> Result<&std::sync::Arc<crate::plugins::PluginManager>, ApiError> {
     state.plugin_manager().ok_or_else(|| {
-        ApiError(
+        ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "plugin host is not available".into(),
             None,
@@ -15350,7 +15479,7 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
     }
 }
 
-#[derive(Debug, serde::Deserialize, Default)]
+#[derive(Debug, serde::Deserialize, Default, schemars::JsonSchema)]
 pub struct PluginCatalogQuery {
     #[serde(default)]
     pub q: Option<String>,
@@ -15731,7 +15860,7 @@ pub async fn plugin_settings(
     Ok(Json(settings))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct PluginSettingsBody {
     #[serde(default)]
     pub values: serde_json::Map<String, Value>,
@@ -16120,7 +16249,7 @@ pub async fn start_provider_credential_enrollment(
     .await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct PluginAuthStartBody {
     pub plugin_id: String,
     pub flow_name: String,
@@ -16605,7 +16734,7 @@ pub async fn start_plugin_auth(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct PluginAuthCallbackQuery {
     pub state: String,
     pub code: Option<String>,
@@ -16909,6 +17038,7 @@ pub async fn plugin_auth_callback(
             StatusCode::SERVICE_UNAVAILABLE,
             "plugin account authorization unavailable: control plane degraded".into(),
             None,
+            vec![],
         ));
     }
 
@@ -16939,7 +17069,7 @@ pub async fn plugin_auth_callback(
     Ok(Redirect::to(&format!("/admin/plugins?{query}")))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct PluginAuthStatusQuery {
     pub state: String,
 }
@@ -16959,7 +17089,7 @@ pub async fn plugin_auth_status(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct PluginAuthManualCallbackBody {
     pub callback_url: String,
 }
@@ -16979,6 +17109,7 @@ pub async fn complete_plugin_auth_manual(
             StatusCode::SERVICE_UNAVAILABLE,
             "plugin account authorization unavailable: control plane degraded".into(),
             None,
+            vec![],
         ));
     }
 
@@ -17095,7 +17226,7 @@ pub async fn reinstall_plugin_package(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct PluginRollbackBody {
     pub sha256: String,
 }
@@ -17103,7 +17234,7 @@ pub struct PluginRollbackBody {
 /// Optional subset approval for `POST /plugins/{id}/permissions/approve`. With
 /// no fields the full declared set is approved (back-compat); with fields the
 /// granted scope is exactly what is requested (a subset of the manifest).
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct PluginPermissionApprovalBody {
     #[serde(default)]
     pub network_hosts: Option<Vec<String>>,
@@ -20625,7 +20756,7 @@ mod credential_enrollment_regression_tests {
             auth_scheme: "bearer".into(),
             custom_header_name: None,
             custom_param_name: None,
-            extra_headers: serde_json::Map::new(),
+            extra_headers: Default::default(),
             timeout_ms: 1_000,
             capability_mode: "permissive".into(),
             models_path: None,
@@ -20998,7 +21129,7 @@ mod credential_enrollment_regression_tests {
                 .unwrap(),
         );
 
-        let axum::Json(account_result) = delete_account(
+        let Json(account_result) = delete_account(
             axum::extract::State(state.clone()),
             auth(),
             Path(account_id.clone()),
@@ -21067,7 +21198,7 @@ mod credential_enrollment_regression_tests {
             .await
             .is_err());
 
-        let axum::Json(provider_result) = delete_provider(
+        let Json(provider_result) = delete_provider(
             axum::extract::State(state.clone()),
             auth(),
             Path(provider_id.clone()),
@@ -24110,6 +24241,7 @@ mod credential_enrollment_regression_tests {
             auth(),
             Query(AccountListQuery {
                 provider_id: Some(provider_id),
+                ..Default::default()
             }),
         )
         .await

@@ -594,8 +594,7 @@ export const Kinetix = {
 
   // --- virtual keys --------------------------------------------------------
   async keys(): Promise<VirtualKey[]> {
-    const r = await api.get<{ keys: any[] }>('/admin/api/keys');
-    return r.keys.map(mapKey);
+    return (await api.collection<any>('/admin/api/keys', 'keys')).map(mapKey);
   },
   async createKey(body: CreateKeyInput): Promise<{ key: VirtualKey; fullKey: string }> {
     const r = await api.post<{ key: any; full_key: string }>('/admin/api/keys', body);
@@ -614,8 +613,7 @@ export const Kinetix = {
 
   // --- providers -----------------------------------------------------------
   async providers(): Promise<Provider[]> {
-    const r = await api.get<{ providers: any[] }>('/admin/api/providers');
-    return r.providers.map(mapProvider);
+    return (await api.collection<any>('/admin/api/providers', 'providers')).map(mapProvider);
   },
   createProvider: (body: Record<string, unknown>) => api.post('/admin/api/providers', body),
   async getProvider(id: string): Promise<Provider> {
@@ -649,8 +647,7 @@ export const Kinetix = {
 
   // --- models --------------------------------------------------------------
   async models(): Promise<ModelConfig[]> {
-    const r = await api.get<{ models: any[] }>('/admin/api/models');
-    return r.models.map(mapModel);
+    return (await api.collection<any>('/admin/api/models', 'models')).map(mapModel);
   },
   createModel: (providerId: string, body: Record<string, unknown>) =>
     api.post(`/admin/api/providers/${providerId}/models`, body),
@@ -682,8 +679,7 @@ export const Kinetix = {
     );
   },
   async accounts(): Promise<Account[]> {
-    const r = await api.get<{ accounts: any[] }>('/admin/api/accounts');
-    return r.accounts.map(mapAccount);
+    return (await api.collection<any>('/admin/api/accounts', 'accounts')).map(mapAccount);
   },
   async validateAccount(body: Record<string, unknown>) {
     return api.post<{ valid: boolean; problems: string[] }>('/admin/api/validate/account', body);
@@ -708,8 +704,7 @@ export const Kinetix = {
 
   // --- routes --------------------------------------------------------------
   async routes(): Promise<Route[]> {
-    const r = await api.get<{ routes: any[] }>('/admin/api/routes');
-    return r.routes.map(mapRoute);
+    return (await api.collection<any>('/admin/api/routes', 'routes')).map(mapRoute);
   },
   createRoute: (body: RouteConfigInput) => api.post('/admin/api/routes', body),
   updateRoute: (id: string, body: RouteConfigInput) => api.put(`/admin/api/routes/${id}`, body),
@@ -721,8 +716,7 @@ export const Kinetix = {
 
   // --- aliases -------------------------------------------------------------
   async aliases(): Promise<ModelAlias[]> {
-    const r = await api.get<{ aliases: any[] }>('/admin/api/aliases');
-    return r.aliases.map(mapAlias);
+    return (await api.collection<any>('/admin/api/aliases', 'aliases')).map(mapAlias);
   },
   createAlias: (body: Record<string, unknown>) => api.post('/admin/api/aliases', body),
   deleteAlias: (id: string) => api.del(`/admin/api/aliases/${id}`),

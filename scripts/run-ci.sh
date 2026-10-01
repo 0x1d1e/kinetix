@@ -90,6 +90,7 @@ dashboard_job() {
   (
     cd dashboard || exit 1
     run_step "npm ci" npm ci &&
+      run_step "dashboard contract tests" npm test &&
       run_step "tsc --noEmit" npx tsc --noEmit &&
       run_step "npm run build" npm run build
   )
