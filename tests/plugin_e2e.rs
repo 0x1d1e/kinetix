@@ -1120,6 +1120,15 @@ async fn api_v1_and_api_v2_legacy_host_imports_coexist_with_opaque_session_conte
     )
     .await
     .unwrap();
+    kinetix::plugins::store::kv_put(
+        &pool,
+        &Crypto::new(&[7u8; 32]),
+        API2_ID,
+        "project:account_fixture",
+        b"legacy-project-read",
+    )
+    .await
+    .unwrap();
 
     // API-v1 executes through its unchanged session-unaware exports. The
     // host-side context must not alter what the API-v1 guest receives.
@@ -1233,6 +1242,8 @@ async fn api_v1_and_api_v2_legacy_host_imports_coexist_with_opaque_session_conte
     };
     let first = adapter.build_body(&context, &request).unwrap();
     assert_eq!(first["session"], expected_identity);
+    assert_eq!(first["account_id"], "account_fixture");
+    assert_eq!(first["project_id"], "legacy-project-read");
     assert_eq!(first["login_hint"], "legacy-storage-read");
     assert_ne!(first["session"], RAW_SESSION);
     assert!(!first["session"].as_str().unwrap().contains(RAW_SESSION));

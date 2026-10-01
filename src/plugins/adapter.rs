@@ -108,23 +108,54 @@ impl PluginAdapter {
 
     fn provider_json(&self, ctx: &UpstreamContext<'_>) -> Result<String, String> {
         let (base_url, models_path) = ctx.provider.resolved_endpoint()?;
-        let mut provider = serde_json::to_value(ctx.provider).map_err(|error| error.to_string())?;
+        let mut provider = serde_json::to_value(ctx.provider)
+            .map_err(|_| "could not serialize plugin provider context".to_string())?;
         provider["base_url"] = serde_json::json!(base_url);
         provider["models_path"] = serde_json::json!(models_path);
-        if self.api_major == 3 {
-            let now_unix_millis = std::time::SystemTime::now()
+        let now_unix_millis = if self.api_major == 3 {
+            std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis()
-                .min(u64::MAX as u128) as u64;
-            Self::inject_kinetix_context(
-                &mut provider,
-                ctx.account_id,
-                ctx.credential_metadata,
+                .min(u64::MAX as u128) as u64
+        } else {
+            0
+        };
+        Self::inject_api_context(
+            self.api_major,
+            &mut provider,
+            ctx.account_id,
+            ctx.credential_metadata,
+            now_unix_millis,
+        );
+        serde_json::to_string(&provider)
+            .map_err(|_| "could not serialize plugin provider context".to_string())
+    }
+
+    fn inject_api_context(
+        api_major: u32,
+        provider: &mut Value,
+        account_id: Option<&str>,
+        credential_metadata: Option<&crate::credentials::CredentialMetadata>,
+        now_unix_millis: u64,
+    ) {
+        match api_major {
+            3 => Self::inject_kinetix_context(
+                provider,
+                account_id,
+                credential_metadata,
                 now_unix_millis,
-            );
+            ),
+            1 | 2 => Self::inject_legacy_account_id(provider, account_id),
+            _ => {}
         }
-        serde_json::to_string(&provider).map_err(|error| error.to_string())
+    }
+
+    fn inject_legacy_account_id(provider: &mut Value, account_id: Option<&str>) {
+        let (Some(object), Some(account_id)) = (provider.as_object_mut(), account_id) else {
+            return;
+        };
+        object.insert("_kinetix".into(), json!({ "account_id": account_id }));
     }
 
     fn inject_kinetix_context(
@@ -625,7 +656,8 @@ mod tests {
         let metadata = crate::credentials::CredentialMetadata {
             project_id: Some(" cloud-project ".into()),
         };
-        PluginAdapter::inject_kinetix_context(
+        PluginAdapter::inject_api_context(
+            3,
             &mut provider,
             Some("account-1"),
             Some(&metadata),
@@ -639,8 +671,34 @@ mod tests {
         assert_eq!(provider["id"], "antigravity");
 
         let mut opaque_provider = json!({ "id": "antigravity" });
-        PluginAdapter::inject_kinetix_context(&mut opaque_provider, None, None, 7);
+        PluginAdapter::inject_api_context(3, &mut opaque_provider, None, None, 7);
         assert!(opaque_provider["_kinetix"].get("project_id").is_none());
+    }
+
+    #[test]
+    fn api_v1_and_v2_provider_json_keep_legacy_account_context() {
+        for api_major in [1, 2] {
+            let mut provider = json!({
+                "id": "antigravity",
+                "_kinetix": { "project_id": "untrusted-provider-value" }
+            });
+            PluginAdapter::inject_api_context(
+                api_major,
+                &mut provider,
+                Some("account-123"),
+                None,
+                7,
+            );
+            let provider_json = serde_json::to_string(&provider).unwrap();
+            let provider: Value = serde_json::from_str(&provider_json).unwrap();
+            assert_eq!(
+                provider,
+                json!({
+                    "id": "antigravity",
+                    "_kinetix": { "account_id": "account-123" }
+                })
+            );
+        }
     }
 
     #[test]
@@ -650,7 +708,7 @@ mod tests {
         };
         for metadata in [None, Some(&blank_metadata)] {
             let mut provider = json!({ "id": "provider" });
-            PluginAdapter::inject_kinetix_context(&mut provider, None, metadata, 7);
+            PluginAdapter::inject_api_context(3, &mut provider, None, metadata, 7);
             let context = &provider["_kinetix"];
             assert!(context.get("account_id").is_none());
             assert!(context.get("project_id").is_none());

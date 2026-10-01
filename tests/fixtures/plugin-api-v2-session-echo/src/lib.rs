@@ -185,17 +185,29 @@ impl AdapterGuest for Component {
 
     fn build_body(
         _request_json: String,
-        _provider_json: String,
+        provider_json: String,
         _model_json: String,
         session: Option<SessionContext>,
     ) -> Result<String, AdapterError> {
-        // Preserve the API-v2 host-storage import contract by reading the
-        // login hint key used by the real Antigravity OAuth flow.
+        // Antigravity's legacy API-v2 flow reads project:<account-id> from
+        // host storage, so consume the host-injected account context here.
+        let provider: serde_json::Value =
+            serde_json::from_str(&provider_json).unwrap_or_default();
+        let account_id = provider
+            .pointer("/_kinetix/account_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let project_key = format!("project:{account_id}");
+        let project_id = adapter_v2::kinetix::plugin1_0_0::host_storage::get(&project_key)
+            .and_then(|bytes| String::from_utf8(bytes).ok());
         let login_hint =
             adapter_v2::kinetix::plugin1_0_0::host_storage::get("_config:login_hint")
                 .and_then(|bytes| String::from_utf8(bytes).ok());
         Ok(serde_json::json!({
             "session": session.map(|session| session.id),
+            "account_id": account_id,
+            "project_id": project_id,
             "login_hint": login_hint,
         })
         .to_string())
