@@ -765,6 +765,72 @@ async fn provider_reads_redact_headers_and_roundtrip_placeholders_safely() {
 }
 
 #[tokio::test]
+async fn collection_query_schemas_only_allow_runtime_supported_filters() {
+    let server = Server::new().await;
+    let reference = server.get("/reference").await;
+    let operations = reference["operations"].as_array().unwrap();
+    for (collection, supported) in [
+        ("keys", vec!["status"]),
+        ("providers", vec![]),
+        ("models", vec!["provider_id"]),
+        ("accounts", vec!["provider_id"]),
+        ("routes", vec![]),
+        ("aliases", vec![]),
+        ("usage", vec!["key_id", "status"]),
+        ("requests", vec!["key_id", "status"]),
+        ("audit", vec!["actor", "action"]),
+    ] {
+        let path = format!("/admin/api/{collection}");
+        let schema = &operations
+            .iter()
+            .find(|operation| operation["path"] == path && operation["method"] == "GET")
+            .unwrap()["query_schema"];
+        assert_eq!(schema["additionalProperties"], false, "{collection}");
+        let properties = schema["properties"].as_object().unwrap();
+        for parameter in ["limit", "offset", "q"] {
+            assert!(
+                properties.contains_key(parameter),
+                "{collection}: {parameter}"
+            );
+        }
+        for filter in ["provider_id", "key_id", "status", "actor", "action"] {
+            let supported = supported.contains(&filter);
+            let response = server
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/{collection}?{filter}=fixture"),
+                )
+                .send()
+                .await
+                .unwrap();
+            if supported {
+                assert_eq!(response.status(), StatusCode::OK, "{collection}: {filter}");
+            } else {
+                error(
+                    response,
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    Some(filter),
+                )
+                .await;
+            }
+            assert_eq!(
+                properties.contains_key(filter),
+                supported,
+                "{collection}: {filter}"
+            );
+        }
+        assert_eq!(properties.len(), 3 + supported.len(), "{collection}");
+    }
+    // Specialized endpoints retain their independent query contracts.
+    let observations = operations
+        .iter()
+        .find(|operation| operation["path"] == "/admin/api/models/{id}/observations")
+        .unwrap();
+    assert!(observations["query_schema"]["properties"]["cursor"].is_object());
+}
+
+#[tokio::test]
 async fn cli_and_http_publish_and_use_the_same_reference_and_error_contract() {
     let server = Server::new().await;
     let binary = env!("CARGO_BIN_EXE_kinetix");

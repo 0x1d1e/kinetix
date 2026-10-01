@@ -127,6 +127,31 @@ impl AdminRouter {
 
     pub fn reference(&self) -> Value {
         let mut operations = self.operations.clone();
+        let collections = super::storage::reference();
+        // ListQuery is shared, but each operation advertises only its storage-supported filters.
+        for operation in &mut operations {
+            if operation["method"] != "GET" {
+                continue;
+            }
+            let Some(collection) = operation["path"]
+                .as_str()
+                .and_then(|path| path.strip_prefix("/admin/api/"))
+                .and_then(|name| collections.get(name))
+            else {
+                continue;
+            };
+            let collection = collection["collection"]
+                .as_str()
+                .map_or(collection, |name| &collections[name]);
+            let filters = collection["filters"].as_array().unwrap();
+            let properties = operation["query_schema"]["properties"]
+                .as_object_mut()
+                .unwrap();
+            properties.retain(|name, _| {
+                matches!(name.as_str(), "limit" | "offset")
+                    || filters.iter().any(|filter| filter.as_str() == Some(name))
+            });
+        }
         operations.push(
             json!({"path": "/admin/api/reference", "method": "GET", "operation": "reference"}),
         );
@@ -139,7 +164,7 @@ impl AdminRouter {
             "error_schema": schemars::schema_for!(super::ErrorBody),
             "error_codes": super::ERROR_CODES.iter().map(|(status, code)| (status.to_string(), json!(code))).collect::<serde_json::Map<_, _>>(),
             "page_schema": schemars::schema_for!(super::Page),
-            "collections": super::storage::reference(),
+            "collections": collections,
             "pagination": {"default_limit": 200, "max_limit": super::MAX_PAGE_SIZE, "max_offset": 1000000, "max_filter_bytes": 256, "search": "ASCII case-insensitive literal substring", "snapshot": "per page, not across pages"},
             "uri_limit_bytes": super::QUERY_LIMIT,
             "resource_ids": "opaque persisted IDs; names are not IDs",
