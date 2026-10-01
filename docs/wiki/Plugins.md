@@ -56,7 +56,7 @@ Plugins execute inside a strictly isolated WebAssembly sandbox with **zero ambie
 
 ## ABI Compatibility
 
-The `plugin_api` major selects the provider-adapter ABI. API v1 uses the unchanged `plugin-adapter` world from `kinetix:plugin@1.0.0`. API v2 uses `plugin-adapter-v2` from `kinetix:plugin@2.0.0`, which adds optional session context to `apply-auth` and `build-body`. The other plugin worlds and host capability interfaces remain API v1.
+The `plugin_api` major selects the provider-adapter ABI. API v1 uses the unchanged `plugin-adapter` world from `kinetix:plugin@1.0.0`. API v2 uses `plugin-adapter-v2` from `kinetix:plugin@2.0.0`, which adds optional session context to `apply-auth` and `build-body`. That world has no host imports. The other plugin worlds and host capability interfaces remain API v1.
 
 Kinetix supports API v1 and v2 concurrently and chooses the adapter world from the manifest. API v1-only hosts reject API v2 plugins; existing API v1 components keep their original WIT contract. Do not ship incompatible exports under API v1 or use a minor WIT package version for a breaking ABI change.
 
@@ -67,7 +67,7 @@ Plugins interact with Kinetix through versioned typed interfaces: API v1 is defi
 ### 1. Provider Adapter (`wire_plugin`)
 * **WIT World**: `plugin-adapter` for API v1; `plugin-adapter-v2` for API v2
 * **Exported Functions**: `wire-format`, `build-url`, `apply-auth`, `build-body`, `classify-error`, `parse-stream-chunk`, `parse-full-response`
-* **Contract**: The adapter is a *pure translation library*. It converts canonical Kinetix requests (`src/types.rs`) into upstream request bodies, and converts upstream response chunks into canonical SSE events (`text`, `tool_call`, `usage`, `finish_reason`). Kinetix core retains full ownership of HTTP transport, connection pooling, client keepalives, and byte-robust SSE framing.
+* **Contract**: The adapter is a *pure translation library*. It converts canonical Kinetix requests (`src/types.rs`) into upstream request bodies, and converts upstream response chunks into canonical SSE events (`text`, `tool_call`, `usage`, `finish_reason`). Kinetix core retains full ownership of HTTP transport, connection pooling, client keepalives, and byte-robust SSE framing. Adapter invocations cannot use host storage, logging, clock, credentials, or buffered HTTP; multi-capability components retain host imports for their other worlds, but calls are denied in the adapter context.
 
 ### 2. Credential Strategy (`credential_plugin`)
 * **WIT World**: `plugin` (`interface credential-strategy`)

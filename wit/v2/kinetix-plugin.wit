@@ -19,6 +19,7 @@ interface provider-adapter {
 
   /// The wire-format name this adapter speaks.
   wire-format: func() -> string;
+  /// Build an upstream URL for the provider/model selected by core; this is not target selection.
   build-url: func(provider-json: string, model-json: string) -> result<string, plugin-error>;
   /// Return the header list (JSON array of [name, value]) to apply.
   apply-auth: func(
@@ -26,13 +27,15 @@ interface provider-adapter {
     credential: string,
     session: option<session-context>
   ) -> result<string, plugin-error>;
+  /// `provider-json` includes reserved `_kinetix` values injected by core, such as
+  /// the selected account ID, a non-secret project ID when available, and host time.
   build-body: func(
     request-json: string,
     provider-json: string,
     model-json: string,
     session: option<session-context>
   ) -> result<string, plugin-error>;
-  /// Return JSON of the classified failure evidence.
+  /// Return classified failure evidence; core applies retry and fallback policy.
   classify-error: func(status: u16, body: string, headers-json: string) -> result<string, plugin-error>;
   /// Parse one upstream SSE `data:` payload into a versioned canonical envelope.
   parse-stream-chunk: func(data: string) -> result<string, plugin-error>;
@@ -41,11 +44,7 @@ interface provider-adapter {
 }
 
 world plugin-adapter-v2 {
-  import kinetix:plugin/host-http@1.0.0;
-  import kinetix:plugin/host-storage@1.0.0;
-  import kinetix:plugin/host-log@1.0.0;
-  import kinetix:plugin/host-credential@1.0.0;
-  import kinetix:plugin/host-clock@1.0.0;
-
+  /// Pure request/response translation has no host imports. Core owns transport,
+  /// credentials, storage, time, scheduling, and all runtime policy.
   export provider-adapter;
 }

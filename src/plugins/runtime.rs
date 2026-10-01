@@ -76,8 +76,7 @@ pub mod adapter_bindings {
     });
 }
 
-/// Session-aware provider adapters use API v2 while sharing the unchanged v1
-/// host capability interfaces.
+/// Session-aware API-v2 provider adapters have no host imports.
 pub mod adapter_v2_bindings {
     wasmtime::component::bindgen!({
         path: "wit/v2",
@@ -314,6 +313,13 @@ impl PluginRuntime {
         )
         .map_err(|e| anyhow::anyhow!("wiring plugin host imports: {e}"))?;
         Ok(linker)
+    }
+
+    /// Linker for a v2 adapter-only component. Any host import is unresolved.
+    /// Multi-capability components still need the normal linker for their other
+    /// worlds; HostCtx then denies host capabilities during adapter calls.
+    pub fn adapter_v2_linker(&self) -> Linker<HostCtx> {
+        Linker::new(&self.engine)
     }
 
     /// Instantiate a component against a prepared linker/store.
@@ -805,6 +811,9 @@ impl HostCtx {
 
 impl bindings::kinetix::plugin::host_storage::Host for HostCtx {
     async fn get(&mut self, key: String) -> anyhow::Result<Option<Vec<u8>>> {
+        if self.capability == "provider_adapter" {
+            anyhow::bail!("host storage is unavailable to provider adapters");
+        }
         Ok(self
             .backing
             .kv_get(&self.plugin_id, &key)
@@ -814,6 +823,11 @@ impl bindings::kinetix::plugin::host_storage::Host for HostCtx {
     }
 
     async fn put(&mut self, key: String, value: Vec<u8>) -> anyhow::Result<Result<(), String>> {
+        if self.capability == "provider_adapter" {
+            return Ok(Err(
+                "host storage is unavailable to provider adapters".into()
+            ));
+        }
         if key.starts_with(CONFIG_PREFIX) || key.starts_with(CACHE_PREFIX) {
             return Ok(Err("host-owned storage namespace is read-only".into()));
         }
@@ -828,6 +842,11 @@ impl bindings::kinetix::plugin::host_storage::Host for HostCtx {
     }
 
     async fn delete(&mut self, key: String) -> anyhow::Result<Result<(), String>> {
+        if self.capability == "provider_adapter" {
+            return Ok(Err(
+                "host storage is unavailable to provider adapters".into()
+            ));
+        }
         if key.starts_with(CONFIG_PREFIX) || key.starts_with(CACHE_PREFIX) {
             return Ok(Err("host-owned storage namespace is read-only".into()));
         }
@@ -885,6 +904,9 @@ impl bindings::kinetix::plugin::host_storage::Host for HostCtx {
 
 impl bindings::kinetix::plugin::host_log::Host for HostCtx {
     async fn log(&mut self, level: wit::host_log::Level, message: String) -> anyhow::Result<()> {
+        if self.capability == "provider_adapter" {
+            anyhow::bail!("host logging is unavailable to provider adapters");
+        }
         let level = match level {
             wit::host_log::Level::Trace => "trace",
             wit::host_log::Level::Debug => "debug",
@@ -901,12 +923,18 @@ impl bindings::kinetix::plugin::host_log::Host for HostCtx {
 
 impl bindings::kinetix::plugin::host_clock::Host for HostCtx {
     async fn now_unix_seconds(&mut self) -> anyhow::Result<u64> {
+        if self.capability == "provider_adapter" {
+            anyhow::bail!("host clock is unavailable to provider adapters");
+        }
         Ok(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0))
     }
     async fn now_unix_millis(&mut self) -> anyhow::Result<u64> {
+        if self.capability == "provider_adapter" {
+            anyhow::bail!("host clock is unavailable to provider adapters");
+        }
         Ok(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -920,6 +948,12 @@ impl bindings::kinetix::plugin::host_credential::Host for HostCtx {
         mut req: wit::types::HttpRequest,
         credential: wit::types::CredentialRef,
     ) -> anyhow::Result<Result<wit::types::HttpRequest, wit::types::PluginError>> {
+        if self.capability == "provider_adapter" {
+            return Ok(Err(err(
+                "permission_denied",
+                "host credentials are unavailable to provider adapters",
+            )));
+        }
         if !self.credential_sign {
             return Ok(Err(err(
                 "permission_denied",
@@ -955,6 +989,12 @@ impl bindings::kinetix::plugin::host_credential::Host for HostCtx {
         &mut self,
         credential: wit::types::CredentialRef,
     ) -> anyhow::Result<Result<String, wit::types::PluginError>> {
+        if self.capability == "provider_adapter" {
+            return Ok(Err(err(
+                "permission_denied",
+                "host credentials are unavailable to provider adapters",
+            )));
+        }
         if !self.credential_sign && !self.credential_read {
             return Ok(Err(err(
                 "permission_denied",
@@ -988,6 +1028,12 @@ impl bindings::kinetix::plugin::host_credential::Host for HostCtx {
         &mut self,
         credential: wit::types::CredentialRef,
     ) -> anyhow::Result<Result<String, wit::types::PluginError>> {
+        if self.capability == "provider_adapter" {
+            return Ok(Err(err(
+                "permission_denied",
+                "host credentials are unavailable to provider adapters",
+            )));
+        }
         // §8.2: plaintext credential read is a distinct, higher-risk grant and
         // is only reachable when the manifest declares `credential_read`.
         if !self.credential_read {
@@ -1030,6 +1076,133 @@ mod tests {
         let rt = PluginRuntime::new().unwrap();
         let linker = rt.linker().unwrap();
         drop(linker);
+    }
+
+    #[tokio::test]
+    async fn adapter_v2_linker_rejects_host_imports() {
+        let rt = PluginRuntime::new().unwrap();
+        let linker = rt.adapter_v2_linker();
+        for import in [
+            "kinetix:plugin/host-http@1.0.0",
+            "kinetix:plugin/host-storage@1.0.0",
+            "kinetix:plugin/host-log@1.0.0",
+            "kinetix:plugin/host-credential@1.0.0",
+            "kinetix:plugin/host-clock@1.0.0",
+        ] {
+            let bytes = wat::parse_str(format!(
+                r#"(component
+                    (type $required-func (func (param "input" string) (result string)))
+                    (type $host (instance
+                        (export "required" (func (type $required-func)))
+                    ))
+                    (import "{import}" (instance (type $host)))
+                )"#
+            ))
+            .unwrap();
+            let component = rt.compile(&bytes).unwrap();
+            let mut store = rt.new_store(test_ctx(false, vec![]), 1024 * 1024);
+            let error = match linker.instantiate_async(&mut store, &component).await {
+                Ok(_) => panic!("v2 adapter linker unexpectedly satisfied {import}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(import),
+                "expected missing-import error for {import}, got: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_adapter_context_denies_host_capabilities() {
+        use bindings::kinetix::plugin::host_clock::Host as ClockHost;
+        use bindings::kinetix::plugin::host_credential::Host as CredentialHost;
+        use bindings::kinetix::plugin::host_http::Host as HttpHost;
+        use bindings::kinetix::plugin::host_log::Host as LogHost;
+        use bindings::kinetix::plugin::host_storage::Host as StorageHost;
+
+        let mut ctx = test_ctx(false, vec!["api.example.com".into()]);
+        ctx.capability = "provider_adapter".into();
+        ctx.credential_read = true;
+        ctx.credential_sign = true;
+
+        let error = ctx.get("state".into()).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unavailable to provider adapters"));
+        assert!(ctx
+            .put("state".into(), vec![1])
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("unavailable to provider adapters"));
+        assert!(ctx
+            .delete("state".into())
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("unavailable to provider adapters"));
+        let http_error = ctx
+            .send(wit::types::HttpRequest {
+                method: "GET".into(),
+                url: "https://api.example.com/".into(),
+                headers: vec![],
+                body: vec![],
+                credential: None,
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(http_error.code, "permission_denied");
+        assert!(http_error
+            .message
+            .contains("not available to this plugin capability"));
+        assert!(ctx
+            .cache_set("fact".into(), "{}".into(), 1000)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("only available during cached routing-fact refresh"));
+        assert!(ctx
+            .now_unix_millis()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unavailable to provider adapters"));
+        assert!(ctx
+            .log(wit::host_log::Level::Info, "adapter log".into())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unavailable to provider adapters"));
+        let credential = wit::types::CredentialRef::Account(wit::types::AccountRef {
+            provider_id: "provider".into(),
+            account_id: "account".into(),
+        });
+        let credential_error = ctx
+            .sign(
+                wit::types::HttpRequest {
+                    method: "GET".into(),
+                    url: "https://api.example.com/".into(),
+                    headers: vec![],
+                    body: vec![],
+                    credential: None,
+                },
+                credential.clone(),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(credential_error
+            .message
+            .contains("unavailable to provider adapters"));
+        let credential_error = ctx.read(credential.clone()).await.unwrap().unwrap_err();
+        assert!(credential_error
+            .message
+            .contains("unavailable to provider adapters"));
+        let credential_error = ctx.lease(credential).await.unwrap().unwrap_err();
+        assert!(credential_error
+            .message
+            .contains("unavailable to provider adapters"));
     }
 
     #[test]
