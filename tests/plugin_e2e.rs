@@ -997,7 +997,11 @@ async fn api_v1_and_session_aware_api_v2_adapters_load_together() {
         m.install(&api1, None, &[], false).await.unwrap().id,
         api1_id
     );
-    let api2_id = m.install(&api2, None, &[], false).await.unwrap().id;
+    let api2_id = m
+        .install(&api2, None, &[], ALLOW_UNTRUSTED_TEST_PACKAGE)
+        .await
+        .unwrap()
+        .id;
     assert_ne!(api1_id, api2_id);
     assert_eq!(
         m.get(api1_id)
