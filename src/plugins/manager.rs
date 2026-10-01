@@ -21,7 +21,8 @@ use super::manifest::{self, HostPolicy};
 use super::package::{self, Package, SignatureStatus};
 use super::runtime::{
     adapter_bindings, adapter_v2_bindings, bindings, health_v2_bindings, health_v2_wit, wit,
-    DeadlineGuard, HostBacking, HostCtx, PluginFault, PluginRuntime, CONFIG_PREFIX,
+    DeadlineGuard, HostBacking, HostCapabilityMode, HostCtx, PluginFault, PluginRuntime,
+    CONFIG_PREFIX,
 };
 use super::store::{self, PermissionGrant, PluginRow};
 use super::types::{Capability, Manifest, Permissions, Provided};
@@ -1274,6 +1275,7 @@ impl PluginManager {
         let ctx = HostCtx {
             plugin_id: row.id.clone(),
             capability: capability.to_string(),
+            host_capability_mode: HostCapabilityMode::Normal,
             network_hosts,
             credential_read,
             credential_sign: !credential_scopes.is_empty(),
@@ -1303,6 +1305,7 @@ impl PluginManager {
         let ctx = HostCtx {
             plugin_id: plugin_id.to_string(),
             capability: capability.to_string(),
+            host_capability_mode: HostCapabilityMode::Normal,
             network_hosts: Vec::new(),
             credential_read: false,
             credential_sign: false,
@@ -1759,6 +1762,9 @@ impl PluginManager {
             self.inner.runtime.linker()?
         };
         let mut store = self.new_store(&row, &limits, &grants, true, false, "provider_adapter");
+        if api_major == Some(2) {
+            store.data_mut().host_capability_mode = HostCapabilityMode::ApiV2Adapter;
+        }
         let plugin = match api_major {
             Some(1) => AdapterGuest::Api1(
                 self.inner
