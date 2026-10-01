@@ -13,7 +13,7 @@ pub enum ParameterType {
 
 /// Identifiers are ASCII letters/digits, underscores and hyphens. Delimiters,
 /// dots and percent escapes are forbidden, including when double-encoded.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Parameter {
     #[serde(rename = "type")]

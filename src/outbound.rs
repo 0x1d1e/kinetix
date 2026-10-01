@@ -370,13 +370,10 @@ async fn send_provider_request_once(
         )));
     }
 
+    ctx.provider
+        .resolved_endpoint()
+        .map_err(OutboundError::denied)?;
     let connection = ctx.provider.connection().map_err(OutboundError::denied)?;
-    crate::provider_connection::resolve_endpoint(
-        &ctx.provider.base_url,
-        ctx.provider.models_path.as_deref(),
-        connection.as_ref(),
-    )
-    .map_err(OutboundError::denied)?;
     for hop in 0..=MAX_REDIRECTS {
         if let Some(parameters) = &connection {
             parameters
@@ -499,6 +496,7 @@ mod tests {
             integration_features: None,
             integration_protocols: None,
             connection_parameters: None,
+            connection_parameters_attested: None,
         }
     }
 

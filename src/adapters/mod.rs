@@ -2385,6 +2385,7 @@ mod execution_profile_tests {
             integration_features: None,
             integration_protocols: None,
             connection_parameters: None,
+            connection_parameters_attested: None,
         }
     }
 

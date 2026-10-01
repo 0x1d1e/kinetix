@@ -1019,6 +1019,8 @@ pub struct ProviderRow {
     pub integration_protocols: Option<String>,
     #[serde(default)]
     pub connection_parameters: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub connection_parameters_attested: Option<i64>,
 }
 
 impl ProviderRow {
@@ -1034,6 +1036,14 @@ impl ProviderRow {
     }
 
     pub fn resolved_endpoint(&self) -> Result<(String, Option<String>), String> {
+        if self.connection_parameters_attested == Some(0)
+            || (self.connection_parameters.is_some()
+                && self.connection_parameters_attested != Some(1))
+        {
+            return Err(
+                "provider connection parameters await source integration attestation".into(),
+            );
+        }
         crate::provider_connection::resolve_endpoint(
             &self.base_url,
             self.models_path.as_deref(),
@@ -1240,6 +1250,40 @@ pub(crate) async fn set_provider_connection_parameters_in_transaction(
         .bind(serialized)
         .bind(id)
         .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn set_provider_connection_parameters_attested_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    attested: bool,
+) -> Result<()> {
+    sqlx::query("UPDATE providers SET connection_parameters_attested=? WHERE id=?")
+        .bind(attested as i64)
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_provider_connection_parameters_attested(
+    pool: &Pool,
+    id: &str,
+    attested: bool,
+) -> Result<()> {
+    sqlx::query("UPDATE providers SET connection_parameters_attested=? WHERE id=?")
+        .bind(attested as i64)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn clear_provider_connection_parameters(pool: &Pool, id: &str) -> Result<()> {
+    sqlx::query("UPDATE providers SET connection_parameters=NULL WHERE id=?")
+        .bind(id)
+        .execute(pool)
         .await?;
     Ok(())
 }

@@ -71,7 +71,7 @@ async fn anonymous_generic_direct_api_pricing_survives_create_edit_and_import() 
 #[tokio::test]
 async fn parameterized_setup_creates_distinct_provider_instances_without_retargeting() {
     let (state, root) = test_state_with_plugins("connection-instances").await;
-    install_public_parameters_plugin(&state, json!({
+    let manifest = json!({
         "manifest_version": crate::plugins::MANIFEST_VERSION,
         "id": "plugin.test", "name": "Test Plugin", "version": "0.1.0", "plugin_api": "1",
         "permissions": {"network_hosts": ["api.example.com"], "credential_read": false},
@@ -79,7 +79,8 @@ async fn parameterized_setup_creates_distinct_provider_instances_without_retarge
             "provider": {"base_url": "https://api.example.com/accounts/{account_id}/v1", "wire_format": "openai", "auth_scheme": "none", "models_path": "/models",
                 "parameters": {"account_id": {"type": "identifier", "min_length": 1, "max_length": 32}}}
         }]
-    })).await;
+    });
+    install_public_parameters_plugin(&state, manifest.clone()).await;
     let path = "/admin/api/plugins/plugin.test/integrations/public/provider";
     let (status, first) = connection_http(
         &state,
@@ -151,7 +152,7 @@ async fn parameterized_setup_creates_distinct_provider_instances_without_retarge
     let (status, exported) =
         connection_http(&state, "GET", "/admin/api/config/export", Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{exported}");
-    let (restored, restored_root) = test_state("connection-instances-import").await;
+    let (restored, restored_root) = test_state_with_plugins("connection-instances-import").await;
     let (status, imported) = connection_http(
         &restored,
         "POST",
@@ -163,15 +164,167 @@ async fn parameterized_setup_creates_distinct_provider_instances_without_retarge
     let restored_providers = db::list_providers(&restored.pool).await.unwrap();
     assert_eq!(restored_providers.len(), 2);
     for tenant in ["tenant-a", "tenant-b"] {
-        assert!(restored_providers
+        let provider = restored_providers
             .iter()
-            .any(|provider| provider.resolved_base_url().unwrap()
-                == format!("https://api.example.com/accounts/{tenant}/v1")));
+            .find(|provider| {
+                provider.connection().unwrap().unwrap().values["account_id"] == tenant
+            })
+            .unwrap();
+        assert_eq!(provider.connection_parameters_attested, Some(0));
+        assert!(provider.resolved_endpoint().is_err());
+    }
+    install_public_parameters_plugin(&restored, manifest).await;
+    super::auto_provision_plugin_providers(&restored, "plugin.test").await;
+    let restored_providers = db::list_providers(&restored.pool).await.unwrap();
+    for tenant in ["tenant-a", "tenant-b"] {
+        assert!(restored_providers.iter().any(|provider| {
+            provider.connection_parameters_attested == Some(1)
+                && provider.resolved_base_url().unwrap()
+                    == format!("https://api.example.com/accounts/{tenant}/v1")
+        }));
     }
     state.pool.close().await;
     restored.pool.close().await;
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_dir_all(restored_root);
+}
+
+#[tokio::test]
+async fn config_import_rejects_manifest_policy_widening_for_installed_integrations() {
+    let manifest = json!({
+        "manifest_version": crate::plugins::MANIFEST_VERSION,
+        "id": "plugin.test", "name": "Test Plugin", "version": "0.1.0", "plugin_api": "1",
+        "permissions": {"network_hosts": ["api.example.com"], "credential_read": false},
+        "integrations": [{"id": "public", "name": "Public API", "credential_mode": "none",
+            "provider": {"base_url": "https://api.example.com/accounts/{account_id}/v1", "wire_format": "openai", "auth_scheme": "none", "models_path": "/models",
+                "parameters": {"account_id": {"type": "identifier", "min_length": 1, "max_length": 32}}}
+        }]
+    });
+    let (source, source_root) = test_state_with_plugins("connection-policy-source").await;
+    install_public_parameters_plugin(&source, manifest.clone()).await;
+    let (status, setup) = connection_http(
+        &source,
+        "POST",
+        "/admin/api/plugins/plugin.test/integrations/public/provider",
+        json!({"connection_values": {"account_id": "tenant-a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{setup}");
+    let (status, mut exported) =
+        connection_http(&source, "GET", "/admin/api/config/export", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{exported}");
+
+    for policy in ["network_hosts", "declarations"] {
+        let (target, target_root) =
+            test_state_with_plugins(&format!("connection-policy-{policy}")).await;
+        install_public_parameters_plugin(&target, manifest.clone()).await;
+        let provider = exported["providers"]
+            .as_array_mut()
+            .unwrap()
+            .first_mut()
+            .unwrap();
+        if policy == "network_hosts" {
+            provider["connection_parameters"]["network_hosts"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("evil.example"));
+        } else {
+            provider["connection_parameters"]["declarations"]["account_id"]["max_length"] =
+                json!(256);
+        }
+        let (status, response) = connection_http(
+            &target,
+            "POST",
+            "/admin/api/config/import",
+            json!({"config": exported.clone(), "apply": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{policy}: {response}");
+        assert!(db::list_providers(&target.pool).await.unwrap().is_empty());
+        target.pool.close().await;
+        let _ = std::fs::remove_dir_all(target_root);
+        let (status, mut baseline) =
+            connection_http(&source, "GET", "/admin/api/config/export", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{baseline}");
+        exported = baseline.take();
+    }
+
+    let (linked, linked_root) = test_state_with_plugins("connection-policy-unlink").await;
+    install_public_parameters_plugin(&linked, manifest.clone()).await;
+    let (status, setup) = connection_http(
+        &linked,
+        "POST",
+        "/admin/api/plugins/plugin.test/integrations/public/provider",
+        json!({"connection_values": {"account_id": "tenant-a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{setup}");
+    let mut detached = exported.clone();
+    detached["providers"][0]["source_plugin_id"] = Value::Null;
+    detached["providers"][0]["source_integration_id"] = Value::Null;
+    detached["providers"][0]["connection_parameters"]["network_hosts"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("evil.example"));
+    let (status, response) = connection_http(
+        &linked,
+        "POST",
+        "/admin/api/config/import",
+        json!({"config": detached, "apply": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    let linked_provider = db::list_providers(&linked.pool).await.unwrap().pop().unwrap();
+    assert_eq!(linked_provider.source_plugin_id.as_deref(), Some("plugin.test"));
+    assert_eq!(
+        linked_provider.connection().unwrap().unwrap().network_hosts,
+        vec!["api.example.com"]
+    );
+    linked.pool.close().await;
+    let _ = std::fs::remove_dir_all(linked_root);
+
+    let (offline, offline_root) = test_state_with_plugins("connection-policy-offline").await;
+    let mut portable = exported.clone();
+    let portable_provider = &mut portable["providers"][0];
+    portable_provider["connection_parameters"]["network_hosts"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("evil.example"));
+    portable_provider["connection_parameters"]["declarations"]["account_id"]["max_length"] =
+        json!(256);
+    let (status, imported) = connection_http(
+        &offline,
+        "POST",
+        "/admin/api/config/import",
+        json!({"config": portable, "apply": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{imported}");
+    let provider = db::list_providers(&offline.pool).await.unwrap().pop().unwrap();
+    let portable_parameters = provider.connection().unwrap().unwrap();
+    assert_eq!(portable_parameters.declarations["account_id"].max_length, 256);
+    assert_eq!(portable_parameters.network_hosts, vec!["api.example.com", "evil.example"]);
+    assert_eq!(provider.connection_parameters_attested, Some(0));
+    assert!(provider.resolved_endpoint().is_err());
+
+    install_public_parameters_plugin(&offline, manifest).await;
+    crate::admin::auto_provision_plugin_providers(&offline, "plugin.test").await;
+    let provider = db::get_provider(&offline.pool, &provider.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let reattested = provider.connection().unwrap().unwrap();
+    assert_eq!(reattested.declarations["account_id"].max_length, 32);
+    assert_eq!(reattested.network_hosts, vec!["api.example.com"]);
+    assert_eq!(provider.connection_parameters_attested, Some(1));
+    assert_eq!(
+        provider.resolved_base_url().unwrap(),
+        "https://api.example.com/accounts/tenant-a/v1"
+    );
+    offline.pool.close().await;
+    let _ = std::fs::remove_dir_all(offline_root);
+    source.pool.close().await;
+    let _ = std::fs::remove_dir_all(source_root);
 }
 
 #[tokio::test]
@@ -309,14 +462,15 @@ async fn public_parameter_http_case(upstream_status: u16, anonymous: bool) {
     });
     let declarations =
         json!({"account_id": {"type": "identifier", "min_length": 1, "max_length": 32}});
-    install_public_parameters_plugin(&state, json!({
-            "manifest_version": crate::plugins::MANIFEST_VERSION,
-            "id": "plugin.test", "name": "Test Plugin", "version": "0.1.0", "plugin_api": "1",
-            "permissions": {"network_hosts": ["localhost"], "credential_read": false},
-            "integrations": [{"id": "anonymous", "name": "Anonymous Provider", "credential_mode": credential_mode,
-                "provider": {"base_url": format!("https://{address}/accounts/{{account_id}}/v1"), "wire_format": "openai", "auth_scheme": auth_scheme, "models_path": "/models", "parameters": declarations}
-            }]
-        })).await;
+    let manifest = json!({
+        "manifest_version": crate::plugins::MANIFEST_VERSION,
+        "id": "plugin.test", "name": "Test Plugin", "version": "0.1.0", "plugin_api": "1",
+        "permissions": {"network_hosts": ["localhost"], "credential_read": false},
+        "integrations": [{"id": "anonymous", "name": "Anonymous Provider", "credential_mode": credential_mode,
+            "provider": {"base_url": format!("https://{address}/accounts/{{account_id}}/v1"), "wire_format": "openai", "auth_scheme": auth_scheme, "models_path": "/models", "parameters": declarations}
+        }]
+    });
+    install_public_parameters_plugin(&state, manifest.clone()).await;
     let setup_path = "/admin/api/plugins/plugin.test/integrations/anonymous/provider";
     for values in [
         json!({}),
@@ -555,7 +709,7 @@ async fn public_parameter_http_case(upstream_status: u16, anonymous: bool) {
     assert_eq!(saved["values"]["account_id"], "tenant-456");
     assert_eq!(exported["providers"][0]["auth_scheme"], auth_scheme);
     assert!(!exported.to_string().contains("upstream-test-token"));
-    let (restored, restored_root) = test_state("connection-import").await;
+    let (restored, restored_root) = test_state_with_plugins("connection-import").await;
     let (status, imported) = connection_http(
         &restored,
         "POST",
@@ -570,6 +724,17 @@ async fn public_parameter_http_case(upstream_status: u16, anonymous: bool) {
         .pop()
         .unwrap();
     assert_eq!(provider.auth_scheme, auth_scheme);
+    let imported_parameters = provider.connection().unwrap().unwrap();
+    assert_eq!(imported_parameters.declarations, serde_json::from_value(declarations.clone()).unwrap());
+    assert_eq!(imported_parameters.values["account_id"], "tenant-456");
+    assert_eq!(imported_parameters.network_hosts, vec!["localhost"]);
+    assert!(provider.resolved_base_url().is_err());
+    install_public_parameters_plugin(&restored, manifest).await;
+    crate::admin::auto_provision_plugin_providers(&restored, "plugin.test").await;
+    let provider = db::get_provider(&restored.pool, &provider.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         provider.resolved_base_url().unwrap(),
         format!("http://{address}/accounts/tenant-456/v1")

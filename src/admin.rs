@@ -9857,7 +9857,7 @@ pub struct ValidateBody {
 
 /// `POST /admin/api/validate/provider` (FR-8.6): full schema + outbound-security
 /// validation of a proposed provider, without creating it.
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ProviderValidationBody {
     #[serde(default)]
     pub provider_id: Option<String>,
@@ -9878,7 +9878,7 @@ pub async fn validate_provider(
         body.custom_header_name.as_deref(),
         body.custom_param_name.as_deref(),
     );
-    if let Err(ApiError(_, problem, _)) = validate_no_auth_body(&body) {
+    if let Err(ApiError(_, problem, _, _)) = validate_no_auth_body(&body) {
         problems.push(problem);
     }
     let mut connection = if let Some(id) = provider_id {
@@ -12796,12 +12796,17 @@ fn normalize_import_config(mut config: Value) -> Result<(Value, u64, Vec<String>
     Ok((config, version, warnings))
 }
 
+struct InstalledSourceIntegration {
+    integration: crate::plugins::types::Integration,
+    network_hosts: Vec<String>,
+}
+
 async fn installed_source_integration(
     state: &AppState,
     provider_name: &str,
     source_plugin_id: Option<&str>,
     source_integration_id: Option<&str>,
-) -> Result<Option<crate::plugins::types::Integration>, String> {
+) -> Result<Option<InstalledSourceIntegration>, String> {
     let source_plugin_id = source_plugin_id.filter(|value| !value.trim().is_empty());
     let source_integration_id = source_integration_id.filter(|value| !value.trim().is_empty());
     let (Some(plugin_id), Some(integration_id)) = (source_plugin_id, source_integration_id) else {
@@ -12855,7 +12860,96 @@ async fn installed_source_integration(
             )
         })?;
     }
-    Ok(Some(integration.clone()))
+    Ok(Some(InstalledSourceIntegration {
+        integration: integration.clone(),
+        network_hosts: manifest.permissions.network_hosts.clone(),
+    }))
+}
+
+fn imported_source_identity(
+    provider_name: &str,
+    provider: &Value,
+    existing_provider: Option<&db::ProviderRow>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let existing_plugin = existing_provider.and_then(|provider| provider.source_plugin_id.clone());
+    let existing_integration =
+        existing_provider.and_then(|provider| provider.source_integration_id.clone());
+    let imported_plugin = provider
+        .get("source_plugin_id")
+        .map(|value| value.as_str().map(str::to_string));
+    let imported_integration = provider
+        .get("source_integration_id")
+        .map(|value| value.as_str().map(str::to_string));
+
+    if existing_plugin.is_some() || existing_integration.is_some() {
+        if imported_plugin
+            .as_ref()
+            .is_some_and(|value| value != &existing_plugin)
+            || imported_integration
+                .as_ref()
+                .is_some_and(|value| value != &existing_integration)
+        {
+            return Err(format!(
+                "provider '{provider_name}': config import cannot change source integration provenance"
+            ));
+        }
+        return Ok((existing_plugin, existing_integration));
+    }
+
+    Ok((imported_plugin.flatten(), imported_integration.flatten()))
+}
+
+fn validate_imported_connection_policy(
+    provider_name: &str,
+    provider: &Value,
+    existing_provider: Option<&db::ProviderRow>,
+    installed: &InstalledSourceIntegration,
+) -> Result<(), String> {
+    let imported_parameters = match provider.get("connection_parameters") {
+        Some(raw) if !raw.is_null() => Some(
+            serde_json::from_value::<crate::provider_connection::ConnectionParameters>(raw.clone())
+                .map_err(|_| {
+                    format!("provider '{provider_name}': invalid connection_parameters")
+                })?,
+        ),
+        Some(_) => None,
+        None => existing_provider.and_then(|provider| provider.connection().ok().flatten()),
+    };
+    let Some(template) = installed.integration.provider.as_ref() else {
+        return if imported_parameters.is_some() {
+            Err(format!(
+                "provider '{provider_name}': source integration '{}' does not declare connection parameters",
+                installed.integration.id
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    let Some(parameters) = imported_parameters else {
+        return if template.parameters.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "provider '{provider_name}': connection_parameters are required by source integration '{}'",
+                installed.integration.id
+            ))
+        };
+    };
+    let declared_hosts = installed
+        .network_hosts
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let imported_hosts = parameters
+        .network_hosts
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if parameters.declarations != template.parameters || imported_hosts != declared_hosts {
+        return Err(format!(
+            "provider '{provider_name}': connection_parameters policy does not match source integration '{}' manifest",
+            installed.integration.id
+        ));
+    }
+    Ok(())
 }
 
 fn validate_imported_plugin_binding_owners(
@@ -13165,6 +13259,7 @@ async fn import_config_apply(
 
     // ---- Validate phase (FR-8.6): schema + outbound security, no writes ----
     let mut provider_integration_ceilings = std::collections::HashMap::new();
+    let mut provider_connection_attestations = std::collections::HashMap::new();
     let mut seen_provider_names = std::collections::HashSet::new();
     for p in providers {
         let name = p["name"].as_str().unwrap_or("");
@@ -13287,20 +13382,23 @@ async fn import_config_apply(
                 )),
             }
         }
-        let source_plugin_id = if p.get("source_plugin_id").is_some() {
-            p["source_plugin_id"].as_str()
-        } else {
-            existing_provider
-                .as_ref()
-                .and_then(|provider| provider.source_plugin_id.as_deref())
-        };
-        let source_integration_id = if p.get("source_integration_id").is_some() {
-            p["source_integration_id"].as_str()
-        } else {
-            existing_provider
-                .as_ref()
-                .and_then(|provider| provider.source_integration_id.as_deref())
-        };
+        let (source_plugin_id, source_integration_id) =
+            match imported_source_identity(name, p, existing_provider) {
+                Ok(identity) => identity,
+                Err(problem) => {
+                    problems.push(problem);
+                    (
+                        existing_provider
+                            .as_ref()
+                            .and_then(|provider| provider.source_plugin_id.clone()),
+                        existing_provider
+                            .as_ref()
+                            .and_then(|provider| provider.source_integration_id.clone()),
+                    )
+                }
+            };
+        let source_plugin_id = source_plugin_id.as_deref();
+        let source_integration_id = source_integration_id.as_deref();
         let installed_integration = match installed_source_integration(
             &state,
             name,
@@ -13315,9 +13413,25 @@ async fn import_config_apply(
                 None
             }
         };
-        let installed_ceilings = installed_integration
-            .as_ref()
-            .map(|integration| (integration.features.clone(), integration.protocols.clone()));
+        let connection_policy_attested = match installed_integration.as_ref() {
+            Some(installed) => {
+                match validate_imported_connection_policy(name, p, existing_provider, installed) {
+                    Ok(()) => true,
+                    Err(problem) => {
+                        problems.push(problem);
+                        false
+                    }
+                }
+            }
+            None => source_plugin_id.is_none() && source_integration_id.is_none(),
+        };
+        provider_connection_attestations.insert(name.to_string(), connection_policy_attested);
+        let installed_ceilings = installed_integration.as_ref().map(|installed| {
+            (
+                installed.integration.features.clone(),
+                installed.integration.protocols.clone(),
+            )
+        });
         let (integration_features, integration_protocols) =
             if let Some(ceilings) = installed_ceilings {
                 ceilings
@@ -13367,11 +13481,11 @@ async fn import_config_apply(
                     false
                 }
                 Ok(()) => match installed_integration.as_ref() {
-                    Some(integration) => {
+                    Some(installed) => {
                         match validate_imported_integration_bindings(
                             name,
                             plugin_id,
-                            integration,
+                            &installed.integration,
                             p["wire_format"].as_str().unwrap_or(""),
                             wire_plugin,
                             credential_plugin,
@@ -14260,16 +14374,8 @@ async fn import_config_apply(
             let credential_mode = explicit_mode
                 .or_else(|| crate::plugins::CredentialMode::parse(&existing.credential_mode))
                 .unwrap_or(crate::plugins::CredentialMode::Manual);
-            let source_plugin_id = if p.get("source_plugin_id").is_some() {
-                p["source_plugin_id"].as_str().map(str::to_string)
-            } else {
-                existing.source_plugin_id.clone()
-            };
-            let source_integration_id = if p.get("source_integration_id").is_some() {
-                p["source_integration_id"].as_str().map(str::to_string)
-            } else {
-                existing.source_integration_id.clone()
-            };
+            let (source_plugin_id, source_integration_id) =
+                imported_source_identity(name, p, Some(existing)).map_err(ApiError::bad)?;
 
             let provider = db::NewProvider {
                 name,
@@ -14402,6 +14508,16 @@ async fn import_config_apply(
             .await
             .map_err(ApiError::internal)?;
         }
+        db::set_provider_connection_parameters_attested_in_transaction(
+            &mut tx,
+            provider_ids.get(name).expect("provider resolved"),
+            provider_connection_attestations
+                .get(name)
+                .copied()
+                .unwrap_or(false),
+        )
+        .await
+        .map_err(ApiError::internal)?;
         if let Some(enabled) = p["enabled"].as_bool() {
             let provider_id = provider_ids
                 .get(name)
@@ -15521,6 +15637,29 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
             existing.truncate(1);
         }
         if !existing.is_empty() {
+            let mut quarantine_failed = false;
+            for provider in &existing {
+                if let Err(error) = db::set_provider_connection_parameters_attested(
+                    &state.pool,
+                    &provider.id,
+                    false,
+                )
+                .await
+                {
+                    quarantine_failed = true;
+                    tracing::warn!(
+                        provider = %provider.id,
+                        plugin = %id,
+                        integration = %integration.id,
+                        %error,
+                        "failed to quarantine provider connection parameters before manifest re-attestation"
+                    );
+                }
+            }
+            let _ = state.registry.reload(&state.pool).await;
+            if quarantine_failed {
+                continue;
+            }
             for provider in existing {
                 if let Err(error) = validate_integration_upstream_protocols(
                     &manager,
@@ -15540,16 +15679,40 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                     continue;
                 }
 
-                if !template.parameters.is_empty() {
-                    let values = provider
-                        .connection()
-                        .ok()
-                        .flatten()
-                        .map(|parameters| parameters.values)
-                        .unwrap_or_default();
+                let current_parameters = match provider.connection() {
+                    Ok(parameters) => parameters,
+                    Err(error) => {
+                        tracing::warn!(
+                            provider = %provider.id,
+                            plugin = %id,
+                            integration = %integration.id,
+                            %error,
+                            "failed to read provider connection parameters for manifest re-attestation"
+                        );
+                        continue;
+                    }
+                };
+                if template.parameters.is_empty() {
+                    if current_parameters.is_some() {
+                        if crate::provider_connection::resolve_endpoint(
+                            &provider.base_url,
+                            provider.models_path.as_deref(),
+                            None,
+                        )
+                        .is_err()
+                            || db::clear_provider_connection_parameters(&state.pool, &provider.id)
+                                .await
+                                .is_err()
+                        {
+                            continue;
+                        }
+                    }
+                } else {
                     let parameters = crate::provider_connection::ConnectionParameters {
                         declarations: template.parameters.clone(),
-                        values,
+                        values: current_parameters
+                            .map(|parameters| parameters.values)
+                            .unwrap_or_default(),
                         network_hosts: manifest.permissions.network_hosts.clone(),
                     };
                     if parameters
@@ -15608,7 +15771,14 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                         error = %error.1,
                         "failed to upgrade plugin provider credential semantics"
                     );
-                } else {
+                } else if db::set_provider_connection_parameters_attested(
+                    &state.pool,
+                    &provider.id,
+                    true,
+                )
+                .await
+                .is_ok()
+                {
                     let _ = state.registry.reload(&state.pool).await;
                 }
             }
@@ -16193,7 +16363,7 @@ pub async fn install_plugin(
     })))
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IntegrationSetupBody {
     #[serde(default)]
@@ -16414,6 +16584,9 @@ pub async fn setup_plugin_integration_provider(
         db::set_provider_connection_parameters(&state.pool, &provider.id, connection.as_ref())
             .await
             .map_err(ApiError::internal)?;
+        db::set_provider_connection_parameters_attested(&state.pool, &provider.id, true)
+            .await
+            .map_err(ApiError::internal)?;
         state
             .registry
             .reload(&state.pool)
@@ -16475,6 +16648,9 @@ pub async fn setup_plugin_integration_provider(
     .map_err(ApiError::internal)?;
 
     db::set_provider_connection_parameters(&state.pool, &id_created, connection.as_ref())
+        .await
+        .map_err(ApiError::internal)?;
+    db::set_provider_connection_parameters_attested(&state.pool, &id_created, true)
         .await
         .map_err(ApiError::internal)?;
     reconcile_provider_integration_semantics(
@@ -16661,6 +16837,7 @@ mod credential_enrollment_tests {
             integration_features: None,
             integration_protocols: None,
             connection_parameters: None,
+            connection_parameters_attested: None,
         }
     }
 
