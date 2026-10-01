@@ -21,11 +21,33 @@ pub enum CredentialHealth {
     Unusable(String),
 }
 
-/// A credential resolved from a strategy, with optional lease scheduling and
-/// rotation metadata. Static keys return no expiry/refresh deadline.
+/// Non-secret context associated with a credential lease. Values are supplied
+/// separately from the leased secret and may be exposed to the same plugin's
+/// adapter for request translation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialMetadata {
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+impl CredentialMetadata {
+    pub fn normalize(&mut self) {
+        self.project_id = self
+            .project_id
+            .take()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+    }
+}
+
+/// A credential resolved from a strategy, with optional lease scheduling,
+/// non-secret metadata, and rotation metadata. Static keys return no
+/// expiry/refresh deadline or adapter metadata.
 #[derive(Debug, Clone)]
 pub struct ResolvedCredential {
     pub secret: String,
+    pub metadata: CredentialMetadata,
     /// RFC3339 instant after which the credential is no longer valid, if known.
     pub expires_at: Option<String>,
     /// RFC3339 instant at which core should proactively renew the credential.
@@ -79,6 +101,7 @@ impl ResolvedCredential {
     fn static_key(secret: String) -> Self {
         ResolvedCredential {
             secret,
+            metadata: CredentialMetadata::default(),
             expires_at: None,
             refresh_after: None,
             rotated: false,

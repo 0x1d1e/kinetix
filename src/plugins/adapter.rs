@@ -109,7 +109,7 @@ impl PluginAdapter {
         Self::inject_kinetix_context(
             &mut provider,
             ctx.account_id,
-            &ctx.credential,
+            ctx.credential_metadata,
             now_unix_millis,
         );
         serde_json::to_string(&provider).map_err(|error| error.to_string())
@@ -118,40 +118,35 @@ impl PluginAdapter {
     fn inject_kinetix_context(
         provider: &mut Value,
         account_id: Option<&str>,
-        credential: &str,
+        credential_metadata: Option<&crate::credentials::CredentialMetadata>,
         now_unix_millis: u64,
     ) {
         if let Some(object) = provider.as_object_mut() {
             object.insert(
                 "_kinetix".into(),
-                Self::kinetix_context(account_id, credential, now_unix_millis),
+                Self::kinetix_context(account_id, credential_metadata, now_unix_millis),
             );
         }
     }
 
-    fn kinetix_context(account_id: Option<&str>, credential: &str, now_unix_millis: u64) -> Value {
+    fn kinetix_context(
+        account_id: Option<&str>,
+        credential_metadata: Option<&crate::credentials::CredentialMetadata>,
+        now_unix_millis: u64,
+    ) -> Value {
         let mut context = serde_json::Map::new();
         if let Some(account_id) = account_id {
             context.insert("account_id".into(), json!(account_id));
         }
-        if let Some(project_id) = Self::credential_project_id(credential) {
+        if let Some(project_id) = credential_metadata
+            .and_then(|metadata| metadata.project_id.as_deref())
+            .map(str::trim)
+            .filter(|project_id| !project_id.is_empty())
+        {
             context.insert("project_id".into(), json!(project_id));
         }
         context.insert("now_unix_millis".into(), json!(now_unix_millis));
         Value::Object(context)
-    }
-
-    /// Expose only the non-secret Google Cloud project identity from a plugin
-    /// credential to the adapter context. Credential contents remain opaque to
-    /// the adapter and are never copied into provider JSON.
-    fn credential_project_id(credential: &str) -> Option<String> {
-        let credential: Value = serde_json::from_str(credential).ok()?;
-        credential
-            .get("project_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|project_id| !project_id.is_empty())
-            .map(str::to_owned)
     }
 
     fn model_json(ctx: &UpstreamContext<'_>) -> String {
@@ -614,10 +609,13 @@ mod tests {
             "id": "antigravity",
             "_kinetix": { "project_id": "untrusted-provider-value" }
         });
+        let metadata = crate::credentials::CredentialMetadata {
+            project_id: Some(" cloud-project ".into()),
+        };
         PluginAdapter::inject_kinetix_context(
             &mut provider,
             Some("account-1"),
-            r#"{"project_id":"cloud-project","private_value":"omitted"}"#,
+            Some(&metadata),
             1_700_000_000_123,
         );
         let context = &provider["_kinetix"];
@@ -625,15 +623,21 @@ mod tests {
         assert_eq!(context["project_id"], "cloud-project");
         assert_eq!(context["now_unix_millis"], 1_700_000_000_123u64);
         assert_eq!(context.as_object().unwrap().len(), 3);
-        assert!(context.get("private_value").is_none());
         assert_eq!(provider["id"], "antigravity");
+
+        let mut opaque_provider = json!({ "id": "antigravity" });
+        PluginAdapter::inject_kinetix_context(&mut opaque_provider, None, None, 7);
+        assert!(opaque_provider["_kinetix"].get("project_id").is_none());
     }
 
     #[test]
     fn adapter_context_omits_missing_or_blank_project_identity() {
-        for credential in ["opaque", r#"{"project_id":"  "}"#] {
+        let blank_metadata = crate::credentials::CredentialMetadata {
+            project_id: Some("  ".into()),
+        };
+        for metadata in [None, Some(&blank_metadata)] {
             let mut provider = json!({ "id": "provider" });
-            PluginAdapter::inject_kinetix_context(&mut provider, None, credential, 7);
+            PluginAdapter::inject_kinetix_context(&mut provider, None, metadata, 7);
             let context = &provider["_kinetix"];
             assert!(context.get("account_id").is_none());
             assert!(context.get("project_id").is_none());

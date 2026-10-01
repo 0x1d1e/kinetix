@@ -577,6 +577,8 @@ pub struct UpstreamContext<'a> {
     pub session_context: Option<&'a str>,
     /// The decrypted credential for the chosen account.
     pub credential: String,
+    /// Non-secret metadata supplied separately by the credential strategy.
+    pub credential_metadata: Option<&'a crate::credentials::CredentialMetadata>,
 }
 
 /// The result of a successful (accepted) upstream call.
@@ -2330,6 +2332,7 @@ mod execution_profile_tests {
             account_id: None,
             session_context: None,
             credential: "must-not-be-sent".into(),
+            credential_metadata: None,
         };
         for adapter in &adapters {
             let request = adapter

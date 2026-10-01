@@ -5438,6 +5438,7 @@ async fn discover_models_native(
             model: &dummy_model,
             account_id: Some(account.id.as_str()),
             session_context: None,
+            credential_metadata: None,
             credential,
         };
         let permit = state
@@ -5625,6 +5626,7 @@ pub async fn test_provider(
         model: &model,
         account_id: Some(account.id.as_str()),
         session_context: None,
+        credential_metadata: None,
         credential,
     };
     let mut internal = crate::types::InternalRequest {
@@ -7830,6 +7832,7 @@ async fn execute_capability_probe_request(
         model: &execution_model,
         account_id: Some(&account_id),
         session_context: None,
+        credential_metadata: None,
         credential,
     };
     let response = crate::outbound::send_provider_request(
@@ -8156,6 +8159,7 @@ pub async fn probe_model_capability(
         model: &execution_model,
         account_id: Some(account.id.as_str()),
         session_context: None,
+        credential_metadata: None,
         credential: credential.clone(),
     };
     let url = adapter
@@ -21303,6 +21307,7 @@ mod credential_enrollment_regression_tests {
             crate::credentials::CredentialRotationError,
         > {
             Ok(crate::credentials::ResolvedCredential {
+                metadata: crate::credentials::CredentialMetadata::default(),
                 secret: "unused".into(),
                 expires_at: None,
                 refresh_after: None,
@@ -21620,6 +21625,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
         let scheduled = crate::credentials::ResolvedCredential {
+            metadata: crate::credentials::CredentialMetadata::default(),
             secret: "schedule-secret".into(),
             expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
             refresh_after: Some((chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339()),

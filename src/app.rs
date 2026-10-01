@@ -347,6 +347,7 @@ impl AppState {
         if provider.auth() == crate::types::AuthScheme::None {
             return Ok(crate::credentials::ResolvedCredential {
                 secret: String::new(),
+                metadata: crate::credentials::CredentialMetadata::default(),
                 expires_at: None,
                 refresh_after: None,
                 rotated: false,

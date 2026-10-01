@@ -22,12 +22,14 @@ use axum::{
 };
 use kinetix::plugins::{
     adapter::{register_declared_adapters, request_to_json, PluginAdapter},
+    credential::PluginCredentialStrategy,
     Capability, HostPolicy, PluginManager,
 };
 use kinetix::{
     adapters::{Adapter, AdapterRegistry, UpstreamContext},
     app::AppState,
     config::Config,
+    credentials::CredentialStrategy,
     crypto::{self, Crypto},
     db::{self, NewProvider, Pool},
     logqueue::UsageLogQueue,
@@ -924,6 +926,7 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         model: &model_row,
         account_id: Some("account_test"),
         session_context: Some(host_session),
+        credential_metadata: None,
         credential: "tok123".into(),
     };
     let registered_body = registered
@@ -1210,6 +1213,7 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         model: &model,
         account_id: Some("account_fixture"),
         session_context: Some(RAW_SESSION),
+        credential_metadata: None,
         credential: "fixture-credential".into(),
     };
     let first = adapter.build_body(&context, &request).unwrap();
@@ -1225,6 +1229,7 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         model: &model,
         account_id: Some("account_fixture"),
         session_context: Some(SECOND_RAW_SESSION),
+        credential_metadata: None,
         credential: "fixture-credential".into(),
     };
     let second = adapter.build_body(&second_context, &request).unwrap();
@@ -1247,6 +1252,7 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         model: &fallback_model,
         account_id: Some("account_fallback"),
         session_context: Some(RAW_SESSION),
+        credential_metadata: None,
         credential: "fixture-credential".into(),
     };
     let fallback = fallback_adapter
@@ -1270,6 +1276,7 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         model: &model,
         account_id: Some("account_fixture"),
         session_context: None,
+        credential_metadata: None,
         credential: "fixture-credential".into(),
     };
     let without_session = adapter.build_body(&no_session_context, &request).unwrap();
@@ -1287,6 +1294,138 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
 
 /// Error classification maps Antigravity's 429 + reset hint onto the host's
 /// typed failure vocabulary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn antigravity_lease_metadata_reaches_the_v2_adapter_without_parsing_the_secret() {
+    let Some(path) = package_path() else {
+        eprintln!(
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+        );
+        return;
+    };
+    const PLUGIN_ID: &str = "dev.kinetix.antigravity-oauth";
+    const ACCOUNT_LABEL: &str = "lease metadata fixture";
+    const ACCESS_TOKEN: &str = "e2e-access-token";
+    const PROJECT_ID: &str = "e2e-cloud-project";
+
+    let bytes = std::fs::read(&path).unwrap();
+    let (manager, pool) = manager().await;
+    let crypto = Arc::new(Crypto::new(&[7u8; 32]));
+    manager
+        .install(&bytes, None, &[], ALLOW_UNTRUSTED_TEST_PACKAGE)
+        .await
+        .unwrap();
+    manager.approve_permissions(PLUGIN_ID).await.unwrap();
+    manager.enable(PLUGIN_ID).await.unwrap();
+
+    let plugin_ref = format!("plugin:{PLUGIN_ID}/antigravity-oauth");
+    let provider_id = db::insert_provider(
+        &pool,
+        &NewProvider {
+            name: "Antigravity lease metadata test",
+            base_url: "https://daily-cloudcode-pa.googleapis.com",
+            wire_format: WireFormat::Plugin,
+            auth_scheme: AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: json!({}),
+            timeout_ms: 30_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: false,
+            wire_plugin: &plugin_ref,
+            credential_plugin: &plugin_ref,
+            model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let imported = json!({
+        "access_token": ACCESS_TOKEN,
+        "expiry": "2999-01-01T00:00:00Z",
+        "project_id": PROJECT_ID,
+    });
+    let encrypted = crypto.encrypt(&imported.to_string()).unwrap();
+    let account_id = db::insert_account(
+        &pool,
+        &provider_id,
+        ACCOUNT_LABEL,
+        &encrypted,
+        "fixture",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+    let account = db::get_account(&pool, &account_id).await.unwrap().unwrap();
+
+    // This invokes the built Antigravity component's real credential resolver.
+    // Its lease contains only the access token; project_id travels in the
+    // separate non-secret metadata KV entry read by core.
+    let strategy =
+        PluginCredentialStrategy::new(Arc::new(manager.clone()), pool.clone(), crypto, PLUGIN_ID);
+    let resolved = strategy.resolve(&account).await.unwrap();
+    assert_eq!(resolved.secret, ACCESS_TOKEN);
+    assert_eq!(resolved.metadata.project_id.as_deref(), Some(PROJECT_ID));
+
+    let provider = db::get_provider(&pool, &provider_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let model = db::ModelRow {
+        id: "antigravity-lease-model".into(),
+        provider_id: provider_id.clone(),
+        upstream_id: "gemini-3-flash".into(),
+        display_name: "Gemini 3 Flash".into(),
+        enabled: 1,
+        context_window: None,
+        max_output_tokens: None,
+        capabilities: "{}".into(),
+        prices: "{}".into(),
+        parameters: "{}".into(),
+        thinking_map: "{}".into(),
+        extra_request: "{}".into(),
+        discovery: "{}".into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        opaque_state_plugin: String::new(),
+    };
+    let request = InternalRequest {
+        requested_model: model.upstream_id.clone(),
+        system: Vec::new(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+        tool_choice: None,
+        tool_choice_name: None,
+        params: SamplingParams::default(),
+        stream: false,
+        include_usage: false,
+        thinking: None,
+        extra: Default::default(),
+        raw_body: None,
+    };
+    let adapter = PluginAdapter::new(manager, PLUGIN_ID.into(), false)
+        .await
+        .unwrap();
+    let context = UpstreamContext {
+        provider: &provider,
+        model: &model,
+        account_id: Some(&account_id),
+        session_context: None,
+        credential: resolved.secret,
+        credential_metadata: Some(&resolved.metadata),
+    };
+    let body = adapter.build_body(&context, &request).unwrap();
+    assert_eq!(body["project"], PROJECT_ID);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adapter_classifies_quota_exhaustion() {
     let Some(path) = package_path() else {

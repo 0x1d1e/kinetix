@@ -757,6 +757,7 @@ mod tests {
                 .is_some_and(|deadline| deadline > now)
             {
                 Ok(Some(ResolvedCredential {
+                    metadata: crate::credentials::CredentialMetadata::default(),
                     secret: self.secret.lock().await.clone(),
                     expires_at: Some(expires_at),
                     refresh_after,
@@ -781,6 +782,7 @@ mod tests {
                 self.rotated_expires_at.clone()
             };
             Ok(ResolvedCredential {
+                metadata: crate::credentials::CredentialMetadata::default(),
                 secret: self.secret.lock().await.clone(),
                 expires_at: Some(expires_at),
                 refresh_after: if has_short_lease {
@@ -834,6 +836,7 @@ mod tests {
                 .forget();
             let now = Utc::now();
             Ok(ResolvedCredential {
+                metadata: crate::credentials::CredentialMetadata::default(),
                 secret: "resolved-after-deletion".into(),
                 expires_at: Some((now + ChronoDuration::hours(1)).to_rfc3339()),
                 refresh_after: Some((now + ChronoDuration::minutes(30)).to_rfc3339()),
@@ -857,6 +860,7 @@ mod tests {
                 lease_refresh_deadline(Some(&self.expires_at), self.refresh_after.as_deref(), now)
                     .is_some_and(|deadline| deadline > now);
             Ok(is_fresh.then(|| ResolvedCredential {
+                metadata: crate::credentials::CredentialMetadata::default(),
                 secret: "fixed-lease-token".into(),
                 expires_at: Some(self.expires_at.clone()),
                 refresh_after: self.refresh_after.clone(),
@@ -869,6 +873,7 @@ mod tests {
             _account: &AccountRow,
         ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
             Ok(ResolvedCredential {
+                metadata: crate::credentials::CredentialMetadata::default(),
                 secret: "fixed-lease-token".into(),
                 expires_at: Some(self.expires_at.clone()),
                 refresh_after: self.refresh_after.clone(),
@@ -890,6 +895,7 @@ mod tests {
         let now = Utc::now();
         let explicit = now.to_owned() + ChronoDuration::minutes(30);
         let credential = ResolvedCredential {
+            metadata: crate::credentials::CredentialMetadata::default(),
             secret: "secret".into(),
             expires_at: Some((now + ChronoDuration::hours(2)).to_rfc3339()),
             refresh_after: Some(explicit.to_rfc3339()),
@@ -904,6 +910,7 @@ mod tests {
         let now = Utc::now();
         let expiry = now.to_owned() + ChronoDuration::minutes(20);
         let credential = ResolvedCredential {
+            metadata: crate::credentials::CredentialMetadata::default(),
             secret: "secret".into(),
             expires_at: Some(expiry.to_rfc3339()),
             refresh_after: None,
@@ -921,6 +928,7 @@ mod tests {
         let now = Utc::now();
         let expiry = now.to_owned() + ChronoDuration::minutes(4);
         let credential = ResolvedCredential {
+            metadata: crate::credentials::CredentialMetadata::default(),
             secret: "secret".into(),
             expires_at: Some(expiry.to_rfc3339()),
             refresh_after: None,
@@ -943,6 +951,7 @@ mod tests {
             "p",
             "a",
             &ResolvedCredential {
+                metadata: crate::credentials::CredentialMetadata::default(),
                 secret: "secret".into(),
                 expires_at: None,
                 refresh_after: None,
@@ -956,6 +965,7 @@ mod tests {
     fn forgetting_provider_releases_all_refresh_maps() {
         let coordinator = RefreshCoordinator::default();
         let credential = ResolvedCredential {
+            metadata: crate::credentials::CredentialMetadata::default(),
             secret: "secret".into(),
             expires_at: Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339()),
             refresh_after: Some((Utc::now() + ChronoDuration::minutes(10)).to_rfc3339()),
@@ -981,6 +991,7 @@ mod tests {
     fn transient_failure_backoff_survives_normal_resolve_observation() {
         let coordinator = RefreshCoordinator::default();
         let credential = ResolvedCredential {
+            metadata: crate::credentials::CredentialMetadata::default(),
             secret: "secret".into(),
             expires_at: Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339()),
             refresh_after: Some((Utc::now() - ChronoDuration::seconds(1)).to_rfc3339()),

@@ -141,6 +141,7 @@ impl CredentialStrategy for TestCredential {
             self.secret.lock().await.clone()
         };
         let credential = ResolvedCredential {
+            metadata: kinetix::credentials::CredentialMetadata::default(),
             secret,
             expires_at: None,
             refresh_after: None,
@@ -233,6 +234,7 @@ impl CredentialStrategy for ResolveRefreshingCredential {
     ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
         if account.label == "fallback-account" {
             let credential = ResolvedCredential {
+                metadata: kinetix::credentials::CredentialMetadata::default(),
                 secret: "fallback-token".into(),
                 expires_at: None,
                 refresh_after: None,
@@ -254,6 +256,7 @@ impl CredentialStrategy for ResolveRefreshingCredential {
 
         let now = chrono::Utc::now();
         let credential = ResolvedCredential {
+            metadata: kinetix::credentials::CredentialMetadata::default(),
             secret: self.secret.lock().await.clone(),
             expires_at: Some((now.to_owned() + chrono::Duration::hours(1)).to_rfc3339()),
             refresh_after: Some((now - chrono::Duration::seconds(1)).to_rfc3339()),
@@ -308,6 +311,7 @@ impl CredentialStrategy for TerminalResolveCredential {
     ) -> std::result::Result<ResolvedCredential, CredentialRotationError> {
         if account.label == "fallback-account" {
             let credential = ResolvedCredential {
+                metadata: kinetix::credentials::CredentialMetadata::default(),
                 secret: "fallback-token".into(),
                 expires_at: None,
                 refresh_after: None,
@@ -921,6 +925,7 @@ async fn request_resolve_and_scheduled_refresh_share_one_refresh_singleflight() 
         &provider.id,
         &account.id,
         &ResolvedCredential {
+            metadata: kinetix::credentials::CredentialMetadata::default(),
             secret: "stale-token".into(),
             expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
             refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
@@ -962,6 +967,7 @@ async fn terminal_credential_expired_from_scheduled_resolve_disables_account() {
         &harness.provider_id,
         &harness.account_id,
         &ResolvedCredential {
+            metadata: kinetix::credentials::CredentialMetadata::default(),
             secret: "stale-token".into(),
             expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
             refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
@@ -1117,6 +1123,7 @@ async fn disable_write_failure_keeps_existing_refresh_schedule() {
         &harness.provider_id,
         &harness.account_id,
         &ResolvedCredential {
+            metadata: kinetix::credentials::CredentialMetadata::default(),
             secret: "previously-valid-token".into(),
             expires_at: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
             refresh_after: Some((now - chrono::Duration::seconds(1)).to_rfc3339()),
@@ -1198,6 +1205,7 @@ async fn confirmed_missing_account_forgets_refresh_schedule() {
         &harness.provider_id,
         missing_account,
         &ResolvedCredential {
+            metadata: kinetix::credentials::CredentialMetadata::default(),
             secret: "stale-token".into(),
             expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
             refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
@@ -1230,6 +1238,7 @@ async fn confirmed_missing_provider_forgets_refresh_schedule() {
         missing_provider,
         &harness.account_id,
         &ResolvedCredential {
+            metadata: kinetix::credentials::CredentialMetadata::default(),
             secret: "stale-token".into(),
             expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
             refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
@@ -1261,6 +1270,7 @@ async fn transient_account_lookup_failure_keeps_refresh_schedule() {
         &harness.provider_id,
         &harness.account_id,
         &ResolvedCredential {
+            metadata: kinetix::credentials::CredentialMetadata::default(),
             secret: "stale-token".into(),
             expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
             refresh_after: Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()),
