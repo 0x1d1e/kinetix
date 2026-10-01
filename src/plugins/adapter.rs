@@ -59,6 +59,7 @@ pub async fn register_declared_adapters(
 pub struct PluginAdapter {
     manager: PluginManager,
     plugin_id: String,
+    api_major: u32,
     /// The wire-format name the guest reported (cached at construction).
     wire_format: &'static str,
     /// Explicit manifest opt-in: the guest consumes canonical thinking levels
@@ -78,10 +79,19 @@ impl PluginAdapter {
             .adapter_wire_format(&plugin_id)
             .await
             .map_err(|e| anyhow::anyhow!("plugin adapter wire_format: {}", e.message()))?;
+        let manifest = manager
+            .get(&plugin_id)
+            .await?
+            .and_then(|row| row.manifest())
+            .ok_or_else(|| anyhow::anyhow!("plugin '{plugin_id}' has no valid manifest"))?;
+        let api_major = manifest
+            .api_major()
+            .ok_or_else(|| anyhow::anyhow!("plugin '{plugin_id}' has an invalid plugin_api"))?;
         let wire_format: &'static str = Box::leak(wf.into_boxed_str());
         Ok(PluginAdapter {
             manager,
             plugin_id,
+            api_major,
             wire_format,
             thinking_translation,
         })
@@ -96,22 +106,24 @@ impl PluginAdapter {
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
     }
 
-    fn provider_json(ctx: &UpstreamContext<'_>) -> Result<String, String> {
+    fn provider_json(&self, ctx: &UpstreamContext<'_>) -> Result<String, String> {
         let (base_url, models_path) = ctx.provider.resolved_endpoint()?;
         let mut provider = serde_json::to_value(ctx.provider).map_err(|error| error.to_string())?;
         provider["base_url"] = serde_json::json!(base_url);
         provider["models_path"] = serde_json::json!(models_path);
-        let now_unix_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u64::MAX as u128) as u64;
-        Self::inject_kinetix_context(
-            &mut provider,
-            ctx.account_id,
-            ctx.credential_metadata,
-            now_unix_millis,
-        );
+        if self.api_major == 3 {
+            let now_unix_millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            Self::inject_kinetix_context(
+                &mut provider,
+                ctx.account_id,
+                ctx.credential_metadata,
+                now_unix_millis,
+            );
+        }
         serde_json::to_string(&provider).map_err(|error| error.to_string())
     }
 
@@ -295,7 +307,7 @@ impl Adapter for PluginAdapter {
 
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
         let (p, m) = (
-            Self::provider_json(ctx).map_err(ProxyError::bad_request)?,
+            self.provider_json(ctx).map_err(ProxyError::bad_request)?,
             Self::model_json(ctx),
         );
         self.block(self.manager.adapter_build_url(&self.plugin_id, &p, &m))
@@ -310,7 +322,8 @@ impl Adapter for PluginAdapter {
         if ctx.provider.auth() == crate::types::AuthScheme::None {
             return Ok(req);
         }
-        let p = Self::provider_json(ctx)
+        let p = self
+            .provider_json(ctx)
             .map_err(|error| Self::protocol_failure("connection", error))?;
         let credential = ctx.credential.clone();
         let headers_json = self
@@ -345,7 +358,7 @@ impl Adapter for PluginAdapter {
     ) -> Result<Value, UpstreamFailure> {
         let request_json = request_to_json(req);
         let (p, m) = (
-            Self::provider_json(ctx)
+            self.provider_json(ctx)
                 .map_err(|error| Self::protocol_failure("connection", error))?,
             Self::model_json(ctx),
         );

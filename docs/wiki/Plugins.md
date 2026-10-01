@@ -45,7 +45,7 @@ Plugins execute inside a strictly isolated WebAssembly sandbox with **zero ambie
 ### Safety Guarantees
 
 1. **Hardware-Enforced Memory Isolation**: Plugins run in WebAssembly linear memory. They cannot inspect host process memory, execute arbitrary system calls, or access the local filesystem or environment.
-2. **Mediated Network Access**: Plugins have no direct socket access. Outbound HTTP requests must pass through the host HTTP capability and the plugin's approved `network_hosts`. Immediately before each request, Kinetix resolves the destination, rejects the entire answer set if any address is private/reserved (unless the explicit development override is enabled), and pins reqwest to those validated addresses. Plugin HTTP disables system proxies and redirects, requires HTTPS, rejects guest `Host` overrides, and applies a request timeout bounded by the effective plugin wall-time. Provider adapters (`plugin-adapter` world) import **no network capabilities at all**.
+2. **Mediated Network Access**: Plugins have no direct socket access. Outbound HTTP requests must pass through the host HTTP capability and the plugin's approved `network_hosts`. Immediately before each request, Kinetix resolves the destination, rejects the entire answer set if any address is private/reserved (unless the explicit development override is enabled), and pins reqwest to those validated addresses. Plugin HTTP disables system proxies and redirects, requires HTTPS, rejects guest `Host` overrides, and applies a request timeout bounded by the effective plugin wall-time. API v1/v2 retain their legacy adapter imports; API v3 adapters have no host imports.
 3. **Encrypted Storage Isolation**: Each plugin receives an isolated logical namespace in SQLite (`plugin_kv`). Values are encrypted with AES-256-GCM using a key derived from `KINETIX_MASTER_KEY` under the context label `kinetix-plugin-kv`.
 4. **All-or-Nothing Permissions**: Operators approve the entire declared permission set before a plugin can be enabled. Revoking any grant disables the plugin immediately.
 5. **Preemptive Execution Limits**: Execution is preempted by Wasmtime epoch interruption (10 ms ticks, default 10 s deadline for evaluations; 30 s for adapter stream setup). Memory is capped at 64 MiB per store.
@@ -56,18 +56,18 @@ Plugins execute inside a strictly isolated WebAssembly sandbox with **zero ambie
 
 ## ABI Compatibility
 
-The `plugin_api` major selects the provider-adapter ABI. API v1 uses the unchanged `plugin-adapter` world from `kinetix:plugin@1.0.0`. API v2 uses `plugin-adapter-v2` from `kinetix:plugin@2.0.0`, which adds optional session context to `apply-auth` and `build-body`. That world has no host imports. The other plugin worlds and host capability interfaces remain API v1.
+The `plugin_api` major selects the provider-adapter ABI. API v1 uses the unchanged `plugin-adapter` world from `kinetix:plugin@1.0.0`. API v2 uses `plugin-adapter-v2` from `kinetix:plugin@2.0.0`, adding optional session context while retaining the host imports and runtime semantics already available to v2 packages. API v3 uses `plugin-adapter-v3` from `kinetix:plugin@3.0.0`, retaining the session-aware signatures in an import-free adapter world; core provides reserved `_kinetix` context in `provider-json`.
 
-Kinetix supports API v1 and v2 concurrently and chooses the adapter world from the manifest. API v1-only hosts reject API v2 plugins; existing API v1 components keep their original WIT contract. Do not ship incompatible exports under API v1 or use a minor WIT package version for a breaking ABI change.
+Kinetix supports API v1, v2, and v3 concurrently and selects the adapter world from the manifest. API v1 and v2 packages keep their existing WIT and host-capability behavior. API v1-only hosts reject newer API majors. Do not ship incompatible exports under an existing `plugin_api` major or use a minor WIT package version for a breaking ABI change.
 
 ## Capability Seams
 
-Plugins interact with Kinetix through versioned typed interfaces: API v1 is defined in `wit/kinetix-plugin.wit`, and the API v2 adapter world is in `wit/v2/kinetix-plugin.wit`.
+Plugins interact with Kinetix through versioned typed interfaces: API v1 is defined in `wit/kinetix-plugin.wit`; the API v2 adapter world is in `wit/v2/kinetix-plugin.wit`; and the import-free API v3 adapter world is in `wit/v3/kinetix-plugin.wit`.
 
 ### 1. Provider Adapter (`wire_plugin`)
-* **WIT World**: `plugin-adapter` for API v1; `plugin-adapter-v2` for API v2
+* **WIT World**: `plugin-adapter` for API v1; `plugin-adapter-v2` for API v2; `plugin-adapter-v3` for API v3
 * **Exported Functions**: `wire-format`, `build-url`, `apply-auth`, `build-body`, `classify-error`, `parse-stream-chunk`, `parse-full-response`
-* **Contract**: The adapter is a *pure translation library*. It converts canonical Kinetix requests (`src/types.rs`) into upstream request bodies, and converts upstream response chunks into canonical SSE events (`text`, `tool_call`, `usage`, `finish_reason`). Kinetix core retains full ownership of HTTP transport, connection pooling, client keepalives, and byte-robust SSE framing. Adapter invocations cannot use host storage, logging, clock, credentials, or buffered HTTP; multi-capability components retain host imports for their other worlds, but calls are denied in the adapter context.
+* **Contract**: API v3 adapters are pure translation libraries: they convert canonical Kinetix requests (`src/types.rs`) into upstream request bodies and response chunks into canonical SSE events. Kinetix core owns HTTP transport, connection pooling, keepalives, and SSE framing. API v1/v2 retain their existing adapter imports and runtime semantics for compatibility. API v3 calls cannot use host storage, logging, clock, credentials, or buffered HTTP; multi-capability components retain imports for other worlds, but calls are denied in the v3 adapter context.
 
 ### 2. Credential Strategy (`credential_plugin`)
 * **WIT World**: `plugin` (`interface credential-strategy`)
@@ -115,7 +115,7 @@ foo.kxp
 
 `plugin_api = "1"` selects the Plugin API 1 ABI. Kinetix 1.x preserves that ABI: existing API-1 plugins remain loadable on later 1.x hosts unless the plugin declares a host-version bound that excludes the host. A manifest without bounds is not limited to the Kinetix version on which it was built.
 
-API-1 revisions may add capabilities through separate optional worlds or interfaces. They must not remove or rename existing interfaces, change existing function signatures or meanings, or make a new guest export mandatory in an existing world. A breaking ABI change requires `plugin_api = "2"` and a new WIT package major; an API-2 plugin is rejected by an API-1 host.
+API-1 revisions may add capabilities through separate optional worlds or interfaces. They must not remove or rename existing interfaces, change existing function signatures or meanings, or make a new guest export mandatory in an existing world. A breaking ABI change requires a new `plugin_api` and WIT package major; hosts may support multiple majors concurrently.
 
 Kinetix pins its Wasmtime/component-model runtime. Runtime upgrades must pass conformance checks with existing API-1 components before release; a runtime upgrade is not a way to bypass the API compatibility promise.
 

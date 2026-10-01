@@ -189,7 +189,16 @@ impl AdapterGuest for Component {
         _model_json: String,
         session: Option<SessionContext>,
     ) -> Result<String, AdapterError> {
-        Ok(serde_json::json!({ "session": session.map(|session| session.id) }).to_string())
+        // Preserve the API-v2 host-storage import contract by reading the
+        // login hint key used by the real Antigravity OAuth flow.
+        let login_hint =
+            adapter_v2::kinetix::plugin1_0_0::host_storage::get("_config:login_hint")
+                .and_then(|bytes| String::from_utf8(bytes).ok());
+        Ok(serde_json::json!({
+            "session": session.map(|session| session.id),
+            "login_hint": login_hint,
+        })
+        .to_string())
     }
 
     fn classify_error(

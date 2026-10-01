@@ -1,8 +1,8 @@
-// Kinetix plugin API v2, introduced for session-aware provider adapters.
-// The main plugin, auth, and model-discovery worlds remain API v1 and are
-// imported by the host using their stable v1 interfaces.
+// Kinetix plugin API v3. Session-aware provider adapters are pure translation;
+// core supplies the required context and retains all host authority.
+// The main plugin, auth, and model-discovery worlds remain API v1.
 
-package kinetix:plugin@2.0.0;
+package kinetix:plugin@3.0.0;
 
 interface types {
   /// Opaque identity for a recognized client session. Stable across turns and
@@ -19,6 +19,7 @@ interface provider-adapter {
 
   /// The wire-format name this adapter speaks.
   wire-format: func() -> string;
+  /// Build an upstream URL for the provider/model selected by core; this is not target selection.
   build-url: func(provider-json: string, model-json: string) -> result<string, plugin-error>;
   /// Return the header list (JSON array of [name, value]) to apply.
   apply-auth: func(
@@ -26,13 +27,15 @@ interface provider-adapter {
     credential: string,
     session: option<session-context>
   ) -> result<string, plugin-error>;
+  /// `provider-json` includes reserved `_kinetix` values injected by core, such as
+  /// the selected account ID, a non-secret project ID when available, and host time.
   build-body: func(
     request-json: string,
     provider-json: string,
     model-json: string,
     session: option<session-context>
   ) -> result<string, plugin-error>;
-  /// Return JSON of the classified failure evidence.
+  /// Return classified failure evidence; core applies retry and fallback policy.
   classify-error: func(status: u16, body: string, headers-json: string) -> result<string, plugin-error>;
   /// Parse one upstream SSE `data:` payload into a versioned canonical envelope.
   parse-stream-chunk: func(data: string) -> result<string, plugin-error>;
@@ -40,12 +43,8 @@ interface provider-adapter {
   parse-full-response: func(body-json: string) -> result<string, plugin-error>;
 }
 
-world plugin-adapter-v2 {
-  import kinetix:plugin/host-http@1.0.0;
-  import kinetix:plugin/host-storage@1.0.0;
-  import kinetix:plugin/host-log@1.0.0;
-  import kinetix:plugin/host-credential@1.0.0;
-  import kinetix:plugin/host-clock@1.0.0;
-
+world plugin-adapter-v3 {
+  /// Pure request/response translation has no host imports. Core owns transport,
+  /// credentials, storage, time, scheduling, and all runtime policy.
   export provider-adapter;
 }

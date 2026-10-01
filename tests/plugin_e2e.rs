@@ -784,7 +784,7 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         .expect("adapter world binds");
     assert_eq!(wf, "antigravity");
 
-    let provider = r#"{"base_url":"https://daily-cloudcode-pa.googleapis.com","extra_headers":"{\"x-antigravity-project\":\"test-project\"}"}"#;
+    let provider = r#"{"base_url":"https://daily-cloudcode-pa.googleapis.com","extra_headers":"{\"x-antigravity-project\":\"test-project\"}","_kinetix":{"account_id":"test-account","project_id":"account-project","now_unix_millis":1700000000123}}"#;
     let model = r#"{"upstream_id":"gemini-3-flash"}"#;
 
     let url = m.adapter_build_url(id, provider, model).await.unwrap();
@@ -952,7 +952,8 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
     let chunk = r#"{"response":{"responseId":"resp_1","candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2}}}"#;
     let events = m.adapter_parse_stream_chunk(id, chunk).await.unwrap();
     let ev: serde_json::Value = serde_json::from_str(&events).unwrap();
-    let arr = ev.as_array().unwrap();
+    assert_eq!(ev["schema"], "kinetix.plugin.response");
+    let arr = ev["events"].as_array().unwrap();
     assert!(arr
         .iter()
         .any(|e| e["type"] == "text_delta" && e["text"] == "hello"));
@@ -972,8 +973,11 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
 /// its original call shape; only API v2 receives the session identity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_v1_and_session_aware_api_v2_adapters_load_together() {
-    let Some(api2_path) = package_path() else {
-        eprintln!("skipping: set KINETIX_PLUGIN_E2E_PACKAGE to an API-v2 .kxp");
+    let Some(api2_path) = std::env::var_os("KINETIX_PLUGIN_API_V2_E2E_PACKAGE")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+    else {
+        eprintln!("skipping: set KINETIX_PLUGIN_API_V2_E2E_PACKAGE to an API-v2 .kxp");
         return;
     };
     let Some(api1_path) = std::env::var_os("KINETIX_PLUGIN_API_V1_E2E_PACKAGE")
@@ -1062,7 +1066,7 @@ async fn api_v1_and_session_aware_api_v2_adapters_load_together() {
 /// API-v1 and API-v2 fixtures always exercise cross-version runtime behavior,
 /// independent of optional externally built release packages.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
+async fn api_v1_and_api_v2_legacy_host_imports_coexist_with_opaque_session_context() {
     const API1_ID: &str = "dev.kinetix.test.api1-adapter";
     const API2_ID: &str = "dev.kinetix.test.api2-session-echo";
     const API2_FALLBACK_ID: &str = "dev.kinetix.test.api2-fallback-session-echo";
@@ -1083,7 +1087,7 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         2,
         api2_component,
     );
-    let (manager, _pool) = manager().await;
+    let (manager, pool) = manager().await;
     assert_eq!(
         manager.install(&api1, None, &[], false).await.unwrap().id,
         API1_ID
@@ -1105,6 +1109,17 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         manager.approve_permissions(id).await.unwrap();
         manager.enable(id).await.unwrap();
     }
+    // Seed host storage so the v2 fixture must successfully call the imported
+    // host-storage interface during build-body, not merely instantiate it.
+    kinetix::plugins::store::kv_put(
+        &pool,
+        &Crypto::new(&[7u8; 32]),
+        API2_ID,
+        "_config:login_hint",
+        b"legacy-storage-read",
+    )
+    .await
+    .unwrap();
 
     // API-v1 executes through its unchanged session-unaware exports. The
     // host-side context must not alter what the API-v1 guest receives.
@@ -1218,6 +1233,7 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
     };
     let first = adapter.build_body(&context, &request).unwrap();
     assert_eq!(first["session"], expected_identity);
+    assert_eq!(first["login_hint"], "legacy-storage-read");
     assert_ne!(first["session"], RAW_SESSION);
     assert!(!first["session"].as_str().unwrap().contains(RAW_SESSION));
 
@@ -1295,7 +1311,7 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
 /// Error classification maps Antigravity's 429 + reset hint onto the host's
 /// typed failure vocabulary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn antigravity_lease_metadata_reaches_the_v2_adapter_without_parsing_the_secret() {
+async fn antigravity_lease_metadata_reaches_the_v3_adapter_without_parsing_the_secret() {
     let Some(path) = package_path() else {
         eprintln!(
             "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"

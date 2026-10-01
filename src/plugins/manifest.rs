@@ -930,8 +930,8 @@ max_length = 32
     }
 
     #[test]
-    fn accepts_api_v1_and_v2_manifests() {
-        for major in [1, 2] {
+    fn accepts_api_v1_v2_and_v3_manifests() {
+        for major in [1, 2, 3] {
             let manifest = GOOD.replace("plugin_api = \"1\"", &format!("plugin_api = \"{major}\""));
             let validated = parse_and_validate(&manifest, HostPolicy::default()).unwrap();
             assert!(validated.manifest.compatible());
@@ -941,9 +941,9 @@ max_length = 32
 
     #[test]
     fn rejects_incompatible_api() {
-        let bad = GOOD.replace("plugin_api = \"1\"", "plugin_api = \"3\"");
+        let bad = GOOD.replace("plugin_api = \"1\"", "plugin_api = \"4\"");
         let error = parse_and_validate(&bad, HostPolicy::default()).unwrap_err();
-        assert!(error.to_string().contains("host supports majors [1, 2]"));
+        assert!(error.to_string().contains("host supports majors [1, 2, 3]"));
     }
 
     #[test]

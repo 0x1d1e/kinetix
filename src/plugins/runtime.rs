@@ -76,11 +76,22 @@ pub mod adapter_bindings {
     });
 }
 
-/// Session-aware API-v2 provider adapters have no host imports.
+/// Legacy session-aware API-v2 adapters retain their host imports.
 pub mod adapter_v2_bindings {
     wasmtime::component::bindgen!({
         path: "wit/v2",
         world: "plugin-adapter-v2",
+        imports: { default: async | trappable },
+        exports: { default: async },
+        anyhow: true,
+    });
+}
+
+/// Import-free, session-aware API-v3 provider adapters.
+pub mod adapter_v3_bindings {
+    wasmtime::component::bindgen!({
+        path: "wit/v3",
+        world: "plugin-adapter-v3",
         imports: { default: async | trappable },
         exports: { default: async },
         anyhow: true,
@@ -172,7 +183,7 @@ impl std::fmt::Display for PluginFault {
 pub enum HostCapabilityMode {
     #[default]
     Normal,
-    ApiV2Adapter,
+    ApiV3Adapter,
 }
 
 /// Per-store host context. Every host-import closure receives this.
@@ -181,7 +192,7 @@ pub struct HostCtx {
     pub plugin_id: String,
     /// Capability label for observability (for example `credential_strategy`).
     pub capability: String,
-    /// API-v2 adapter calls have no host-capability authority, even when a
+    /// API-v3 adapter calls have no host-capability authority, even when a
     /// multi-capability component is instantiated with the normal linker.
     pub host_capability_mode: HostCapabilityMode,
     /// Granted network hosts (already validated, §9).
@@ -325,10 +336,10 @@ impl PluginRuntime {
         Ok(linker)
     }
 
-    /// Linker for a v2 adapter-only component. Any host import is unresolved.
+    /// Linker for a v3 adapter-only component. Any host import is unresolved.
     /// Multi-capability components still need the normal linker for their other
-    /// worlds; HostCtx then denies host capabilities during adapter calls.
-    pub fn adapter_v2_linker(&self) -> Linker<HostCtx> {
+    /// worlds; HostCtx then denies host capabilities during v3 adapter calls.
+    pub fn adapter_v3_linker(&self) -> Linker<HostCtx> {
         Linker::new(&self.engine)
     }
 
@@ -401,7 +412,7 @@ impl PluginRuntime {
             .map_err(|e| anyhow::anyhow!("instantiating plugin adapter component: {e}"))
     }
 
-    /// Instantiate a session-aware API-v2 adapter component.
+    /// Instantiate a legacy session-aware API-v2 adapter component.
     pub async fn instantiate_adapter_v2(
         &self,
         linker: &Linker<HostCtx>,
@@ -411,6 +422,18 @@ impl PluginRuntime {
         adapter_v2_bindings::PluginAdapterV2::instantiate_async(store, component, linker)
             .await
             .map_err(|e| anyhow::anyhow!("instantiating plugin API v2 adapter component: {e}"))
+    }
+
+    /// Instantiate an import-free session-aware API-v3 adapter component.
+    pub async fn instantiate_adapter_v3(
+        &self,
+        linker: &Linker<HostCtx>,
+        store: &mut Store<HostCtx>,
+        component: &Component,
+    ) -> Result<adapter_v3_bindings::PluginAdapterV3> {
+        adapter_v3_bindings::PluginAdapterV3::instantiate_async(store, component, linker)
+            .await
+            .map_err(|e| anyhow::anyhow!("instantiating plugin API v3 adapter component: {e}"))
     }
 
     /// Arm a wall-time budget for a store (§14, §15): the returned guard bumps
@@ -821,7 +844,7 @@ impl HostCtx {
 
 impl bindings::kinetix::plugin::host_storage::Host for HostCtx {
     async fn get(&mut self, key: String) -> anyhow::Result<Option<Vec<u8>>> {
-        if self.host_capability_mode == HostCapabilityMode::ApiV2Adapter {
+        if self.host_capability_mode == HostCapabilityMode::ApiV3Adapter {
             anyhow::bail!("host storage is unavailable to provider adapters");
         }
         Ok(self
@@ -833,7 +856,7 @@ impl bindings::kinetix::plugin::host_storage::Host for HostCtx {
     }
 
     async fn put(&mut self, key: String, value: Vec<u8>) -> anyhow::Result<Result<(), String>> {
-        if self.host_capability_mode == HostCapabilityMode::ApiV2Adapter {
+        if self.host_capability_mode == HostCapabilityMode::ApiV3Adapter {
             return Ok(Err(
                 "host storage is unavailable to provider adapters".into()
             ));
@@ -852,7 +875,7 @@ impl bindings::kinetix::plugin::host_storage::Host for HostCtx {
     }
 
     async fn delete(&mut self, key: String) -> anyhow::Result<Result<(), String>> {
-        if self.host_capability_mode == HostCapabilityMode::ApiV2Adapter {
+        if self.host_capability_mode == HostCapabilityMode::ApiV3Adapter {
             return Ok(Err(
                 "host storage is unavailable to provider adapters".into()
             ));
@@ -914,7 +937,7 @@ impl bindings::kinetix::plugin::host_storage::Host for HostCtx {
 
 impl bindings::kinetix::plugin::host_log::Host for HostCtx {
     async fn log(&mut self, level: wit::host_log::Level, message: String) -> anyhow::Result<()> {
-        if self.host_capability_mode == HostCapabilityMode::ApiV2Adapter {
+        if self.host_capability_mode == HostCapabilityMode::ApiV3Adapter {
             anyhow::bail!("host logging is unavailable to provider adapters");
         }
         let level = match level {
@@ -933,7 +956,7 @@ impl bindings::kinetix::plugin::host_log::Host for HostCtx {
 
 impl bindings::kinetix::plugin::host_clock::Host for HostCtx {
     async fn now_unix_seconds(&mut self) -> anyhow::Result<u64> {
-        if self.host_capability_mode == HostCapabilityMode::ApiV2Adapter {
+        if self.host_capability_mode == HostCapabilityMode::ApiV3Adapter {
             anyhow::bail!("host clock is unavailable to provider adapters");
         }
         Ok(std::time::SystemTime::now()
@@ -942,7 +965,7 @@ impl bindings::kinetix::plugin::host_clock::Host for HostCtx {
             .unwrap_or(0))
     }
     async fn now_unix_millis(&mut self) -> anyhow::Result<u64> {
-        if self.host_capability_mode == HostCapabilityMode::ApiV2Adapter {
+        if self.host_capability_mode == HostCapabilityMode::ApiV3Adapter {
             anyhow::bail!("host clock is unavailable to provider adapters");
         }
         Ok(std::time::SystemTime::now()
@@ -958,7 +981,7 @@ impl bindings::kinetix::plugin::host_credential::Host for HostCtx {
         mut req: wit::types::HttpRequest,
         credential: wit::types::CredentialRef,
     ) -> anyhow::Result<Result<wit::types::HttpRequest, wit::types::PluginError>> {
-        if self.host_capability_mode == HostCapabilityMode::ApiV2Adapter {
+        if self.host_capability_mode == HostCapabilityMode::ApiV3Adapter {
             return Ok(Err(err(
                 "permission_denied",
                 "host credentials are unavailable to provider adapters",
@@ -999,7 +1022,7 @@ impl bindings::kinetix::plugin::host_credential::Host for HostCtx {
         &mut self,
         credential: wit::types::CredentialRef,
     ) -> anyhow::Result<Result<String, wit::types::PluginError>> {
-        if self.host_capability_mode == HostCapabilityMode::ApiV2Adapter {
+        if self.host_capability_mode == HostCapabilityMode::ApiV3Adapter {
             return Ok(Err(err(
                 "permission_denied",
                 "host credentials are unavailable to provider adapters",
@@ -1038,7 +1061,7 @@ impl bindings::kinetix::plugin::host_credential::Host for HostCtx {
         &mut self,
         credential: wit::types::CredentialRef,
     ) -> anyhow::Result<Result<String, wit::types::PluginError>> {
-        if self.host_capability_mode == HostCapabilityMode::ApiV2Adapter {
+        if self.host_capability_mode == HostCapabilityMode::ApiV3Adapter {
             return Ok(Err(err(
                 "permission_denied",
                 "host credentials are unavailable to provider adapters",
@@ -1089,9 +1112,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_v2_linker_rejects_host_imports() {
+    async fn adapter_v3_linker_rejects_host_imports() {
         let rt = PluginRuntime::new().unwrap();
-        let linker = rt.adapter_v2_linker();
+        let linker = rt.adapter_v3_linker();
         for import in [
             "kinetix:plugin/host-http@1.0.0",
             "kinetix:plugin/host-storage@1.0.0",
@@ -1112,7 +1135,7 @@ mod tests {
             let component = rt.compile(&bytes).unwrap();
             let mut store = rt.new_store(test_ctx(false, vec![]), 1024 * 1024);
             let error = match linker.instantiate_async(&mut store, &component).await {
-                Ok(_) => panic!("v2 adapter linker unexpectedly satisfied {import}"),
+                Ok(_) => panic!("v3 adapter linker unexpectedly satisfied {import}"),
                 Err(error) => error,
             };
             assert!(
@@ -1123,7 +1146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_v2_provider_adapter_context_denies_host_capabilities() {
+    async fn api_v3_provider_adapter_context_denies_host_capabilities() {
         use bindings::kinetix::plugin::host_clock::Host as ClockHost;
         use bindings::kinetix::plugin::host_credential::Host as CredentialHost;
         use bindings::kinetix::plugin::host_http::Host as HttpHost;
@@ -1132,7 +1155,7 @@ mod tests {
 
         let mut ctx = test_ctx(false, vec!["api.example.com".into()]);
         ctx.capability = "provider_adapter".into();
-        ctx.host_capability_mode = HostCapabilityMode::ApiV2Adapter;
+        ctx.host_capability_mode = HostCapabilityMode::ApiV3Adapter;
         ctx.credential_read = true;
         ctx.credential_sign = true;
 

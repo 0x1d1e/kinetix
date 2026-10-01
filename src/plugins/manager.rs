@@ -20,9 +20,9 @@ use crate::db::Pool;
 use super::manifest::{self, HostPolicy};
 use super::package::{self, Package, SignatureStatus};
 use super::runtime::{
-    adapter_bindings, adapter_v2_bindings, bindings, health_v2_bindings, health_v2_wit, wit,
-    DeadlineGuard, HostBacking, HostCapabilityMode, HostCtx, PluginFault, PluginRuntime,
-    CONFIG_PREFIX,
+    adapter_bindings, adapter_v2_bindings, adapter_v3_bindings, bindings, health_v2_bindings,
+    health_v2_wit, wit, DeadlineGuard, HostBacking, HostCapabilityMode, HostCtx, PluginFault,
+    PluginRuntime, CONFIG_PREFIX,
 };
 use super::store::{self, PermissionGrant, PluginRow};
 use super::types::{Capability, Manifest, Permissions, Provided};
@@ -252,6 +252,7 @@ enum ValidationWorld {
     AccountModelSource,
     ProviderAdapter,
     ProviderAdapterV2,
+    ProviderAdapterV3,
     HealthV2,
 }
 
@@ -1339,6 +1340,7 @@ impl PluginManager {
             ValidationWorld::AccountModelSource => "plugin-model-source",
             ValidationWorld::ProviderAdapter => "plugin-adapter",
             ValidationWorld::ProviderAdapterV2 => "plugin-adapter-v2",
+            ValidationWorld::ProviderAdapterV3 => "plugin-adapter-v3",
             ValidationWorld::HealthV2 => "plugin-health-v2",
         };
         let mut store = self.new_validation_store(plugin_id, limits, "validation");
@@ -1375,6 +1377,12 @@ impl PluginManager {
                 self.inner
                     .runtime
                     .instantiate_adapter_v2(linker, &mut store, component)
+                    .await?;
+            }
+            ValidationWorld::ProviderAdapterV3 => {
+                self.inner
+                    .runtime
+                    .instantiate_adapter_v3(linker, &mut store, component)
                     .await?;
             }
             ValidationWorld::HealthV2 => {
@@ -1453,11 +1461,12 @@ impl PluginManager {
             let (world, world_name) = match manifest.api_major() {
                 Some(1) => (ValidationWorld::ProviderAdapter, "provider-adapter"),
                 Some(2) => (ValidationWorld::ProviderAdapterV2, "provider-adapter-v2"),
+                Some(3) => (ValidationWorld::ProviderAdapterV3, "provider-adapter-v3"),
                 Some(major) => bail!("unsupported plugin API major {major}"),
                 None => bail!("plugin '{}' has invalid plugin_api", manifest.id),
             };
-            let result = if manifest.api_major() == Some(2) && !has_other_capability {
-                let adapter_linker = self.inner.runtime.adapter_v2_linker();
+            let result = if manifest.api_major() == Some(3) && !has_other_capability {
+                let adapter_linker = self.inner.runtime.adapter_v3_linker();
                 self.validate_component_world(
                     &manifest.id,
                     limits,
@@ -1756,14 +1765,14 @@ impl PluginManager {
         self.ensure_circuit_ready(id).await?;
         let limits = validated.effective;
         let component = self.compiled_component(&row)?;
-        let linker = if api_major == Some(2) && !has_other_capability {
-            self.inner.runtime.adapter_v2_linker()
+        let linker = if api_major == Some(3) && !has_other_capability {
+            self.inner.runtime.adapter_v3_linker()
         } else {
             self.inner.runtime.linker()?
         };
         let mut store = self.new_store(&row, &limits, &grants, true, false, "provider_adapter");
-        if api_major == Some(2) {
-            store.data_mut().host_capability_mode = HostCapabilityMode::ApiV2Adapter;
+        if api_major == Some(3) {
+            store.data_mut().host_capability_mode = HostCapabilityMode::ApiV3Adapter;
         }
         let plugin = match api_major {
             Some(1) => AdapterGuest::Api1(
@@ -1776,6 +1785,12 @@ impl PluginManager {
                 self.inner
                     .runtime
                     .instantiate_adapter_v2(&linker, &mut store, component.as_ref())
+                    .await?,
+            ),
+            Some(3) => AdapterGuest::Api3(
+                self.inner
+                    .runtime
+                    .instantiate_adapter_v3(&linker, &mut store, component.as_ref())
                     .await?,
             ),
             Some(major) => bail!("unsupported plugin API major {major}"),
@@ -2631,6 +2646,7 @@ struct AdapterPrepared {
 enum AdapterGuest {
     Api1(adapter_bindings::PluginAdapter),
     Api2(adapter_v2_bindings::PluginAdapterV2),
+    Api3(adapter_v3_bindings::PluginAdapterV3),
 }
 
 impl AdapterGuest {
@@ -2646,6 +2662,11 @@ impl AdapterGuest {
                 .map_err(map_call_error),
             Self::Api2(plugin) => plugin
                 .kinetix_plugin2_0_0_provider_adapter()
+                .call_wire_format(store)
+                .await
+                .map_err(map_call_error),
+            Self::Api3(plugin) => plugin
+                .kinetix_plugin3_0_0_provider_adapter()
                 .call_wire_format(store)
                 .await
                 .map_err(map_call_error),
@@ -2667,6 +2688,12 @@ impl AdapterGuest {
                 .and_then(map_adapter_result),
             Self::Api2(plugin) => plugin
                 .kinetix_plugin2_0_0_provider_adapter()
+                .call_build_url(store, provider_json, model_json)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+            Self::Api3(plugin) => plugin
+                .kinetix_plugin3_0_0_provider_adapter()
                 .call_build_url(store, provider_json, model_json)
                 .await
                 .map_err(map_call_error)
@@ -2697,6 +2724,19 @@ impl AdapterGuest {
                 .await
                 .map_err(map_call_error)
                 .and_then(map_adapter_result),
+            Self::Api3(plugin) => {
+                let session = opaque_session_context.map(|id| {
+                    adapter_v3_bindings::kinetix::plugin3_0_0::types::SessionContext {
+                        id: id.into(),
+                    }
+                });
+                plugin
+                    .kinetix_plugin3_0_0_provider_adapter()
+                    .call_apply_auth(store, provider_json, credential, session.as_ref())
+                    .await
+                    .map_err(map_call_error)
+                    .and_then(map_adapter_result)
+            }
         }
     }
 
@@ -2730,6 +2770,25 @@ impl AdapterGuest {
                 .await
                 .map_err(map_call_error)
                 .and_then(map_adapter_result),
+            Self::Api3(plugin) => {
+                let session = opaque_session_context.map(|id| {
+                    adapter_v3_bindings::kinetix::plugin3_0_0::types::SessionContext {
+                        id: id.into(),
+                    }
+                });
+                plugin
+                    .kinetix_plugin3_0_0_provider_adapter()
+                    .call_build_body(
+                        store,
+                        request_json,
+                        provider_json,
+                        model_json,
+                        session.as_ref(),
+                    )
+                    .await
+                    .map_err(map_call_error)
+                    .and_then(map_adapter_result)
+            }
         }
     }
 
@@ -2749,6 +2808,12 @@ impl AdapterGuest {
                 .and_then(map_adapter_result),
             Self::Api2(plugin) => plugin
                 .kinetix_plugin2_0_0_provider_adapter()
+                .call_classify_error(store, status, body, headers_json)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+            Self::Api3(plugin) => plugin
+                .kinetix_plugin3_0_0_provider_adapter()
                 .call_classify_error(store, status, body, headers_json)
                 .await
                 .map_err(map_call_error)
@@ -2774,6 +2839,12 @@ impl AdapterGuest {
                 .await
                 .map_err(map_call_error)
                 .and_then(map_adapter_result),
+            Self::Api3(plugin) => plugin
+                .kinetix_plugin3_0_0_provider_adapter()
+                .call_parse_stream_chunk(store, data)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
         }
     }
 
@@ -2791,6 +2862,12 @@ impl AdapterGuest {
                 .and_then(map_adapter_result),
             Self::Api2(plugin) => plugin
                 .kinetix_plugin2_0_0_provider_adapter()
+                .call_parse_full_response(store, body_json)
+                .await
+                .map_err(map_call_error)
+                .and_then(map_adapter_result),
+            Self::Api3(plugin) => plugin
+                .kinetix_plugin3_0_0_provider_adapter()
                 .call_parse_full_response(store, body_json)
                 .await
                 .map_err(map_call_error)
@@ -2873,6 +2950,17 @@ impl AdapterPluginError for adapter_bindings::kinetix::plugin::types::PluginErro
 }
 
 impl AdapterPluginError for adapter_v2_bindings::kinetix::plugin1_0_0::types::PluginError {
+    fn into_fault(self) -> PluginFault {
+        PluginFault::PluginError {
+            code: self.code,
+            message: self.message,
+            retryable: self.retryable,
+            retry_after: self.retry_after,
+        }
+    }
+}
+
+impl AdapterPluginError for adapter_v3_bindings::kinetix::plugin1_0_0::types::PluginError {
     fn into_fault(self) -> PluginFault {
         PluginFault::PluginError {
             code: self.code,
@@ -3149,15 +3237,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_v2_adapter_contract_rejects_every_host_import() {
+    async fn api_v3_adapter_contract_rejects_every_host_import() {
         let (manager, pool, dir) = concurrency_test_manager().await;
         let manifest: Manifest = toml::from_str(
             r#"
             manifest_version = 1
-            id = "dev.example.v2-adapter"
-            name = "V2 adapter"
+            id = "dev.example.v3-adapter"
+            name = "V3 adapter"
             version = "0.1.0"
-            plugin_api = "2"
+            plugin_api = "3"
 
             [provides]
             provider_adapters = ["test-adapter"]
@@ -3197,9 +3285,9 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("provider-adapter-v2 world validation")
+                    .contains("provider-adapter-v3 world validation")
                     && error.to_string().contains(import),
-                "expected API-v2 contract to reject {import}, got: {error}"
+                "expected API-v3 contract to reject {import}, got: {error}"
             );
         }
 

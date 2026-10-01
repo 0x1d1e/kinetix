@@ -28901,7 +28901,7 @@ provider_adapters = ["session-echo"]
 memory = "128MiB"
 storage = "2MiB"
 "#,
-            crate::plugins::PLUGIN_API_MAJOR
+            2
         );
         let mut foreign_archive = tar::Builder::new(Vec::new());
         for (path, data) in [
@@ -29032,7 +29032,7 @@ network_hosts = ["native.example"]
 memory = "128MiB"
 storage = "2MiB"
 "#,
-            crate::plugins::PLUGIN_API_MAJOR
+            2
         );
         let mut archive = tar::Builder::new(Vec::new());
         for (path, data) in [
