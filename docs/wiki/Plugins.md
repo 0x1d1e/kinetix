@@ -341,6 +341,14 @@ After a browser AuthFlow succeeds, Kinetix may return the non-secret provider
 id to the dashboard so it can immediately run discovery. Authorization codes,
 access tokens, refresh tokens, and account secrets never appear in that URL.
 
+### Draft install proposal metadata
+
+Integrations may declare `manual_credential` (a kind and named requirements) and `install` (an optional account label and route IDs/models). These fields contain no credential values, approval tokens, activation flags, or account pins. Legacy manual declarations without this metadata remain valid.
+
+Kinetix parses, validates, and retains these declarations; it does not apply their proposals. Enrollment, object persistence, permission approval, and traffic activation remain host-owned. Proposed routes target the provider account pool, not the initially proposed account. Runtime account selection remains unchanged.
+
+The proposed contract and planner live in [kinetix-plugins PR #78](https://github.com/PrightCord/kinetix-plugins/pull/78). The mirrored corpus at `wit/fixtures/plugin-manifest/v1/cases.json` is checked by both repositories; it covers native/anonymous providers, public parameters, legacy manifests, installation metadata, and invalid declarations. Keep the contract draft until both changes land.
+
 ### Native dashboard actions
 
 Plugins may optionally declare `[[ui.actions]]` records. These are

@@ -190,6 +190,8 @@ fn validate_for_host(
                 _ => {}
             }
         }
+        validate_install_declarations(integration)
+            .map_err(|error| anyhow!("integration '{}': {error}", integration.id))?;
         if integration.provider_adapter.is_none()
             && integration.credential_strategy.is_none()
             && integration.auth_flow.is_none()
@@ -699,6 +701,67 @@ fn validate_integration_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_install_declarations(integration: &super::types::Integration) -> Result<()> {
+    if let Some(manual) = &integration.manual_credential {
+        if integration.credential_mode != Some(CredentialMode::Manual) {
+            bail!("manual_credential requires explicit manual credential mode");
+        }
+        validate_install_identifier(&manual.kind, "manual credential kind")?;
+        if manual.requirements.is_empty() {
+            bail!("manual credential requirements must not be empty");
+        }
+        let mut requirements = std::collections::HashSet::new();
+        for requirement in &manual.requirements {
+            validate_install_identifier(requirement, "manual credential requirement")?;
+            if !requirements.insert(requirement) {
+                bail!("duplicate manual credential requirement '{requirement}'");
+            }
+        }
+    }
+    if let Some(install) = &integration.install {
+        let mode = integration
+            .credential_mode
+            .ok_or_else(|| anyhow!("install requires explicit credential_mode"))?;
+        if integration.provider.is_none() {
+            bail!("install requires a provider template");
+        }
+        if mode == CredentialMode::Manual && integration.manual_credential.is_none() {
+            bail!("manual install requires manual_credential kind and requirements");
+        }
+        if let Some(account) = &install.account {
+            if mode == CredentialMode::None {
+                bail!("none credential mode cannot propose an account or credential");
+            }
+            if account.name.trim().is_empty() {
+                bail!("install account name must not be empty");
+            }
+        }
+        let mut route_ids = std::collections::HashSet::new();
+        for route in &install.routes {
+            validate_install_identifier(&route.id, "install route id")?;
+            if !route_ids.insert(&route.id) {
+                bail!("duplicate install route id '{}'", route.id);
+            }
+            if route.model.trim().is_empty() {
+                bail!("install route model must not be empty");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_install_identifier(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+    {
+        bail!("{label} must be 1..=64 lowercase ASCII letters, digits, '_' or '-'");
+    }
+    Ok(())
+}
+
 fn validate_capability_name(cap: Capability, name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
         bail!(
@@ -838,6 +901,34 @@ storage = "2MiB"
             error.to_string().contains("model_discovery must match"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn portable_manifest_vectors_match_host_contract() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../wit/fixtures/plugin-manifest/v1/cases.json"
+        ))
+        .unwrap();
+        for case in vectors["cases"].as_array().unwrap() {
+            let result =
+                parse_and_validate(case["manifest"].as_str().unwrap(), HostPolicy::default());
+            assert_eq!(
+                result.is_ok(),
+                case["valid"].as_bool().unwrap(),
+                "{}: {result:?}",
+                case["name"]
+            );
+            if let Ok(validated) = result {
+                let encoded = toml::to_string(&validated.manifest).unwrap();
+                let round_trip = parse_and_validate(&encoded, HostPolicy::default()).unwrap();
+                assert_eq!(
+                    serde_json::to_value(validated.manifest).unwrap(),
+                    serde_json::to_value(round_trip.manifest).unwrap(),
+                    "{} must retain its declarations",
+                    case["name"]
+                );
+            }
+        }
     }
 
     #[test]

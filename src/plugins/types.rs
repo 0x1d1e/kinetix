@@ -345,6 +345,38 @@ impl IntegrationProtocolsV1 {
     }
 }
 
+/// Named credential inputs only. Enrollment and value validation stay host-owned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualCredential {
+    pub kind: String,
+    pub requirements: Vec<String>,
+}
+
+/// Inspect-only object proposals. Parsing these declarations does not apply them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationInstall {
+    #[serde(default)]
+    pub account: Option<InstallAccount>,
+    #[serde(default)]
+    pub routes: Vec<InstallRoute>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallAccount {
+    pub name: String,
+}
+
+/// Routes target the provider pool; account selection is not plugin metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallRoute {
+    pub id: String,
+    pub model: String,
+}
+
 /// A user-facing integration assembled from one or more capabilities provided
 /// by the same plugin. This metadata is declarative only: it grants no
 /// authority and contains no browser-executable code.
@@ -357,6 +389,10 @@ pub struct Integration {
     pub description: String,
     #[serde(default)]
     pub credential_mode: Option<CredentialMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_credential: Option<ManualCredential>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<IntegrationInstall>,
     #[serde(default)]
     pub provider_adapter: Option<String>,
     #[serde(default)]
