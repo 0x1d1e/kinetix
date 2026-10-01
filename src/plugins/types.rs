@@ -195,6 +195,9 @@ impl PricingScope {
 #[serde(deny_unknown_fields)]
 pub struct IntegrationProvider {
     pub base_url: String,
+    /// Required non-secret path identifiers, configured on the provider.
+    #[serde(default)]
+    pub parameters: std::collections::BTreeMap<String, crate::provider_connection::Parameter>,
     #[serde(default = "default_integration_wire_format")]
     pub wire_format: String,
     #[serde(default = "default_integration_auth_scheme")]

@@ -15,6 +15,13 @@ remove:
 `<DIR>/data`, `<DIR>/state` and **ignores any `.env`** — ideal for isolated or
 test instances.
 
+Anonymous bootstrap providers use `auth_scheme = "none"` and
+`credential_mode = "none"`, without credential accounts or custom auth fields.
+Anonymous authentication does not imply integration pricing: non-plugin-backed
+Providers retain `direct_api` pricing by default.
+For public identifiers stored separately from tokens, see
+[Public connection parameters](Plugins#public-connection-parameters).
+
 ## Configuration precedence
 
 ```
@@ -137,9 +144,12 @@ and missing resources. Ambiguous existing account labels are conflicts. Applying
 uses one transaction; a failed import leaves the database unchanged. Imports
 upsert providers, models, Routes, and aliases without deleting them. Unambiguous
 account matches receive imported operator policy while retaining their existing
-credentials; imported credentials are used only for new accounts. Changing a
-provider to `credential_mode: none` may remove its credential accounts to enforce
-that mode.
+credentials; imported credentials are used only for new accounts. Plugin-backed
+connection policy is checked against its source integration manifest when
+available. If the plugin is absent, import preserves the portable parameters but
+the provider remains unavailable for routing until the plugin is installed and
+enabled for policy re-attestation. Changing a provider to `credential_mode: none`
+may remove its credential accounts to enforce that mode.
 
 ## Plugin storage and host configuration
 

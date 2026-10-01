@@ -96,16 +96,18 @@ impl PluginAdapter {
         tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
     }
 
-    fn provider_json(ctx: &UpstreamContext<'_>) -> String {
-        let mut provider =
-            serde_json::to_value(ctx.provider).unwrap_or_else(|_| serde_json::json!({}));
+    fn provider_json(ctx: &UpstreamContext<'_>) -> Result<String, String> {
+        let (base_url, models_path) = ctx.provider.resolved_endpoint()?;
+        let mut provider = serde_json::to_value(ctx.provider).map_err(|error| error.to_string())?;
+        provider["base_url"] = serde_json::json!(base_url);
+        provider["models_path"] = serde_json::json!(models_path);
         if let (Some(account_id), Some(object)) = (ctx.account_id, provider.as_object_mut()) {
             object.insert(
                 "_kinetix".into(),
                 serde_json::json!({ "account_id": account_id }),
             );
         }
-        serde_json::to_string(&provider).unwrap_or_else(|_| "{}".to_string())
+        serde_json::to_string(&provider).map_err(|error| error.to_string())
     }
 
     fn model_json(ctx: &UpstreamContext<'_>) -> String {
@@ -253,7 +255,10 @@ impl Adapter for PluginAdapter {
     }
 
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
-        let (p, m) = (Self::provider_json(ctx), Self::model_json(ctx));
+        let (p, m) = (
+            Self::provider_json(ctx).map_err(ProxyError::bad_request)?,
+            Self::model_json(ctx),
+        );
         self.block(self.manager.adapter_build_url(&self.plugin_id, &p, &m))
             .map_err(Self::plugin_err)
     }
@@ -263,7 +268,11 @@ impl Adapter for PluginAdapter {
         ctx: &UpstreamContext<'_>,
         req: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, UpstreamFailure> {
-        let p = Self::provider_json(ctx);
+        if ctx.provider.auth() == crate::types::AuthScheme::None {
+            return Ok(req);
+        }
+        let p = Self::provider_json(ctx)
+            .map_err(|error| Self::protocol_failure("connection", error))?;
         let credential = ctx.credential.clone();
         let headers_json = self
             .block(self.manager.adapter_apply_auth(
@@ -296,7 +305,11 @@ impl Adapter for PluginAdapter {
         req: &InternalRequest,
     ) -> Result<Value, UpstreamFailure> {
         let request_json = request_to_json(req);
-        let (p, m) = (Self::provider_json(ctx), Self::model_json(ctx));
+        let (p, m) = (
+            Self::provider_json(ctx)
+                .map_err(|error| Self::protocol_failure("connection", error))?,
+            Self::model_json(ctx),
+        );
         let body = self
             .block(self.manager.adapter_build_body(
                 &self.plugin_id,

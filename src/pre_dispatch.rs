@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreDispatchFacts {
     pub request_eligible: bool,
+    pub connection_attested: bool,
     pub account_eligible: bool,
     /// `None` means the planner has not reached the account-quota check yet.
     pub account_quota_reached: Option<bool>,
@@ -23,6 +24,7 @@ pub(crate) struct PreDispatchFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreDispatchDecision {
     RequestIneligible,
+    ConnectionUnattested,
     AccountUnavailable,
     QuotaOverrideUnavailable,
     CheckAccountQuota,
@@ -92,10 +94,14 @@ pub(crate) fn normalized_weight(weight: i64) -> u64 {
 }
 
 /// Apply the same ordered gates for an individual candidate in runtime and
-/// dry-run. Quota is intentionally checked before provider-circuit availability.
+/// dry-run. Connection attestation is checked before account state and quota;
+/// quota is checked before provider-circuit availability.
 pub(crate) fn plan_candidate(facts: PreDispatchFacts) -> PreDispatchDecision {
     if !facts.request_eligible {
         return PreDispatchDecision::RequestIneligible;
+    }
+    if !facts.connection_attested {
+        return PreDispatchDecision::ConnectionUnattested;
     }
     if !facts.account_eligible {
         return PreDispatchDecision::AccountUnavailable;
@@ -221,6 +227,8 @@ pub(crate) fn plan_dispatch(
             } else if stochastic_selection && decisions[index] == PreDispatchDecision::Dispatchable
             {
                 "outside_stochastic_frontier"
+            } else if decisions[index] == PreDispatchDecision::ConnectionUnattested {
+                "connection_attestation"
             } else if decisions[index] == PreDispatchDecision::SkipAfterQuota {
                 "account_soft_quota_fallback"
             } else if decisions[index] == PreDispatchDecision::Dispatchable {
@@ -415,6 +423,7 @@ mod tests {
     fn facts() -> PreDispatchFacts {
         PreDispatchFacts {
             request_eligible: true,
+            connection_attested: true,
             account_eligible: true,
             account_quota_reached: Some(false),
             quota_fallback_allowed: false,
@@ -435,6 +444,30 @@ mod tests {
             defer_for_circuit: false,
             facts,
         }
+    }
+
+    #[test]
+    fn unattested_provider_is_skipped_before_a_healthy_fallback() {
+        let mut quarantined = facts();
+        quarantined.connection_attested = false;
+        let plan = plan_dispatch(
+            &[
+                candidate("quarantined", 0, quarantined),
+                candidate("healthy", 1, facts()),
+            ],
+            true,
+            DispatchStrategy::Ordered,
+            None,
+            false,
+        );
+
+        assert_eq!(plan.outcome, DispatchOutcome::Selected("healthy".into()));
+        assert_eq!(
+            plan.candidates[0].decision,
+            PreDispatchDecision::ConnectionUnattested
+        );
+        assert_eq!(plan.candidates[0].decision_reason, "connection_attestation");
+        assert!(plan.candidates[1].selected);
     }
 
     #[test]

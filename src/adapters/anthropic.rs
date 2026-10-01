@@ -339,7 +339,8 @@ impl Adapter for AnthropicAdapter {
     }
 
     fn build_url(&self, ctx: &UpstreamContext<'_>) -> Result<String, ProxyError> {
-        let base = ctx.provider.base_url.trim_end_matches('/');
+        let resolved = ctx.provider.resolved_base_url()?;
+        let base = resolved.trim_end_matches('/');
         Ok(format!("{base}/messages"))
     }
 
@@ -348,7 +349,8 @@ impl Adapter for AnthropicAdapter {
     }
 
     fn count_tokens_url(&self, ctx: &UpstreamContext<'_>) -> Result<Option<String>, ProxyError> {
-        let base = ctx.provider.base_url.trim_end_matches('/');
+        let resolved = ctx.provider.resolved_base_url()?;
+        let base = resolved.trim_end_matches('/');
         Ok(Some(format!("{base}/messages/count_tokens")))
     }
 
@@ -362,6 +364,7 @@ impl Adapter for AnthropicAdapter {
             req = req.header("user-agent", "claude-cli/1.18.31 (external, cli)");
         }
         Ok(match ctx.provider.auth() {
+            AuthScheme::None => req,
             AuthScheme::Bearer => req.bearer_auth(&ctx.credential),
             AuthScheme::CustomHeader => {
                 let name = ctx
@@ -1043,6 +1046,8 @@ mod tests {
             pricing_scope: "direct_api".into(),
             integration_features: None,
             integration_protocols: None,
+            connection_parameters: None,
+            connection_parameters_attested: None,
         }
     }
 

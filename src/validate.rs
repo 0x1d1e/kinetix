@@ -19,6 +19,13 @@ use serde_json::{json, Value};
 
 use crate::types::{ParamPolicy, Prices, WireFormat};
 
+pub(crate) fn is_auth_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "proxy-authorization" | "x-api-key" | "x-goog-api-key"
+    )
+}
+
 /// Schema-level validation of a proposed provider (FR-8.6).
 pub fn validate_provider_schema(
     name: &str,
@@ -41,7 +48,7 @@ pub fn validate_provider_schema(
         ));
     }
     match auth_scheme {
-        "bearer" => {}
+        "bearer" | "none" => {}
         "custom_header" => {
             if custom_header_name.unwrap_or("").trim().is_empty() {
                 problems.push("auth_scheme 'custom_header' requires custom_header_name".into());
@@ -53,7 +60,7 @@ pub fn validate_provider_schema(
             }
         }
         other => problems.push(format!(
-            "unknown auth_scheme '{other}' (expected bearer, custom_header, or query_param)"
+            "unknown auth_scheme '{other}' (expected none, bearer, custom_header, or query_param)"
         )),
     }
     problems

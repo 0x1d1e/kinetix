@@ -339,7 +339,7 @@ fn token_count_exact_target(
     let needs = req.capability_needs();
     let allowed_providers = key.allowed_providers();
 
-    let eligible = |target: &ResolvedTarget| {
+    let capability_eligible = |target: &ResolvedTarget| {
         let capabilities_match = provider_accepts_input_protocol(&target.provider, input_protocol)
             && integration_feature_ceiling_satisfies_needs(&target.provider, &needs)
             && (!target.provider.strict()
@@ -354,6 +354,9 @@ fn token_count_exact_target(
                 .unwrap_or(false));
         (allowed_providers.is_empty() || allowed_providers.contains(&target.provider.id))
             && capabilities_match
+    };
+    let eligible = |target: &ResolvedTarget| {
+        target.provider.connection_policy_attested() && capability_eligible(target)
     };
 
     match resolved {
@@ -381,6 +384,9 @@ fn token_count_exact_target(
                     crate::types::ErrorKind::Forbidden,
                     "this key is not allowed to use the resolved provider",
                 ));
+            }
+            if !provider.connection_policy_attested() {
+                return Ok(None);
             }
             let account = select_accounts(&snap, &provider_id, None)?
                 .into_iter()
@@ -416,8 +422,15 @@ fn token_count_exact_target(
             }))
         }
         Resolved::Route { targets, .. } => {
+            let has_capability_eligible_target =
+                targets.iter().any(|target| capability_eligible(target));
             let mut targets: Vec<_> = targets.into_iter().filter(eligible).collect();
             if targets.is_empty() {
+                if has_capability_eligible_target {
+                    // Quarantined providers have no usable exact tokenizer. Keep the local
+                    // estimate path instead of turning connection quarantine into a 400.
+                    return Ok(None);
+                }
                 return Err(ProxyError::unsupported(
                     "no configured target can satisfy this token-count request",
                 ));
@@ -1057,9 +1070,10 @@ pub(crate) async fn run_with_disconnect(
     let mut dispatch_candidates = Vec::with_capacity(targets.len());
     for (rank, target) in targets.iter().enumerate() {
         let status = pool::effective_status(&target.account);
+        let connection_attested = target.provider.connection_policy_attested();
         let account_eligible =
             matches!(status, pool::AccountStatus::Healthy) || pool::should_probe(&target.account);
-        let account_quota_reached = if account_eligible {
+        let account_quota_reached = if connection_attested && account_eligible {
             Some(
                 pool::soft_quota_reached(&state.pool, &target.account)
                     .await
@@ -1068,19 +1082,20 @@ pub(crate) async fn run_with_disconnect(
         } else {
             None
         };
-        let provider_circuit_available = if account_eligible && account_quota_reached != Some(true)
-        {
-            Some(
-                state
-                    .provider_circuits
-                    .availability(&target.provider.id)
-                    .available,
-            )
-        } else {
-            None
-        };
+        let provider_circuit_available =
+            if connection_attested && account_eligible && account_quota_reached != Some(true) {
+                Some(
+                    state
+                        .provider_circuits
+                        .availability(&target.provider.id)
+                        .available,
+                )
+            } else {
+                None
+            };
         let facts = crate::pre_dispatch::PreDispatchFacts {
             request_eligible: true,
+            connection_attested,
             account_eligible,
             account_quota_reached,
             quota_fallback_allowed,
@@ -1215,6 +1230,19 @@ pub(crate) async fn run_with_disconnect(
             .get(&candidate_id)
             .expect("runtime candidate has a dispatch-plan record");
         let status = pool::effective_status(&target.account);
+        if dispatch_record.decision
+            == crate::pre_dispatch::PreDispatchDecision::ConnectionUnattested
+        {
+            meta.fallback_path
+                .push(format!("{}:connection_attestation", target.provider.name));
+            trace.step(
+                "skip",
+                Some(target.provider.name.clone()),
+                "provider connection parameters await source integration attestation",
+            );
+            state.record_skip();
+            continue;
+        }
         if dispatch_record.decision == crate::pre_dispatch::PreDispatchDecision::AccountUnavailable
         {
             let why = account_skip_detail(target, status);
@@ -4442,9 +4470,10 @@ fn stable_route_hash(seed: u64, bytes: &[u8]) -> u64 {
 
 fn adaptive_account_dispatchable(target: &ResolvedTarget) -> bool {
     let status = pool::effective_status(&target.account);
-    matches!(status, pool::AccountStatus::Healthy)
-        || (matches!(status, pool::AccountStatus::CircuitOpen)
-            && pool::should_probe(&target.account))
+    target.provider.connection_policy_attested()
+        && (matches!(status, pool::AccountStatus::Healthy)
+            || (matches!(status, pool::AccountStatus::CircuitOpen)
+                && pool::should_probe(&target.account)))
 }
 
 /// Order logical route targets according to the route strategy (FR-12.5), then
@@ -7557,6 +7586,7 @@ pub async fn dry_run(
         let status = pool::effective_status(&t.account);
         let half_open_probe =
             matches!(status, pool::AccountStatus::CircuitOpen) && pool::should_probe(&t.account);
+        let connection_attested = t.provider.connection_policy_attested();
         let account_eligible = matches!(status, pool::AccountStatus::Healthy) || half_open_probe;
         let account_quota_reached = pool::soft_quota_reached(&state.pool, &t.account)
             .await
@@ -7579,6 +7609,7 @@ pub async fn dry_run(
         let request_eligible = decision.eligible() && protocol_ok;
         let pre_dispatch_facts = crate::pre_dispatch::PreDispatchFacts {
             request_eligible,
+            connection_attested,
             account_eligible,
             account_quota_reached: Some(account_quota_reached),
             quota_fallback_allowed,
@@ -7607,6 +7638,9 @@ pub async fn dry_run(
         }
         if let Some(error) = decision.execution_profile_error.as_deref() {
             reasons.push(format!("invalid_execution_profile: {error}"));
+        }
+        if !connection_attested {
+            reasons.push("connection_attestation".to_string());
         }
         if !account_eligible {
             reasons.push("account_state".to_string());
@@ -7653,6 +7687,7 @@ pub async fn dry_run(
             "account_id": t.account.id,
             "account_status": status.as_str(),
             "half_open_probe": half_open_probe,
+            "provider_connection_attested": connection_attested,
             "route_target_id": t.route_target_id.as_deref(),
             "priority": t.priority,
             "weight": t.weight,
@@ -7731,7 +7766,12 @@ pub async fn dry_run(
             && record.decision_reason != "ineligible"
         {
             if let Some(reasons) = candidate["not_selected_reasons"].as_array_mut() {
-                reasons.push(serde_json::json!(record.decision_reason));
+                if !reasons
+                    .iter()
+                    .any(|reason| reason == record.decision_reason)
+                {
+                    reasons.push(serde_json::json!(record.decision_reason));
+                }
             }
         }
     }
@@ -8146,6 +8186,8 @@ mod route_policy_tests {
             pricing_scope: "direct_api".into(),
             integration_features: None,
             integration_protocols: None,
+            connection_parameters: None,
+            connection_parameters_attested: None,
         }
     }
 

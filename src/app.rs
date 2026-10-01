@@ -344,6 +344,14 @@ impl AppState {
         provider: &crate::db::ProviderRow,
         account: &crate::db::AccountRow,
     ) -> std::result::Result<crate::credentials::ResolvedCredential, CredentialRotationError> {
+        if provider.auth() == crate::types::AuthScheme::None {
+            return Ok(crate::credentials::ResolvedCredential {
+                secret: String::new(),
+                expires_at: None,
+                refresh_after: None,
+                rotated: false,
+            });
+        }
         if let Some(r) = provider.credential_plugin_ref() {
             let Some(identity) = self.provider_work_identity(&provider.id, Some(&account.id))
             else {

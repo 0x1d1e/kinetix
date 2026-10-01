@@ -370,7 +370,16 @@ async fn send_provider_request_once(
         )));
     }
 
+    ctx.provider
+        .resolved_endpoint()
+        .map_err(OutboundError::denied)?;
+    let connection = ctx.provider.connection().map_err(OutboundError::denied)?;
     for hop in 0..=MAX_REDIRECTS {
+        if let Some(parameters) = &connection {
+            parameters
+                .authorize_url(&current)
+                .map_err(OutboundError::denied)?;
+        }
         let destination = resolve_destination(&current, allow_private, insecure_tls).await?;
         tracing::debug!(
             target = %destination.host,
@@ -400,9 +409,11 @@ async fn send_provider_request_once(
         }
 
         if authorized {
-            builder = adapter
-                .apply_auth(ctx, builder)
-                .map_err(OutboundError::adapter)?;
+            if ctx.provider.auth() != crate::types::AuthScheme::None {
+                builder = adapter
+                    .apply_auth(ctx, builder)
+                    .map_err(OutboundError::adapter)?;
+            }
             for (name, value) in ctx.provider.extra_headers_map() {
                 builder = builder.header(name, value);
             }
@@ -484,6 +495,8 @@ mod tests {
             pricing_scope: "direct_api".into(),
             integration_features: None,
             integration_protocols: None,
+            connection_parameters: None,
+            connection_parameters_attested: None,
         }
     }
 

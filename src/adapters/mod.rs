@@ -2312,6 +2312,50 @@ mod reasoning_discovery_tests {
 mod execution_profile_tests {
     use super::*;
 
+    #[test]
+    fn native_adapters_do_not_mutate_auth_for_anonymous_providers() {
+        let adapters: Vec<Box<dyn Adapter>> = vec![
+            Box::new(openai::OpenAiAdapter::new()),
+            Box::new(openai_responses::OpenAiResponsesAdapter::new()),
+            Box::new(anthropic::AnthropicAdapter::new()),
+            Box::new(gemini::GeminiAdapter::new()),
+        ];
+        let mut provider = provider();
+        provider.auth_scheme = "none".into();
+        provider.credential_mode = "none".into();
+        let model = model();
+        let ctx = UpstreamContext {
+            provider: &provider,
+            model: &model,
+            account_id: None,
+            session_context: None,
+            credential: "must-not-be-sent".into(),
+        };
+        for adapter in &adapters {
+            let request = adapter
+                .apply_auth(
+                    &ctx,
+                    reqwest::Client::new()
+                        .get("https://example.test/models")
+                        .header("x-metadata", "preserved"),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(request.url().as_str(), "https://example.test/models");
+            assert_eq!(request.headers().len(), 1);
+            assert_eq!(request.headers()["x-metadata"], "preserved");
+            for status in [429, 503] {
+                let failure = adapter.classify_error(
+                    status,
+                    "temporary failure",
+                    &reqwest::header::HeaderMap::new(),
+                );
+                assert_ne!(failure.kind, crate::types::FailureKind::AuthError);
+            }
+        }
+    }
+
     fn provider() -> crate::db::ProviderRow {
         crate::db::ProviderRow {
             id: "provider".into(),
@@ -2340,6 +2384,8 @@ mod execution_profile_tests {
             pricing_scope: "direct_api".into(),
             integration_features: None,
             integration_protocols: None,
+            connection_parameters: None,
+            connection_parameters_attested: None,
         }
     }
 

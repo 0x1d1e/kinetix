@@ -244,8 +244,78 @@ Kinetix validates the template when the package is installed. Creating the
 provider is a separate admin operation and re-runs outbound URL checks plus
 capability-binding checks. The host derives `wire_plugin`,
 `credential_plugin`, and `model_source_plugin` from the parent Integration;
-the package cannot inject bindings to another plugin. Repeating setup returns
-the existing matching provider instead of creating a duplicate.
+the package cannot inject bindings to another plugin. Repeating setup with the
+same connection values returns the existing Provider; different values create
+another Provider without retargeting existing instances. When multiple instances
+exist, setup requires explicit `connection_values`.
+
+### Anonymous authentication
+
+`credential_mode = "none"` only describes enrollment. For an API that genuinely
+accepts anonymous requests, also declare `auth_scheme = "none"` in
+`[integrations.provider]`. Do not bind a credential strategy or auth flow, set
+custom auth fields, or supply auth headers. Native inference and discovery then
+send no authentication material. Kinetix retains a secret-free routing account
+for health, throttling, and Route selection; existing authenticated schemes
+still require their usual credentials.
+
+### Public connection parameters
+
+Use bounded identifiers in complete URL path segments when an API needs a
+public account identifier alongside a separate secret token:
+
+```toml
+[permissions]
+network_hosts = ["api.example.com"]
+credential_read = false
+
+[[integrations]]
+id = "identifier-api"
+name = "Identifier API"
+credential_mode = "manual"
+
+[integrations.provider]
+base_url = "https://api.example.com/accounts/{account_id}/v1"
+wire_format = "openai"
+auth_scheme = "bearer"
+models_path = "/models"
+
+[integrations.provider.parameters.account_id]
+type = "identifier"
+min_length = 1
+max_length = 64
+```
+
+Enter values in Plugins during provider setup, or POST
+`{"connection_values":{"account_id":"tenant-123"}}` to
+`/admin/api/plugins/:id/integrations/:integration_id/provider`. Edit them on
+the Provider page or with the same `connection_values` field in a provider
+update. Validate an edit through `/admin/api/validate/provider` with
+`provider_id` so validation uses the saved declarations.
+
+Values are provider-scoped: all its credential accounts share the identifier.
+Use **Add another Provider** in Plugins for each distinct identifier, or repeat
+the setup API call with different values. Native inference,
+native discovery, and plugin discovery receive the same resolved base URL;
+`models_path` is appended to that base, not resolved from the host root.
+Account-aware discovery receives its account reference as before, without
+needing `credential_read` to obtain the public identifier.
+
+Identifiers allow only ASCII letters, digits, underscores and hyphens, with
+explicit bounds of 1-256 bytes and at most 16 declarations. Missing, extra,
+invalid or oversized values are rejected before outbound work. Variables
+cannot occupy the scheme, host, query, fragment or partial path segments.
+Encoding, delimiters and traversal cannot enter through a value; expansion
+preserves the origin. Declared `network_hosts` also constrain redirects;
+DNS/SSRF checks and credential-host binding remain in force.
+
+Public declarations and values round-trip in `connection_parameters` in
+configuration exports, separately from encrypted credentials. Bootstrap and
+CLI-created providers accept that object with `declarations`, `values`, and
+`network_hosts`; the CLI reads it from `--connection-parameters <JSON-file>`.
+Do not put secrets in these fields: the dashboard and configuration exports
+expose them. Existing manifests without parameters retain their behavior;
+this adds no WIT requirement to API-v1 or API-v2 guests.
 
 ### Account-aware model discovery
 

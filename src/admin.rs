@@ -1593,6 +1593,7 @@ fn provider_json(p: &db::ProviderRow) -> Value {
         "timeout_ms": p.timeout_ms,
         "capability_mode": p.capability_mode,
         "models_path": p.models_path,
+        "connection_parameters": p.connection().ok().flatten(),
         "rate_limit_rules": serde_json::from_str::<Value>(&p.rate_limit_rules).unwrap_or(json!({})),
         "enabled": p.enabled != 0,
         "follow_redirects": p.follow_redirects != 0,
@@ -1692,6 +1693,8 @@ pub struct ProviderBody {
     pub model_source_plugin: String,
     #[serde(default)]
     pub pricing_scope: Option<String>,
+    #[serde(default)]
+    pub connection_values: Option<std::collections::BTreeMap<String, String>>,
     /// Optional initial credential.
     pub api_key: Option<String>,
     pub account_label: Option<String>,
@@ -1812,6 +1815,24 @@ async fn provider_plugin_binding_problems(state: &AppState, body: &ProviderBody)
 
     problems
 }
+fn validate_no_auth_body(body: &ProviderBody) -> Result<(), ApiError> {
+    if body.auth_scheme == "none"
+        && (body.api_key.as_ref().is_some_and(|key| !key.is_empty())
+            || !body.credential_plugin.is_empty()
+            || body.custom_header_name.is_some()
+            || body.custom_param_name.is_some()
+            || body
+                .extra_headers
+                .keys()
+                .any(|name| crate::validate::is_auth_header(name)))
+    {
+        return Err(ApiError::bad(
+            "no-auth providers must not configure credentials or auth fields",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn create_provider(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -1820,6 +1841,18 @@ pub async fn create_provider(
     restore_redacted_headers(&mut body.extra_headers, None)?;
     validate_provider_fields(&body)?;
     validate_outbound_url(&state, &body.base_url).map_err(|error| error.on_field("base_url"))?;
+    validate_no_auth_body(&body)?;
+    crate::provider_connection::resolve_endpoint(&body.base_url, body.models_path.as_deref(), None)
+        .map_err(ApiError::bad)?;
+    if body
+        .connection_values
+        .as_ref()
+        .is_some_and(|values| !values.is_empty())
+    {
+        return Err(ApiError::bad(
+            "connection values require an integration with declared parameters",
+        ));
+    }
     let binding_problems = provider_plugin_binding_problems(&state, &body).await;
     if !binding_problems.is_empty() {
         return Err(ApiError::bad(binding_problems.join("; ")));
@@ -1833,8 +1866,14 @@ pub async fn create_provider(
     }
     let auth =
         AuthScheme::parse(&body.auth_scheme).ok_or_else(|| ApiError::bad("invalid auth_scheme"))?;
+    let credential_mode = if auth == AuthScheme::None {
+        "none"
+    } else {
+        "manual"
+    };
     let conservative_scope = db::conservative_provider_pricing_scope(
-        "manual",
+        auth,
+        credential_mode,
         None,
         None,
         &body.wire_plugin,
@@ -1874,13 +1913,16 @@ pub async fn create_provider(
             wire_plugin: &body.wire_plugin,
             credential_plugin: &body.credential_plugin,
             model_source_plugin: &body.model_source_plugin,
-            credential_mode: "manual",
+            credential_mode,
             source_plugin_id: None,
             source_integration_id: None,
         },
     )
     .await
     .map_err(ApiError::internal)?;
+    if auth == AuthScheme::None {
+        reconcile_provider_account_mode(&state, &id, crate::plugins::CredentialMode::None).await?;
+    }
     if body.pricing_scope.as_deref() == Some("integration") {
         db::update_provider_pricing_scope(&state.pool, &id, "integration")
             .await
@@ -2094,6 +2136,29 @@ pub async fn update_provider(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
     restore_redacted_headers(&mut body.extra_headers, Some(&existing))?;
+    validate_no_auth_body(&body)?;
+    if (existing.auth() == AuthScheme::None) != (body.auth_scheme == "none") {
+        return Err(ApiError::bad(
+            "changing between anonymous and authenticated providers requires a new provider",
+        ));
+    }
+    let mut connection = existing.connection().map_err(ApiError::bad)?;
+    match (&mut connection, &body.connection_values) {
+        (Some(parameters), values) => {
+            if let Some(values) = values {
+                parameters.values = values.clone();
+            }
+            parameters
+                .resolve(&body.base_url, body.models_path.as_deref())
+                .map_err(ApiError::bad)?;
+        }
+        (None, Some(values)) if !values.is_empty() => {
+            return Err(ApiError::bad(
+                "connection values require declared parameters",
+            ))
+        }
+        _ => {}
+    }
     if body
         .api_key
         .as_deref()
@@ -2149,6 +2214,7 @@ pub async fn update_provider(
     let auth =
         AuthScheme::parse(&body.auth_scheme).ok_or_else(|| ApiError::bad("invalid auth_scheme"))?;
     let conservative_scope = db::conservative_provider_pricing_scope(
+        auth,
         &existing.credential_mode,
         existing.source_plugin_id.as_deref(),
         existing.source_integration_id.as_deref(),
@@ -2216,9 +2282,15 @@ pub async fn update_provider(
         source_plugin_id: existing.source_plugin_id.as_deref(),
         source_integration_id: existing.source_integration_id.as_deref(),
     };
-    db::update_provider(&state.pool, &id, &provider, body.pricing_scope.as_deref())
-        .await
-        .map_err(ApiError::internal)?;
+    db::update_provider(
+        &state.pool,
+        &id,
+        &provider,
+        body.pricing_scope.as_deref(),
+        Some(connection.as_ref()),
+    )
+    .await
+    .map_err(ApiError::internal)?;
     if let Some(api_key) = body.api_key.filter(|k| !k.trim().is_empty()) {
         let enc = state.crypto.encrypt(&api_key).map_err(ApiError::internal)?;
         db::insert_account(
@@ -3786,7 +3858,8 @@ pub(crate) async fn reconcile_provider_id(
             )));
         }
 
-        let models_path = provider.models_path.clone().unwrap_or_default();
+        let (base_url, models_path) = provider.resolved_endpoint().map_err(ApiError::bad)?;
+        let models_path = models_path.unwrap_or_default();
         let list = if account_aware {
             let accounts = db::accounts_for_provider(&state.pool, &provider.id)
                 .await
@@ -3815,7 +3888,7 @@ pub(crate) async fn reconcile_provider_id(
                         &pref.plugin_id,
                         &provider.id,
                         &account.id,
-                        &provider.base_url,
+                        &base_url,
                         &models_path,
                     )
                     .await
@@ -3851,12 +3924,7 @@ pub(crate) async fn reconcile_provider_id(
                 .await
                 .map_err(provider_work_acquire_error)?;
             match manager
-                .model_discover(
-                    &pref.plugin_id,
-                    &provider.id,
-                    &provider.base_url,
-                    &models_path,
-                )
+                .model_discover(&pref.plugin_id, &provider.id, &base_url, &models_path)
                 .await
             {
                 Ok(models) => {
@@ -5322,11 +5390,9 @@ async fn discover_models_native(
     }
 
     let adapter = state.adapters.for_provider(provider);
-    let path = provider
-        .models_path
-        .clone()
-        .unwrap_or_else(|| adapter.default_models_path().to_string());
-    let base = provider.base_url.trim_end_matches('/');
+    let (resolved, models_path) = provider.resolved_endpoint().map_err(ApiError::bad)?;
+    let path = models_path.unwrap_or_else(|| adapter.default_models_path().to_string());
+    let base = resolved.trim_end_matches('/');
     let url = if path.starts_with('/') {
         format!("{base}{path}")
     } else {
@@ -9791,10 +9857,18 @@ pub struct ValidateBody {
 
 /// `POST /admin/api/validate/provider` (FR-8.6): full schema + outbound-security
 /// validation of a proposed provider, without creating it.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ProviderValidationBody {
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(flatten)]
+    pub body: ProviderBody,
+}
+
 pub async fn validate_provider(
     State(state): State<AppState>,
     _auth: AdminAuth,
-    Json(body): Json<ProviderBody>,
+    Json(ProviderValidationBody { provider_id, body }): Json<ProviderValidationBody>,
 ) -> ApiResult {
     let mut problems = crate::validate::validate_provider_schema(
         &body.name,
@@ -9804,6 +9878,37 @@ pub async fn validate_provider(
         body.custom_header_name.as_deref(),
         body.custom_param_name.as_deref(),
     );
+    if let Err(ApiError(_, problem, _, _)) = validate_no_auth_body(&body) {
+        problems.push(problem);
+    }
+    let mut connection = if let Some(id) = provider_id {
+        db::get_provider(&state.pool, &id)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found("provider not found"))?
+            .connection()
+            .map_err(ApiError::internal)?
+    } else {
+        None
+    };
+    if let Some(values) = &body.connection_values {
+        if let Some(parameters) = &mut connection {
+            parameters.values = values.clone();
+        } else if !values.is_empty() {
+            problems.push("connection values require declared parameters".into());
+        }
+    }
+    let resolved = match crate::provider_connection::resolve_endpoint(
+        &body.base_url,
+        body.models_path.as_deref(),
+        connection.as_ref(),
+    ) {
+        Ok((base, _)) => base,
+        Err(problem) => {
+            problems.push(problem);
+            body.base_url.clone()
+        }
+    };
     problems.extend(provider_plugin_binding_problems(&state, &body).await);
     if body.wire_format == "plugin" && body.wire_plugin.trim().is_empty() {
         problems.push("wire_format 'plugin' requires a wire_plugin binding".into());
@@ -9813,7 +9918,7 @@ pub async fn validate_provider(
     if body.base_url.trim().is_empty() {
         // already reported as a schema problem
     } else {
-        match validate_outbound_url(&state, &body.base_url) {
+        match validate_outbound_url(&state, &resolved) {
             Ok(()) => security = Value::String("passed".into()),
             Err(ApiError(_, msg, _, _)) => problems.push(msg),
         }
@@ -12207,6 +12312,7 @@ where
             "pricing_scope": p.pricing_scope,
             "integration_features": integration_features,
             "integration_protocols": integration_protocols,
+            "connection_parameters": p.connection().map_err(ApiError::internal)?,
             "enabled": p.enabled != 0,
         }));
     }
@@ -12433,6 +12539,7 @@ async fn resolve_imported_provider_pricing_scope(
     name: &str,
     base_url: &str,
     requested_scope: Option<&str>,
+    auth_scheme: AuthScheme,
     credential_mode: crate::plugins::CredentialMode,
     source_plugin_id: Option<&str>,
     source_integration_id: Option<&str>,
@@ -12442,6 +12549,7 @@ async fn resolve_imported_provider_pricing_scope(
 ) -> Result<String, String> {
     let requested_scope = requested_scope.unwrap_or_else(|| {
         db::conservative_provider_pricing_scope(
+            auth_scheme,
             credential_mode.as_str(),
             source_plugin_id,
             source_integration_id,
@@ -12455,6 +12563,7 @@ async fn resolve_imported_provider_pricing_scope(
     }
 
     let conservative_scope = db::conservative_provider_pricing_scope(
+        auth_scheme,
         credential_mode.as_str(),
         source_plugin_id,
         source_integration_id,
@@ -12687,12 +12796,17 @@ fn normalize_import_config(mut config: Value) -> Result<(Value, u64, Vec<String>
     Ok((config, version, warnings))
 }
 
+struct InstalledSourceIntegration {
+    integration: crate::plugins::types::Integration,
+    network_hosts: Vec<String>,
+}
+
 async fn installed_source_integration(
     state: &AppState,
     provider_name: &str,
     source_plugin_id: Option<&str>,
     source_integration_id: Option<&str>,
-) -> Result<Option<crate::plugins::types::Integration>, String> {
+) -> Result<Option<InstalledSourceIntegration>, String> {
     let source_plugin_id = source_plugin_id.filter(|value| !value.trim().is_empty());
     let source_integration_id = source_integration_id.filter(|value| !value.trim().is_empty());
     let (Some(plugin_id), Some(integration_id)) = (source_plugin_id, source_integration_id) else {
@@ -12746,7 +12860,96 @@ async fn installed_source_integration(
             )
         })?;
     }
-    Ok(Some(integration.clone()))
+    Ok(Some(InstalledSourceIntegration {
+        integration: integration.clone(),
+        network_hosts: manifest.permissions.network_hosts.clone(),
+    }))
+}
+
+fn imported_source_identity(
+    provider_name: &str,
+    provider: &Value,
+    existing_provider: Option<&db::ProviderRow>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let existing_plugin = existing_provider.and_then(|provider| provider.source_plugin_id.clone());
+    let existing_integration =
+        existing_provider.and_then(|provider| provider.source_integration_id.clone());
+    let imported_plugin = provider
+        .get("source_plugin_id")
+        .map(|value| value.as_str().map(str::to_string));
+    let imported_integration = provider
+        .get("source_integration_id")
+        .map(|value| value.as_str().map(str::to_string));
+
+    if existing_plugin.is_some() || existing_integration.is_some() {
+        if imported_plugin
+            .as_ref()
+            .is_some_and(|value| value != &existing_plugin)
+            || imported_integration
+                .as_ref()
+                .is_some_and(|value| value != &existing_integration)
+        {
+            return Err(format!(
+                "provider '{provider_name}': config import cannot change source integration provenance"
+            ));
+        }
+        return Ok((existing_plugin, existing_integration));
+    }
+
+    Ok((imported_plugin.flatten(), imported_integration.flatten()))
+}
+
+fn validate_imported_connection_policy(
+    provider_name: &str,
+    provider: &Value,
+    existing_provider: Option<&db::ProviderRow>,
+    installed: &InstalledSourceIntegration,
+) -> Result<(), String> {
+    let imported_parameters = match provider.get("connection_parameters") {
+        Some(raw) if !raw.is_null() => Some(
+            serde_json::from_value::<crate::provider_connection::ConnectionParameters>(raw.clone())
+                .map_err(|_| {
+                    format!("provider '{provider_name}': invalid connection_parameters")
+                })?,
+        ),
+        Some(_) => None,
+        None => existing_provider.and_then(|provider| provider.connection().ok().flatten()),
+    };
+    let Some(template) = installed.integration.provider.as_ref() else {
+        return if imported_parameters.is_some() {
+            Err(format!(
+                "provider '{provider_name}': source integration '{}' does not declare connection parameters",
+                installed.integration.id
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    let Some(parameters) = imported_parameters else {
+        return if template.parameters.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "provider '{provider_name}': connection_parameters are required by source integration '{}'",
+                installed.integration.id
+            ))
+        };
+    };
+    let declared_hosts = installed
+        .network_hosts
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let imported_hosts = parameters
+        .network_hosts
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if parameters.declarations != template.parameters || imported_hosts != declared_hosts {
+        return Err(format!(
+            "provider '{provider_name}': connection_parameters policy does not match source integration '{}' manifest",
+            installed.integration.id
+        ));
+    }
+    Ok(())
 }
 
 fn validate_imported_plugin_binding_owners(
@@ -13056,6 +13259,7 @@ async fn import_config_apply(
 
     // ---- Validate phase (FR-8.6): schema + outbound security, no writes ----
     let mut provider_integration_ceilings = std::collections::HashMap::new();
+    let mut provider_connection_attestations = std::collections::HashMap::new();
     let mut seen_provider_names = std::collections::HashSet::new();
     for p in providers {
         let name = p["name"].as_str().unwrap_or("");
@@ -13078,6 +13282,43 @@ async fn import_config_apply(
             p["custom_param_name"].as_str(),
         ) {
             problems.push(format!("provider '{name}': {problem}"));
+        }
+        if let Some(raw) = p.get("connection_parameters").filter(|raw| !raw.is_null()) {
+            match serde_json::from_value::<crate::provider_connection::ConnectionParameters>(
+                raw.clone(),
+            ) {
+                Ok(parameters) => {
+                    if let Err(problem) = parameters.resolve(base_url, p["models_path"].as_str()) {
+                        problems.push(format!("provider '{name}': {problem}"));
+                    }
+                }
+                Err(_) => {
+                    problems.push(format!("provider '{name}': invalid connection_parameters"))
+                }
+            }
+        } else if base_url.contains(['{', '}'])
+            || p["models_path"]
+                .as_str()
+                .is_some_and(|path| path.contains(['{', '}']))
+        {
+            problems.push(format!(
+                "provider '{name}': URL templates require connection_parameters"
+            ));
+        }
+        if p["auth_scheme"] == "none"
+            && (p["credential_mode"] != "none"
+                || !p["credential_plugin"].as_str().unwrap_or("").is_empty()
+                || !p["custom_header_name"].is_null()
+                || !p["custom_param_name"].is_null()
+                || p["extra_headers"].as_object().is_some_and(|headers| {
+                    headers
+                        .keys()
+                        .any(|name| crate::validate::is_auth_header(name))
+                }))
+        {
+            problems.push(format!(
+                "provider '{name}': no-auth requires credential_mode 'none' without auth fields"
+            ));
         }
         if p.get("timeout_ms").is_some_and(|value| !value.is_null())
             && !p["timeout_ms"].as_i64().is_some_and(|timeout| timeout > 0)
@@ -13141,20 +13382,23 @@ async fn import_config_apply(
                 )),
             }
         }
-        let source_plugin_id = if p.get("source_plugin_id").is_some() {
-            p["source_plugin_id"].as_str()
-        } else {
-            existing_provider
-                .as_ref()
-                .and_then(|provider| provider.source_plugin_id.as_deref())
-        };
-        let source_integration_id = if p.get("source_integration_id").is_some() {
-            p["source_integration_id"].as_str()
-        } else {
-            existing_provider
-                .as_ref()
-                .and_then(|provider| provider.source_integration_id.as_deref())
-        };
+        let (source_plugin_id, source_integration_id) =
+            match imported_source_identity(name, p, existing_provider) {
+                Ok(identity) => identity,
+                Err(problem) => {
+                    problems.push(problem);
+                    (
+                        existing_provider
+                            .as_ref()
+                            .and_then(|provider| provider.source_plugin_id.clone()),
+                        existing_provider
+                            .as_ref()
+                            .and_then(|provider| provider.source_integration_id.clone()),
+                    )
+                }
+            };
+        let source_plugin_id = source_plugin_id.as_deref();
+        let source_integration_id = source_integration_id.as_deref();
         let installed_integration = match installed_source_integration(
             &state,
             name,
@@ -13169,9 +13413,25 @@ async fn import_config_apply(
                 None
             }
         };
-        let installed_ceilings = installed_integration
-            .as_ref()
-            .map(|integration| (integration.features.clone(), integration.protocols.clone()));
+        let connection_policy_attested = match installed_integration.as_ref() {
+            Some(installed) => {
+                match validate_imported_connection_policy(name, p, existing_provider, installed) {
+                    Ok(()) => true,
+                    Err(problem) => {
+                        problems.push(problem);
+                        false
+                    }
+                }
+            }
+            None => source_plugin_id.is_none() && source_integration_id.is_none(),
+        };
+        provider_connection_attestations.insert(name.to_string(), connection_policy_attested);
+        let installed_ceilings = installed_integration.as_ref().map(|installed| {
+            (
+                installed.integration.features.clone(),
+                installed.integration.protocols.clone(),
+            )
+        });
         let (integration_features, integration_protocols) =
             if let Some(ceilings) = installed_ceilings {
                 ceilings
@@ -13221,11 +13481,11 @@ async fn import_config_apply(
                     false
                 }
                 Ok(()) => match installed_integration.as_ref() {
-                    Some(integration) => {
+                    Some(installed) => {
                         match validate_imported_integration_bindings(
                             name,
                             plugin_id,
-                            integration,
+                            &installed.integration,
                             p["wire_format"].as_str().unwrap_or(""),
                             wire_plugin,
                             credential_plugin,
@@ -13339,6 +13599,8 @@ async fn import_config_apply(
             name,
             base_url,
             p["pricing_scope"].as_str(),
+            AuthScheme::parse(p["auth_scheme"].as_str().unwrap_or("bearer"))
+                .unwrap_or(AuthScheme::Bearer),
             effective_mode,
             source_plugin_id,
             source_integration_id,
@@ -14112,16 +14374,8 @@ async fn import_config_apply(
             let credential_mode = explicit_mode
                 .or_else(|| crate::plugins::CredentialMode::parse(&existing.credential_mode))
                 .unwrap_or(crate::plugins::CredentialMode::Manual);
-            let source_plugin_id = if p.get("source_plugin_id").is_some() {
-                p["source_plugin_id"].as_str().map(str::to_string)
-            } else {
-                existing.source_plugin_id.clone()
-            };
-            let source_integration_id = if p.get("source_integration_id").is_some() {
-                p["source_integration_id"].as_str().map(str::to_string)
-            } else {
-                existing.source_integration_id.clone()
-            };
+            let (source_plugin_id, source_integration_id) =
+                imported_source_identity(name, p, Some(existing)).map_err(ApiError::bad)?;
 
             let provider = db::NewProvider {
                 name,
@@ -14235,6 +14489,35 @@ async fn import_config_apply(
             provider_ids.insert(name.to_string(), id);
             provider_modes.insert(name.to_string(), credential_mode.as_str().to_string());
         }
+        if let Some(raw) = p.get("connection_parameters") {
+            let parameters = if raw.is_null() {
+                None
+            } else {
+                Some(
+                    serde_json::from_value::<crate::provider_connection::ConnectionParameters>(
+                        raw.clone(),
+                    )
+                    .map_err(ApiError::internal)?,
+                )
+            };
+            db::set_provider_connection_parameters_in_transaction(
+                &mut tx,
+                provider_ids.get(name).expect("provider resolved"),
+                parameters.as_ref(),
+            )
+            .await
+            .map_err(ApiError::internal)?;
+        }
+        db::set_provider_connection_parameters_attested_in_transaction(
+            &mut tx,
+            provider_ids.get(name).expect("provider resolved"),
+            provider_connection_attestations
+                .get(name)
+                .copied()
+                .unwrap_or(false),
+        )
+        .await
+        .map_err(ApiError::internal)?;
         if let Some(enabled) = p["enabled"].as_bool() {
             let provider_id = provider_ids
                 .get(name)
@@ -14928,7 +15211,15 @@ async fn reconcile_provider_account_mode(
                 .into_iter()
                 .filter(|account| account.provider_id == provider_id)
                 .collect();
-            let empty_secret = state.crypto.encrypt("").map_err(ApiError::internal)?;
+            let provider = db::get_provider(&state.pool, provider_id)
+                .await
+                .map_err(ApiError::internal)?;
+            let empty_secret =
+                if provider.is_some_and(|provider| provider.auth() == AuthScheme::None) {
+                    String::new()
+                } else {
+                    state.crypto.encrypt("").map_err(ApiError::internal)?
+                };
 
             if accounts.len() == 1
                 && (accounts[0].label == "__kinetix_noauth__"
@@ -15043,7 +15334,16 @@ async fn reconcile_provider_account_mode_in_transaction(
             .fetch_all(&mut **tx)
             .await
             .map_err(ApiError::internal)?;
-            let empty_secret = state.crypto.encrypt("").map_err(ApiError::internal)?;
+            let auth: String = sqlx::query_scalar("SELECT auth_scheme FROM providers WHERE id=?")
+                .bind(provider_id)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(ApiError::internal)?;
+            let empty_secret = if auth == "none" {
+                String::new()
+            } else {
+                state.crypto.encrypt("").map_err(ApiError::internal)?
+            };
             if accounts.len() == 1 {
                 let id: String = accounts[0].try_get("id").map_err(ApiError::internal)?;
                 let label: String = accounts[0].try_get("label").map_err(ApiError::internal)?;
@@ -15311,84 +15611,176 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
         };
         // Portable imports retain provenance even when their plugin capability names go stale.
         // Rebind those providers by provenance; only legacy rows without provenance use bindings.
-        let existing = providers
+        let mut existing: Vec<_> = providers
             .iter()
-            .find(|provider| {
+            .filter(|provider| {
                 provider.source_plugin_id.as_deref() == Some(id)
                     && provider.source_integration_id.as_deref() == Some(&integration.id)
             })
-            .or_else(|| {
-                providers.iter().find(|provider| {
-                    provider.source_plugin_id.is_none()
-                        && provider.source_integration_id.is_none()
-                        && normalize_provider_endpoint_identity(&provider.base_url)
-                            == normalize_provider_endpoint_identity(&template.base_url)
-                        && provider.wire_plugin == wire_plugin
-                        && provider.credential_plugin == credential_plugin
-                        && provider.model_source_plugin == model_source_plugin
-                })
-            })
-            .cloned();
-        if let Some(provider) = existing {
-            if let Err(error) = validate_integration_upstream_protocols(
-                &manager,
-                integration.protocols.as_ref(),
-                wire.as_str(),
-                &wire_plugin,
-            )
-            .await
-            {
-                tracing::warn!(
-                    provider = %provider.id,
-                    plugin = %id,
-                    integration = %integration.id,
-                    %error,
-                    "integration upstream protocols do not match the provider template"
-                );
+            .cloned()
+            .collect();
+        if existing.is_empty() {
+            if let Some(provider) = providers.iter().find(|provider| {
+                provider.source_plugin_id.is_none()
+                    && provider.source_integration_id.is_none()
+                    && normalize_provider_endpoint_identity(&provider.base_url)
+                        == normalize_provider_endpoint_identity(&template.base_url)
+                    && provider.auth_scheme == template.auth_scheme
+                    && provider.wire_plugin == wire_plugin
+                    && provider.credential_plugin == credential_plugin
+                    && provider.model_source_plugin == model_source_plugin
+            }) {
+                existing.push(provider.clone());
+            }
+        }
+        if template.parameters.is_empty() {
+            existing.truncate(1);
+        }
+        if !existing.is_empty() {
+            let mut quarantine_failed = false;
+            for provider in &existing {
+                if let Err(error) = db::set_provider_connection_parameters_attested(
+                    &state.pool,
+                    &provider.id,
+                    false,
+                )
+                .await
+                {
+                    quarantine_failed = true;
+                    tracing::warn!(
+                        provider = %provider.id,
+                        plugin = %id,
+                        integration = %integration.id,
+                        %error,
+                        "failed to quarantine provider connection parameters before manifest re-attestation"
+                    );
+                }
+            }
+            let _ = state.registry.reload(&state.pool).await;
+            if quarantine_failed {
                 continue;
             }
+            for provider in existing {
+                if let Err(error) = validate_integration_upstream_protocols(
+                    &manager,
+                    integration.protocols.as_ref(),
+                    wire.as_str(),
+                    &wire_plugin,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        provider = %provider.id,
+                        plugin = %id,
+                        integration = %integration.id,
+                        %error,
+                        "integration upstream protocols do not match the provider template"
+                    );
+                    continue;
+                }
 
-            // Keep operator configuration intact; only reconcile the integration-owned bindings here.
-            if let Err(error) = db::update_provider_integration_bindings(
-                &state.pool,
-                &provider.id,
-                wire,
-                &wire_plugin,
-                &credential_plugin,
-                &model_source_plugin,
-            )
-            .await
-            {
-                tracing::warn!(
-                    provider = %provider.id,
-                    plugin = %id,
-                    integration = %integration.id,
-                    %error,
-                    "failed to update provider integration bindings"
-                );
-                continue;
-            }
-            if let Err(error) = reconcile_provider_integration_semantics(
-                state,
-                &provider.id,
-                credential_mode,
-                id,
-                &integration.id,
-                integration.features.as_ref(),
-                integration.protocols.as_ref(),
-                template.pricing_scope,
-            )
-            .await
-            {
-                tracing::warn!(
-                    provider = %provider.id,
-                    plugin = %id,
-                    integration = %integration.id,
-                    error = %error.1,
-                    "failed to upgrade plugin provider credential semantics"
-                );
-            } else {
-                let _ = state.registry.reload(&state.pool).await;
+                let current_parameters = match provider.connection() {
+                    Ok(parameters) => parameters,
+                    Err(error) => {
+                        tracing::warn!(
+                            provider = %provider.id,
+                            plugin = %id,
+                            integration = %integration.id,
+                            %error,
+                            "failed to read provider connection parameters for manifest re-attestation"
+                        );
+                        continue;
+                    }
+                };
+                if template.parameters.is_empty() {
+                    if current_parameters.is_some() {
+                        if crate::provider_connection::resolve_endpoint(
+                            &provider.base_url,
+                            provider.models_path.as_deref(),
+                            None,
+                        )
+                        .is_err()
+                            || db::clear_provider_connection_parameters(&state.pool, &provider.id)
+                                .await
+                                .is_err()
+                        {
+                            continue;
+                        }
+                    }
+                } else {
+                    let parameters = crate::provider_connection::ConnectionParameters {
+                        declarations: template.parameters.clone(),
+                        values: current_parameters
+                            .map(|parameters| parameters.values)
+                            .unwrap_or_default(),
+                        network_hosts: manifest.permissions.network_hosts.clone(),
+                    };
+                    if parameters
+                        .resolve(&provider.base_url, provider.models_path.as_deref())
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    if db::set_provider_connection_parameters(
+                        &state.pool,
+                        &provider.id,
+                        Some(&parameters),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        continue;
+                    }
+                }
+                // Keep operator configuration intact; only reconcile the integration-owned bindings here.
+                if let Err(error) = db::update_provider_integration_bindings(
+                    &state.pool,
+                    &provider.id,
+                    wire,
+                    &wire_plugin,
+                    &credential_plugin,
+                    &model_source_plugin,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        provider = %provider.id,
+                        plugin = %id,
+                        integration = %integration.id,
+                        %error,
+                        "failed to update provider integration bindings"
+                    );
+                    continue;
+                }
+                if let Err(error) = reconcile_provider_integration_semantics(
+                    state,
+                    &provider.id,
+                    credential_mode,
+                    id,
+                    &integration.id,
+                    integration.features.as_ref(),
+                    integration.protocols.as_ref(),
+                    template.pricing_scope,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        provider = %provider.id,
+                        plugin = %id,
+                        integration = %integration.id,
+                        error = %error.1,
+                        "failed to upgrade plugin provider credential semantics"
+                    );
+                } else if db::set_provider_connection_parameters_attested(
+                    &state.pool,
+                    &provider.id,
+                    true,
+                )
+                .await
+                .is_ok()
+                {
+                    let _ = state.registry.reload(&state.pool).await;
+                }
             }
             continue;
         }
@@ -15410,6 +15802,10 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
             continue;
         }
 
+        // Parameterized integrations require explicit operator values at setup.
+        if !template.parameters.is_empty() {
+            continue;
+        }
         let credential_hosts = template.credential_hosts.join(",");
         let extra_headers = serde_json::to_value(&template.extra_headers).unwrap_or(json!({}));
         let insert_res = db::insert_provider(
@@ -15967,12 +16363,20 @@ pub async fn install_plugin(
     })))
 }
 
+#[derive(Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationSetupBody {
+    #[serde(default)]
+    pub connection_values: Option<std::collections::BTreeMap<String, String>>,
+}
+
 /// `POST /admin/api/plugins/{id}/integrations/{integration}/provider` —
 /// create (or return) the host-owned provider described by an Integration.
 pub async fn setup_plugin_integration_provider(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Path((id, integration_id)): Path<(String, String)>,
+    body: Option<Json<IntegrationSetupBody>>,
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
     let row = manager
@@ -15999,7 +16403,6 @@ pub async fn setup_plugin_integration_provider(
         .ok_or_else(|| ApiError::bad("integration does not declare provider defaults"))?;
 
     validate_outbound_url(&state, &template.base_url)?;
-
     let wire_plugin = integration
         .provider_adapter
         .as_deref()
@@ -16066,17 +16469,98 @@ pub async fn setup_plugin_integration_provider(
     let auth = AuthScheme::parse(&template.auth_scheme)
         .ok_or_else(|| ApiError::bad("integration provider has invalid auth_scheme"))?;
 
-    let existing = db::list_providers(&state.pool)
+    let values = body.and_then(|Json(body)| body.connection_values);
+    let mut candidates: Vec<_> = db::list_providers(&state.pool)
         .await
         .map_err(ApiError::internal)?
         .into_iter()
-        .find(|provider| {
-            normalize_provider_endpoint_identity(&provider.base_url)
-                == normalize_provider_endpoint_identity(&template.base_url)
-                && provider.wire_plugin == wire_plugin
-                && provider.credential_plugin == credential_plugin
-                && provider.model_source_plugin == model_source_plugin
-        });
+        .filter(|provider| {
+            (provider.source_plugin_id.as_deref() == Some(&id)
+                && provider.source_integration_id.as_deref() == Some(&integration.id))
+                || (provider.source_plugin_id.is_none()
+                    && provider.source_integration_id.is_none()
+                    && normalize_provider_endpoint_identity(&provider.base_url)
+                        == normalize_provider_endpoint_identity(&template.base_url)
+                    && provider.auth_scheme == template.auth_scheme
+                    && provider.wire_plugin == wire_plugin
+                    && provider.credential_plugin == credential_plugin
+                    && provider.model_source_plugin == model_source_plugin)
+        })
+        .collect();
+    let instance_names: std::collections::HashSet<_> = candidates
+        .iter()
+        .map(|provider| provider.name.clone())
+        .collect();
+    let existing = if template.parameters.is_empty() {
+        candidates.into_iter().next()
+    } else if let Some(values) = &values {
+        let mut matching = None;
+        for provider in candidates {
+            if provider
+                .connection()
+                .map_err(ApiError::bad)?
+                .is_some_and(|parameters| parameters.values == *values)
+            {
+                if matching.is_some() {
+                    return Err(ApiError::bad(
+                        "multiple Providers match these connection values; edit the intended Provider directly",
+                    ));
+                }
+                matching = Some(provider);
+            }
+        }
+        matching
+    } else {
+        if candidates.len() > 1 {
+            return Err(ApiError::bad(
+                "connection_values are required when an integration has multiple Providers",
+            ));
+        }
+        candidates.pop()
+    };
+    if existing
+        .as_ref()
+        .is_some_and(|provider| (provider.auth() == AuthScheme::None) != (auth == AuthScheme::None))
+    {
+        return Err(ApiError::bad(
+            "changing between anonymous and authenticated providers requires a new provider",
+        ));
+    }
+    let connection = if template.parameters.is_empty() {
+        if values.is_some_and(|values| !values.is_empty()) {
+            return Err(ApiError::bad("unexpected connection parameters"));
+        }
+        None
+    } else {
+        let saved = existing
+            .as_ref()
+            .map(|provider| provider.connection())
+            .transpose()
+            .map_err(ApiError::bad)?
+            .flatten();
+        let parameters = crate::provider_connection::ConnectionParameters {
+            declarations: template.parameters.clone(),
+            values: values
+                .or_else(|| saved.map(|parameters| parameters.values))
+                .unwrap_or_default(),
+            network_hosts: manifest.permissions.network_hosts.clone(),
+        };
+        let base_url = existing
+            .as_ref()
+            .map_or(template.base_url.as_str(), |provider| {
+                provider.base_url.as_str()
+            });
+        let models_path = existing
+            .as_ref()
+            .map_or(template.models_path.as_deref(), |provider| {
+                provider.models_path.as_deref()
+            });
+        let (resolved, _) = parameters
+            .resolve(base_url, models_path)
+            .map_err(ApiError::bad)?;
+        validate_outbound_url(&state, &resolved)?;
+        Some(parameters)
+    };
     if let Some(provider) = existing {
         validate_integration_upstream_protocols(
             manager,
@@ -16097,6 +16581,12 @@ pub async fn setup_plugin_integration_provider(
             template.pricing_scope,
         )
         .await?;
+        db::set_provider_connection_parameters(&state.pool, &provider.id, connection.as_ref())
+            .await
+            .map_err(ApiError::internal)?;
+        db::set_provider_connection_parameters_attested(&state.pool, &provider.id, true)
+            .await
+            .map_err(ApiError::internal)?;
         state
             .registry
             .reload(&state.pool)
@@ -16118,11 +16608,20 @@ pub async fn setup_plugin_integration_provider(
     .await
     .map_err(ApiError::bad)?;
 
+    // Instance labels must not reveal connection identifiers.
+    let mut provider_name = integration.name.clone();
+    if connection.is_some() {
+        let mut suffix = 2;
+        while instance_names.contains(&provider_name) {
+            provider_name = format!("{} ({suffix})", integration.name);
+            suffix += 1;
+        }
+    }
     let credential_hosts = template.credential_hosts.join(",");
     let id_created = db::insert_provider(
         &state.pool,
         &db::NewProvider {
-            name: &integration.name,
+            name: &provider_name,
             base_url: &template.base_url,
             wire_format: wire,
             auth_scheme: auth,
@@ -16148,6 +16647,12 @@ pub async fn setup_plugin_integration_provider(
     .await
     .map_err(ApiError::internal)?;
 
+    db::set_provider_connection_parameters(&state.pool, &id_created, connection.as_ref())
+        .await
+        .map_err(ApiError::internal)?;
+    db::set_provider_connection_parameters_attested(&state.pool, &id_created, true)
+        .await
+        .map_err(ApiError::internal)?;
     reconcile_provider_integration_semantics(
         &state,
         &id_created,
@@ -16181,7 +16686,7 @@ pub async fn setup_plugin_integration_provider(
 
     Ok(Json(json!({
         "id": id_created,
-        "name": integration.name,
+        "name": provider_name,
         "created": true,
     })))
 }
@@ -16331,6 +16836,8 @@ mod credential_enrollment_tests {
             pricing_scope: "integration".into(),
             integration_features: None,
             integration_protocols: None,
+            connection_parameters: None,
+            connection_parameters_attested: None,
         }
     }
 
@@ -19858,6 +20365,8 @@ mod credential_enrollment_regression_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    include!("provider_connection_tests.rs");
+
     async fn test_state_with_plugins(tag: &str) -> (AppState, std::path::PathBuf) {
         let (state, root) = test_state(tag).await;
         let manager = crate::plugins::PluginManager::new(
@@ -20768,6 +21277,7 @@ mod credential_enrollment_regression_tests {
             credential_plugin: String::new(),
             model_source_plugin: String::new(),
             pricing_scope: None,
+            connection_values: None,
             api_key: api_key.map(str::to_string),
             account_label: Some("manual-key".into()),
         }
@@ -22288,7 +22798,7 @@ mod credential_enrollment_regression_tests {
             source_plugin_id: existing.source_plugin_id.as_deref(),
             source_integration_id: existing.source_integration_id.as_deref(),
         };
-        db::update_provider(&state.pool, &provider_id, &provider, None)
+        db::update_provider(&state.pool, &provider_id, &provider, None, None)
             .await
             .unwrap();
 
@@ -28626,6 +29136,7 @@ storage = "2MiB"
                 source_integration_id: disabled_provider.source_integration_id.as_deref(),
             },
             Some(&disabled_provider.pricing_scope),
+            None,
         )
         .await
         .unwrap();

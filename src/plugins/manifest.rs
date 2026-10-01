@@ -98,8 +98,13 @@ fn validate_for_host(
     validate_host_compatibility(&manifest, host_version)?;
 
     let provided = manifest.provides.provided();
-    if provided.is_empty() {
-        bail!("manifest provides no capabilities");
+    if provided.is_empty()
+        && manifest
+            .integrations
+            .iter()
+            .all(|integration| integration.provider.is_none())
+    {
+        bail!("manifest provides no capabilities or provider integrations");
     }
     let mut capability_names = std::collections::HashSet::new();
     for p in &provided {
@@ -189,6 +194,7 @@ fn validate_for_host(
             && integration.credential_strategy.is_none()
             && integration.auth_flow.is_none()
             && integration.model_source.is_none()
+            && integration.provider.is_none()
         {
             bail!(
                 "integration '{}' must reference at least one provided capability",
@@ -241,6 +247,25 @@ fn validate_for_host(
             }
         }
         if let Some(provider) = &integration.provider {
+            if !provider.parameters.is_empty() {
+                crate::provider_connection::ConnectionParameters {
+                    declarations: provider.parameters.clone(),
+                    values: Default::default(),
+                    network_hosts: manifest.permissions.network_hosts.clone(),
+                }
+                .validate_declarations(&provider.base_url, provider.models_path.as_deref())
+                .map_err(anyhow::Error::msg)?;
+                if manifest.permissions.network_hosts.is_empty() {
+                    bail!("parameterized integration requires declared network_hosts");
+                }
+            } else if provider.base_url.contains(['{', '}'])
+                || provider
+                    .models_path
+                    .as_ref()
+                    .is_some_and(|path| path.contains(['{', '}']))
+            {
+                bail!("integration URL templates require declared parameters");
+            }
             let parsed = url::Url::parse(&provider.base_url).map_err(|e| {
                 anyhow!(
                     "integration '{}' provider base_url is invalid: {e}",
@@ -301,6 +326,21 @@ fn validate_for_host(
 
             match provider.auth_scheme.as_str() {
                 "bearer" => {}
+                "none" => {
+                    if integration.effective_credential_mode(&manifest.permissions)
+                        != super::types::CredentialMode::None
+                        || integration.credential_strategy.is_some()
+                        || integration.auth_flow.is_some()
+                        || provider.custom_header_name.is_some()
+                        || provider.custom_param_name.is_some()
+                        || provider
+                            .extra_headers
+                            .keys()
+                            .any(|name| crate::validate::is_auth_header(name))
+                    {
+                        bail!("integration '{}' no-auth provider must use credential_mode 'none' without credential bindings or auth fields", integration.id);
+                    }
+                }
                 "custom_header" => {
                     if provider
                         .custom_header_name
@@ -801,6 +841,63 @@ storage = "2MiB"
     }
 
     #[test]
+    fn accepts_anonymous_native_integration_with_public_parameters() {
+        let manifest = r#"
+manifest_version = 1
+plugin_api = "1"
+id = "dev.example.anonymous"
+name = "Anonymous"
+version = "0.1.0"
+[permissions]
+network_hosts = ["api.example.com"]
+credential_read = false
+[[integrations]]
+id = "anonymous"
+name = "Anonymous"
+credential_mode = "none"
+[integrations.provider]
+base_url = "https://api.example.com/accounts/{account_id}/v1"
+wire_format = "openai"
+auth_scheme = "none"
+models_path = "/models"
+[integrations.provider.parameters.account_id]
+type = "identifier"
+min_length = 1
+max_length = 32
+"#;
+        let validated = parse_and_validate(manifest, HostPolicy::default()).unwrap();
+        assert!(!validated.manifest.permissions.credential_read);
+        assert_eq!(
+            validated.manifest.integrations[0]
+                .provider
+                .as_ref()
+                .unwrap()
+                .parameters
+                .len(),
+            1
+        );
+        for invalid in [
+            manifest.replace("credential_mode = \"none\"", "credential_mode = \"manual\""),
+            manifest.replace(
+                "auth_scheme = \"none\"",
+                "auth_scheme = \"none\"\ncustom_header_name = \"x-api-key\"",
+            ),
+            manifest.replace(
+                "https://api.example.com/accounts/{account_id}/v1",
+                "https://{account_id}.example.com/v1",
+            ),
+            manifest.replace("{account_id}", "{unknown}"),
+            manifest.replace("max_length = 32", "max_length = 257"),
+            manifest.replace(
+                "network_hosts = [\"api.example.com\"]",
+                "network_hosts = []",
+            ),
+        ] {
+            assert!(parse_and_validate(&invalid, HostPolicy::default()).is_err());
+        }
+    }
+
+    #[test]
     fn validates_a_good_manifest() {
         let v = parse_and_validate(GOOD, HostPolicy::default()).unwrap();
         assert_eq!(v.manifest.id, "dev.example.foo");
@@ -943,12 +1040,12 @@ storage = "2MiB"
     }
 
     #[test]
-    fn rejects_no_capabilities() {
-        let bad = GOOD
-            .replace("credential_strategies = [\"foo-auth\"]", "")
-            .replace("auth_flows = [\"foo-login\"]", "")
-            .replace("model_sources = [\"foo-models\"]", "");
-        assert!(parse_and_validate(&bad, HostPolicy::default()).is_err());
+    fn rejects_no_capabilities_or_provider_integrations() {
+        let bad = "manifest_version = 1\nplugin_api = \"1\"\nid = \"dev.example.empty\"\nname = \"Empty\"\nversion = \"0.1.0\"\n";
+        assert!(parse_and_validate(bad, HostPolicy::default())
+            .unwrap_err()
+            .to_string()
+            .contains("no capabilities or provider integrations"));
     }
 
     #[test]
