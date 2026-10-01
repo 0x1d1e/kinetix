@@ -804,6 +804,7 @@ mod tests {
             model: &model,
             account_id: None,
             session_context: None,
+            credential_metadata: None,
             credential: "secret".into(),
         };
         let adapter = OpenAiResponsesAdapter;
@@ -834,6 +835,7 @@ mod tests {
             model: &model,
             account_id: None,
             session_context: None,
+            credential_metadata: None,
             credential: "secret".into(),
         };
         let mut req = request();
@@ -858,6 +860,7 @@ mod tests {
             model: &model,
             account_id: None,
             session_context: None,
+            credential_metadata: None,
             credential: "secret".into(),
         };
         let mut req = request();
@@ -902,6 +905,7 @@ mod tests {
             model: &model,
             account_id: None,
             session_context: None,
+            credential_metadata: None,
             credential: "secret".into(),
         };
         let mut req = request();
@@ -934,6 +938,7 @@ mod tests {
             model: &model,
             account_id: None,
             session_context: None,
+            credential_metadata: None,
             credential: "secret".into(),
         };
         let mut req = request();
@@ -951,6 +956,7 @@ mod tests {
             model: &model,
             account_id: None,
             session_context: None,
+            credential_metadata: None,
             credential: "secret".into(),
         };
         let mut req = request();
@@ -973,6 +979,7 @@ mod tests {
             model: &model,
             account_id: None,
             session_context: None,
+            credential_metadata: None,
             credential: "secret".into(),
         };
         let mut req = request();

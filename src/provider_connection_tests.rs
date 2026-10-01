@@ -993,6 +993,7 @@ async fn public_parameter_http_case(upstream_status: u16, anonymous: bool) {
             account_id: Some(&accounts[0].id),
             session_context: None,
             credential: String::new(),
+            credential_metadata: None,
         };
         let adapter = state.adapters.for_provider(&redirect_provider);
         let error = crate::outbound::send_provider_request(
@@ -1027,6 +1028,7 @@ async fn public_parameter_http_case(upstream_status: u16, anonymous: bool) {
                 account_id: Some(&accounts[0].id),
                 session_context: None,
                 credential: String::new(),
+                credential_metadata: None,
             };
             assert!(adapter.build_url(&ctx).is_err());
         }

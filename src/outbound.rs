@@ -592,6 +592,7 @@ mod tests {
             model: &model,
             account_id: Some("acc"),
             session_context: None,
+            credential_metadata: None,
             credential: "secret".into(),
         };
         let adapter: Arc<dyn Adapter> = Arc::new(crate::adapters::openai::OpenAiAdapter::new());
@@ -652,6 +653,7 @@ mod tests {
             model: &model,
             account_id: None,
             session_context: None,
+            credential_metadata: None,
             credential: "secret".into(),
         };
 

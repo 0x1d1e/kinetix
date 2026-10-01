@@ -18,8 +18,9 @@ interface types {
     code: string,
     /// Redacted, client-safe message.
     message: string,
+    /// Error evidence only. The core chooses retry, fallback, and stop policy.
     retryable: bool,
-    /// Optional retry-after hint in seconds.
+    /// Optional retry-after hint in seconds; not an instruction to schedule a retry.
     retry-after: option<u64>,
     /// Optional reset instant (RFC3339) for quota exhaustion.
     reset-at: option<string>,
@@ -67,7 +68,7 @@ interface types {
     raw-metadata: option<string>,
   }
 
-  /// Health evidence. Core translates this into account state.
+  /// Health evidence only. Core interprets it and owns account state and probe scheduling.
   record health-observation {
     /// healthy | degraded | unavailable | unknown
     state: string,
@@ -77,13 +78,56 @@ interface types {
     detail-code: option<string>,
   }
 
-  /// An opaque credential lease. The handle is meaningful only to the
-  /// host.
+  /// Scope of a quota snapshot. Model-scoped quota applies only to the exact
+  /// provider model id returned by the provider; it is not account-wide.
+  variant quota-scope-v1 {
+    /// Use only when the provider establishes account-wide scope.
+    account,
+    /// Exact provider model id; this quota must not be generalized.
+    model(string),
+    /// Scope is not established by the provider response.
+    unknown,
+  }
+
+  /// One provider-reported quota bucket. Missing values are unknown, never
+  /// zero or 100%. `remaining-fraction`, when present, is in the range [0, 1].
+  record quota-snapshot-v1 {
+    scope: quota-scope-v1,
+    /// Provider-defined group label; this does not imply account-wide scope.
+    group: option<string>,
+    /// Provider-defined identity for this bucket.
+    bucket-id: option<string>,
+    remaining-fraction: option<f64>,
+    /// Finite, non-negative amounts in `unit`; fractions are allowed.
+    remaining: option<f64>,
+    limit: option<f64>,
+    /// Canonical values include `requests`, `tokens`, and `credits`.
+    unit: option<string>,
+    /// Provider-reported window label, e.g. `5h`, `daily`, or `weekly`.
+    window: option<string>,
+    /// RFC3339 reset instant, if reported by the provider.
+    reset-at: option<string>,
+  }
+
+  /// Structured health evidence for the opt-in v2 probe world. An empty
+  /// `quota-snapshots` list means no quota data is known.
+  record health-observation-v2 {
+    /// healthy | degraded | unavailable | unknown
+    state: string,
+    quota-state: option<string>,
+    reset-at: option<string>,
+    retry-after: option<u64>,
+    detail-code: option<string>,
+    quota-snapshots: list<quota-snapshot-v1>,
+  }
+
+  /// An opaque credential lease (§6.1).
+  /// The handle is meaningful only to the host.
   record credential-lease {
     handle: string,
     expires-at: option<string>,
     refresh-after: option<string>,
-    /// healthy | expiring | unusable
+    /// healthy | expiring | unusable evidence; core owns refresh scheduling and policy.
     health: string,
   }
 
@@ -113,15 +157,16 @@ interface host-http {
   send: func(req: http-request) -> result<http-response, plugin-error>;
 }
 
-/// Host-managed plugin KV storage. Scoped to the plugin id. Keys are
-/// ordinary plugin state. The reserved `_cache:` namespace is the only way a
+/// Host-managed plugin-private KV storage, scoped to the plugin id. It is
+/// not the persistence interface for core observations or account health.
+/// Keys are ordinary plugin state. The reserved `_cache:` namespace is the only way a
 /// plugin may persist a fact the host will publish as a cached routing fact
 /// writes to this namespace are version-checked and time-bounded by the host.
 interface host-storage {
   get: func(key: string) -> option<list<u8>>;
   put: func(key: string, value: list<u8>) -> result<_, string>;
   delete: func(key: string) -> result<_, string>;
-  /// Publish a cached routing fact during the core-owned background refresh.
+  /// Report a cached routing fact during the core-owned background refresh.
   /// The value is buffered for the current invocation; only after the guest
   /// call succeeds does the host stamp `observed-at` and atomically replace
   /// the complete reserved `_cache:<name>` snapshot. Direct put/delete
@@ -174,7 +219,8 @@ world plugin {
   import host-credential;
   import host-clock;
 
-  /// Produce or refresh an account credential.
+  /// Provide provider-specific credential operations. Core owns secret persistence,
+  /// refresh scheduling, selection, and use policy; guests only perform a core-invoked operation.
   export credential-strategy: interface {
     use types.{plugin-error, credential-lease};
     resolve: func(provider-id: string, account-id: string, account-label: string) -> result<credential-lease, plugin-error>;
@@ -182,19 +228,19 @@ world plugin {
     rotate: func(provider-id: string, account-id: string) -> result<_, plugin-error>;
   }
 
-  /// Provider-specific model discovery.
+  /// Provider-specific model discovery. Core owns observation persistence and model selection.
   export model-source: interface {
     use types.{plugin-error, discovered-model};
     discover: func(provider-id: string, base-url: string, models-path: string) -> result<list<discovered-model>, plugin-error>;
   }
 
-  /// Bounded account/provider health probe.
+  /// Return bounded health evidence. Core owns probe scheduling, interpretation, and state changes.
   export health-probe: interface {
     use types.{plugin-error, health-observation};
     probe: func(provider-id: string, account-id: string) -> result<health-observation, plugin-error>;
   }
 
-  /// Typed routing facts. Must be pure or cached; never a target pick.
+  /// Typed routing facts. Must be pure or cached; facts inform core policy but never select a target.
   export routing-facts: interface {
     use types.{plugin-error, routing-fact};
     /// `request-json` carries only request/config facts core already knows.
@@ -210,9 +256,18 @@ world plugin {
   }
 }
 
-/// Account authorization world. Kept separate from `plugin` so existing API
-/// v1 components do not gain a mandatory export. Core owns CSRF state and PKCE
-/// material; the plugin owns provider-specific URLs/exchange behavior.
+/// Structured quota observations, versioned separately so existing API-v1
+/// components and the legacy health-probe contract remain unchanged.
+world plugin-health-v2 {
+  export health-probe-v2: interface {
+    use types.{plugin-error, health-observation-v2};
+    probe: func(provider-id: string, account-id: string) -> result<health-observation-v2, plugin-error>;
+  }
+}
+
+/// Provider-specific authorization steps only. Core owns consent, callback-state validation,
+/// PKCE lifecycle, credential persistence, and scheduling. Kept separate from `plugin` so
+/// existing API v1 components do not gain a mandatory export.
 world plugin-auth {
   import host-http;
   import host-storage;
@@ -236,10 +291,9 @@ world plugin-auth {
   }
 }
 
-/// Account-aware model discovery world. Kept separate from `plugin` so API-v1
-/// components using the legacy unauthenticated `model-source` export remain
-/// loadable. Core supplies an explicit account reference; host credential
-/// policy still decides whether the guest may use it.
+/// Account-aware model discovery. The guest reports provider data; core owns persistence
+/// and chooses which discovered model, if any, is used. Kept separate from `plugin` so API-v1
+/// components using the legacy unauthenticated `model-source` export remain loadable.
 world plugin-model-source {
   import host-http;
   import host-storage;
@@ -259,8 +313,10 @@ world plugin-model-source {
 }
 
 /// Adapter world: a separate world so the buffered host-http above
-/// can never be used as the adapter transport. Streaming is a host capability
-/// added in a later revision without changing this world's exports.
+/// can never be used as the adapter transport. Adapters translate requests and responses
+/// for a provider/model already selected by core; they cannot select runtime targets or
+/// control retries, fallback, scheduling, persistence, or concurrency. Streaming is a host
+/// capability added in a later revision without changing this world's exports.
 world plugin-adapter {
   import host-http;
   import host-storage;
@@ -272,11 +328,12 @@ world plugin-adapter {
     use types.{plugin-error};
     /// The wire-format name this adapter speaks.
     wire-format: func() -> string;
+    /// Build an upstream URL for the provider/model selected by core; this is not target selection.
     build-url: func(provider-json: string, model-json: string) -> result<string, plugin-error>;
     /// Return the header list (JSON array of [name, value]) to apply.
     apply-auth: func(provider-json: string, credential: string) -> result<string, plugin-error>;
     build-body: func(request-json: string, provider-json: string, model-json: string) -> result<string, plugin-error>;
-    /// Return JSON of the classified failure evidence.
+    /// Return classified failure evidence; core applies retry and fallback policy.
     classify-error: func(status: u16, body: string, headers-json: string) -> result<string, plugin-error>;
     /// Parse one upstream SSE `data:` payload into a versioned
     /// `kinetix.plugin.response` JSON envelope (schema version 1 or 2)

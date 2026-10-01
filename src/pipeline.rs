@@ -422,8 +422,7 @@ fn token_count_exact_target(
             }))
         }
         Resolved::Route { targets, .. } => {
-            let has_capability_eligible_target =
-                targets.iter().any(|target| capability_eligible(target));
+            let has_capability_eligible_target = targets.iter().any(capability_eligible);
             let mut targets: Vec<_> = targets.into_iter().filter(eligible).collect();
             if targets.is_empty() {
                 if has_capability_eligible_target {
@@ -485,11 +484,11 @@ pub async fn count_tokens(
     if !adapter.supports_count_tokens() {
         return Ok(estimate());
     }
-    let credential = match state
+    let resolved_credential = match state
         .credential_for(&target.provider, &target.account)
         .await
     {
-        Ok(credential) => credential.secret,
+        Ok(credential) => credential,
         Err(error) => {
             if let Err(disable_error) = state
                 .disable_invalid_credential(
@@ -514,7 +513,8 @@ pub async fn count_tokens(
         model: &target.model,
         account_id: Some(target.account.id.as_str()),
         session_context: None,
-        credential,
+        credential: resolved_credential.secret,
+        credential_metadata: Some(&resolved_credential.metadata),
     };
     let Some(url) = adapter.count_tokens_url(&ctx)? else {
         return Ok(estimate());
@@ -1389,7 +1389,7 @@ pub(crate) async fn run_with_disconnect(
         {
             Ok(c) => {
                 crate::alerts::record_credential_success();
-                c.secret
+                c
             }
             Err(error) => {
                 tracing::error!(
@@ -1608,7 +1608,8 @@ pub(crate) async fn run_with_disconnect(
             model: &execution_model,
             account_id: Some(target.account.id.as_str()),
             session_context: session_context.as_deref(),
-            credential,
+            credential: credential.secret,
+            credential_metadata: Some(&credential.metadata),
         };
 
         // Parameter policy reject (FR-10.6): a request-level failure, never retried.
@@ -10325,6 +10326,7 @@ mod route_policy_tests {
             model: &m,
             account_id: Some("acc_test"),
             session_context: None,
+            credential_metadata: None,
             credential: "sk-ant-api03-test".into(),
         };
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
@@ -10366,6 +10368,7 @@ mod route_policy_tests {
             model: &m,
             account_id: Some("acc_test"),
             session_context: None,
+            credential_metadata: None,
             credential: "sk-ant-api03-test".into(),
         };
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
@@ -10404,6 +10407,7 @@ mod route_policy_tests {
             model: &m,
             account_id: Some("acc_test"),
             session_context: None,
+            credential_metadata: None,
             credential: "sk-ant-api03-test".into(),
         };
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
@@ -10440,6 +10444,7 @@ mod route_policy_tests {
             model: &m,
             account_id: Some("acc_test"),
             session_context: None,
+            credential_metadata: None,
             credential: "sk-ant-api03-test".into(),
         };
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
@@ -10477,6 +10482,7 @@ mod route_policy_tests {
             model: &m,
             account_id: Some("acc_test"),
             session_context: None,
+            credential_metadata: None,
             credential: "sk-ant-api03-test".into(),
         };
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
@@ -10514,6 +10520,7 @@ mod route_policy_tests {
             model: &m,
             account_id: Some("acc_test"),
             session_context: None,
+            credential_metadata: None,
             credential: "sk-ant-api03-test".into(),
         };
         let adapter = crate::adapters::anthropic::AnthropicAdapter::new();
@@ -11318,6 +11325,7 @@ mod route_policy_tests {
             model: &target.model,
             account_id: Some(target.account.id.as_str()),
             session_context: None,
+            credential_metadata: None,
             credential: "test".into(),
         };
         let body = build_upstream_body(adapter.as_ref(), &ctx, &req, false).unwrap();
@@ -11380,6 +11388,7 @@ mod route_policy_tests {
             model: &target.model,
             account_id: Some(target.account.id.as_str()),
             session_context: None,
+            credential_metadata: None,
             credential: "test".into(),
         };
         let adapter = crate::adapters::openai::OpenAiAdapter::new();
@@ -11510,6 +11519,7 @@ mod route_policy_tests {
             model: &m,
             account_id: None,
             session_context: None,
+            credential_metadata: None,
             credential: "k".into(),
         };
         let mut req = request();
@@ -11539,6 +11549,7 @@ mod route_policy_tests {
             model: &m,
             account_id: None,
             session_context: None,
+            credential_metadata: None,
             credential: "k".into(),
         };
 

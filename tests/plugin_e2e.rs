@@ -22,12 +22,14 @@ use axum::{
 };
 use kinetix::plugins::{
     adapter::{register_declared_adapters, request_to_json, PluginAdapter},
+    credential::PluginCredentialStrategy,
     Capability, HostPolicy, PluginManager,
 };
 use kinetix::{
     adapters::{Adapter, AdapterRegistry, UpstreamContext},
     app::AppState,
     config::Config,
+    credentials::CredentialStrategy,
     crypto::{self, Crypto},
     db::{self, NewProvider, Pool},
     logqueue::UsageLogQueue,
@@ -782,7 +784,7 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         .expect("adapter world binds");
     assert_eq!(wf, "antigravity");
 
-    let provider = r#"{"base_url":"https://daily-cloudcode-pa.googleapis.com","extra_headers":"{\"x-antigravity-project\":\"test-project\"}"}"#;
+    let provider = r#"{"base_url":"https://daily-cloudcode-pa.googleapis.com","extra_headers":"{\"x-antigravity-project\":\"test-project\"}","_kinetix":{"account_id":"test-account","project_id":"account-project","now_unix_millis":1700000000123}}"#;
     let model = r#"{"upstream_id":"gemini-3-flash"}"#;
 
     let url = m.adapter_build_url(id, provider, model).await.unwrap();
@@ -924,6 +926,7 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
         model: &model_row,
         account_id: Some("account_test"),
         session_context: Some(host_session),
+        credential_metadata: None,
         credential: "tok123".into(),
     };
     let registered_body = registered
@@ -949,7 +952,8 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
     let chunk = r#"{"response":{"responseId":"resp_1","candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2}}}"#;
     let events = m.adapter_parse_stream_chunk(id, chunk).await.unwrap();
     let ev: serde_json::Value = serde_json::from_str(&events).unwrap();
-    let arr = ev.as_array().unwrap();
+    assert_eq!(ev["schema"], "kinetix.plugin.response");
+    let arr = ev["events"].as_array().unwrap();
     assert!(arr
         .iter()
         .any(|e| e["type"] == "text_delta" && e["text"] == "hello"));
@@ -969,8 +973,11 @@ async fn adapter_world_translates_the_antigravity_wire_format() {
 /// its original call shape; only API v2 receives the session identity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_v1_and_session_aware_api_v2_adapters_load_together() {
-    let Some(api2_path) = package_path() else {
-        eprintln!("skipping: set KINETIX_PLUGIN_E2E_PACKAGE to an API-v2 .kxp");
+    let Some(api2_path) = std::env::var_os("KINETIX_PLUGIN_API_V2_E2E_PACKAGE")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+    else {
+        eprintln!("skipping: set KINETIX_PLUGIN_API_V2_E2E_PACKAGE to an API-v2 .kxp");
         return;
     };
     let Some(api1_path) = std::env::var_os("KINETIX_PLUGIN_API_V1_E2E_PACKAGE")
@@ -990,7 +997,11 @@ async fn api_v1_and_session_aware_api_v2_adapters_load_together() {
         m.install(&api1, None, &[], false).await.unwrap().id,
         api1_id
     );
-    let api2_id = m.install(&api2, None, &[], false).await.unwrap().id;
+    let api2_id = m
+        .install(&api2, None, &[], ALLOW_UNTRUSTED_TEST_PACKAGE)
+        .await
+        .unwrap()
+        .id;
     assert_ne!(api1_id, api2_id);
     assert_eq!(
         m.get(api1_id)
@@ -1059,7 +1070,7 @@ async fn api_v1_and_session_aware_api_v2_adapters_load_together() {
 /// API-v1 and API-v2 fixtures always exercise cross-version runtime behavior,
 /// independent of optional externally built release packages.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
+async fn api_v1_and_api_v2_legacy_host_imports_coexist_with_opaque_session_context() {
     const API1_ID: &str = "dev.kinetix.test.api1-adapter";
     const API2_ID: &str = "dev.kinetix.test.api2-session-echo";
     const API2_FALLBACK_ID: &str = "dev.kinetix.test.api2-fallback-session-echo";
@@ -1080,7 +1091,7 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         2,
         api2_component,
     );
-    let (manager, _pool) = manager().await;
+    let (manager, pool) = manager().await;
     assert_eq!(
         manager.install(&api1, None, &[], false).await.unwrap().id,
         API1_ID
@@ -1102,6 +1113,26 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         manager.approve_permissions(id).await.unwrap();
         manager.enable(id).await.unwrap();
     }
+    // Seed host storage so the v2 fixture must successfully call the imported
+    // host-storage interface during build-body, not merely instantiate it.
+    kinetix::plugins::store::kv_put(
+        &pool,
+        &Crypto::new(&[7u8; 32]),
+        API2_ID,
+        "_config:login_hint",
+        b"legacy-storage-read",
+    )
+    .await
+    .unwrap();
+    kinetix::plugins::store::kv_put(
+        &pool,
+        &Crypto::new(&[7u8; 32]),
+        API2_ID,
+        "project:account_fixture",
+        b"legacy-project-read",
+    )
+    .await
+    .unwrap();
 
     // API-v1 executes through its unchanged session-unaware exports. The
     // host-side context must not alter what the API-v1 guest receives.
@@ -1210,10 +1241,14 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         model: &model,
         account_id: Some("account_fixture"),
         session_context: Some(RAW_SESSION),
+        credential_metadata: None,
         credential: "fixture-credential".into(),
     };
     let first = adapter.build_body(&context, &request).unwrap();
     assert_eq!(first["session"], expected_identity);
+    assert_eq!(first["account_id"], "account_fixture");
+    assert_eq!(first["project_id"], "legacy-project-read");
+    assert_eq!(first["login_hint"], "legacy-storage-read");
     assert_ne!(first["session"], RAW_SESSION);
     assert!(!first["session"].as_str().unwrap().contains(RAW_SESSION));
 
@@ -1225,6 +1260,7 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         model: &model,
         account_id: Some("account_fixture"),
         session_context: Some(SECOND_RAW_SESSION),
+        credential_metadata: None,
         credential: "fixture-credential".into(),
     };
     let second = adapter.build_body(&second_context, &request).unwrap();
@@ -1247,6 +1283,7 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         model: &fallback_model,
         account_id: Some("account_fallback"),
         session_context: Some(RAW_SESSION),
+        credential_metadata: None,
         credential: "fixture-credential".into(),
     };
     let fallback = fallback_adapter
@@ -1270,6 +1307,7 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
         model: &model,
         account_id: Some("account_fixture"),
         session_context: None,
+        credential_metadata: None,
         credential: "fixture-credential".into(),
     };
     let without_session = adapter.build_body(&no_session_context, &request).unwrap();
@@ -1287,6 +1325,198 @@ async fn api_v1_and_api_v2_fixtures_coexist_with_opaque_session_context() {
 
 /// Error classification maps Antigravity's 429 + reset hint onto the host's
 /// typed failure vocabulary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn antigravity_lease_metadata_reaches_the_v3_adapter_without_parsing_the_secret() {
+    let Some(path) = package_path() else {
+        eprintln!(
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+        );
+        return;
+    };
+    const PLUGIN_ID: &str = "dev.kinetix.antigravity-oauth";
+    const ACCOUNT_LABEL: &str = "lease metadata fixture";
+    const ACCESS_TOKEN: &str = "e2e-access-token";
+    const PROJECT_ID: &str = "e2e-cloud-project";
+
+    let bytes = std::fs::read(&path).unwrap();
+    let (manager, pool) = manager().await;
+    let crypto = Arc::new(Crypto::new(&[7u8; 32]));
+    manager
+        .install(&bytes, None, &[], ALLOW_UNTRUSTED_TEST_PACKAGE)
+        .await
+        .unwrap();
+    manager.approve_permissions(PLUGIN_ID).await.unwrap();
+    manager.enable(PLUGIN_ID).await.unwrap();
+
+    let plugin_ref = format!("plugin:{PLUGIN_ID}/antigravity-oauth");
+    let provider_id = db::insert_provider(
+        &pool,
+        &NewProvider {
+            name: "Antigravity lease metadata test",
+            base_url: "https://daily-cloudcode-pa.googleapis.com",
+            wire_format: WireFormat::Plugin,
+            auth_scheme: AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: json!({}),
+            timeout_ms: 30_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: false,
+            wire_plugin: &plugin_ref,
+            credential_plugin: &plugin_ref,
+            model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let imported = json!({
+        "access_token": ACCESS_TOKEN,
+        "expiry": "2999-01-01T00:00:00Z",
+        "project_id": PROJECT_ID,
+    });
+    let encrypted = crypto.encrypt(&imported.to_string()).unwrap();
+    let account_id = db::insert_account(
+        &pool,
+        &provider_id,
+        ACCOUNT_LABEL,
+        &encrypted,
+        "fixture",
+        1,
+        1,
+        None,
+        "none",
+    )
+    .await
+    .unwrap();
+    let account = db::get_account(&pool, &account_id).await.unwrap().unwrap();
+
+    // This invokes the built Antigravity component's real credential resolver.
+    // Its lease contains only the access token; project_id travels in the
+    // separate non-secret metadata KV entry read by core.
+    let strategy =
+        PluginCredentialStrategy::new(Arc::new(manager.clone()), pool.clone(), crypto, PLUGIN_ID);
+    let resolved = strategy.resolve(&account).await.unwrap();
+    assert_eq!(resolved.secret, ACCESS_TOKEN);
+    assert_eq!(resolved.metadata.project_id.as_deref(), Some(PROJECT_ID));
+
+    let provider = db::get_provider(&pool, &provider_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let model = db::ModelRow {
+        id: "antigravity-lease-model".into(),
+        provider_id: provider_id.clone(),
+        upstream_id: "gemini-3-flash".into(),
+        display_name: "Gemini 3 Flash".into(),
+        enabled: 1,
+        context_window: None,
+        max_output_tokens: None,
+        capabilities: "{}".into(),
+        prices: "{}".into(),
+        parameters: "{}".into(),
+        thinking_map: "{}".into(),
+        extra_request: "{}".into(),
+        discovery: "{}".into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        opaque_state_plugin: String::new(),
+    };
+    let request = InternalRequest {
+        requested_model: model.upstream_id.clone(),
+        system: Vec::new(),
+        messages: Vec::new(),
+        tools: Vec::new(),
+        tool_choice: None,
+        tool_choice_name: None,
+        params: SamplingParams::default(),
+        stream: false,
+        include_usage: false,
+        thinking: None,
+        extra: Default::default(),
+        raw_body: None,
+    };
+    let adapter = PluginAdapter::new(manager, PLUGIN_ID.into(), false)
+        .await
+        .unwrap();
+    let context = UpstreamContext {
+        provider: &provider,
+        model: &model,
+        account_id: Some(&account_id),
+        session_context: None,
+        credential: resolved.secret,
+        credential_metadata: Some(&resolved.metadata),
+    };
+    let body = adapter.build_body(&context, &request).unwrap();
+    assert_eq!(body["project"], PROJECT_ID);
+
+    // Public connection parameters must still resolve before invoking the
+    // guest, without losing the API-v3 credential metadata.
+    let mut parameterized_provider = provider.clone();
+    parameterized_provider.base_url =
+        "https://daily-cloudcode-pa.googleapis.com/accounts/{tenant}".into();
+    parameterized_provider.connection_parameters = Some(
+        json!({
+            "declarations": {
+                "tenant": { "type": "identifier", "min_length": 1, "max_length": 32 }
+            },
+            "values": { "tenant": "tenant-123" },
+            "network_hosts": ["daily-cloudcode-pa.googleapis.com"]
+        })
+        .to_string(),
+    );
+    parameterized_provider.connection_parameters_attested = Some(1);
+    let parameterized_context = UpstreamContext {
+        provider: &parameterized_provider,
+        credential: context.credential.clone(),
+        ..context
+    };
+    assert_eq!(
+        adapter.build_url(&parameterized_context).unwrap(),
+        "https://daily-cloudcode-pa.googleapis.com/accounts/tenant-123/v1internal:streamGenerateContent?alt=sse"
+    );
+    assert_eq!(
+        adapter
+            .build_body(&parameterized_context, &request)
+            .unwrap()["project"],
+        PROJECT_ID
+    );
+
+    // Unattested parameters fail closed at both adapter entry points.
+    let mut unattested_provider = parameterized_provider.clone();
+    unattested_provider.connection_parameters_attested = Some(0);
+    let unattested_context = UpstreamContext {
+        provider: &unattested_provider,
+        credential: parameterized_context.credential.clone(),
+        ..parameterized_context
+    };
+    assert!(adapter.build_url(&unattested_context).is_err());
+    assert!(adapter.build_body(&unattested_context, &request).is_err());
+
+    // Anonymous providers must not receive plugin-generated auth headers.
+    let mut anonymous_provider = provider.clone();
+    anonymous_provider.auth_scheme = "none".into();
+    let anonymous_context = UpstreamContext {
+        provider: &anonymous_provider,
+        ..unattested_context
+    };
+    let anonymous_request = adapter
+        .apply_auth(
+            &anonymous_context,
+            reqwest::Client::new().get("https://daily-cloudcode-pa.googleapis.com"),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    assert!(anonymous_request.headers().is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adapter_classifies_quota_exhaustion() {
     let Some(path) = package_path() else {

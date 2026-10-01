@@ -6,11 +6,11 @@
 use serde::{Deserialize, Serialize};
 
 /// The latest plugin API major version this build implements.
-pub const PLUGIN_API_MAJOR: u32 = 2;
+pub const PLUGIN_API_MAJOR: u32 = 3;
 
-/// API majors accepted concurrently by this host. API v2 adds a separately
-/// versioned session-aware adapter world; all other API-v1 worlds remain live.
-pub const SUPPORTED_PLUGIN_API_MAJORS: [u32; 2] = [1, PLUGIN_API_MAJOR];
+/// API majors accepted concurrently by this host. API v2 retains its original
+/// host imports; API v3 adds the import-free session-aware adapter world.
+pub const SUPPORTED_PLUGIN_API_MAJORS: [u32; 3] = [1, 2, PLUGIN_API_MAJOR];
 
 /// The supported manifest schema version.
 pub const MANIFEST_VERSION: u32 = 1;

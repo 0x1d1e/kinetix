@@ -570,9 +570,9 @@ async fn revoking_a_permission_disables_the_plugin() {
 }
 
 #[tokio::test]
-async fn api_v1_and_v2_manifests_are_accepted_and_v3_is_rejected() {
+async fn api_v1_v2_and_v3_manifests_are_accepted_and_v4_is_rejected() {
     let (m, _pool) = manager().await;
-    for major in [1, 2] {
+    for major in [1, 2, 3] {
         let manifest = GOOD_MANIFEST
             .replace("dev.example.foo", &format!("dev.example.foo.v{major}"))
             .replace("plugin_api = \"1\"", &format!("plugin_api = \"{major}\""));
@@ -593,7 +593,7 @@ async fn api_v1_and_v2_manifests_are_accepted_and_v3_is_rejected() {
         );
     }
 
-    let bad = GOOD_MANIFEST.replace("plugin_api = \"1\"", "plugin_api = \"3\"");
+    let bad = GOOD_MANIFEST.replace("plugin_api = \"1\"", "plugin_api = \"4\"");
     let err = m
         .install(&build_kxp(&bad, VALID_COMPONENT), None, &[], false)
         .await

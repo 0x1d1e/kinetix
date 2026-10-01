@@ -5438,6 +5438,7 @@ async fn discover_models_native(
             model: &dummy_model,
             account_id: Some(account.id.as_str()),
             session_context: None,
+            credential_metadata: None,
             credential,
         };
         let permit = state
@@ -5625,6 +5626,7 @@ pub async fn test_provider(
         model: &model,
         account_id: Some(account.id.as_str()),
         session_context: None,
+        credential_metadata: None,
         credential,
     };
     let mut internal = crate::types::InternalRequest {
@@ -7830,6 +7832,7 @@ async fn execute_capability_probe_request(
         model: &execution_model,
         account_id: Some(&account_id),
         session_context: None,
+        credential_metadata: None,
         credential,
     };
     let response = crate::outbound::send_provider_request(
@@ -8156,6 +8159,7 @@ pub async fn probe_model_capability(
         model: &execution_model,
         account_id: Some(account.id.as_str()),
         session_context: None,
+        credential_metadata: None,
         credential: credential.clone(),
     };
     let url = adapter
@@ -15693,8 +15697,8 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                     }
                 };
                 if template.parameters.is_empty() {
-                    if current_parameters.is_some() {
-                        if crate::provider_connection::resolve_endpoint(
+                    if current_parameters.is_some()
+                        && (crate::provider_connection::resolve_endpoint(
                             &provider.base_url,
                             provider.models_path.as_deref(),
                             None,
@@ -15702,10 +15706,9 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                         .is_err()
                             || db::clear_provider_connection_parameters(&state.pool, &provider.id)
                                 .await
-                                .is_err()
-                        {
-                            continue;
-                        }
+                                .is_err())
+                    {
+                        continue;
                     }
                 } else {
                     let parameters = crate::provider_connection::ConnectionParameters {
@@ -21303,6 +21306,7 @@ mod credential_enrollment_regression_tests {
             crate::credentials::CredentialRotationError,
         > {
             Ok(crate::credentials::ResolvedCredential {
+                metadata: crate::credentials::CredentialMetadata::default(),
                 secret: "unused".into(),
                 expires_at: None,
                 refresh_after: None,
@@ -21620,6 +21624,7 @@ mod credential_enrollment_regression_tests {
         .await
         .unwrap();
         let scheduled = crate::credentials::ResolvedCredential {
+            metadata: crate::credentials::CredentialMetadata::default(),
             secret: "schedule-secret".into(),
             expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
             refresh_after: Some((chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339()),
@@ -28895,7 +28900,7 @@ provider_adapters = ["session-echo"]
 memory = "128MiB"
 storage = "2MiB"
 "#,
-            crate::plugins::PLUGIN_API_MAJOR
+            2
         );
         let mut foreign_archive = tar::Builder::new(Vec::new());
         for (path, data) in [
@@ -29026,7 +29031,7 @@ network_hosts = ["native.example"]
 memory = "128MiB"
 storage = "2MiB"
 "#,
-            crate::plugins::PLUGIN_API_MAJOR
+            2
         );
         let mut archive = tar::Builder::new(Vec::new());
         for (path, data) in [

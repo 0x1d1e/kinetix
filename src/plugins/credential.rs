@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 
 use crate::credentials::{
-    CredentialHealth, CredentialRotationError, CredentialStrategy, ResolvedCredential,
+    CredentialHealth, CredentialMetadata, CredentialRotationError, CredentialStrategy,
+    ResolvedCredential,
 };
 use crate::crypto::Crypto;
 use crate::db::{AccountRow, Pool};
@@ -21,6 +22,8 @@ use super::manager::PluginManager;
 
 /// The KV key prefix under which a plugin stores a leased secret.
 const LEASE_PREFIX: &str = "lease:";
+/// Optional non-secret JSON metadata associated with a lease handle.
+const LEASE_METADATA_PREFIX: &str = "credential-metadata:";
 
 fn credential_error(fault: super::runtime::PluginFault) -> CredentialRotationError {
     match fault {
@@ -221,6 +224,36 @@ impl PluginCredentialStrategy {
             )
         })
     }
+
+    async fn lease_metadata(
+        &self,
+        handle: &str,
+    ) -> std::result::Result<CredentialMetadata, CredentialRotationError> {
+        let key = format!("{LEASE_METADATA_PREFIX}{handle}");
+        let Some(bytes) = super::store::kv_get(&self.pool, &self.crypto, &self.plugin_id, &key)
+            .await
+            .map_err(|error| {
+                CredentialRotationError::new(
+                    "plugin_internal",
+                    format!("reading plugin credential metadata: {error}"),
+                    true,
+                    None,
+                )
+            })?
+        else {
+            return Ok(CredentialMetadata::default());
+        };
+        let mut metadata: CredentialMetadata = serde_json::from_slice(&bytes).map_err(|_| {
+            CredentialRotationError::new(
+                "plugin_internal",
+                "credential metadata must be a valid non-secret metadata object",
+                false,
+                None,
+            )
+        })?;
+        metadata.normalize();
+        Ok(metadata)
+    }
 }
 
 #[async_trait]
@@ -257,8 +290,10 @@ impl CredentialStrategy for PluginCredentialStrategy {
             }
             Err(error) => return Err(error),
         };
+        let metadata = self.lease_metadata(&lease.handle).await?;
         Ok(Some(ResolvedCredential {
             secret,
+            metadata,
             expires_at: lease.expires_at,
             refresh_after: lease.refresh_after,
             rotated: false,
@@ -282,6 +317,7 @@ impl CredentialStrategy for PluginCredentialStrategy {
             .await
             .map_err(credential_error)?;
         let secret = self.lease_secret(&lease.handle).await?;
+        let metadata = self.lease_metadata(&lease.handle).await?;
         if !self.cache_lease_if_current(&key, &generation, lease.clone()) {
             return Err(CredentialRotationError::new(
                 "credential_state_evicted",
@@ -292,6 +328,7 @@ impl CredentialStrategy for PluginCredentialStrategy {
         }
         Ok(ResolvedCredential {
             secret,
+            metadata,
             expires_at: lease.expires_at,
             refresh_after: lease.refresh_after,
             // API v1 exposes the handle as opaque lookup data, not as a stable

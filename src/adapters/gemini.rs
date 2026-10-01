@@ -1352,6 +1352,7 @@ mod schema_tests {
             model: &model,
             account_id: None,
             session_context: None,
+            credential_metadata: None,
             credential: "k".into(),
         };
         let req = InternalRequest {
