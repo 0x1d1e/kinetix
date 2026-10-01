@@ -1451,6 +1451,66 @@ async fn antigravity_lease_metadata_reaches_the_v3_adapter_without_parsing_the_s
     };
     let body = adapter.build_body(&context, &request).unwrap();
     assert_eq!(body["project"], PROJECT_ID);
+
+    // Public connection parameters must still resolve before invoking the
+    // guest, without losing the API-v3 credential metadata.
+    let mut parameterized_provider = provider.clone();
+    parameterized_provider.base_url =
+        "https://daily-cloudcode-pa.googleapis.com/accounts/{tenant}".into();
+    parameterized_provider.connection_parameters = Some(
+        json!({
+            "declarations": {
+                "tenant": { "type": "identifier", "min_length": 1, "max_length": 32 }
+            },
+            "values": { "tenant": "tenant-123" },
+            "network_hosts": ["daily-cloudcode-pa.googleapis.com"]
+        })
+        .to_string(),
+    );
+    parameterized_provider.connection_parameters_attested = Some(1);
+    let parameterized_context = UpstreamContext {
+        provider: &parameterized_provider,
+        credential: context.credential.clone(),
+        ..context
+    };
+    assert_eq!(
+        adapter.build_url(&parameterized_context).unwrap(),
+        "https://daily-cloudcode-pa.googleapis.com/accounts/tenant-123/v1internal:streamGenerateContent?alt=sse"
+    );
+    assert_eq!(
+        adapter
+            .build_body(&parameterized_context, &request)
+            .unwrap()["project"],
+        PROJECT_ID
+    );
+
+    // Unattested parameters fail closed at both adapter entry points.
+    let mut unattested_provider = parameterized_provider.clone();
+    unattested_provider.connection_parameters_attested = Some(0);
+    let unattested_context = UpstreamContext {
+        provider: &unattested_provider,
+        credential: parameterized_context.credential.clone(),
+        ..parameterized_context
+    };
+    assert!(adapter.build_url(&unattested_context).is_err());
+    assert!(adapter.build_body(&unattested_context, &request).is_err());
+
+    // Anonymous providers must not receive plugin-generated auth headers.
+    let mut anonymous_provider = provider.clone();
+    anonymous_provider.auth_scheme = "none".into();
+    let anonymous_context = UpstreamContext {
+        provider: &anonymous_provider,
+        ..unattested_context
+    };
+    let anonymous_request = adapter
+        .apply_auth(
+            &anonymous_context,
+            reqwest::Client::new().get("https://daily-cloudcode-pa.googleapis.com"),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    assert!(anonymous_request.headers().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
