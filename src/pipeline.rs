@@ -422,8 +422,7 @@ fn token_count_exact_target(
             }))
         }
         Resolved::Route { targets, .. } => {
-            let has_capability_eligible_target =
-                targets.iter().any(|target| capability_eligible(target));
+            let has_capability_eligible_target = targets.iter().any(capability_eligible);
             let mut targets: Vec<_> = targets.into_iter().filter(eligible).collect();
             if targets.is_empty() {
                 if has_capability_eligible_target {

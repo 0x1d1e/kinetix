@@ -15697,8 +15697,8 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                     }
                 };
                 if template.parameters.is_empty() {
-                    if current_parameters.is_some() {
-                        if crate::provider_connection::resolve_endpoint(
+                    if current_parameters.is_some()
+                        && (crate::provider_connection::resolve_endpoint(
                             &provider.base_url,
                             provider.models_path.as_deref(),
                             None,
@@ -15706,10 +15706,9 @@ pub(crate) async fn auto_provision_plugin_providers(state: &AppState, id: &str) 
                         .is_err()
                             || db::clear_provider_connection_parameters(&state.pool, &provider.id)
                                 .await
-                                .is_err()
-                        {
-                            continue;
-                        }
+                                .is_err())
+                    {
+                        continue;
                     }
                 } else {
                     let parameters = crate::provider_connection::ConnectionParameters {
