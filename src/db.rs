@@ -1035,11 +1035,14 @@ impl ProviderRow {
             .transpose()
     }
 
+    pub fn connection_policy_attested(&self) -> bool {
+        self.connection_parameters_attested != Some(0)
+            && (self.connection_parameters.is_none()
+                || self.connection_parameters_attested == Some(1))
+    }
+
     pub fn resolved_endpoint(&self) -> Result<(String, Option<String>), String> {
-        if self.connection_parameters_attested == Some(0)
-            || (self.connection_parameters.is_some()
-                && self.connection_parameters_attested != Some(1))
-        {
+        if !self.connection_policy_attested() {
             return Err(
                 "provider connection parameters await source integration attestation".into(),
             );

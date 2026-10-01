@@ -190,6 +190,207 @@ async fn parameterized_setup_creates_distinct_provider_instances_without_retarge
 }
 
 #[tokio::test]
+async fn quarantined_provider_is_skipped_for_fallback_and_reported_by_dry_run() {
+    let (state, root) = test_state_with_plugins("connection-attestation-routing").await;
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("localhost:{}", listener.local_addr().unwrap().port());
+    let upstream = axum::Router::new().fallback(axum::routing::any(
+        move |uri: axum::http::Uri| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().await.push(uri.path().to_owned());
+                axum::http::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(concat!(
+                        "data: {\"id\":\"chat-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"healthy\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"id\":\"chat-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+                        "data: [DONE]\n\n"
+                    )))
+                    .unwrap()
+            }
+        },
+    ));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+    let manifest = json!({
+        "manifest_version": crate::plugins::MANIFEST_VERSION,
+        "id": "plugin.test", "name": "Test Plugin", "version": "0.1.0", "plugin_api": "1",
+        "permissions": {"network_hosts": ["localhost"], "credential_read": false},
+        "integrations": [{"id": "public", "name": "Public API", "credential_mode": "none",
+            "provider": {"base_url": format!("https://{address}/accounts/{{account_id}}/v1"), "wire_format": "openai", "auth_scheme": "none", "models_path": "/models",
+                "parameters": {"account_id": {"type": "identifier", "min_length": 1, "max_length": 32}}}
+        }]
+    });
+    install_public_parameters_plugin(&state, manifest).await;
+    let setup_path = "/admin/api/plugins/plugin.test/integrations/public/provider";
+    let (status, quarantined) = connection_http(
+        &state,
+        "POST",
+        setup_path,
+        json!({"connection_values": {"account_id": "tenant-a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{quarantined}");
+    let (status, healthy) = connection_http(
+        &state,
+        "POST",
+        setup_path,
+        json!({"connection_values": {"account_id": "tenant-b"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{healthy}");
+    let quarantined_id = quarantined["id"].as_str().unwrap();
+    let healthy_id = healthy["id"].as_str().unwrap();
+    for (provider, tenant) in [(&quarantined, "tenant-a"), (&healthy, "tenant-b")] {
+        let (status, updated) = connection_http(
+            &state,
+            "PUT",
+            &format!("/admin/api/providers/{}", provider["id"].as_str().unwrap()),
+            json!({
+                "name": provider["name"],
+                "base_url": format!("http://{address}/accounts/{{account_id}}/v1"),
+                "models_path": "/models",
+                "wire_format": "openai",
+                "auth_scheme": "none",
+                "allow_insecure_tls": true,
+                "connection_values": {"account_id": tenant}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+    }
+    db::set_provider_connection_parameters_attested(&state.pool, quarantined_id, false)
+        .await
+        .unwrap();
+    let quarantined_model =
+        insert_transport_test_model(&state, quarantined_id, "quarantined-model", json!({})).await;
+    let healthy_model =
+        insert_transport_test_model(&state, healthy_id, "healthy-model", json!({})).await;
+    let route_id = db::insert_route(
+        &state.pool,
+        &db::NewRoute {
+            name: "connection-attestation-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(2),
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &state.pool,
+        &route_id,
+        None,
+        &quarantined_model,
+        1,
+        1,
+        "{}",
+        "{}",
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(
+        &state.pool,
+        &route_id,
+        None,
+        &healthy_model,
+        2,
+        1,
+        "{}",
+        "{}",
+    )
+    .await
+    .unwrap();
+    state.registry.reload(&state.pool).await.unwrap();
+
+    let (status, key) = connection_http(
+        &state,
+        "POST",
+        "/admin/api/keys",
+        json!({"name": "test", "owner": "test"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{key}");
+    let request = |model: &str| {
+        crate::router::build(state.clone()).oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", key["full_key"].as_str().unwrap()),
+                )
+                .body(axum::body::Body::from(
+                    json!({"model": model, "messages": [{"role": "user", "content": "hello"}], "stream": true}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+    let response = request("connection-attestation-route").await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        requests.lock().await.as_slice(),
+        ["/accounts/tenant-b/v1/chat/completions"]
+    );
+
+    let response = request("quarantined-model").await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        requests.lock().await.as_slice(),
+        ["/accounts/tenant-b/v1/chat/completions"]
+    );
+
+    let (status, dry_run) = connection_http(
+        &state,
+        "POST",
+        "/admin/api/routes/dry-run",
+        json!({"model": "connection-attestation-route"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dry_run}");
+    let candidates = dry_run["candidates"].as_array().unwrap();
+    let quarantined_candidate = candidates
+        .iter()
+        .find(|candidate| candidate["provider_id"] == quarantined_id)
+        .unwrap();
+    assert_eq!(quarantined_candidate["eligible"], false);
+    assert_eq!(quarantined_candidate["provider_connection_attested"], false);
+    assert_eq!(quarantined_candidate["decision_reason"], "connection_attestation");
+    assert!(quarantined_candidate["not_selected_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reason| reason == "connection_attestation"));
+    assert!(dry_run["would_select"].is_string());
+    let healthy_candidate = candidates
+        .iter()
+        .find(|candidate| candidate["provider_id"] == healthy_id)
+        .unwrap();
+    assert_eq!(healthy_candidate["selected"], true);
+
+    server.abort();
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn config_import_rejects_manifest_policy_widening_for_installed_integrations() {
     let manifest = json!({
         "manifest_version": crate::plugins::MANIFEST_VERSION,
