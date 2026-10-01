@@ -339,7 +339,7 @@ fn token_count_exact_target(
     let needs = req.capability_needs();
     let allowed_providers = key.allowed_providers();
 
-    let eligible = |target: &ResolvedTarget| {
+    let capability_eligible = |target: &ResolvedTarget| {
         let capabilities_match = provider_accepts_input_protocol(&target.provider, input_protocol)
             && integration_feature_ceiling_satisfies_needs(&target.provider, &needs)
             && (!target.provider.strict()
@@ -354,6 +354,9 @@ fn token_count_exact_target(
                 .unwrap_or(false));
         (allowed_providers.is_empty() || allowed_providers.contains(&target.provider.id))
             && capabilities_match
+    };
+    let eligible = |target: &ResolvedTarget| {
+        target.provider.connection_policy_attested() && capability_eligible(target)
     };
 
     match resolved {
@@ -381,6 +384,9 @@ fn token_count_exact_target(
                     crate::types::ErrorKind::Forbidden,
                     "this key is not allowed to use the resolved provider",
                 ));
+            }
+            if !provider.connection_policy_attested() {
+                return Ok(None);
             }
             let account = select_accounts(&snap, &provider_id, None)?
                 .into_iter()
@@ -416,8 +422,15 @@ fn token_count_exact_target(
             }))
         }
         Resolved::Route { targets, .. } => {
+            let has_capability_eligible_target =
+                targets.iter().any(|target| capability_eligible(target));
             let mut targets: Vec<_> = targets.into_iter().filter(eligible).collect();
             if targets.is_empty() {
+                if has_capability_eligible_target {
+                    // Quarantined providers have no usable exact tokenizer. Keep the local
+                    // estimate path instead of turning connection quarantine into a 400.
+                    return Ok(None);
+                }
                 return Err(ProxyError::unsupported(
                     "no configured target can satisfy this token-count request",
                 ));

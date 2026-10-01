@@ -391,6 +391,140 @@ async fn quarantined_provider_is_skipped_for_fallback_and_reported_by_dry_run() 
 }
 
 #[tokio::test]
+async fn quarantined_anthropic_provider_uses_local_token_count_estimate() {
+    let (state, root) = test_state_with_plugins("connection-attestation-token-count").await;
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("localhost:{}", listener.local_addr().unwrap().port());
+    let upstream = axum::Router::new().fallback(axum::routing::any(
+        move |uri: axum::http::Uri| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().await.push(uri.path().to_owned());
+                axum::http::StatusCode::OK
+            }
+        },
+    ));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+    let manifest = json!({
+        "manifest_version": crate::plugins::MANIFEST_VERSION,
+        "id": "plugin.test", "name": "Test Plugin", "version": "0.1.0", "plugin_api": "1",
+        "permissions": {"network_hosts": ["localhost"], "credential_read": false},
+        "integrations": [{"id": "public", "name": "Public API", "credential_mode": "none",
+            "provider": {"base_url": format!("https://{address}/accounts/{{account_id}}/v1"), "wire_format": "anthropic", "auth_scheme": "none", "models_path": "/models",
+                "parameters": {"account_id": {"type": "identifier", "min_length": 1, "max_length": 32}}}
+        }]
+    });
+    install_public_parameters_plugin(&state, manifest).await;
+    let setup_path = "/admin/api/plugins/plugin.test/integrations/public/provider";
+    let (status, provider) = connection_http(
+        &state,
+        "POST",
+        setup_path,
+        json!({"connection_values": {"account_id": "tenant-a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{provider}");
+    let provider_id = provider["id"].as_str().unwrap();
+    let (status, updated) = connection_http(
+        &state,
+        "PUT",
+        &format!("/admin/api/providers/{provider_id}"),
+        json!({
+            "name": provider["name"],
+            "base_url": format!("http://{address}/accounts/{{account_id}}/v1"),
+            "models_path": "/models",
+            "wire_format": "anthropic",
+            "auth_scheme": "none",
+            "allow_insecure_tls": true,
+            "connection_values": {"account_id": "tenant-a"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    db::set_provider_connection_parameters_attested(&state.pool, provider_id, false)
+        .await
+        .unwrap();
+    let model_id =
+        insert_transport_test_model(&state, provider_id, "quarantined-anthropic", json!({})).await;
+    let route_id = db::insert_route(
+        &state.pool,
+        &db::NewRoute {
+            name: "quarantined-count-route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: json!({}),
+            portability_policy: "reject",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: Some(1),
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(&state.pool, &route_id, None, &model_id, 1, 1, "{}", "{}")
+        .await
+        .unwrap();
+    state.registry.reload(&state.pool).await.unwrap();
+
+    let (status, key) = connection_http(
+        &state,
+        "POST",
+        "/admin/api/keys",
+        json!({"name": "test", "owner": "test"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{key}");
+    for model in ["quarantined-anthropic", "quarantined-count-route"] {
+        let response = crate::router::build(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages/count_tokens")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", key["full_key"].as_str().unwrap())
+                    .header("anthropic-version", "2023-06-01")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "max_tokens": 32
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let token_count_mode = response
+            .headers()
+            .get("x-kinetix-token-count")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(token_count_mode, "estimated");
+        assert!(serde_json::from_slice::<Value>(&body).unwrap()["input_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0);
+    }
+    assert!(requests.lock().await.is_empty(), "quarantined provider was contacted");
+
+    server.abort();
+    state.pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn config_import_rejects_manifest_policy_widening_for_installed_integrations() {
     let manifest = json!({
         "manifest_version": crate::plugins::MANIFEST_VERSION,
