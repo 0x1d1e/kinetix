@@ -244,8 +244,10 @@ Kinetix validates the template when the package is installed. Creating the
 provider is a separate admin operation and re-runs outbound URL checks plus
 capability-binding checks. The host derives `wire_plugin`,
 `credential_plugin`, and `model_source_plugin` from the parent Integration;
-the package cannot inject bindings to another plugin. Repeating setup returns
-the existing matching provider instead of creating a duplicate.
+the package cannot inject bindings to another plugin. Repeating setup with the
+same connection values returns the existing Provider; different values create
+another Provider without retargeting existing instances. When multiple instances
+exist, setup requires explicit `connection_values`.
 
 ### Anonymous authentication
 
@@ -292,7 +294,8 @@ update. Validate an edit through `/admin/api/validate/provider` with
 `provider_id` so validation uses the saved declarations.
 
 Values are provider-scoped: all its credential accounts share the identifier.
-Use a separate Provider for each distinct identifier. Native inference,
+Use **Add another Provider** in Plugins for each distinct identifier, or repeat
+the setup API call with different values. Native inference,
 native discovery, and plugin discovery receive the same resolved base URL;
 `models_path` is appended to that base, not resolved from the host root.
 Account-aware discovery receives its account reference as before, without

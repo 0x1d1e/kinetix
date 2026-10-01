@@ -482,7 +482,8 @@ export const PluginsView: React.FC = () => {
     setError(null);
     setNotice(null);
     try {
-      const provider = await Kinetix.setupPluginIntegrationProvider(pluginId, integrationId, connectionDrafts[`${pluginId}/${integrationId}`] || providers.find((provider) => provider.sourcePluginId === pluginId && provider.sourceIntegrationId === integrationId)?.connectionParameters?.values || {});
+      const provider = await Kinetix.setupPluginIntegrationProvider(pluginId, integrationId, connectionDrafts[`${pluginId}/${integrationId}`] || {});
+      setConnectionDrafts((drafts) => ({ ...drafts, [`${pluginId}/${integrationId}`]: {} }));
       await authEnrollment.begin(
         provider.id,
         () => Kinetix.startProviderCredentialEnrollment(provider.id),
@@ -499,8 +500,9 @@ export const PluginsView: React.FC = () => {
     setError(null);
     setNotice(null);
     try {
-      await Kinetix.setupPluginIntegrationProvider(pluginId, integrationId, connectionDrafts[`${pluginId}/${integrationId}`] || providers.find((provider) => provider.sourcePluginId === pluginId && provider.sourceIntegrationId === integrationId)?.connectionParameters?.values || {});
-      setNotice('Provider created successfully.');
+      const provider = await Kinetix.setupPluginIntegrationProvider(pluginId, integrationId, connectionDrafts[`${pluginId}/${integrationId}`] || {});
+      setConnectionDrafts((drafts) => ({ ...drafts, [`${pluginId}/${integrationId}`]: {} }));
+      setNotice(provider.created ? 'Provider created successfully.' : 'Existing Provider selected. Connection values unchanged.');
       await refresh(selectedId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -1063,7 +1065,13 @@ export const PluginsView: React.FC = () => {
                 <WobblyCard decoration="tape" className="p-5">
                   <h4 className="text-lg font-heading font-bold mb-3">Integrations</h4>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {selected.integrations.map((integration) => (
+                    {selected.integrations.map((integration) => {
+                      const parameterized = Object.keys(integration.provider?.parameters || {}).length > 0;
+                      const integrationProviders = providers.filter((provider) =>
+                        provider.sourcePluginId === selected.id && provider.sourceIntegrationId === integration.id,
+                      );
+                      const values = connectionDrafts[`${selected.id}/${integration.id}`] || {};
+                      return (
                       <div
                         key={integration.id}
                         className="p-4 border-2 border-[var(--ink)]/30 bg-[var(--surface)]"
@@ -1104,43 +1112,31 @@ export const PluginsView: React.FC = () => {
                           )}
                         </div>
 
-                        {integration.provider?.parameters && Object.keys(integration.provider.parameters).length > 0 && !providers.some((provider) => provider.sourcePluginId === selected.id && provider.sourceIntegrationId === integration.id) && (
+                        {parameterized && integration.provider?.parameters && (
                           <div className="mt-3">
                             <ConnectionParameterFields
                               declarations={integration.provider.parameters}
-                              values={connectionDrafts[`${selected.id}/${integration.id}`] || {}}
+                              values={values}
                               onChange={(values) => setConnectionDrafts((drafts) => ({ ...drafts, [`${selected.id}/${integration.id}`]: values }))}
                               disabled={busy !== null || selected.status !== 'enabled'}
                             />
+                            {integrationProviders.length > 0 && (
+                              <p className="mt-2 text-xs font-body text-[var(--ink)]/60">
+                                Different values create another Provider. Existing Providers are not changed.
+                              </p>
+                            )}
                           </div>
                         )}
-                        {providers.some(
-                          (p) =>
-                            p.baseUrl === integration.provider?.base_url &&
-                            (!integration.provider_adapter ||
-                              p.wirePlugin === `plugin:${selected.id}/${integration.provider_adapter}`)
-                        ) && (
+                        {integrationProviders.length > 0 && (
                           <div className="mt-3 flex items-center gap-1.5 text-xs font-heading font-bold text-emerald-700">
                             <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                             <span>
-                              Active in Upstream Providers (
-                              {providers.find(
-                                (p) =>
-                                  p.baseUrl === integration.provider?.base_url &&
-                                  (!integration.provider_adapter ||
-                                    p.wirePlugin === `plugin:${selected.id}/${integration.provider_adapter}`)
-                              )?.name}
-                              )
+                              Active in Upstream Providers ({integrationProviders.map((provider) => provider.name).join(', ')})
                             </span>
                           </div>
                         )}
 
-                        {!providers.some(
-                          (p) =>
-                            p.baseUrl === integration.provider?.base_url &&
-                            (!integration.provider_adapter ||
-                              p.wirePlugin === `plugin:${selected.id}/${integration.provider_adapter}`)
-                        ) &&
+                        {(parameterized || integrationProviders.length === 0) &&
                           integration.provider &&
                           selected.ui.actions.filter((action) => action.integration === integration.id).length === 0 && (
                             <div className="mt-4 space-y-2">
@@ -1154,7 +1150,7 @@ export const PluginsView: React.FC = () => {
                                 onClick={() => void setupProvider(selected.id, integration.id)}
                               >
                                 <PackagePlus className="w-4 h-4" />
-                                {busy === `setup:${integration.id}` ? 'Setting up…' : 'Set up Provider'}
+                                {busy === `setup:${integration.id}` ? 'Setting up…' : integrationProviders.length > 0 ? 'Add another Provider' : 'Set up Provider'}
                               </SketchButton>
                               <p className="text-xs font-body text-[var(--ink)]/60">
                                 Create the upstream provider from the plugin&apos;s validated defaults.
@@ -1204,7 +1200,7 @@ export const PluginsView: React.FC = () => {
                                     {action.label} · {provider.name}
                                   </SketchButton>
                                 ))}
-                                {compatibleProviders.length === 0 &&
+                                {(compatibleProviders.length === 0 || parameterized) &&
                                   (integration.provider ? (
                                     <div className="space-y-2">
                                       <div className="text-xs font-mono text-[var(--ink)]/55 break-all">
@@ -1225,7 +1221,9 @@ export const PluginsView: React.FC = () => {
                                         <LogIn className="w-4 h-4" />
                                         {busy === `setup:${integration.id}`
                                           ? 'Setting up…'
-                                          : `Set up & ${action.label.toLowerCase()}`}
+                                          : integrationProviders.length > 0
+                                            ? `Add another Provider & ${action.label.toLowerCase()}`
+                                            : `Set up & ${action.label.toLowerCase()}`}
                                       </SketchButton>
                                       <p className="text-xs font-body text-[var(--ink)]/60">
                                         Kinetix will create the provider from the plugin&apos;s
@@ -1246,7 +1244,8 @@ export const PluginsView: React.FC = () => {
                             );
                           })}
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </WobblyCard>
               )}

@@ -52,6 +52,7 @@ async fn cli_public_parameters_and_anonymous_auth_remain_separate_from_credentia
     let provider = &providers[0];
     assert_eq!(provider.auth_scheme, "none");
     assert_eq!(provider.credential_mode, "none");
+    assert_eq!(provider.pricing_scope, "direct_api");
     assert_eq!(
         provider.connection().unwrap().unwrap().values["account_id"],
         "tenant-123"

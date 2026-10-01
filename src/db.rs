@@ -1187,6 +1187,7 @@ pub struct NewProvider<'a> {
 }
 
 pub fn conservative_provider_pricing_scope(
+    auth_scheme: AuthScheme,
     credential_mode: &str,
     source_plugin_id: Option<&str>,
     source_integration_id: Option<&str>,
@@ -1196,7 +1197,8 @@ pub fn conservative_provider_pricing_scope(
 ) -> &'static str {
     if source_plugin_id.is_some()
         || source_integration_id.is_some()
-        || credential_mode != "manual"
+        || (credential_mode != "manual"
+            && !(credential_mode == "none" && auth_scheme == AuthScheme::None))
         || !wire_plugin.is_empty()
         || !credential_plugin.is_empty()
         || !model_source_plugin.is_empty()
@@ -1331,6 +1333,7 @@ pub async fn insert_provider(pool: &Pool, p: &NewProvider<'_>) -> Result<String>
     validate_provider_auth(p)?;
     let id = format!("prov_{}", uuid::Uuid::new_v4().simple());
     let pricing_scope = conservative_provider_pricing_scope(
+        p.auth_scheme,
         p.credential_mode,
         p.source_plugin_id,
         p.source_integration_id,
@@ -1451,6 +1454,7 @@ pub async fn update_provider(
         || existing.model_source_plugin != p.model_source_plugin;
     let catalog_identity_changed = existing.base_url != p.base_url || drivers_changed;
     let conservative = conservative_provider_pricing_scope(
+        p.auth_scheme,
         p.credential_mode,
         p.source_plugin_id,
         p.source_integration_id,
@@ -1641,6 +1645,7 @@ pub async fn update_provider_credential_semantics_with_scope(
         || existing.source_plugin_id.as_deref() != source_plugin_id
         || existing.source_integration_id.as_deref() != source_integration_id;
     let conservative = conservative_provider_pricing_scope(
+        existing.auth(),
         credential_mode,
         source_plugin_id,
         source_integration_id,

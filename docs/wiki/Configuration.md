@@ -17,6 +17,8 @@ test instances.
 
 Anonymous bootstrap providers use `auth_scheme = "none"` and
 `credential_mode = "none"`, without credential accounts or custom auth fields.
+Anonymous authentication does not imply integration pricing: non-plugin-backed
+Providers retain `direct_api` pricing by default.
 For public identifiers stored separately from tokens, see
 [Public connection parameters](Plugins#public-connection-parameters).
 

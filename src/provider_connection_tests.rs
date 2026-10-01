@@ -25,6 +25,156 @@ async fn connection_http(
 }
 
 #[tokio::test]
+async fn anonymous_generic_direct_api_pricing_survives_create_edit_and_import() {
+    let (state, root) = test_state("anonymous-direct-pricing").await;
+    let body = json!({"name": "public-api", "base_url": "https://api.example.com/v1", "wire_format": "openai", "auth_scheme": "none", "pricing_scope": "direct_api"});
+    let (status, created) =
+        connection_http(&state, "POST", "/admin/api/providers", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["id"].as_str().unwrap();
+    let provider = db::get_provider(&state.pool, id).await.unwrap().unwrap();
+    assert_eq!(provider.pricing_scope, "direct_api");
+    assert_eq!(provider.credential_mode, "none");
+    let (status, edited) =
+        connection_http(&state, "PUT", &format!("/admin/api/providers/{id}"), body).await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    assert_eq!(
+        db::get_provider(&state.pool, id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pricing_scope,
+        "direct_api"
+    );
+    let (status, exported) =
+        connection_http(&state, "GET", "/admin/api/config/export", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{exported}");
+    let (restored, restored_root) = test_state("anonymous-direct-pricing-import").await;
+    let (status, imported) = connection_http(
+        &restored,
+        "POST",
+        "/admin/api/config/import",
+        json!({"config": exported, "apply": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{imported}");
+    assert_eq!(
+        db::list_providers(&restored.pool).await.unwrap()[0].pricing_scope,
+        "direct_api"
+    );
+    state.pool.close().await;
+    restored.pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(restored_root);
+}
+
+#[tokio::test]
+async fn parameterized_setup_creates_distinct_provider_instances_without_retargeting() {
+    let (state, root) = test_state_with_plugins("connection-instances").await;
+    install_public_parameters_plugin(&state, json!({
+        "manifest_version": crate::plugins::MANIFEST_VERSION,
+        "id": "plugin.test", "name": "Test Plugin", "version": "0.1.0", "plugin_api": "1",
+        "permissions": {"network_hosts": ["api.example.com"], "credential_read": false},
+        "integrations": [{"id": "public", "name": "Public API", "credential_mode": "none",
+            "provider": {"base_url": "https://api.example.com/accounts/{account_id}/v1", "wire_format": "openai", "auth_scheme": "none", "models_path": "/models",
+                "parameters": {"account_id": {"type": "identifier", "min_length": 1, "max_length": 32}}}
+        }]
+    })).await;
+    let path = "/admin/api/plugins/plugin.test/integrations/public/provider";
+    let (status, first) = connection_http(
+        &state,
+        "POST",
+        path,
+        json!({"connection_values": {"account_id": "tenant-a"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["created"], true);
+    let (status, second) = connection_http(
+        &state,
+        "POST",
+        path,
+        json!({"connection_values": {"account_id": "tenant-b"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["created"], true);
+    assert_ne!(first["id"], second["id"]);
+    assert_ne!(first["name"], second["name"]);
+    assert!(!first["name"].as_str().unwrap().contains("tenant-a"));
+    assert!(!second["name"].as_str().unwrap().contains("tenant-b"));
+    assert_eq!(db::list_providers(&state.pool).await.unwrap().len(), 2);
+    for (created, tenant) in [(&first, "tenant-a"), (&second, "tenant-b")] {
+        let provider = db::get_provider(&state.pool, created["id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.pricing_scope, "integration");
+        assert_eq!(
+            provider.resolved_base_url().unwrap(),
+            format!("https://api.example.com/accounts/{tenant}/v1")
+        );
+        let (status, repeated) = connection_http(
+            &state,
+            "POST",
+            path,
+            json!({"connection_values": {"account_id": tenant}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{repeated}");
+        assert_eq!(repeated["id"], created["id"]);
+        assert_eq!(repeated["created"], false);
+    }
+    assert_eq!(
+        connection_http(&state, "POST", path, json!({})).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(db::list_providers(&state.pool).await.unwrap().len(), 2);
+    for provider in db::list_providers(&state.pool).await.unwrap() {
+        let mut parameters = provider.connection().unwrap().unwrap();
+        parameters
+            .declarations
+            .get_mut("account_id")
+            .unwrap()
+            .max_length = 16;
+        db::set_provider_connection_parameters(&state.pool, &provider.id, Some(&parameters))
+            .await
+            .unwrap();
+    }
+    super::auto_provision_plugin_providers(&state, "plugin.test").await;
+    for provider in db::list_providers(&state.pool).await.unwrap() {
+        assert_eq!(
+            provider.connection().unwrap().unwrap().declarations["account_id"].max_length,
+            32
+        );
+    }
+    let (status, exported) =
+        connection_http(&state, "GET", "/admin/api/config/export", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{exported}");
+    let (restored, restored_root) = test_state("connection-instances-import").await;
+    let (status, imported) = connection_http(
+        &restored,
+        "POST",
+        "/admin/api/config/import",
+        json!({"config": exported, "apply": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{imported}");
+    let restored_providers = db::list_providers(&restored.pool).await.unwrap();
+    assert_eq!(restored_providers.len(), 2);
+    for tenant in ["tenant-a", "tenant-b"] {
+        assert!(restored_providers
+            .iter()
+            .any(|provider| provider.resolved_base_url().unwrap()
+                == format!("https://api.example.com/accounts/{tenant}/v1")));
+    }
+    state.pool.close().await;
+    restored.pool.close().await;
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(restored_root);
+}
+
+#[tokio::test]
 async fn anonymous_provider_http_rejects_credentials_and_materializes_routing_account() {
     let (state, root) = test_state("anonymous-http").await;
     let body = json!({"name": "anonymous", "base_url": "https://api.example.com/v1", "wire_format": "openai", "auth_scheme": "none"});
@@ -348,19 +498,47 @@ async fn public_parameter_http_case(upstream_status: u16, anonymous: bool) {
         redirect_provider.follow_redirects = 1;
         let snapshot = state.registry.snapshot();
         let model = snapshot.models.get(&model_id).unwrap();
-        let ctx = UpstreamContext { provider: &redirect_provider, model, account_id: Some(&accounts[0].id), session_context: None, credential: String::new() };
+        let ctx = UpstreamContext {
+            provider: &redirect_provider,
+            model,
+            account_id: Some(&accounts[0].id),
+            session_context: None,
+            credential: String::new(),
+        };
         let adapter = state.adapters.for_provider(&redirect_provider);
-        let error = crate::outbound::send_provider_request(&state.outbound_clients, true, true, &adapter, &ctx, crate::outbound::ProviderRequest {
-            method: reqwest::Method::GET, url: url::Url::parse(&format!("http://{address}/redirect")).unwrap(), json_body: None, accept_event_stream: false, request_id: None, headers: Vec::new(), total_timeout: Some(std::time::Duration::from_secs(2)),
-        }).await.unwrap_err();
+        let error = crate::outbound::send_provider_request(
+            &state.outbound_clients,
+            true,
+            true,
+            &adapter,
+            &ctx,
+            crate::outbound::ProviderRequest {
+                method: reqwest::Method::GET,
+                url: url::Url::parse(&format!("http://{address}/redirect")).unwrap(),
+                json_body: None,
+                accept_event_stream: false,
+                request_id: None,
+                headers: Vec::new(),
+                total_timeout: Some(std::time::Duration::from_secs(2)),
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(error.message.contains("network_hosts"), "{error:?}");
         assert_eq!(requests.lock().await.len(), captured_count + 1);
         for value in [json!({}), json!({"account_id": "../escape"})] {
             let mut parameters = redirect_provider.connection().unwrap().unwrap();
             parameters.values = serde_json::from_value(value).unwrap();
             let mut invalid_provider = redirect_provider.clone();
-            invalid_provider.connection_parameters = Some(serde_json::to_string(&parameters).unwrap());
-            let ctx = UpstreamContext { provider: &invalid_provider, model, account_id: Some(&accounts[0].id), session_context: None, credential: String::new() };
+            invalid_provider.connection_parameters =
+                Some(serde_json::to_string(&parameters).unwrap());
+            let ctx = UpstreamContext {
+                provider: &invalid_provider,
+                model,
+                account_id: Some(&accounts[0].id),
+                session_context: None,
+                credential: String::new(),
+            };
             assert!(adapter.build_url(&ctx).is_err());
         }
         assert_eq!(requests.lock().await.len(), captured_count + 1);
