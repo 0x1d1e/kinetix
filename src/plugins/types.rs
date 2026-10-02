@@ -112,7 +112,7 @@ pub struct Permissions {
 }
 
 /// Manifest `[limits]` (§5, §14). These are *requests*; host policy wins.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
     #[serde(default = "default_memory")]

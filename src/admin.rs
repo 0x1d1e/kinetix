@@ -80,6 +80,9 @@ impl ApiError {
     fn not_found(msg: impl Into<String>) -> Self {
         ApiError::new(StatusCode::NOT_FOUND, msg.into(), None)
     }
+    fn conflict(msg: impl Into<String>) -> Self {
+        ApiError::new(StatusCode::CONFLICT, msg.into(), None)
+    }
     pub(crate) fn internal(e: impl std::fmt::Display) -> Self {
         tracing::error!(error = %crypto::redact(&e.to_string()), "Admin API operation failed");
         ApiError::new(
@@ -15126,6 +15129,15 @@ fn plugin_bad(e: anyhow::Error) -> ApiError {
     ApiError::bad(e.to_string())
 }
 
+fn plugin_lifecycle_error(e: anyhow::Error) -> ApiError {
+    let message = e.to_string();
+    if message.contains("is referenced by") {
+        ApiError::conflict(message)
+    } else {
+        plugin_bad(e)
+    }
+}
+
 fn plugin_manager(
     state: &AppState,
 ) -> Result<&std::sync::Arc<crate::plugins::PluginManager>, ApiError> {
@@ -15925,6 +15937,12 @@ pub async fn plugin_catalog(
         let ready =
             crate::plugins::catalog::install_ready(plugin, &trust).map_err(ApiError::internal)?;
         let mut value = serde_json::to_value(plugin).map_err(ApiError::internal)?;
+        value["release_url"] = json!(crate::plugins::catalog::safe_external_link(
+            plugin.release_url.as_deref()
+        ));
+        value["changelog_url"] = json!(crate::plugins::catalog::safe_external_link(
+            plugin.changelog_url.as_deref()
+        ));
         value["install_ready"] = json!(ready);
         value["trust_status"] = json!(if ready {
             "trusted"
@@ -15936,15 +15954,24 @@ pub async fn plugin_catalog(
 
         let installed = installed_plugins.iter().find(|p| p.id == plugin.id);
         if let Some(inst) = installed {
+            let pinned_version = crate::plugins::store::pinned_version(&state.pool, &plugin.id)
+                .await
+                .map_err(ApiError::internal)?;
+            let has_update =
+                crate::plugins::catalog::is_update_available(&inst.version, &plugin.latest_version);
             value["installed"] = json!(true);
             value["installed_version"] = json!(inst.version);
-            value["update_available"] = json!(crate::plugins::catalog::is_update_available(
-                &inst.version,
-                &plugin.latest_version
-            ));
+            value["pinned_version"] = json!(pinned_version);
+            value["update_available"] = json!(
+                has_update
+                    && pinned_version
+                        .as_deref()
+                        .is_none_or(|pinned| pinned == plugin.latest_version)
+            );
         } else {
             value["installed"] = json!(false);
             value["installed_version"] = json!(null);
+            value["pinned_version"] = json!(null);
             value["update_available"] = json!(false);
         }
         plugins.push(value);
@@ -16122,19 +16149,48 @@ pub async fn preview_catalog_plugin(
     let verified = verify_catalog_package(&state, manager, &id).await?;
 
     let current = manager.get(&id).await.map_err(ApiError::internal)?;
-    let (current_version, current_permissions) = match current {
-        Some(row) => {
-            let manifest = row
-                .manifest()
-                .ok_or_else(|| ApiError::bad("installed plugin manifest is unreadable"))?;
-            (Some(row.version), manifest.permissions)
-        }
-        None => (None, crate::plugins::Permissions::default()),
-    };
+    let (current_version, current_permissions, current_limits, current_approval_complete) =
+        match current {
+            Some(row) => {
+                let manifest = row
+                    .manifest()
+                    .ok_or_else(|| ApiError::bad("installed plugin manifest is unreadable"))?;
+                let requested = crate::plugins::manager::permission_grants(&manifest);
+                let approved = crate::plugins::store::permissions(&state.pool, &id)
+                    .await
+                    .map_err(ApiError::internal)?
+                    .into_iter()
+                    .map(|grant| crate::plugins::store::PermissionGrant {
+                        permission: grant.permission,
+                        value_json: grant.value_json,
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    Some(row.version),
+                    manifest.permissions,
+                    manifest.limits,
+                    crate::plugins::manager::permission_grants_match(&requested, &approved),
+                )
+            }
+            None => (
+                None,
+                crate::plugins::Permissions::default(),
+                crate::plugins::Limits::default(),
+                true,
+            ),
+        };
 
     let target_permissions = verified.validated.manifest.permissions.clone();
-    let permission_diff =
-        crate::plugins::manager::permission_diff(&current_permissions, &target_permissions);
+    let permission_diff = crate::plugins::manager::permission_diff(
+        &current_permissions,
+        &current_limits,
+        &target_permissions,
+        &verified.validated.manifest.limits,
+    );
+    let target_grants = crate::plugins::manager::permission_grants(&verified.validated.manifest);
+    let approval_required = permission_diff.expanded
+        || !current_approval_complete
+        || (current_version.is_none() && !target_grants.is_empty());
 
     Ok(Json(json!({
         "id": verified.plugin.id,
@@ -16148,8 +16204,12 @@ pub async fn preview_catalog_plugin(
             .map(|distribution| distribution.sha256.clone())
             .unwrap_or_default(),
         "signature": "verified",
+        "release_url": crate::plugins::catalog::safe_external_link(verified.plugin.release_url.as_deref()),
+        "changelog_url": crate::plugins::catalog::safe_external_link(verified.plugin.changelog_url.as_deref()),
+        "pinned_version": manager.pinned_version(&id).await.map_err(ApiError::internal)?,
         "permissions": target_permissions,
         "permission_diff": permission_diff,
+        "approval_required": approval_required,
         "provides": verified.validated.manifest.provides.provided(),
         "source": format!(
             "catalog:{}@{}",
@@ -16166,6 +16226,17 @@ pub async fn install_catalog_plugin(
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
     let verified = verify_catalog_package(&state, manager, &id).await?;
+    if let Some(pinned_version) = manager
+        .pinned_version(&id)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        if pinned_version != verified.plugin.latest_version {
+            return Err(ApiError::conflict(format!(
+                "plugin '{id}' is pinned at v{pinned_version}; unpin before a catalog update"
+            )));
+        }
+    }
     let distribution = verified
         .plugin
         .distribution
@@ -16216,10 +16287,15 @@ pub async fn install_catalog_plugin(
 pub async fn list_plugins(State(state): State<AppState>, _auth: AdminAuth) -> ApiResult {
     let manager = plugin_manager(&state)?;
     let rows = manager.list().await.map_err(ApiError::internal)?;
-    let plugins: Vec<Value> = rows
-        .iter()
-        .map(crate::plugins::manager::manifest_summary)
-        .collect();
+    let mut plugins = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut summary = crate::plugins::manager::manifest_summary(&row);
+        summary["pinned_version"] =
+            json!(crate::plugins::store::pinned_version(&state.pool, &row.id)
+                .await
+                .map_err(ApiError::internal)?);
+        plugins.push(summary);
+    }
     Ok(Json(json!({ "plugins": plugins })))
 }
 
@@ -16248,6 +16324,9 @@ pub async fn get_plugin(
     summary["permissions_approved"] = json!(perms);
     summary["runtime"] = json!(runtime);
     summary["packages"] = json!(packages);
+    summary["pinned_version"] = json!(crate::plugins::store::pinned_version(&state.pool, &id)
+        .await
+        .map_err(ApiError::internal)?);
     Ok(Json(summary))
 }
 
@@ -17748,6 +17827,12 @@ pub struct PluginRollbackBody {
     pub sha256: String,
 }
 
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub struct PluginImpactAcknowledgementBody {
+    #[serde(default)]
+    pub impact_fingerprint: Option<String>,
+}
+
 /// Optional subset approval for `POST /plugins/{id}/permissions/approve`. With
 /// no fields the full declared set is approved (back-compat); with fields the
 /// granted scope is exactly what is requested (a subset of the manifest).
@@ -17759,6 +17844,8 @@ pub struct PluginPermissionApprovalBody {
     pub credential_scopes: Option<Vec<String>>,
     #[serde(default)]
     pub credential_read: Option<bool>,
+    #[serde(default)]
+    pub limits: Option<crate::plugins::Limits>,
 }
 
 /// `POST /admin/api/plugins/{id}/rollback` — reactivate a retained package.
@@ -17825,14 +17912,32 @@ pub async fn enable_plugin(
     Ok(Json(json!({ "ok": true, "id": id, "enabled": true })))
 }
 
-/// `POST /admin/api/plugins/{id}/disable`.
-pub async fn disable_plugin(
+/// `GET /admin/api/plugins/{id}/impact` — enumerate bound Providers and Routes.
+pub async fn plugin_dependency_impact(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Path(id): Path<String>,
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
-    manager.disable(&id).await.map_err(ApiError::internal)?;
+    let impact = manager.dependency_impact(&id).await.map_err(plugin_bad)?;
+    Ok(Json(
+        serde_json::to_value(impact).map_err(ApiError::internal)?,
+    ))
+}
+
+/// `POST /admin/api/plugins/{id}/disable`.
+pub async fn disable_plugin(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+    body: Option<Json<PluginImpactAcknowledgementBody>>,
+) -> ApiResult {
+    let manager = plugin_manager(&state)?;
+    let acknowledged = body.and_then(|Json(body)| body.impact_fingerprint);
+    let impact = manager
+        .disable_with_impact_acknowledgement(&id, acknowledged.as_deref())
+        .await
+        .map_err(plugin_lifecycle_error)?;
     state.unregister_plugin_capabilities(&id);
     let _ = db::insert_audit(
         &state.pool,
@@ -17841,7 +17946,11 @@ pub async fn disable_plugin(
         "plugin",
         &id,
         &id,
-        "Disabled plugin.",
+        &format!(
+            "Disabled plugin after reviewing {} Provider(s) and {} Route(s).",
+            impact.providers.len(),
+            impact.routes.len()
+        ),
     )
     .await;
     Ok(Json(json!({ "ok": true, "id": id, "enabled": false })))
@@ -17852,9 +17961,14 @@ pub async fn remove_plugin(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Path(id): Path<String>,
+    body: Option<Json<PluginImpactAcknowledgementBody>>,
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
-    manager.remove(&id).await.map_err(ApiError::internal)?;
+    let acknowledged = body.and_then(|Json(body)| body.impact_fingerprint);
+    let impact = manager
+        .remove_with_impact_acknowledgement(&id, acknowledged.as_deref())
+        .await
+        .map_err(plugin_lifecycle_error)?;
     state.unregister_plugin_capabilities(&id);
     let _ = db::insert_audit(
         &state.pool,
@@ -17863,10 +17977,58 @@ pub async fn remove_plugin(
         "plugin",
         &id,
         &id,
-        "Removed plugin and its stored state.",
+        &format!(
+            "Removed plugin and its stored state after reviewing {} Provider(s) and {} Route(s).",
+            impact.providers.len(),
+            impact.routes.len()
+        ),
     )
     .await;
     Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+/// `POST /admin/api/plugins/{id}/pin` — pin the installed release version.
+pub async fn pin_plugin_version(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let manager = plugin_manager(&state)?;
+    let version = manager.pin_current_version(&id).await.map_err(plugin_bad)?;
+    let _ = db::insert_audit(
+        &state.pool,
+        "admin",
+        "plugin_version_pinned",
+        "plugin",
+        &id,
+        &id,
+        &format!("Pinned catalog updates at v{version}."),
+    )
+    .await;
+    Ok(Json(
+        json!({ "ok": true, "id": id, "pinned_version": version }),
+    ))
+}
+
+/// `DELETE /admin/api/plugins/{id}/pin` — resume catalog updates.
+pub async fn unpin_plugin_version(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let manager = plugin_manager(&state)?;
+    let removed = manager.unpin_version(&id).await.map_err(plugin_bad)?;
+    let _ = db::insert_audit(
+        &state.pool,
+        "admin",
+        "plugin_version_unpinned",
+        "plugin",
+        &id,
+        &id,
+        "Removed catalog version pin.",
+    )
+    .await;
+    Ok(Json(json!({ "ok": true, "id": id, "unpinned": removed })))
 }
 
 /// `POST /admin/api/plugins/{id}/validate` — re-instantiate and self-check.
@@ -17914,6 +18076,7 @@ pub async fn approve_plugin_permissions(
     let grants = if scoped.network_hosts.is_none()
         && scoped.credential_scopes.is_none()
         && scoped.credential_read.is_none()
+        && scoped.limits.is_none()
     {
         manager.approve_permissions(&id).await.map_err(plugin_bad)?
     } else {
@@ -17923,6 +18086,7 @@ pub async fn approve_plugin_permissions(
                 scoped.network_hosts,
                 scoped.credential_scopes,
                 scoped.credential_read,
+                scoped.limits,
             )
             .await
             .map_err(plugin_bad)?
@@ -29139,6 +29303,10 @@ storage = "2MiB"
         let foreign_manager = target.plugin_manager().unwrap().clone();
         foreign_manager
             .install(&foreign_package, None, &[], false)
+            .await
+            .unwrap();
+        foreign_manager
+            .approve_permissions("plugin.other")
             .await
             .unwrap();
         foreign_manager.enable("plugin.other").await.unwrap();

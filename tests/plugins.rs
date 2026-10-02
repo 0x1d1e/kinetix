@@ -344,7 +344,7 @@ async fn enable_requires_explicit_permission_approval() {
 }
 
 #[tokio::test]
-async fn upgrade_disables_plugin_and_clears_previous_approvals() {
+async fn non_expanding_upgrade_disables_plugin_and_carries_complete_approval() {
     let (m, pool) = manager().await;
     let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     m.install(&kxp, None, &[], false).await.unwrap();
@@ -360,12 +360,11 @@ async fn upgrade_disables_plugin_and_clears_previous_approvals() {
     let row = m.get("dev.example.foo").await.unwrap().unwrap();
     assert_eq!(row.version, "1.3.0");
     assert_eq!(row.enabled, 0);
-    assert!(
-        kinetix::plugins::store::permissions(&pool, "dev.example.foo")
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let approved = kinetix::plugins::store::permissions(&pool, "dev.example.foo")
+        .await
+        .unwrap();
+    assert_eq!(approved.len(), 2);
+    assert!(m.enable("dev.example.foo").await.is_ok());
 
     let packages = kinetix::plugins::store::list_packages(&pool, "dev.example.foo")
         .await
@@ -373,6 +372,167 @@ async fn upgrade_disables_plugin_and_clears_previous_approvals() {
     assert_eq!(packages.len(), 2);
     assert!(packages.iter().any(|p| p.version == "1.2.0"));
     assert!(packages.iter().any(|p| p.version == "1.3.0"));
+}
+
+#[tokio::test]
+async fn plugin_version_pin_tracks_installed_release_until_unpinned() {
+    let (m, _pool) = manager().await;
+    m.install(&build_kxp(GOOD_MANIFEST, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        m.pin_current_version("dev.example.foo").await.unwrap(),
+        "1.2.0"
+    );
+    assert_eq!(
+        m.pinned_version("dev.example.foo")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1.2.0")
+    );
+    assert!(m.unpin_version("dev.example.foo").await.unwrap());
+    assert!(!m.unpin_version("dev.example.foo").await.unwrap());
+    assert_eq!(m.pinned_version("dev.example.foo").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn plugin_disable_and_remove_require_current_provider_and_route_impact_ack() {
+    let (m, pool) = manager().await;
+    m.install(&build_kxp(GOOD_MANIFEST, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+
+    let provider_id = db::insert_provider(
+        &pool,
+        &db::NewProvider {
+            name: "plugin-backed provider",
+            base_url: "https://api.example",
+            wire_format: kinetix::types::WireFormat::Plugin,
+            auth_scheme: kinetix::types::AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: serde_json::json!({}),
+            timeout_ms: 30_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: serde_json::json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: false,
+            wire_plugin: "plugin:dev.example.foo/foo-adapter",
+            credential_plugin: "",
+            model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let model_id = db::insert_model(
+        &pool,
+        &db::NewModel {
+            provider_id: &provider_id,
+            upstream_id: "model-x",
+            display_name: "Model X",
+            enabled: true,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: serde_json::json!({}),
+            prices: serde_json::json!({}),
+            parameters: serde_json::json!({}),
+            thinking_map: serde_json::json!({}),
+            extra_request: serde_json::json!({}),
+            discovery: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let route_id = db::insert_route(
+        &pool,
+        &db::NewRoute {
+            name: "plugin-dependent route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: serde_json::json!({}),
+            portability_policy: "strip",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: None,
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(&pool, &route_id, None, &model_id, 1, 1, "{}", "{}")
+        .await
+        .unwrap();
+
+    let impact = m.dependency_impact("dev.example.foo").await.unwrap();
+    assert_eq!(impact.providers.len(), 1);
+    assert_eq!(impact.providers[0].id, provider_id);
+    assert_eq!(impact.routes.len(), 1);
+    assert_eq!(impact.routes[0].id, route_id);
+    assert_eq!(impact.routes[0].provider_ids, [provider_id]);
+    assert!(m.disable("dev.example.foo").await.is_err());
+    assert!(m
+        .disable_with_impact_acknowledgement("dev.example.foo", Some("stale"))
+        .await
+        .is_err());
+
+    sqlx::query("UPDATE routes SET name = 'renamed plugin-dependent route' WHERE id = ?")
+        .bind(&route_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(m
+        .disable_with_impact_acknowledgement("dev.example.foo", Some(&impact.fingerprint))
+        .await
+        .is_err());
+
+    let current = m.dependency_impact("dev.example.foo").await.unwrap();
+    m.disable_with_impact_acknowledgement("dev.example.foo", Some(&current.fingerprint))
+        .await
+        .unwrap();
+    assert_eq!(m.get("dev.example.foo").await.unwrap().unwrap().enabled, 0);
+    assert!(m.remove("dev.example.foo").await.is_err());
+    m.remove_with_impact_acknowledgement("dev.example.foo", Some(&current.fingerprint))
+        .await
+        .unwrap();
+    assert!(m.get("dev.example.foo").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn expanded_upgrade_clears_previous_approval_and_stays_disabled() {
+    let (m, pool) = manager().await;
+    m.install(&build_kxp(GOOD_MANIFEST, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+
+    let expanded = GOOD_MANIFEST
+        .replace("version = \"1.2.0\"", "version = \"1.3.0\"")
+        .replace(
+            "network_hosts = [\"api.foo.example\"]",
+            "network_hosts = [\"api.foo.example\", \"api.new.example\"]",
+        )
+        .replace("memory = \"64MiB\"", "memory = \"128MiB\"");
+    m.install(&build_kxp(&expanded, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+
+    let row = m.get("dev.example.foo").await.unwrap().unwrap();
+    assert_eq!(row.enabled, 0);
+    assert!(
+        kinetix::plugins::store::permissions(&pool, "dev.example.foo")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let error = m.enable("dev.example.foo").await.unwrap_err();
+    assert!(error.to_string().contains("permissions are not approved"));
 }
 
 #[tokio::test]
@@ -524,6 +684,7 @@ async fn scoped_permission_approval_grants_only_the_requested_subset() {
             Some(vec!["api.foo.example".to_string()]),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -540,6 +701,7 @@ async fn scoped_permission_approval_grants_only_the_requested_subset() {
         .approve_permissions_scoped(
             "dev.example.foo",
             Some(vec!["evil.example".to_string()]),
+            None,
             None,
             None,
         )

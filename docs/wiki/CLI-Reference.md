@@ -127,7 +127,7 @@ kinetix alias remove <ALIAS>      # remove takes the alias NAME, not an id
 ```
 
 ### `plugin`
-Manage WebAssembly plugins (`.kxp` packages). Plugins are installed disabled by default and require explicit permission approval and enablement.
+Manage WebAssembly plugins (`.kxp` packages). Installs and updates remain disabled until explicitly enabled; permission increases require approval. Non-expanding updates retain grants only when they exactly covered the previous manifest.
 
 ```bash
 # Install a .kxp package (installed-disabled by default)
@@ -148,17 +148,29 @@ kinetix plugin approve <ID>
 # Enable an installed plugin
 kinetix plugin enable <ID>
 
-# Disable a plugin (new requests stop referencing it)
-kinetix plugin disable <ID>
+# Review dependent Providers and Routes
+kinetix plugin impact <ID>
+
+# Disable or remove (referenced plugins require impact acknowledgement)
+kinetix plugin disable <ID> [--force]
+kinetix plugin remove <ID> [--force]
+
+# Browse catalog metadata and release/changelog links
+kinetix plugin catalog list [--refresh] [--capability <CAPABILITY>]
+kinetix plugin catalog show <ID> [--refresh]
+
+# Update an installed catalog plugin; --approve approves new permissions
+kinetix plugin update [ID] [--approve]
+
+# Pin/unpin the currently installed version
+kinetix plugin pin <ID>
+kinetix plugin unpin <ID>
 
 # List approved permission grants
 kinetix plugin permissions <ID>
 
 # Revoke a single permission grant (disables plugin, retains KV state)
 kinetix plugin revoke <ID> <PERMISSION>
-
-# Remove a plugin and cascade-delete its permissions, circuit state, and KV storage
-kinetix plugin remove <ID>
 ```
 
 | Subcommand | Purpose |
@@ -169,10 +181,14 @@ kinetix plugin remove <ID>
 | `validate <id>` | Instantiates the WebAssembly component in a test store to verify linking and export conformance. |
 | `approve <id>` | Approves all declared permissions for the installed version. |
 | `enable <id>` | Validates exports, checks that all requested permissions are approved, and marks the plugin active in memory and SQLite. |
-| `disable <id>` | Marks the plugin disabled; any bound provider or Route fails closed immediately. |
+| `disable <id> [--force]` | Shows dependent Providers and Routes; `--force` acknowledges the displayed impact. Bound targets remain unchanged and fail closed. |
+| `impact <id>` | Prints the bound Providers, dependent Routes, and current impact fingerprint. |
+| `catalog list/show` | Shows available releases and safe release/changelog links. |
+| `update [id] [--approve]` | Updates one or all installed catalog plugins. Permission increases are skipped without `--approve`; approved updates re-enable only plugins that were enabled before the update. |
+| `pin <id>` / `unpin <id>` | Pin the installed version against marketplace updates or remove that pin. |
 | `permissions <id>` | Prints approved permissions and their parameters. |
 | `revoke <id> <perm>` | Revokes an approved permission grant. |
-| `remove <id>` | Cascades removal of the plugin, its approved permissions, runtime state, and encrypted KV store. |
+| `remove <id> [--force]` | Shows dependent Providers and Routes; removal with dependencies requires `--force`. Bindings remain unchanged. |
 
 ### `export`
 ```bash

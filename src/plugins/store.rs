@@ -83,8 +83,8 @@ impl RuntimeStateRow {
     }
 }
 
-/// Insert or replace an installed plugin in a disabled, unapproved state.
-/// Every install or upgrade requires explicit permission approval before enable.
+/// Insert or replace an installed plugin in a disabled state. A caller may
+/// carry forward grants only after proving the new manifest is non-expanding.
 pub async fn upsert_plugin(
     pool: &Pool,
     validated: &ValidatedManifest,
@@ -93,6 +93,7 @@ pub async fn upsert_plugin(
     signature: &str,
     package_path: &str,
     source: &str,
+    carried_approval: Option<&[PermissionGrant]>,
 ) -> Result<()> {
     let manifest_json = serde_json::to_string(&validated.manifest)?;
     let api_major = validated.manifest.api_major().unwrap_or(0) as i64;
@@ -129,12 +130,26 @@ pub async fn upsert_plugin(
     .execute(&mut *tx)
     .await?;
 
-    // Installation and upgrade never approve permissions implicitly. Clear any
-    // previous grants so a new component cannot inherit authority.
+    // Replace grants atomically with the component. Non-expanding updates may
+    // retain a previously complete approval; every other update clears it.
     sqlx::query("DELETE FROM plugin_permissions WHERE plugin_id = ?")
         .bind(&validated.manifest.id)
         .execute(&mut *tx)
         .await?;
+    if let Some(grants) = carried_approval {
+        for grant in grants {
+            sqlx::query(
+                "INSERT INTO plugin_permissions (plugin_id, permission, value_json, approved_at)
+                 VALUES (?,?,?,?)",
+            )
+            .bind(&validated.manifest.id)
+            .bind(&grant.permission)
+            .bind(&grant.value_json)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
 
     // Retain immutable provenance independently from the active plugin row.
     // Reinstalling identical bytes is idempotent; older package versions remain.
@@ -188,6 +203,45 @@ pub async fn get_plugin(pool: &Pool, id: &str) -> Result<Option<PluginRow>> {
             .fetch_optional(pool)
             .await?,
     )
+}
+
+pub async fn pinned_version(pool: &Pool, id: &str) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT version FROM plugin_catalog_pins WHERE plugin_id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+pub async fn set_catalog_pin(pool: &Pool, id: &str, version: &str) -> Result<()> {
+    let mut tx = pool.begin().await.context("begin plugin version pin")?;
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM plugins WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if exists.is_none() {
+        bail!("plugin '{id}' is not installed");
+    }
+    sqlx::query(
+        "INSERT INTO plugin_catalog_pins (plugin_id, version, pinned_at) VALUES (?,?,?)
+         ON CONFLICT(plugin_id) DO UPDATE SET version=excluded.version, pinned_at=excluded.pinned_at",
+    )
+    .bind(id)
+    .bind(version)
+    .bind(crate::db::now_iso())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn clear_catalog_pin(pool: &Pool, id: &str) -> Result<bool> {
+    let result = sqlx::query("DELETE FROM plugin_catalog_pins WHERE plugin_id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn list_packages(pool: &Pool, id: &str) -> Result<Vec<PackageRow>> {

@@ -14,6 +14,20 @@ pub const DEFAULT_CATALOG_URL: &str =
     "https://raw.githubusercontent.com/PrightCord/kinetix-plugins/main/catalog.json";
 pub const CATALOG_CACHE_FILE: &str = "catalog.cache.json";
 
+pub fn safe_external_link(value: Option<&str>) -> Option<&str> {
+    let value = value?;
+    let (scheme, remainder) = value.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority = remainder.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let parsed = url::Url::parse(value).ok()?;
+    (parsed.scheme() == "https" && parsed.host_str().is_some()).then_some(value)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Catalog {
     pub schema_version: u32,
@@ -30,6 +44,10 @@ pub struct CatalogPlugin {
     #[serde(default)]
     pub official: bool,
     pub homepage: String,
+    #[serde(default)]
+    pub release_url: Option<String>,
+    #[serde(default)]
+    pub changelog_url: Option<String>,
     pub latest_version: String,
     pub artifact_name: String,
     #[serde(default)]
@@ -433,6 +451,29 @@ mod tests {
             .plugins
             .iter()
             .any(|plugin| plugin.id == "dev.kinetix.antigravity-oauth"));
+    }
+
+    #[test]
+    fn external_links_require_https_host_and_no_embedded_credentials() {
+        assert_eq!(
+            safe_external_link(Some("https://example.com/releases/v1")),
+            Some("https://example.com/releases/v1")
+        );
+        assert_eq!(
+            safe_external_link(Some("http://example.com/releases/v1")),
+            None
+        );
+        assert_eq!(
+            safe_external_link(Some("https://user:pass@example.com/release")),
+            None
+        );
+        assert_eq!(safe_external_link(Some("https://")), None);
+        assert_eq!(safe_external_link(Some("https:///release")), None);
+        assert_eq!(
+            safe_external_link(Some("https://@example.com/release")),
+            None
+        );
+        assert_eq!(safe_external_link(Some("mailto:release@example.com")), None);
     }
 
     #[test]

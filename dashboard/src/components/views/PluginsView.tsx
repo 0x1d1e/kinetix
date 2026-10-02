@@ -20,8 +20,10 @@ import {
   Kinetix,
   PluginCatalogEntry,
   PluginCatalogPreview,
+  PluginDependencyImpact,
   PluginDetail,
   PluginInstallResult,
+  PluginPermissionDiff,
   PluginPermissionResponse,
   PluginRollbackPreview,
   PluginSettingState,
@@ -50,6 +52,14 @@ function fileAsBase64(file: File): Promise<string> {
   });
 }
 
+const DEFAULT_PLUGIN_LIMITS = {
+  memory: '64MiB',
+  wall_time_ms: 5000,
+  max_outbound_requests: 4,
+  max_http_body: '4MiB',
+  storage: '2MiB',
+};
+
 function requestedGrantPairs(plugin: PluginSummary): Array<[string, string]> {
   const out: Array<[string, string]> = [];
   if (plugin.permissions.network_hosts.length > 0) {
@@ -61,6 +71,9 @@ function requestedGrantPairs(plugin: PluginSummary): Array<[string, string]> {
   if (plugin.permissions.credential_read) {
     out.push(['credential_read', 'true']);
   }
+  if (JSON.stringify(plugin.limits) !== JSON.stringify(DEFAULT_PLUGIN_LIMITS)) {
+    out.push(['limits', JSON.stringify(plugin.limits)]);
+  }
   return out;
 }
 
@@ -69,8 +82,66 @@ function isFullyApproved(plugin: PluginSummary, permissions: PluginPermissionRes
   const approved = new Set(
     permissions.approved.map((grant) => `${grant.permission}\0${grant.value_json}`),
   );
-  return requestedGrantPairs(plugin).every(
+  const requested = requestedGrantPairs(plugin);
+  return requested.length === approved.size && requested.every(
     ([permission, value]) => approved.has(`${permission}\0${value}`),
+  );
+}
+
+function PermissionDiffView({ diff }: { diff: PluginPermissionDiff }) {
+  const lists = [
+    ['Network hosts', diff.network_hosts],
+    ['Credential scopes', diff.credential_scopes],
+  ] as const;
+  const limits = [
+    ['Memory', diff.memory],
+    ['Storage', diff.storage],
+    ['Wall time (ms)', diff.wall_time_ms],
+    ['Outbound requests', diff.max_outbound_requests],
+    ['HTTP body', diff.max_http_body],
+  ] as const;
+  const hasChanges = lists.some(([, item]) => item.added.length > 0 || item.removed.length > 0) ||
+    diff.credential_read.changed || limits.some(([, item]) => item.changed);
+
+  return (
+    <div className="mt-4 space-y-3">
+      {diff.expanded && (
+        <div className="p-3 border border-[var(--marker-red)] bg-[var(--tint-red)] text-sm font-body text-[var(--danger-text)]">
+          This update increases requested authority. Approval is required before the plugin can be enabled.
+        </div>
+      )}
+      {!hasChanges && <p className="text-sm font-mono text-[var(--ink)]/60">No permission or limit changes.</p>}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        {lists.map(([label, item]) => (
+          <div key={label} className="p-3 border border-[var(--ink)]/20 bg-[var(--surface)]">
+            <h4 className="font-heading font-bold text-sm">{label}</h4>
+            {item.added.length === 0 && item.removed.length === 0 ? (
+              <p className="mt-1 text-xs font-mono text-[var(--ink)]/55">No change</p>
+            ) : (
+              <div className="mt-1 space-y-1 text-xs font-mono break-all">
+                {item.added.map((value) => <div key={`add-${value}`} className="text-[var(--danger-text)]">+ {value}</div>)}
+                {item.removed.map((value) => <div key={`remove-${value}`}>- {value}</div>)}
+              </div>
+            )}
+          </div>
+        ))}
+        <div className="p-3 border border-[var(--ink)]/20 bg-[var(--surface)]">
+          <h4 className="font-heading font-bold text-sm">Credential plaintext</h4>
+          <p className="mt-1 text-xs font-mono">
+            {diff.credential_read.from ? 'enabled' : 'disabled'} -&gt; {diff.credential_read.to ? 'enabled' : 'disabled'}
+            {diff.credential_read.expanded ? ' (increase)' : ''}
+          </p>
+        </div>
+        {limits.map(([label, item]) => (
+          <div key={label} className="p-3 border border-[var(--ink)]/20 bg-[var(--surface)]">
+            <h4 className="font-heading font-bold text-sm">{label}</h4>
+            <p className="mt-1 text-xs font-mono break-all">
+              {item.from} -&gt; {item.to}{item.expanded ? ' (increase)' : ''}{!item.changed ? ' (unchanged)' : ''}
+            </p>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -91,7 +162,8 @@ export const PluginsView: React.FC = () => {
   const [settingDrafts, setSettingDrafts] = useState<Record<string, string | boolean>>({});
   const [rollbackPreview, setRollbackPreview] = useState<PluginRollbackPreview | null>(null);
   const [catalogPreview, setCatalogPreview] = useState<PluginCatalogPreview | null>(null);
-  const [pluginToRemove, setPluginToRemove] = useState<string | null>(null);
+  const [lifecyclePreview, setLifecyclePreview] = useState<PluginDependencyImpact | null>(null);
+  const [lifecycleAction, setLifecycleAction] = useState<{ action: 'disable' | 'remove'; id: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [connectionDrafts, setConnectionDrafts] = useState<Record<string, Record<string, string>>>({});
@@ -274,23 +346,52 @@ export const PluginsView: React.FC = () => {
     }
   };
 
-  const removePlugin = async (id: string): Promise<boolean> => {
-    setBusy('remove');
+  const reviewLifecycle = async (action: 'disable' | 'remove', id: string) => {
+    setBusy(`${action}-impact`);
     setError(null);
     setNotice(null);
     try {
-      await Kinetix.removePlugin(id);
-      setSelectedId(null);
-      setDetail(null);
-      setPermissions(null);
-      setSettings([]);
-      setSettingDrafts({});
-      setNotice('Plugin removed.');
-      await refresh(null);
-      return true;
+      const impact = await Kinetix.pluginImpact(id);
+      setLifecyclePreview(impact);
+      setLifecycleAction({ action, id });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-      return false;
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const confirmLifecycle = async () => {
+    if (!lifecycleAction || !lifecyclePreview) return;
+    const { action, id } = lifecycleAction;
+    const impact = lifecyclePreview;
+    const hasDependencies = impact.providers.length > 0 || impact.routes.length > 0;
+    setBusy(action);
+    setError(null);
+    setNotice(null);
+    try {
+      if (action === 'disable') {
+        await Kinetix.disablePlugin(id, hasDependencies ? impact.fingerprint : undefined);
+        setNotice('Plugin disabled. Bound Providers and Routes remain unchanged and fail closed.');
+      } else {
+        await Kinetix.removePlugin(id, hasDependencies ? impact.fingerprint : undefined);
+        setSelectedId(null);
+        setDetail(null);
+        setPermissions(null);
+        setSettings([]);
+        setSettingDrafts({});
+        setNotice('Plugin removed. Bound Providers and Routes remain unchanged and fail closed.');
+      }
+      setLifecyclePreview(null);
+      setLifecycleAction(null);
+      await refresh(action === 'remove' ? null : selectedId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      try {
+        setLifecyclePreview(await Kinetix.pluginImpact(id));
+      } catch {
+        // Preserve the reviewed impact if the refresh also fails.
+      }
     } finally {
       setBusy(null);
     }
@@ -407,9 +508,13 @@ export const PluginsView: React.FC = () => {
     try {
       const outcome = await Kinetix.installCatalogPlugin(preview.id);
       if (approveAndEnable) {
-        await Kinetix.approvePluginPermissions(outcome.id);
+        if (preview.approval_required) {
+          await Kinetix.approvePluginPermissions(outcome.id);
+        }
         await Kinetix.enablePlugin(outcome.id);
-        setNotice(`Installed, approved, and enabled ${outcome.id} v${outcome.version}.`);
+        setNotice(preview.approval_required
+          ? `Installed, approved, and enabled ${outcome.id} v${outcome.version}.`
+          : `Installed and enabled ${outcome.id} v${outcome.version}.`);
       } else {
         setNotice(
           `Installed ${outcome.id} v${outcome.version} from the trusted catalog. Review permissions before enabling it.`,
@@ -710,46 +815,94 @@ export const PluginsView: React.FC = () => {
       </Modal>
 
       <Modal
-        open={pluginToRemove !== null}
-        onClose={() => setPluginToRemove(null)}
-        title="Remove plugin?"
-        className="max-w-lg"
+        open={lifecycleAction !== null && lifecyclePreview !== null}
+        onClose={() => {
+          setLifecycleAction(null);
+          setLifecyclePreview(null);
+        }}
+        title={lifecycleAction?.action === 'disable' ? 'Review disable impact' : 'Review removal impact'}
+        className="max-w-2xl"
       >
-        <div className="space-y-4 p-5">
-          {error && (
-            <div role="alert" className="p-3 bg-[var(--tint-red)] border border-[var(--marker-red)] text-sm font-mono text-[var(--danger-text)]">
-              {error}
+        {lifecycleAction && lifecyclePreview && (
+          <div className="space-y-4 p-5">
+            {error && (
+              <div role="alert" className="p-3 bg-[var(--tint-red)] border border-[var(--marker-red)] text-sm font-mono text-[var(--danger-text)]">
+                {error}
+              </div>
+            )}
+            <p className="text-sm font-body">
+              {lifecycleAction.action === 'disable'
+                ? 'Disabling this plugin leaves its bindings in place. Dependent targets will be ineligible; Kinetix will not substitute native behavior.'
+                : 'Removing this plugin leaves its bindings in place. Dependent targets will be ineligible; Kinetix will not substitute native behavior.'}
+            </p>
+            {lifecyclePreview.providers.length === 0 && lifecyclePreview.routes.length === 0 ? (
+              <p className="p-3 border border-[var(--pen-green)] bg-[var(--tint-green)] text-sm font-mono">
+                No Providers or Routes reference this plugin.
+              </p>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <section className="p-3 border border-[var(--ink)]/25 bg-[var(--surface)]">
+                  <h4 className="font-heading font-bold">Affected Providers ({lifecyclePreview.providers.length})</h4>
+                  {lifecyclePreview.providers.length === 0 ? (
+                    <p className="mt-2 text-xs font-mono text-[var(--ink)]/55">None</p>
+                  ) : (
+                    <ul className="mt-2 space-y-2 text-xs font-mono">
+                      {lifecyclePreview.providers.map((provider) => (
+                        <li key={provider.id}>
+                          <div>{provider.name} ({provider.id})</div>
+                          <div className="text-[var(--ink)]/60">Uses: {provider.uses.join(', ')}</div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </section>
+                <section className="p-3 border border-[var(--ink)]/25 bg-[var(--surface)]">
+                  <h4 className="font-heading font-bold">Affected Routes ({lifecyclePreview.routes.length})</h4>
+                  {lifecyclePreview.routes.length === 0 ? (
+                    <p className="mt-2 text-xs font-mono text-[var(--ink)]/55">None</p>
+                  ) : (
+                    <ul className="mt-2 space-y-2 text-xs font-mono">
+                      {lifecyclePreview.routes.map((route) => (
+                        <li key={route.id}>
+                          <div>{route.name} ({route.id})</div>
+                          <div className="text-[var(--ink)]/60">Providers: {route.provider_ids.join(', ')}</div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </section>
+              </div>
+            )}
+            <div className="text-xs font-mono break-all text-[var(--ink)]/60">
+              Impact fingerprint: {lifecyclePreview.fingerprint}
             </div>
-          )}
-          <p className="text-sm font-body">
-            This removes the installed package and its host-managed plugin state:
-          </p>
-          <code className="block break-all bg-[var(--erased)] p-3 text-sm">{pluginToRemove}</code>
-          <div className="flex justify-end gap-2">
-            <SketchButton
-              type="button"
-              variant="secondary"
-              onClick={() => setPluginToRemove(null)}
-            >
-              Cancel
-            </SketchButton>
-            <SketchButton
-              type="button"
-              variant="danger"
-              disabled={busy !== null || pluginToRemove === null}
-              onClick={() => {
-                if (!pluginToRemove) return;
-                void removePlugin(pluginToRemove).then((removed) => {
-                  if (removed) setPluginToRemove(null);
-                });
-              }}
-              className="gap-2"
-            >
-              <Trash2 className="w-4 h-4" />
-              {busy === 'remove' ? 'Removing…' : 'Remove plugin'}
-            </SketchButton>
+            <div className="flex justify-end gap-2">
+              <SketchButton
+                type="button"
+                variant="secondary"
+                disabled={busy !== null}
+                onClick={() => {
+                  setLifecycleAction(null);
+                  setLifecyclePreview(null);
+                }}
+              >
+                Cancel
+              </SketchButton>
+              <SketchButton
+                type="button"
+                variant={lifecycleAction.action === 'remove' ? 'danger' : 'primary'}
+                disabled={busy !== null}
+                onClick={() => void confirmLifecycle()}
+                className="gap-2"
+              >
+                {lifecycleAction.action === 'remove' && <Trash2 className="w-4 h-4" />}
+                {busy === lifecycleAction.action
+                  ? lifecycleAction.action === 'remove' ? 'Removing…' : 'Disabling…'
+                  : `${lifecyclePreview.providers.length || lifecyclePreview.routes.length ? 'Acknowledge impact and ' : ''}${lifecycleAction.action === 'remove' ? 'remove plugin' : 'disable plugin'}`}
+              </SketchButton>
+            </div>
           </div>
-        </div>
+        )}
       </Modal>
 
       {catalog.length > 0 && (
@@ -860,6 +1013,15 @@ export const PluginsView: React.FC = () => {
                     </div>
 
                     <p className="mt-2 text-sm font-body text-[var(--ink)]/75">{entry.description}</p>
+                    {(entry.release_url || entry.changelog_url) && (
+                      <div className="mt-2 flex gap-3 text-xs font-mono">
+                        {entry.release_url && <a href={entry.release_url} target="_blank" rel="noopener noreferrer" className="underline">Release notes</a>}
+                        {entry.changelog_url && <a href={entry.changelog_url} target="_blank" rel="noopener noreferrer" className="underline">Changelog</a>}
+                      </div>
+                    )}
+                    {entry.pinned_version && (
+                      <p className="mt-2 text-xs font-mono text-amber-800">Pinned at v{entry.pinned_version}</p>
+                    )}
                     <div className="mt-3 flex flex-wrap gap-1">
                       {entry.capabilities.map((capability) => (
                         <code key={capability} className="text-xs bg-[var(--erased)] px-2 py-1">
@@ -875,7 +1037,9 @@ export const PluginsView: React.FC = () => {
                         Artifact: {entry.artifact_name}
                       </div>
                       {installed && !hasUpdate ? (
-                        <SketchBadge variant="green">Current (v{installed.version})</SketchBadge>
+                        <SketchBadge variant={entry.pinned_version ? 'yellow' : 'green'}>
+                          {entry.pinned_version ? `Pinned at v${entry.pinned_version}` : `Current (v${installed.version})`}
+                        </SketchBadge>
                       ) : entry.install_ready ? (
                         <SketchButton
                           variant="primary"
@@ -934,52 +1098,23 @@ export const PluginsView: React.FC = () => {
             <SketchBadge variant="green">Signature verified</SketchBadge>
           </div>
 
-          <div className="mt-4 grid grid-cols-1 lg:grid-cols-3 gap-4">
-            <div>
-              <h4 className="font-heading font-bold text-sm mb-2">Network hosts</h4>
-              {catalogPreview.permission_diff.network_hosts.added.length === 0 &&
-              catalogPreview.permission_diff.network_hosts.removed.length === 0 ? (
-                <p className="text-xs font-mono text-[var(--ink)]/55">No change</p>
-              ) : (
-                <div className="space-y-1 text-xs font-mono">
-                  {catalogPreview.permission_diff.network_hosts.added.map((value) => (
-                    <div key={`catalog-host-add-${value}`}>+ {value}</div>
-                  ))}
-                  {catalogPreview.permission_diff.network_hosts.removed.map((value) => (
-                    <div key={`catalog-host-remove-${value}`}>− {value}</div>
-                  ))}
-                </div>
-              )}
+          <PermissionDiffView diff={catalogPreview.permission_diff} />
+          {catalogPreview.approval_required && (
+            <p className="text-sm font-mono text-[var(--danger-text)]">
+              Permission approval is required before enablement.
+            </p>
+          )}
+          {catalogPreview.pinned_version && (
+            <p className="text-sm font-mono text-amber-800">
+              Pinned at v{catalogPreview.pinned_version}; unpin before updating to a different version.
+            </p>
+          )}
+          {(catalogPreview.release_url || catalogPreview.changelog_url) && (
+            <div className="flex gap-3 text-sm font-mono">
+              {catalogPreview.release_url && <a href={catalogPreview.release_url} target="_blank" rel="noopener noreferrer" className="underline">Release notes</a>}
+              {catalogPreview.changelog_url && <a href={catalogPreview.changelog_url} target="_blank" rel="noopener noreferrer" className="underline">Changelog</a>}
             </div>
-
-            <div>
-              <h4 className="font-heading font-bold text-sm mb-2">Credential scopes</h4>
-              {catalogPreview.permission_diff.credential_scopes.added.length === 0 &&
-              catalogPreview.permission_diff.credential_scopes.removed.length === 0 ? (
-                <p className="text-xs font-mono text-[var(--ink)]/55">No change</p>
-              ) : (
-                <div className="space-y-1 text-xs font-mono">
-                  {catalogPreview.permission_diff.credential_scopes.added.map((value) => (
-                    <div key={`catalog-scope-add-${value}`}>+ {value}</div>
-                  ))}
-                  {catalogPreview.permission_diff.credential_scopes.removed.map((value) => (
-                    <div key={`catalog-scope-remove-${value}`}>− {value}</div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div>
-              <h4 className="font-heading font-bold text-sm mb-2">Credential plaintext</h4>
-              <p className="text-xs font-mono">
-                {catalogPreview.permission_diff.credential_read.changed
-                  ? `${catalogPreview.permission_diff.credential_read.from ? 'enabled' : 'disabled'} → ${catalogPreview.permission_diff.credential_read.to ? 'enabled' : 'disabled'}`
-                  : catalogPreview.permission_diff.credential_read.to
-                    ? 'enabled (unchanged)'
-                    : 'disabled (unchanged)'}
-              </p>
-            </div>
-          </div>
+          )}
 
           <div className="mt-4 p-3 bg-[var(--erased)]/60 border border-dashed border-[var(--ink)]/25">
             <div className="text-xs font-mono break-all">SHA-256: {catalogPreview.sha256}</div>
@@ -991,23 +1126,25 @@ export const PluginsView: React.FC = () => {
           <div className="mt-4 flex gap-2 flex-wrap items-center">
             <SketchButton
               variant="primary"
-              disabled={busy !== null}
+              disabled={busy !== null || Boolean(catalogPreview.pinned_version && catalogPreview.pinned_version !== catalogPreview.target_version)}
               onClick={() => void confirmCatalogInstall(true)}
             >
               <CheckCircle2 className="w-4 h-4" />
               {busy === `catalog:${catalogPreview.id}`
                 ? 'Installing…'
-                : catalogPreview.current_version
-                  ? `Update & Enable (v${catalogPreview.target_version})`
-                  : `Install & Enable (v${catalogPreview.target_version})`}
+                : catalogPreview.approval_required
+                  ? `Approve & Enable (v${catalogPreview.target_version})`
+                  : catalogPreview.current_version
+                    ? `Update & Enable (v${catalogPreview.target_version})`
+                    : `Install & Enable (v${catalogPreview.target_version})`}
             </SketchButton>
             <SketchButton
               variant="secondary"
-              disabled={busy !== null}
+              disabled={busy !== null || Boolean(catalogPreview.pinned_version && catalogPreview.pinned_version !== catalogPreview.target_version)}
               onClick={() => void confirmCatalogInstall(false)}
             >
               <PackagePlus className="w-4 h-4" />
-              Install Disabled (Review Later)
+              {catalogPreview.current_version ? 'Update Disabled' : 'Install Disabled (Review Later)'}
             </SketchButton>
             <SketchButton
               variant="secondary"
@@ -1059,6 +1196,9 @@ export const PluginsView: React.FC = () => {
               <div className="mt-2 text-xs font-mono text-[var(--ink)]/70">
                 v{plugin.version} · API {plugin.plugin_api_major}
               </div>
+              {plugin.pinned_version && (
+                <div className="mt-1 text-xs font-mono text-amber-800">Pinned at v{plugin.pinned_version}</div>
+              )}
             </button>
           ))}
         </div>
@@ -1087,6 +1227,19 @@ export const PluginsView: React.FC = () => {
                     <SketchButton
                       variant="secondary"
                       disabled={busy !== null}
+                      onClick={() => void mutate(
+                        selected.pinned_version ? 'unpin' : 'pin',
+                        () => selected.pinned_version
+                          ? Kinetix.unpinPluginVersion(selected.id)
+                          : Kinetix.pinPluginVersion(selected.id),
+                        selected.pinned_version ? 'Marketplace updates unpinned.' : `Pinned at v${selected.version}.`,
+                      )}
+                    >
+                      {selected.pinned_version ? `Unpin v${selected.pinned_version}` : 'Pin version'}
+                    </SketchButton>
+                    <SketchButton
+                      variant="secondary"
+                      disabled={busy !== null}
                       onClick={() =>
                         void mutate(
                           'validate',
@@ -1101,13 +1254,7 @@ export const PluginsView: React.FC = () => {
                       <SketchButton
                         variant="secondary"
                         disabled={busy !== null}
-                        onClick={() =>
-                          void mutate(
-                            'disable',
-                            () => Kinetix.disablePlugin(selected.id),
-                            'Plugin disabled.',
-                          )
-                        }
+                        onClick={() => void reviewLifecycle('disable', selected.id)}
                         className="gap-2"
                       >
                         <PowerOff className="w-4 h-4" /> Disable
@@ -1516,52 +1663,7 @@ export const PluginsView: React.FC = () => {
                     </SketchBadge>
                   </div>
 
-                  <div className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-4">
-                    <div>
-                      <h5 className="font-heading font-bold text-sm mb-2">Network hosts</h5>
-                      {rollbackPreview.permission_diff.network_hosts.added.length === 0 &&
-                      rollbackPreview.permission_diff.network_hosts.removed.length === 0 ? (
-                        <p className="text-xs font-mono text-[var(--ink)]/55">No change</p>
-                      ) : (
-                        <div className="space-y-1 text-xs font-mono">
-                          {rollbackPreview.permission_diff.network_hosts.added.map((value) => (
-                            <div key={`host-add-${value}`}>+ {value}</div>
-                          ))}
-                          {rollbackPreview.permission_diff.network_hosts.removed.map((value) => (
-                            <div key={`host-remove-${value}`}>− {value}</div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-
-                    <div>
-                      <h5 className="font-heading font-bold text-sm mb-2">Credential scopes</h5>
-                      {rollbackPreview.permission_diff.credential_scopes.added.length === 0 &&
-                      rollbackPreview.permission_diff.credential_scopes.removed.length === 0 ? (
-                        <p className="text-xs font-mono text-[var(--ink)]/55">No change</p>
-                      ) : (
-                        <div className="space-y-1 text-xs font-mono">
-                          {rollbackPreview.permission_diff.credential_scopes.added.map((value) => (
-                            <div key={`scope-add-${value}`}>+ {value}</div>
-                          ))}
-                          {rollbackPreview.permission_diff.credential_scopes.removed.map((value) => (
-                            <div key={`scope-remove-${value}`}>− {value}</div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="mt-4 p-3 bg-[var(--erased)]/60 border border-dashed border-[var(--ink)]/25 text-sm">
-                    Plaintext credential access:{' '}
-                    <strong>
-                      {rollbackPreview.permission_diff.credential_read.changed
-                        ? `${rollbackPreview.permission_diff.credential_read.from ? 'enabled' : 'disabled'} → ${rollbackPreview.permission_diff.credential_read.to ? 'enabled' : 'disabled'}`
-                        : rollbackPreview.permission_diff.credential_read.to
-                          ? 'enabled (unchanged)'
-                          : 'disabled (unchanged)'}
-                    </strong>
-                  </div>
+                  <PermissionDiffView diff={rollbackPreview.permission_diff} />
 
                   <div className="mt-4 flex gap-2 flex-wrap">
                     <SketchButton
@@ -1634,6 +1736,15 @@ export const PluginsView: React.FC = () => {
                     </div>
                   )}
 
+                  <div className="p-3 border-2 border-[var(--ink)]/30 bg-[var(--surface)]">
+                    <div className="font-heading font-bold text-sm">Requested runtime limits</div>
+                    <div className="mt-2 grid grid-cols-2 gap-2 text-xs font-mono">
+                      {Object.entries(selected.limits).map(([name, value]) => (
+                        <div key={name}><span className="text-[var(--ink)]/60">{name}:</span> {value}</div>
+                      ))}
+                    </div>
+                  </div>
+
                   {selected.permissions.credential_read && (
                     <div className="p-3 border-2 border-[var(--marker-red)] bg-[var(--tint-red)]">
                       <div className="flex items-center gap-2 font-heading font-bold text-sm text-[var(--danger-text)]">
@@ -1694,9 +1805,7 @@ export const PluginsView: React.FC = () => {
                   <SketchButton
                     variant="danger"
                     disabled={busy !== null}
-                    onClick={() => {
-                      setPluginToRemove(selected.id);
-                    }}
+                    onClick={() => void reviewLifecycle('remove', selected.id)}
                     className="gap-2"
                   >
                     <Trash2 className="w-4 h-4" /> Remove

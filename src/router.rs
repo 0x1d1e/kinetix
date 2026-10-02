@@ -265,6 +265,11 @@ pub(crate) fn admin_routes() -> crate::admin_contract::reference::AdminRouter {
             get(admin::get_plugin).delete(admin::remove_plugin),
         )
         .route("/plugins/{id}/enable", post(admin::enable_plugin))
+        .route("/plugins/{id}/impact", get(admin::plugin_dependency_impact))
+        .route(
+            "/plugins/{id}/pin",
+            post(admin::pin_plugin_version).delete(admin::unpin_plugin_version),
+        )
         .route("/plugins/{id}/disable", post(admin::disable_plugin))
         .route("/plugins/{id}/validate", post(admin::validate_plugin))
         .route("/plugins/{id}/rollback", post(admin::rollback_plugin))

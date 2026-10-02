@@ -505,8 +505,34 @@ impl PluginManager {
             .persist_package(&validated.manifest.id, &pkg.package_sha256, bytes)
             .await?;
 
-        // Installation and upgrade never grant authority. The operator must
-        // explicitly approve the declared permission set before enablement.
+        // A previously approved plugin may carry its approval forward only if
+        // the new manifest requests no additional authority. It remains
+        // disabled after every install, so activation is still an explicit,
+        // fail-closed operation.
+        let carried_approval = if let Some(previous) =
+            store::get_plugin(&self.inner.pool, &validated.manifest.id).await?
+        {
+            let previous_manifest = previous
+                .manifest()
+                .ok_or_else(|| anyhow!("installed plugin manifest is unreadable"))?;
+            let previous_validated = self.validate_persisted_manifest(previous_manifest.clone())?;
+            let approved = self.approved_permissions(&validated.manifest.id).await?;
+            let diff = permission_diff(
+                &previous_manifest.permissions,
+                &previous_manifest.limits,
+                &validated.manifest.permissions,
+                &validated.manifest.limits,
+            );
+            (!diff.expanded
+                && permission_grants_match(
+                    &permission_grants(&previous_validated.manifest),
+                    &approved,
+                ))
+            .then(|| permission_grants(&validated.manifest))
+        } else {
+            None
+        };
+
         store::upsert_plugin(
             &self.inner.pool,
             &validated,
@@ -515,6 +541,7 @@ impl PluginManager {
             sig.as_str(),
             &package_path,
             source,
+            carried_approval.as_deref(),
         )
         .await?;
 
@@ -668,7 +695,9 @@ impl PluginManager {
             permissions: validated.manifest.permissions.clone(),
             permission_diff: permission_diff(
                 &current_manifest.permissions,
+                &current_manifest.limits,
                 &validated.manifest.permissions,
+                &validated.manifest.limits,
             ),
             provides: validated.manifest.provides.provided(),
         })
@@ -713,6 +742,7 @@ impl PluginManager {
             &retained.signature,
             &retained.package_path,
             &source,
+            None,
         )
         .await?;
 
@@ -765,11 +795,6 @@ impl PluginManager {
         .await?;
         store::set_enabled(&self.inner.pool, id, true).await?;
         store::clear_plugin_failures(&self.inner.pool, id).await?;
-        Ok(())
-    }
-
-    pub async fn disable(&self, id: &str) -> Result<()> {
-        store::set_enabled(&self.inner.pool, id, false).await?;
         Ok(())
     }
 
@@ -830,7 +855,124 @@ impl PluginManager {
         Ok(())
     }
 
-    pub async fn remove(&self, id: &str) -> Result<()> {
+    pub async fn dependency_impact(&self, id: &str) -> Result<PluginDependencyImpact> {
+        if self.get(id).await?.is_none() {
+            bail!("plugin '{id}' is not installed");
+        }
+
+        let mut providers = BTreeMap::new();
+        for provider in crate::db::list_providers(&self.inner.pool).await? {
+            let mut uses = Vec::new();
+            for (kind, value) in [
+                ("wire adapter", provider.wire_plugin.as_str()),
+                ("credential strategy", provider.credential_plugin.as_str()),
+                ("model source", provider.model_source_plugin.as_str()),
+            ] {
+                if super::types::PluginRef::parse(value)
+                    .is_some_and(|reference| reference.plugin_id == id)
+                {
+                    uses.push(kind.to_string());
+                }
+            }
+            if provider.source_plugin_id.as_deref() == Some(id) {
+                uses.push("plugin integration".to_string());
+            }
+            if !uses.is_empty() {
+                uses.sort();
+                providers.insert(
+                    provider.id.clone(),
+                    PluginProviderDependency {
+                        id: provider.id,
+                        name: provider.name,
+                        uses,
+                    },
+                );
+            }
+        }
+
+        let affected_provider_ids: BTreeSet<_> = providers.keys().cloned().collect();
+        let accounts: HashMap<_, _> = crate::db::list_accounts(&self.inner.pool)
+            .await?
+            .into_iter()
+            .map(|account| (account.id, account.provider_id))
+            .collect();
+        let models: HashMap<_, _> = crate::db::list_models(&self.inner.pool)
+            .await?
+            .into_iter()
+            .map(|model| (model.id, model.provider_id))
+            .collect();
+        let mut routes = Vec::new();
+        for route in crate::db::list_routes(&self.inner.pool).await? {
+            let mut route_providers = BTreeSet::new();
+            for target in crate::db::route_targets(&self.inner.pool, &route.id).await? {
+                if let Some(provider_id) = target
+                    .account_id
+                    .as_deref()
+                    .and_then(|account_id| accounts.get(account_id))
+                    .filter(|provider_id| affected_provider_ids.contains(*provider_id))
+                {
+                    route_providers.insert(provider_id.clone());
+                }
+                if let Some(provider_id) = models
+                    .get(&target.model_id)
+                    .filter(|provider_id| affected_provider_ids.contains(*provider_id))
+                {
+                    route_providers.insert(provider_id.clone());
+                }
+            }
+            if !route_providers.is_empty() {
+                routes.push(PluginRouteDependency {
+                    id: route.id,
+                    name: route.name,
+                    provider_ids: route_providers.into_iter().collect(),
+                });
+            }
+        }
+        let providers: Vec<_> = providers.into_values().collect();
+        let fingerprint_data = serde_json::to_vec(&(id, &providers, &routes))?;
+        let fingerprint = package::sha256_hex(&fingerprint_data);
+        Ok(PluginDependencyImpact {
+            plugin_id: id.to_string(),
+            providers,
+            routes,
+            fingerprint,
+        })
+    }
+
+    /// Disable only after the caller acknowledges the exact current dependency
+    /// impact. The fingerprint prevents stale previews from authorizing a
+    /// different set of provider and Route references.
+    pub async fn disable_with_impact_acknowledgement(
+        &self,
+        id: &str,
+        acknowledged_fingerprint: Option<&str>,
+    ) -> Result<PluginDependencyImpact> {
+        let impact = self.dependency_impact(id).await?;
+        if impact.has_dependencies()
+            && acknowledged_fingerprint != Some(impact.fingerprint.as_str())
+        {
+            bail!(impact_acknowledgement_error(&impact));
+        }
+        store::set_enabled(&self.inner.pool, id, false).await?;
+        Ok(impact)
+    }
+
+    pub async fn disable(&self, id: &str) -> Result<()> {
+        self.disable_with_impact_acknowledgement(id, None).await?;
+        Ok(())
+    }
+
+    pub async fn remove_with_impact_acknowledgement(
+        &self,
+        id: &str,
+        acknowledged_fingerprint: Option<&str>,
+    ) -> Result<PluginDependencyImpact> {
+        let impact = self.dependency_impact(id).await?;
+        if impact.has_dependencies()
+            && acknowledged_fingerprint != Some(impact.fingerprint.as_str())
+        {
+            bail!(impact_acknowledgement_error(&impact));
+        }
         store::delete_plugin(&self.inner.pool, id).await?;
         self.inner
             .plugin_semaphores
@@ -841,7 +983,32 @@ impl PluginManager {
             .metrics
             .retain(|(plugin_id, _), _| plugin_id != id);
         self.inner.component_cache.remove(id);
+        Ok(impact)
+    }
+
+    pub async fn remove(&self, id: &str) -> Result<()> {
+        self.remove_with_impact_acknowledgement(id, None).await?;
         Ok(())
+    }
+
+    pub async fn pinned_version(&self, id: &str) -> Result<Option<String>> {
+        store::pinned_version(&self.inner.pool, id).await
+    }
+
+    pub async fn pin_current_version(&self, id: &str) -> Result<String> {
+        let row = self
+            .get(id)
+            .await?
+            .ok_or_else(|| anyhow!("plugin '{id}' is not installed"))?;
+        store::set_catalog_pin(&self.inner.pool, id, &row.version).await?;
+        Ok(row.version)
+    }
+
+    pub async fn unpin_version(&self, id: &str) -> Result<bool> {
+        if self.get(id).await?.is_none() {
+            bail!("plugin '{id}' is not installed");
+        }
+        store::clear_catalog_pin(&self.inner.pool, id).await
     }
 
     pub async fn list(&self) -> Result<Vec<PluginRow>> {
@@ -999,6 +1166,7 @@ impl PluginManager {
         network_hosts: Option<Vec<String>>,
         credential_scopes: Option<Vec<String>>,
         credential_read: Option<bool>,
+        approved_limits: Option<super::types::Limits>,
     ) -> Result<Vec<PermissionGrant>> {
         let row = self
             .get(id)
@@ -1049,6 +1217,19 @@ impl PluginManager {
                 });
             }
         }
+        match (limits_grant(&manifest.limits), approved_limits) {
+            (Some(requested), Some(approved))
+                if serde_json::to_string(&approved)? == requested.value_json =>
+            {
+                grants.push(requested);
+            }
+            (Some(_), Some(_)) => bail!("approved limits must exactly match the plugin manifest"),
+            (Some(_), None) => {
+                bail!("plugin requests non-default limits; include an exact limits approval")
+            }
+            (None, Some(_)) => bail!("plugin manifest does not request non-default limits"),
+            (None, None) => {}
+        }
 
         store::replace_permissions(&self.inner.pool, id, &grants).await?;
         Ok(grants)
@@ -1059,8 +1240,8 @@ impl PluginManager {
         if self.get(id).await?.is_none() {
             bail!("plugin '{id}' is not installed");
         }
-        store::revoke_permission(&self.inner.pool, id, permission).await?;
-        self.disable(id).await
+        self.disable(id).await?;
+        store::revoke_permission(&self.inner.pool, id, permission).await
     }
 
     /// Validate a persisted manifest against the current host contract.
@@ -3027,6 +3208,15 @@ pub struct PermissionBoolDiff {
     pub from: bool,
     pub to: bool,
     pub changed: bool,
+    pub expanded: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PermissionLimitDiff {
+    pub from: String,
+    pub to: String,
+    pub changed: bool,
+    pub expanded: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3034,6 +3224,61 @@ pub struct PermissionDiff {
     pub network_hosts: PermissionListDiff,
     pub credential_scopes: PermissionListDiff,
     pub credential_read: PermissionBoolDiff,
+    pub memory: PermissionLimitDiff,
+    pub storage: PermissionLimitDiff,
+    pub wall_time_ms: PermissionLimitDiff,
+    pub max_outbound_requests: PermissionLimitDiff,
+    pub max_http_body: PermissionLimitDiff,
+    pub expanded: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PluginProviderDependency {
+    pub id: String,
+    pub name: String,
+    pub uses: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PluginRouteDependency {
+    pub id: String,
+    pub name: String,
+    pub provider_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PluginDependencyImpact {
+    pub plugin_id: String,
+    pub providers: Vec<PluginProviderDependency>,
+    pub routes: Vec<PluginRouteDependency>,
+    pub fingerprint: String,
+}
+
+impl PluginDependencyImpact {
+    pub fn has_dependencies(&self) -> bool {
+        !self.providers.is_empty() || !self.routes.is_empty()
+    }
+}
+
+fn impact_acknowledgement_error(impact: &PluginDependencyImpact) -> String {
+    let provider_names = impact
+        .providers
+        .iter()
+        .map(|provider| format!("{} ({})", provider.name, provider.id))
+        .collect::<Vec<_>>();
+    let route_names = impact
+        .routes
+        .iter()
+        .map(|route| format!("{} ({})", route.name, route.id))
+        .collect::<Vec<_>>();
+    format!(
+        "plugin '{}' is referenced by providers [{}] and Routes [{}]; review `kinetix plugin impact {}` and acknowledge fingerprint {}",
+        impact.plugin_id,
+        provider_names.join(", "),
+        route_names.join(", "),
+        impact.plugin_id,
+        impact.fingerprint,
+    )
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3064,15 +3309,75 @@ fn list_permission_diff(from: &[String], to: &[String]) -> PermissionListDiff {
     }
 }
 
-pub(crate) fn permission_diff(from: &Permissions, to: &Permissions) -> PermissionDiff {
+pub(crate) fn permission_diff(
+    from: &Permissions,
+    from_limits: &super::types::Limits,
+    to: &Permissions,
+    to_limits: &super::types::Limits,
+) -> PermissionDiff {
+    let network_hosts = list_permission_diff(&from.network_hosts, &to.network_hosts);
+    let credential_scopes = list_permission_diff(&from.credential_scopes, &to.credential_scopes);
+    let credential_read = PermissionBoolDiff {
+        from: from.credential_read,
+        to: to.credential_read,
+        changed: from.credential_read != to.credential_read,
+        expanded: !from.credential_read && to.credential_read,
+    };
+    let memory = size_limit_diff(&from_limits.memory, &to_limits.memory);
+    let storage = size_limit_diff(&from_limits.storage, &to_limits.storage);
+    let wall_time_ms = numeric_limit_diff(from_limits.wall_time_ms, to_limits.wall_time_ms);
+    let max_outbound_requests = numeric_limit_diff(
+        from_limits.max_outbound_requests,
+        to_limits.max_outbound_requests,
+    );
+    let max_http_body = size_limit_diff(&from_limits.max_http_body, &to_limits.max_http_body);
+    let expanded = !network_hosts.added.is_empty()
+        || !credential_scopes.added.is_empty()
+        || credential_read.expanded
+        || memory.expanded
+        || storage.expanded
+        || wall_time_ms.expanded
+        || max_outbound_requests.expanded
+        || max_http_body.expanded;
+
     PermissionDiff {
-        network_hosts: list_permission_diff(&from.network_hosts, &to.network_hosts),
-        credential_scopes: list_permission_diff(&from.credential_scopes, &to.credential_scopes),
-        credential_read: PermissionBoolDiff {
-            from: from.credential_read,
-            to: to.credential_read,
-            changed: from.credential_read != to.credential_read,
+        network_hosts,
+        credential_scopes,
+        credential_read,
+        memory,
+        storage,
+        wall_time_ms,
+        max_outbound_requests,
+        max_http_body,
+        expanded,
+    }
+}
+
+fn size_limit_diff(from: &str, to: &str) -> PermissionLimitDiff {
+    let from_size = super::types::parse_size(from);
+    let to_size = super::types::parse_size(to);
+    PermissionLimitDiff {
+        from: from.to_string(),
+        to: to.to_string(),
+        changed: from != to,
+        // Invalid persisted values are treated as an expansion, never silently
+        // carried forward as an approved update.
+        expanded: match (from_size, to_size) {
+            (Some(from), Some(to)) => to > from,
+            _ => from != to,
         },
+    }
+}
+
+fn numeric_limit_diff<T>(from: T, to: T) -> PermissionLimitDiff
+where
+    T: Copy + PartialEq + PartialOrd + std::fmt::Display,
+{
+    PermissionLimitDiff {
+        from: from.to_string(),
+        to: to.to_string(),
+        changed: from != to,
+        expanded: to > from,
     }
 }
 
@@ -3119,10 +3424,29 @@ pub fn permission_grants(manifest: &Manifest) -> Vec<PermissionGrant> {
             value_json: "true".into(),
         });
     }
+    if let Some(limits) = limits_grant(&manifest.limits) {
+        grants.push(limits);
+    }
     grants
 }
 
-fn permission_grants_match(requested: &[PermissionGrant], approved: &[PermissionGrant]) -> bool {
+fn limits_grant(limits: &super::types::Limits) -> Option<PermissionGrant> {
+    let defaults = super::types::Limits::default();
+    (limits.memory != defaults.memory
+        || limits.storage != defaults.storage
+        || limits.wall_time_ms != defaults.wall_time_ms
+        || limits.max_outbound_requests != defaults.max_outbound_requests
+        || limits.max_http_body != defaults.max_http_body)
+        .then(|| PermissionGrant {
+            permission: "limits".into(),
+            value_json: serde_json::to_string(limits).unwrap_or_else(|_| "{}".into()),
+        })
+}
+
+pub(crate) fn permission_grants_match(
+    requested: &[PermissionGrant],
+    approved: &[PermissionGrant],
+) -> bool {
     let requested_set: std::collections::BTreeSet<_> = requested
         .iter()
         .map(|grant| (grant.permission.as_str(), grant.value_json.as_str()))
@@ -3562,6 +3886,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("does not belong"), "{err}");
+    }
+
+    #[test]
+    fn permission_diff_detects_every_authority_increase() {
+        let from_permissions = Permissions::default();
+        let to_permissions = Permissions {
+            network_hosts: vec!["api.example".into()],
+            credential_scopes: vec!["provider:example".into()],
+            credential_read: true,
+        };
+        let from_limits = super::super::types::Limits::default();
+        let to_limits = super::super::types::Limits {
+            memory: "128MiB".into(),
+            storage: "4MiB".into(),
+            wall_time_ms: 10_000,
+            max_outbound_requests: 8,
+            max_http_body: "8MiB".into(),
+        };
+
+        let diff = permission_diff(&from_permissions, &from_limits, &to_permissions, &to_limits);
+        assert!(diff.expanded);
+        assert_eq!(diff.network_hosts.added, ["api.example"]);
+        assert_eq!(diff.credential_scopes.added, ["provider:example"]);
+        assert!(diff.credential_read.expanded);
+        assert!(diff.memory.expanded);
+        assert!(diff.storage.expanded);
+        assert!(diff.wall_time_ms.expanded);
+        assert!(diff.max_outbound_requests.expanded);
+        assert!(diff.max_http_body.expanded);
+
+        let reduced = permission_diff(&to_permissions, &to_limits, &from_permissions, &from_limits);
+        assert!(!reduced.expanded);
+        assert!(reduced
+            .network_hosts
+            .removed
+            .contains(&"api.example".into()));
+        assert!(reduced
+            .credential_scopes
+            .removed
+            .contains(&"provider:example".into()));
+        assert!(reduced.credential_read.changed);
+        assert!(!reduced.memory.expanded);
+        assert!(!reduced.storage.expanded);
+        assert!(!reduced.wall_time_ms.expanded);
+        assert!(!reduced.max_outbound_requests.expanded);
+        assert!(!reduced.max_http_body.expanded);
     }
 
     #[test]

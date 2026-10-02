@@ -417,7 +417,7 @@ pub enum PluginAction {
     Update {
         /// Plugin ID to update (or all installed plugins if omitted).
         id: Option<String>,
-        /// Automatically approve new permissions and enable after update.
+        /// Automatically approve new permissions and re-enable if previously enabled.
         #[arg(long)]
         approve: bool,
     },
@@ -428,11 +428,27 @@ pub enum PluginAction {
     /// Enable an installed plugin.
     Enable { id: String },
     /// Disable a plugin (new requests stop referencing it).
-    Disable { id: String },
+    Disable {
+        id: String,
+        /// Acknowledge the exact Provider and Route impact printed before mutation.
+        #[arg(long)]
+        force: bool,
+    },
     /// Validate a plugin by instantiating it (self-check).
     Validate { id: String },
     /// Remove a plugin and its stored state.
-    Remove { id: String },
+    Remove {
+        id: String,
+        /// Acknowledge the exact Provider and Route impact printed before mutation.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show Providers and Routes that reference an installed plugin.
+    Impact { id: String },
+    /// Pin the installed version to prevent marketplace updates.
+    Pin { id: String },
+    /// Remove the marketplace version pin.
+    Unpin { id: String },
     /// List approved permission grants.
     Permissions { id: String },
     /// Approve the plugin's currently declared permission set (all-or-nothing).
@@ -1467,6 +1483,14 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
 
                 let plugin = crate::plugins::catalog::find_plugin_in_catalog(&catalog, &cat_id)
                     .ok_or_else(|| anyhow!("catalog plugin '{cat_id}' not found in marketplace"))?;
+                if let Some(pinned) = manager.pinned_version(&cat_id).await? {
+                    if pinned != plugin.latest_version {
+                        bail!(
+                            "plugin '{cat_id}' is pinned at v{pinned}; unpin before installing v{}",
+                            plugin.latest_version
+                        );
+                    }
+                }
 
                 let distribution = plugin.distribution.as_ref().ok_or_else(|| {
                     anyhow!("catalog plugin '{cat_id}' has no installable distribution")
@@ -1732,6 +1756,16 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                 println!("Publisher:    {}", p.publisher);
                 println!("Latest:       v{}", p.latest_version);
                 println!("Homepage:     {}", p.homepage);
+                if let Some(url) =
+                    crate::plugins::catalog::safe_external_link(p.release_url.as_deref())
+                {
+                    println!("Release:      {url}");
+                }
+                if let Some(url) =
+                    crate::plugins::catalog::safe_external_link(p.changelog_url.as_deref())
+                {
+                    println!("Changelog:    {url}");
+                }
                 println!("Description:  {}", p.description);
                 println!("Capabilities: {}", p.capabilities.join(", "));
                 println!("Installable:  {}", if p.installable { "yes" } else { "no" });
@@ -1775,12 +1809,24 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
             };
 
             let mut updated_any = false;
+            let mut updates_skipped = false;
             for inst in to_update {
                 let Some(cat_entry) =
                     crate::plugins::catalog::find_plugin_in_catalog(&catalog, &inst.id)
                 else {
                     continue;
                 };
+
+                if let Some(pinned) = manager.pinned_version(&inst.id).await? {
+                    if pinned != cat_entry.latest_version {
+                        println!(
+                            "{}: pinned at v{}; unpin before updating to v{}",
+                            inst.id, pinned, cat_entry.latest_version
+                        );
+                        updates_skipped = true;
+                        continue;
+                    }
+                }
 
                 if !crate::plugins::catalog::is_update_available(
                     &inst.version,
@@ -1800,12 +1846,14 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
 
                 let Some(distribution) = &cat_entry.distribution else {
                     println!("  Skipping {}: no distribution metadata", inst.id);
+                    updates_skipped = true;
                     continue;
                 };
 
                 let keys = crate::plugins::catalog::trusted_keys(&trust, cat_entry)?;
                 if keys.is_empty() {
                     println!("  Skipping {}: untrusted publisher key", inst.id);
+                    updates_skipped = true;
                     continue;
                 }
 
@@ -1822,7 +1870,38 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                 if sig_status != crate::plugins::package::SignatureStatus::Verified {
                     bail!("signature verification failed for {}", inst.id);
                 }
+                let next = crate::plugins::package::validate_manifest(&pkg, manager.policy())?;
+                let current = inst.manifest().ok_or_else(|| {
+                    anyhow!("installed plugin '{}' has an unreadable manifest", inst.id)
+                })?;
+                let permission_diff = crate::plugins::manager::permission_diff(
+                    &current.permissions,
+                    &current.limits,
+                    &next.manifest.permissions,
+                    &next.manifest.limits,
+                );
+                print_plugin_permission_diff(&permission_diff);
+                if permission_diff.expanded && !approve {
+                    println!(
+                        "  Skipping {}: permission increase requires explicit approval; rerun with --approve",
+                        inst.id
+                    );
+                    updates_skipped = true;
+                    continue;
+                }
 
+                if let Some(url) =
+                    crate::plugins::catalog::safe_external_link(cat_entry.release_url.as_deref())
+                {
+                    println!("Release: {url}");
+                } else if let Some(distribution) = &cat_entry.distribution {
+                    println!("Release artifact: {}", distribution.url);
+                }
+                if let Some(url) =
+                    crate::plugins::catalog::safe_external_link(cat_entry.changelog_url.as_deref())
+                {
+                    println!("Changelog: {url}");
+                }
                 let source = format!("catalog:{}@{}", cat_entry.id, cat_entry.latest_version);
                 let was_enabled = inst.status().is_enabled();
 
@@ -1831,7 +1910,7 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                     .await?;
 
                 println!(
-                    "  Installed {} v{} (installed-disabled pending permission approval)",
+                    "  Installed {} v{} (disabled pending explicit enablement)",
                     outcome.id, outcome.version
                 );
 
@@ -1843,18 +1922,35 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                         println!("  Re-enabled {}", outcome.id);
                     }
                 } else {
-                    println!("  To review permissions and re-enable:");
-                    println!("    kinetix plugin approve {}", outcome.id);
-                    if was_enabled {
-                        println!("    kinetix plugin enable {}", outcome.id);
+                    let approved = crate::plugins::store::permissions(&pool, &outcome.id)
+                        .await?
+                        .into_iter()
+                        .map(|grant| crate::plugins::store::PermissionGrant {
+                            permission: grant.permission,
+                            value_json: grant.value_json,
+                        })
+                        .collect::<Vec<_>>();
+                    let requested = crate::plugins::manager::permission_grants(&next.manifest);
+                    if crate::plugins::manager::permission_grants_match(&requested, &approved) {
+                        println!(
+                            "  No new approval is needed; existing complete approval was retained."
+                        );
+                        if was_enabled {
+                            println!("  Re-enable with: kinetix plugin enable {}", outcome.id);
+                        }
+                    } else {
+                        println!("  Approve the declared permissions before enabling:");
+                        println!("    kinetix plugin approve {}", outcome.id);
                     }
                 }
 
                 updated_any = true;
             }
 
-            if !updated_any {
+            if !updated_any && !updates_skipped {
                 println!("All catalog plugins are up to date.");
+            } else if !updated_any {
+                println!("No updates installed; review the reasons above.");
             }
 
             Ok(())
@@ -1888,8 +1984,18 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
             println!("enabled '{id}'");
             Ok(())
         }
-        PluginAction::Disable { id } => {
-            manager.disable(&id).await?;
+        PluginAction::Disable { id, force } => {
+            let impact = manager.dependency_impact(&id).await?;
+            print_plugin_impact(&impact);
+            if impact.has_dependencies() && !force {
+                bail!("disable refused while Providers or Routes reference this plugin; review the impact above and rerun with --force to acknowledge it");
+            }
+            manager
+                .disable_with_impact_acknowledgement(
+                    &id,
+                    force.then_some(impact.fingerprint.as_str()),
+                )
+                .await?;
             println!("disabled '{id}'");
             Ok(())
         }
@@ -1898,9 +2004,37 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
             println!("'{id}' validates; provides {} capabilities", provides.len());
             Ok(())
         }
-        PluginAction::Remove { id } => {
-            manager.remove(&id).await?;
+        PluginAction::Remove { id, force } => {
+            let impact = manager.dependency_impact(&id).await?;
+            print_plugin_impact(&impact);
+            if impact.has_dependencies() && !force {
+                bail!("removal refused while Providers or Routes reference this plugin; review the impact above and rerun with --force to acknowledge it");
+            }
+            manager
+                .remove_with_impact_acknowledgement(
+                    &id,
+                    force.then_some(impact.fingerprint.as_str()),
+                )
+                .await?;
             println!("removed '{id}'");
+            Ok(())
+        }
+        PluginAction::Impact { id } => {
+            let impact = manager.dependency_impact(&id).await?;
+            print_plugin_impact(&impact);
+            Ok(())
+        }
+        PluginAction::Pin { id } => {
+            let version = manager.pin_current_version(&id).await?;
+            println!("pinned '{id}' at v{version}");
+            Ok(())
+        }
+        PluginAction::Unpin { id } => {
+            if manager.unpin_version(&id).await? {
+                println!("removed version pin for '{id}'");
+            } else {
+                println!("'{id}' has no version pin");
+            }
             Ok(())
         }
         PluginAction::Permissions { id } => {
@@ -1919,6 +2053,87 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
             println!("revoked '{permission}' from '{id}'; plugin disabled (KV state retained)");
             Ok(())
         }
+    }
+}
+
+fn print_plugin_impact(impact: &crate::plugins::manager::PluginDependencyImpact) {
+    println!("Plugin: {}", impact.plugin_id);
+    println!("Impact fingerprint: {}", impact.fingerprint);
+    if impact.providers.is_empty() && impact.routes.is_empty() {
+        println!("No Providers or Routes reference this plugin.");
+        return;
+    }
+    println!("Affected Providers:");
+    for provider in &impact.providers {
+        println!(
+            "  {} ({}) - {}",
+            provider.name,
+            provider.id,
+            provider.uses.join(", ")
+        );
+    }
+    println!("Affected Routes:");
+    for route in &impact.routes {
+        println!(
+            "  {} ({}) - Providers: {}",
+            route.name,
+            route.id,
+            route.provider_ids.join(", ")
+        );
+    }
+}
+
+fn print_plugin_permission_diff(diff: &crate::plugins::manager::PermissionDiff) {
+    let mut changes = 0;
+    for (label, values) in [
+        ("network_hosts", &diff.network_hosts),
+        ("credential_scopes", &diff.credential_scopes),
+    ] {
+        for value in &values.added {
+            println!("  permission + {label}: {value}");
+            changes += 1;
+        }
+        for value in &values.removed {
+            println!("  permission - {label}: {value}");
+            changes += 1;
+        }
+    }
+    if diff.credential_read.changed {
+        println!(
+            "  permission credential_read: {} -> {}{}",
+            diff.credential_read.from,
+            diff.credential_read.to,
+            if diff.credential_read.expanded {
+                " (increase)"
+            } else {
+                ""
+            }
+        );
+        changes += 1;
+    }
+    for (label, limit) in [
+        ("memory", &diff.memory),
+        ("storage", &diff.storage),
+        ("wall_time_ms", &diff.wall_time_ms),
+        ("max_outbound_requests", &diff.max_outbound_requests),
+        ("max_http_body", &diff.max_http_body),
+    ] {
+        if limit.changed {
+            println!(
+                "  limit {label}: {} -> {}{}",
+                limit.from,
+                limit.to,
+                if limit.expanded { " (increase)" } else { "" }
+            );
+            changes += 1;
+        }
+    }
+    if changes == 0 {
+        println!("  Permission diff: no changes");
+    } else if diff.expanded {
+        println!("  This update expands plugin authority and requires --approve.");
+    } else {
+        println!("  No permission increases.");
     }
 }
 

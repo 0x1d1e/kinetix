@@ -178,7 +178,7 @@ storage = "1MiB"
 
 CLI installs, dashboard marketplace installs, and local package installs use the same backend validation before package bytes or active plugin metadata are published. Kinetix rejects malformed or unknown manifest fields, unsupported API/host ranges, invalid or duplicate capabilities, undeclared integration references, invalid permission and limit requests, malformed packages, and hash mismatches when an expected SHA-256 is supplied. Local unsigned packages are allowed; a present signature must be well-formed, and an untrusted signature requires an explicit override. Marketplace artifacts require the catalog's exact SHA-256 and a trusted publisher signature.
 
-Kinetix compiles the component and instantiates every world required by its declared capabilities under validation limits with no network or credential authority and isolated temporary storage. Missing exports or failed initialization abort installation. Accepted plugins remain disabled and receive no permission grants until an operator approves them.
+Kinetix compiles the component and instantiates every world required by its declared capabilities under validation limits with no network or credential authority and isolated temporary storage. Missing exports or failed initialization abort installation. Accepted plugins remain disabled. An update retains prior grants only when the new manifest adds no authority and the old grants exactly covered the old manifest; otherwise grants are cleared until approval.
 
 ### Integration descriptors
 
@@ -476,10 +476,12 @@ Kinetix vendors a default offline snapshot at `src/plugins/catalog.snapshot.json
 `GET /admin/api/plugins/catalog`. The catalog powers dashboard discovery, but it is deliberately
 **not** a trust root for package installation.
 
-Catalog metadata may describe publisher, capabilities, version, and expected
-artifact naming. Package installation still requires the normal Kinetix package
+Catalog metadata may describe publisher, capabilities, available version, and
+release or changelog links. Kinetix exposes only HTTPS links with a host and no
+embedded credentials. Package installation still requires the normal Kinetix
 pipeline: package bytes are hashed, signatures are evaluated, permissions are
-reviewed, and the plugin installs disabled.
+reviewed, and the plugin installs disabled. Operators can pin the installed
+version to prevent marketplace updates to a different release.
 
 Remote signed release-asset installation is enabled only when all of the
 following are present:
@@ -527,13 +529,19 @@ and applies the same distribution trust checks as installation:
 - manifest id and version match;
 - Ed25519 signature from the separately trusted publisher key.
 
-Kinetix then compares the target manifest with the currently active manifest
-(or an empty permission set for a first install) and shows semantic changes to
-`network_hosts`, `credential_scopes`, and `credential_read`.
+Kinetix then compares the target manifest with the installed manifest (or
+manifest defaults for a first install) and shows changes to network hosts,
+credential scopes, credential-read access, memory, storage, wall time, outbound
+request budget, and HTTP body size. An increase requires explicit approval;
+non-expanding updates may retain grants only when those grants fully matched the
+previous manifest. Every update remains disabled until explicitly enabled.
 
 Confirmation does not reuse the preview as an authorization token. Kinetix
-downloads and verifies the artifact again before installation, then installs it
-disabled with permission grants cleared.
+downloads and verifies the artifact again before installation. Before disabling
+or removing a plugin, Kinetix lists bound Providers and dependent Routes. A
+mutation with dependencies requires acknowledgment of the current impact
+fingerprint. Bindings remain unchanged; unavailable plugin-backed targets fail
+closed.
 
 ## Version history and rollback
 
@@ -553,11 +561,8 @@ Rolling back is deliberately a reactivation, not a pointer swap:
 
 Before rollback, the dashboard requests a retained-package preview. Kinetix
 re-hashes and revalidates the target package, then computes a semantic
-permission delta for:
-
-- added/removed `network_hosts`;
-- added/removed `credential_scopes`;
-- changes to `credential_read`.
+authority delta for network hosts, credential scopes, credential-read access,
+and each requested resource limit.
 
 The reactivated package is always **disabled** and all permission grants are
 cleared even when the diff is empty. An operator must review and approve the
