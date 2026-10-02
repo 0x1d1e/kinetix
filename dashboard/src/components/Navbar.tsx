@@ -1,6 +1,5 @@
 import React from 'react';
 import {
-  ShieldCheck,
   Activity,
   DollarSign,
   Play,
@@ -24,7 +23,7 @@ import {
 } from 'lucide-react';
 import { ProxyMetrics } from '../types';
 import { formatCurrency } from '../lib/designSystem';
-import { SketchButton, SketchBadge } from './HandDrawnElements';
+import { SketchButton } from './HandDrawnElements';
 import type { ThemeMode } from '../lib/theme';
 
 export type NavTab = 'keys' | 'routes' | 'providers' | 'accounts' | 'plugins' | 'usage' | 'requests' | 'health' | 'aliases' | 'audit' | 'settings';
@@ -106,12 +105,7 @@ function Brand({ compact = false }: { compact?: boolean }) {
         K
       </div>
       <div className="min-w-0">
-        <div className="flex items-center gap-2">
-          <h1 className="text-2xl font-heading font-bold tracking-tight text-[var(--ink)]">Kinetix</h1>
-          <SketchBadge variant="yellow" rotation="1deg" className="text-xs font-heading">
-            v0.1
-          </SketchBadge>
-        </div>
+        <h1 className="text-2xl font-heading font-bold tracking-tight text-[var(--ink)]">Kinetix</h1>
         {!compact && (
           <p className="text-xs text-[var(--ink)]/70 font-body leading-tight">
             Multi-Protocol LLM Proxy
@@ -294,6 +288,7 @@ const ThemeSwitch: React.FC<{ mode: ThemeMode; onChange: (m: ThemeMode) => void 
         key={opt.mode}
         onClick={() => onChange(opt.mode)}
         title={`${opt.label} theme`}
+        aria-label={`${opt.label} theme`}
         aria-pressed={mode === opt.mode}
         className={`px-2 py-1.5 cursor-pointer transition-colors ${
           mode === opt.mode
@@ -346,18 +341,6 @@ export const TopBar: React.FC<TopBarProps> = ({
 
         {/* At-a-glance status — grouped, quiet, wraps on small screens */}
         <div className="flex items-center gap-2 flex-wrap justify-end">
-          <div
-            className="hidden sm:flex items-center gap-1.5 bg-[var(--surface)] px-2.5 py-1 border-2 border-[var(--ink)] sketch-shadow-sm text-xs"
-            style={{ borderRadius: '15px 225px 255px 25px / 255px 25px 225px 15px' }}
-            title="Cloudflare Tunnel status"
-          >
-            <span className="w-2 h-2 rounded-full bg-[var(--pen-green)] animate-pulse border border-[var(--ink)]" />
-            <ShieldCheck className="w-3.5 h-3.5 text-[var(--pen-blue)]" />
-            <span className="font-body text-[var(--ink)]">
-              Tunnel <strong className="font-heading">Online</strong>
-            </span>
-          </div>
-
           <div
             className="flex items-center gap-1.5 bg-[var(--surface)] px-2.5 py-1 border-2 border-[var(--ink)] sketch-shadow-sm text-xs"
             style={{ borderRadius: '255px 25px 225px 25px / 25px 225px 25px 255px' }}

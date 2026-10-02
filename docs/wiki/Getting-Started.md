@@ -35,9 +35,14 @@ By default, the installer:
 4. Falls back to a source build if a usable prebuilt release cannot be obtained.
 5. Installs `kinetix` under `~/.local/bin`.
 6. Adds the binary directory to your shell `PATH` when necessary.
-7. Runs `kinetix init`.
-8. Creates the configuration, data, and state directories.
-9. Generates and prints the dashboard admin password **once**.
+
+The installer does not initialize local state. When ready, run:
+
+```bash
+kinetix init
+```
+
+This creates the configuration, data, and state directories and prints the dashboard admin password **once**.
 
 Kinetix stores its default state under:
 
@@ -148,7 +153,7 @@ The embedded dashboard is available at:
 http://127.0.0.1:8080/admin
 ```
 
-Log in with the admin password printed during installation or `kinetix init`.
+Log in with the admin password printed by `kinetix init`.
 
 ## Verify the installation
 

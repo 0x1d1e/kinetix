@@ -259,3 +259,13 @@ h1, h2, h3, h4, h5, h6 {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--marker-red);
 }
+
+.kinetix-modal {
+  margin: auto;
+  border-radius: var(--wobbly-3);
+}
+
+.kinetix-modal::backdrop {
+  background: rgb(0 0 0 / 48%);
+  backdrop-filter: blur(2px);
+}

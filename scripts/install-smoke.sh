@@ -12,6 +12,7 @@ HOME_DIR="$WORK/home"
 PREFIX="$WORK/prefix"
 PREBUILT_DIR="$WORK/mock-release"
 LOG="$WORK/order.log"
+INIT_LOG="$WORK/init.log"
 
 mkdir -p "$SOURCE/dashboard" "$FAKE_BIN" "$HOME_DIR" "$PREBUILT_DIR" "$WORK/stage"
 printf '{}\n' > "$SOURCE/dashboard/package-lock.json"
@@ -25,6 +26,7 @@ ASSET_NAME="kinetix-v9.9.9-${RUST_TARGET}.tar.gz"
 cat > "$WORK/stage/kinetix" <<'EOF_BIN'
 #!/usr/bin/env bash
 if [ "${1:-}" = "init" ]; then
+  printf 'init\n' >> "$INSTALL_TEST_INIT_LOG"
   exit 0
 fi
 printf 'prebuilt-binary-v9.9.9\n'
@@ -104,6 +106,9 @@ printf 'cargo %s\n' "$*" >> "$INSTALL_TEST_LOG"
 mkdir -p target/release
 cat > target/release/kinetix <<'EOF_BIN'
 #!/usr/bin/env bash
+if [ "${1:-}" = "init" ]; then
+  printf 'init\n' >> "$INSTALL_TEST_INIT_LOG"
+fi
 exit 0
 EOF_BIN
 chmod +x target/release/kinetix
@@ -112,12 +117,13 @@ SH
 chmod +x "$FAKE_BIN/curl" "$FAKE_BIN/node" "$FAKE_BIN/npm" "$FAKE_BIN/cargo"
 
 # --- Test 1: Default install prefers prebuilt binary ------------------------
-INSTALL_TEST_LOG="$LOG" \
+install_output="$(INSTALL_TEST_LOG="$LOG" \
+INSTALL_TEST_INIT_LOG="$INIT_LOG" \
 HOME="$HOME_DIR" \
 PATH="$FAKE_BIN:$PATH" \
 KINETIX_REPO="mock://repo" \
 KINETIX_PREFIX="$PREFIX" \
-  "$ROOT/install.sh" >/dev/null
+  "$ROOT/install.sh")"
 
 [ -x "$PREFIX/bin/kinetix" ] || {
   echo "prebuilt installer did not install an executable binary" >&2
@@ -135,10 +141,20 @@ output="$("$PREFIX/bin/kinetix")"
   cat "$LOG" >&2
   exit 1
 }
+[ ! -f "$INIT_LOG" ] || {
+  echo "installer must not run kinetix init automatically:" >&2
+  cat "$INIT_LOG" >&2
+  exit 1
+}
+printf '%s\n' "$install_output" | grep -F "kinetix init" >/dev/null || {
+  echo "installer should tell the user to run kinetix init" >&2
+  exit 1
+}
 
 echo "installer prebuilt download smoke passed"
 
 # --- Test 2: Explicit source build fallback when VERSION=main --------------
+rm -f "$LOG" "$INIT_LOG"
 rm -rf "$PREFIX"
 mkdir -p "$PREFIX"
 
@@ -152,6 +168,7 @@ mkdir -p "$PREFIX"
 )
 
 INSTALL_TEST_LOG="$LOG" \
+INSTALL_TEST_INIT_LOG="$INIT_LOG" \
 HOME="$HOME_DIR" \
 PATH="$FAKE_BIN:$PATH" \
 KINETIX_REPO="$SOURCE" \
@@ -174,6 +191,11 @@ actual="$(head -n 3 "$LOG")"
 [ "$actual" = "$expected" ] || {
   echo "unexpected source-build order:" >&2
   cat "$LOG" >&2
+  exit 1
+}
+[ ! -f "$INIT_LOG" ] || {
+  echo "source-build installer must not run kinetix init automatically:" >&2
+  cat "$INIT_LOG" >&2
   exit 1
 }
 

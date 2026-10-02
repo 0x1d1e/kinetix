@@ -117,6 +117,7 @@ export default function App() {
   const [metrics, setMetrics] = useState<ProxyMetrics>(EMPTY_METRICS);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [initialDataLoaded, setInitialDataLoaded] = useState(false);
 
   // ---- session bootstrap --------------------------------------------------
   useEffect(() => {
@@ -158,6 +159,7 @@ export default function App() {
       setExportRetentionDays(exp.retention_days);
       setExportDays(exp.days);
       setLoadError(null);
+      setInitialDataLoaded(true);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
         setAuth('signed-out');
@@ -536,6 +538,10 @@ export default function App() {
             onUpdateKeyStatus={handleUpdateKeyStatus}
             onUpdateKeyIps={handleUpdateKeyIps}
             onDeleteKey={handleDeleteKey}
+            showSetupGuide={initialDataLoaded}
+            providerCount={providers.length}
+            modelCount={models.length}
+            onOpenProviders={() => handleSelectTab('providers')}
           />
         )}
 
@@ -621,15 +627,13 @@ export default function App() {
         </div>
 
         <footer className="w-full py-6 px-4 text-center font-body text-sm text-[var(--ink)]/70">
-          <p className="flex items-center justify-center gap-2 flex-wrap">
+          <p>
             <strong className="font-heading text-base text-[var(--ink)]">Kinetix</strong>
-            <span>•</span>
-            <span>Zero-downtime LLM Multi-Protocol Proxy</span>
-            <span>•</span>
-            <span className="underline decoration-wavy decoration-[var(--marker-red)]">Hand-Drawn Design System</span>
+            <span className="mx-2">·</span>
+            Self-hosted, streaming-first LLM gateway
           </p>
           <p className="text-xs text-[var(--ink)]/50 font-mono mt-1">
-            OpenAI &amp; Anthropic streaming in • Gemini, OpenAI, &amp; Anthropic upstream out • SQLite WAL at rest
+            OpenAI- and Anthropic-compatible APIs · Operator-configured upstreams
           </p>
         </footer>
       </div>

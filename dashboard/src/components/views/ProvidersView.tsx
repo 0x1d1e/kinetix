@@ -292,6 +292,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const [confirmDeleteProviderId, setConfirmDeleteProviderId] = useState<string | null>(null);
   const [isDiscovering, setIsDiscovering] = useState(false);
   const [discoveryResults, setDiscoveryResults] = useState<DiscoveredModel[] | null>(null);
+  const [showDiscoveryResults, setShowDiscoveryResults] = useState(false);
   const [discoverySearch, setDiscoverySearch] = useState('');
   const [providerSearch, setProviderSearch] = useState('');
   const [pingStatus, setPingStatus] = useState<Record<string, { ok: boolean; pingMs: number; error?: string }>>({});
@@ -439,10 +440,13 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   useEffect(() => {
     if (!activeProvider) {
       setDiscoveryResults(null);
+      setShowDiscoveryResults(false);
       setProviderLifecycle(null);
       return;
     }
     let cancelled = false;
+    setDiscoveryResults(null);
+    setShowDiscoveryResults(false);
     Kinetix.cachedDiscovery(activeProvider.id)
       .then((cached) => {
         if (cancelled) return;
@@ -599,6 +603,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
   const handleFetchModelsDiscovery = async () => {
     if (!activeProvider) return;
     setIsDiscovering(true);
+    setShowDiscoveryResults(true);
     setDiscoveryResults(null);
     setDiscoverySearch('');
     try {
@@ -1255,6 +1260,19 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                       <RefreshCw className={`w-4 h-4 ${isDiscovering ? 'animate-spin' : ''}`} />
                       {isDiscovering ? 'Querying Upstream...' : 'Fetch Models (Discovery)'}
                     </SketchButton>
+                    {discoveryResults !== null && (
+                      <button
+                        type="button"
+                        aria-expanded={showDiscoveryResults}
+                        aria-controls="provider-discovery-results"
+                        onClick={() => setShowDiscoveryResults((visible) => !visible)}
+                        className="px-2.5 py-1.5 border-2 border-[var(--ink)]/40 bg-[var(--surface)] text-sm font-heading font-bold hover:bg-[var(--erased)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--pen-blue)]"
+                      >
+                        {showDiscoveryResults
+                          ? 'Hide'
+                          : `Show ${discoveryResults.length} discovered model${discoveryResults.length === 1 ? '' : 's'}`}
+                      </button>
+                    )}
                     <SketchButton
                       variant="secondary"
                       size="sm"
@@ -1410,8 +1428,8 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                 </div>
 
               {/* Model Discovery Results (if any) */}
-              {discoveryResults && (
-                <div className="p-4 bg-[var(--postit)] border-2 border-[var(--ink)] sketch-shadow-sm mb-6 rounded-lg">
+              {showDiscoveryResults && discoveryResults !== null && (
+                <div id="provider-discovery-results" className="p-4 bg-[var(--postit)] border-2 border-[var(--ink)] sketch-shadow-sm mb-6 rounded-lg">
                   <h4 className="font-heading font-bold text-lg text-[var(--ink)] mb-1">
                     🔍 Discovered Upstream Models (Live Probe)
                   </h4>

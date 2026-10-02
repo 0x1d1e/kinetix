@@ -20,8 +20,9 @@ use crate::db::{self, Pool};
 #[command(
     name = "kinetix",
     version,
-    about = "Kinetix — multi-protocol LLM proxy (OpenAI/Anthropic in, configurable upstreams out)",
+    about = "Self-hosted, multi-protocol LLM gateway",
     long_about = None,
+    after_help = "First run (initialization is explicit):\n  kinetix init\n\nCommon setup:\n  kinetix provider add --name \"My Provider\" --base-url https://api.example.com/v1 \\\n    --wire-format openai --auth-scheme bearer --api-key \"$UPSTREAM_API_KEY\" --account-label primary\n  kinetix model add --provider \"My Provider\" --upstream-id <model-id> --display-name \"<Model>\"\n  kinetix key create --name local-client --owner me\n  kinetix serve\n\nRun `kinetix <COMMAND> --help` for command options. Most setup commands work without the server; `kinetix api` calls a running Admin API.",
 )]
 pub struct Cli {
     /// Root directory holding config/, data/, and state/ (overrides XDG).

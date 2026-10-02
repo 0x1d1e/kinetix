@@ -5,6 +5,7 @@ import { WobblyCard, SketchButton, SketchBadge } from '../HandDrawnElements';
 import { formatCurrency, formatTokens } from '../../lib/designSystem';
 import { useConfirm } from '../../lib/useConfirm';
 import ClientProfileGenerator from './ClientProfileGenerator';
+import { FirstRunGuide } from '../FirstRunGuide';
 
 interface KeysViewProps {
   keys: VirtualKey[];
@@ -12,6 +13,10 @@ interface KeysViewProps {
   onUpdateKeyStatus: (id: string, status: 'active' | 'disabled' | 'revoked') => void;
   onUpdateKeyIps: (id: string, ips: string[]) => void;
   onDeleteKey?: (id: string) => void;
+  showSetupGuide?: boolean;
+  providerCount?: number;
+  modelCount?: number;
+  onOpenProviders?: () => void;
 }
 
 /** Inline per-key IP allowlist editor (FR-3.4). Empty means "no restriction". */
@@ -80,6 +85,10 @@ export const KeysView: React.FC<KeysViewProps> = ({
   onUpdateKeyStatus,
   onUpdateKeyIps,
   onDeleteKey,
+  showSetupGuide = false,
+  providerCount = 0,
+  modelCount = 0,
+  onOpenProviders = () => {},
 }) => {
   const { confirm, confirmNode } = useConfirm();
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -168,6 +177,15 @@ export const KeysView: React.FC<KeysViewProps> = ({
   return (
     <div className="space-y-6">
       {confirmNode}
+      {showSetupGuide && (
+        <FirstRunGuide
+          providerCount={providerCount}
+          modelCount={modelCount}
+          keyCount={keys.length}
+          onOpenProviders={onOpenProviders}
+          onCreateKey={() => setShowCreateModal(true)}
+        />
+      )}
       {/* Top Banner & Action */}
       <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
         <div>

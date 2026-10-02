@@ -3,9 +3,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh | bash
 #
-# It installs the `kinetix` binary to ~/.local/bin, creates the XDG config/data/
-# state directories, and prints the generated admin password once. Everything is
-# then configurable through the CLI — no .env file, no dashboard required.
+# It installs the `kinetix` binary to ~/.local/bin. Run `kinetix init` when you
+# are ready to create local state and generate the dashboard admin password.
+# Everything is then configurable through the CLI — no .env file required.
 #
 # Environment overrides:
 #   KINETIX_VERSION   release tag or branch to install (default: latest release, fallback: main)
@@ -144,22 +144,16 @@ if ! printf '%s' ":$PATH:" | grep -q ":$BIN_DIR:"; then
   fi
 fi
 
-log "Initializing (creates config/data/state directories)"
-"$BIN_DIR/kinetix" init
-
 cat <<EOF
 
-Next steps:
-  1. Add an upstream provider and its credential:
-       kinetix provider add --name "My Provider" --base-url https://.../v1 \\
-         --wire-format openai --auth-scheme bearer --api-key sk-... --account-label primary
-  2. Add a model it serves:
-       kinetix model add --provider "My Provider" --upstream-id <model-id> --display-name "<Model>"
-  3. Issue a virtual key for your client:
-       kinetix key create --name "pi" --owner me
-  4. Run the proxy:
-       kinetix serve
-     (In production, keep it on localhost behind cloudflared; see deploy/README.md.)
+Kinetix is installed. To create local state and generate the dashboard admin password, run:
+  kinetix init
 
-  Run \`kinetix --help\` for the full command surface.
+Then configure an upstream provider, register a model, create a virtual key, and start the proxy:
+  kinetix provider add --help
+  kinetix model add --help
+  kinetix key create --help
+  kinetix serve
+
+Run \`kinetix --help\` for the full command surface.
 EOF

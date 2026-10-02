@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   Box,
   CheckCircle2,
+  ChevronDown,
   KeyRound,
   LogIn,
   Network,
@@ -30,6 +31,7 @@ import { Provider } from '../../types';
 import { SketchBadge, SketchButton, WobblyCard } from '../HandDrawnElements';
 import { ConnectionParameterFields } from '../ConnectionParameterFields';
 import { useAuthEnrollment } from '../CredentialAuthFlow';
+import { Modal } from '../Modal';
 
 function fileAsBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -89,6 +91,7 @@ export const PluginsView: React.FC = () => {
   const [settingDrafts, setSettingDrafts] = useState<Record<string, string | boolean>>({});
   const [rollbackPreview, setRollbackPreview] = useState<PluginRollbackPreview | null>(null);
   const [catalogPreview, setCatalogPreview] = useState<PluginCatalogPreview | null>(null);
+  const [pluginToRemove, setPluginToRemove] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [connectionDrafts, setConnectionDrafts] = useState<Record<string, Record<string, string>>>({});
@@ -271,7 +274,7 @@ export const PluginsView: React.FC = () => {
     }
   };
 
-  const removePlugin = async (id: string) => {
+  const removePlugin = async (id: string): Promise<boolean> => {
     setBusy('remove');
     setError(null);
     setNotice(null);
@@ -284,8 +287,10 @@ export const PluginsView: React.FC = () => {
       setSettingDrafts({});
       setNotice('Plugin removed.');
       await refresh(null);
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      return false;
     } finally {
       setBusy(null);
     }
@@ -588,18 +593,20 @@ export const PluginsView: React.FC = () => {
       )}
 
 
-      {showInstall && (
-        <WobblyCard decoration="tape" className="p-5">
-          <form onSubmit={install} className="space-y-4">
-            <div>
-              <h3 className="text-xl font-heading font-bold flex items-center gap-2">
-                <Upload className="w-5 h-5 text-[var(--pen-blue)]" />
-                Install Kinetix Extension Package
-              </h3>
-              <p className="text-sm font-body text-[var(--ink)]/75">
-                Install a custom <span className="font-mono">.kxp</span> package from a local file or remote URL (GitHub release, CDN, or raw git host).
-              </p>
+      <Modal
+        open={showInstall}
+        onClose={() => setShowInstall(false)}
+        title="Install Kinetix Extension Package"
+      >
+        <form onSubmit={install} className="space-y-4 p-5">
+          <p className="text-sm font-body text-[var(--ink)]/75">
+            Install a custom <span className="font-mono">.kxp</span> package from a local file or remote URL (GitHub release, CDN, or raw git host).
+          </p>
+          {error && (
+            <div role="alert" className="p-3 bg-[var(--tint-red)] border border-[var(--marker-red)] text-sm font-mono text-[var(--danger-text)]">
+              {error}
             </div>
+          )}
 
             <div className="flex gap-2 border-b border-[var(--ink)]/20 pb-2">
               <button
@@ -699,20 +706,73 @@ export const PluginsView: React.FC = () => {
                 Cancel
               </SketchButton>
             </div>
-          </form>
-        </WobblyCard>
-      )}
+        </form>
+      </Modal>
+
+      <Modal
+        open={pluginToRemove !== null}
+        onClose={() => setPluginToRemove(null)}
+        title="Remove plugin?"
+        className="max-w-lg"
+      >
+        <div className="space-y-4 p-5">
+          {error && (
+            <div role="alert" className="p-3 bg-[var(--tint-red)] border border-[var(--marker-red)] text-sm font-mono text-[var(--danger-text)]">
+              {error}
+            </div>
+          )}
+          <p className="text-sm font-body">
+            This removes the installed package and its host-managed plugin state:
+          </p>
+          <code className="block break-all bg-[var(--erased)] p-3 text-sm">{pluginToRemove}</code>
+          <div className="flex justify-end gap-2">
+            <SketchButton
+              type="button"
+              variant="secondary"
+              onClick={() => setPluginToRemove(null)}
+            >
+              Cancel
+            </SketchButton>
+            <SketchButton
+              type="button"
+              variant="danger"
+              disabled={busy !== null || pluginToRemove === null}
+              onClick={() => {
+                if (!pluginToRemove) return;
+                void removePlugin(pluginToRemove).then((removed) => {
+                  if (removed) setPluginToRemove(null);
+                });
+              }}
+              className="gap-2"
+            >
+              <Trash2 className="w-4 h-4" />
+              {busy === 'remove' ? 'Removing…' : 'Remove plugin'}
+            </SketchButton>
+          </div>
+        </div>
+      </Modal>
 
       {catalog.length > 0 && (
-        <WobblyCard variant="muted" className="p-5">
-          <div className="flex items-start justify-between gap-3 flex-wrap">
+        <details className="group">
+          <summary
+            className="flex list-none cursor-pointer items-center justify-between gap-4 border-2 border-[var(--ink)] bg-[var(--surface)] p-4 sketch-shadow-sm [&::-webkit-details-marker]:hidden"
+            style={{ borderRadius: '14px 10px 16px 10px / 10px 16px 10px 14px' }}
+          >
             <div>
               <h3 className="text-xl font-heading font-bold">Discover Marketplace</h3>
               <p className="text-sm font-body text-[var(--ink)]/70">
-                Official plugins verified and distributed through the Kinetix ecosystem.
-                Installing or updating validates cryptographic signatures and prompts for operator permission approval.
+                Browse {catalog.length} catalog plugins. Marketplace stays closed until you open it.
               </p>
             </div>
+            <ChevronDown className="w-5 h-5 shrink-0 transition-transform group-open:rotate-180" aria-hidden="true" />
+          </summary>
+          <WobblyCard variant="muted" className="mt-3 p-5">
+            <div className="flex items-start justify-between gap-3 flex-wrap">
+              <div>
+                <p className="text-sm font-body text-[var(--ink)]/70">
+                  Catalog packages are signature-verified. Review requested permissions before enabling a plugin.
+                </p>
+              </div>
             <div className="flex items-center gap-2">
               <SketchButton
                 variant="secondary"
@@ -843,19 +903,29 @@ export const PluginsView: React.FC = () => {
               })}
             </div>
           )}
-        </WobblyCard>
+          </WobblyCard>
+        </details>
       )}
 
-      {catalogPreview && (
-        <WobblyCard decoration="tape" className="p-5">
+      <Modal
+        open={catalogPreview !== null}
+        onClose={() => setCatalogPreview(null)}
+        title={catalogPreview
+          ? catalogPreview.current_version
+            ? `Review update: v${catalogPreview.current_version} to v${catalogPreview.target_version}`
+            : `Review install: v${catalogPreview.target_version}`
+          : 'Review plugin install'}
+      >
+        {catalogPreview && (
+          <div className="space-y-4 p-5">
+          {error && (
+            <div role="alert" className="p-3 bg-[var(--tint-red)] border border-[var(--marker-red)] text-sm font-mono text-[var(--danger-text)]">
+              {error}
+            </div>
+          )}
           <div className="flex flex-col md:flex-row md:items-start gap-4">
             <div className="flex-1">
-              <h3 className="text-xl font-heading font-bold">
-                {catalogPreview.current_version
-                  ? `Review update: v${catalogPreview.current_version} → v${catalogPreview.target_version}`
-                  : `Review install: v${catalogPreview.target_version}`}
-              </h3>
-              <p className="mt-1 text-sm font-body text-[var(--ink)]/70">
+              <p className="text-sm font-body text-[var(--ink)]/70">
                 Kinetix downloaded the exact catalog artifact and verified its HTTPS distribution
                 constraints, SHA-256, manifest identity/version, and trusted Ed25519 signature.
                 Confirmation repeats those checks before installation.
@@ -947,8 +1017,9 @@ export const PluginsView: React.FC = () => {
               Cancel
             </SketchButton>
           </div>
-        </WobblyCard>
-      )}
+          </div>
+        )}
+      </Modal>
 
       <div className="grid grid-cols-1 xl:grid-cols-[minmax(280px,0.8fr)_minmax(0,2fr)] gap-6">
         <div className="space-y-3">
@@ -1624,10 +1695,7 @@ export const PluginsView: React.FC = () => {
                     variant="danger"
                     disabled={busy !== null}
                     onClick={() => {
-                      if (!window.confirm(`Remove plugin ${selected.id}? This also removes its plugin state.`)) {
-                        return;
-                      }
-                      void removePlugin(selected.id);
+                      setPluginToRemove(selected.id);
                     }}
                     className="gap-2"
                   >

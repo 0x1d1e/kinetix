@@ -74,9 +74,13 @@ Fallback is only attempted before the response has been committed to the client.
 curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh | bash
 ```
 
-The installer places `kinetix` in `~/.local/bin` and initializes its local state.
+The installer places `kinetix` in `~/.local/bin` without creating local state. Initialize the installation when ready:
 
-No `.env` file is required for the normal CLI workflow.
+```bash
+kinetix init
+```
+
+This creates the config, data, and state directories and prints the dashboard admin password once. No `.env` file is required for the normal CLI workflow.
 
 ### Add a provider
 

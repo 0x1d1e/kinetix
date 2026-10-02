@@ -5346,11 +5346,11 @@ async fn credential_for_admin_action(
     provider: &db::ProviderRow,
     account: &db::AccountRow,
     context: &'static str,
-) -> Result<String, ApiError> {
+) -> Result<crate::credentials::ResolvedCredential, ApiError> {
     match state.credential_for(provider, account).await {
         Ok(credential) => {
             crate::alerts::record_credential_success();
-            Ok(credential.secret)
+            Ok(credential)
         }
         Err(error) => {
             crate::alerts::record_credential_failure();
@@ -5438,8 +5438,8 @@ async fn discover_models_native(
             model: &dummy_model,
             account_id: Some(account.id.as_str()),
             session_context: None,
-            credential_metadata: None,
-            credential,
+            credential_metadata: Some(&credential.metadata),
+            credential: credential.secret.clone(),
         };
         let permit = state
             .provider_work
@@ -5626,8 +5626,8 @@ pub async fn test_provider(
         model: &model,
         account_id: Some(account.id.as_str()),
         session_context: None,
-        credential_metadata: None,
-        credential,
+        credential_metadata: Some(&credential.metadata),
+        credential: credential.secret.clone(),
     };
     let mut internal = crate::types::InternalRequest {
         requested_model: upstream_id.clone(),
@@ -7815,6 +7815,7 @@ async fn execute_capability_probe_request(
     account_id: String,
     identity: crate::registry::ProviderWorkIdentity,
     credential: String,
+    credential_metadata: crate::credentials::CredentialMetadata,
     adapter: std::sync::Arc<dyn crate::adapters::Adapter>,
     url: url::Url,
     outbound: Value,
@@ -7832,7 +7833,7 @@ async fn execute_capability_probe_request(
         model: &execution_model,
         account_id: Some(&account_id),
         session_context: None,
-        credential_metadata: None,
+        credential_metadata: Some(&credential_metadata),
         credential,
     };
     let response = crate::outbound::send_provider_request(
@@ -8159,8 +8160,8 @@ pub async fn probe_model_capability(
         model: &execution_model,
         account_id: Some(account.id.as_str()),
         session_context: None,
-        credential_metadata: None,
-        credential: credential.clone(),
+        credential_metadata: Some(&credential.metadata),
+        credential: credential.secret.clone(),
     };
     let url = adapter
         .build_url(&ctx)
@@ -8212,7 +8213,8 @@ pub async fn probe_model_capability(
     let work_model = execution_model.clone();
     let work_account_id = account.id.clone();
     let work_adapter = adapter.clone();
-    let work_credential = credential;
+    let work_credential = credential.secret;
+    let work_credential_metadata = credential.metadata;
     let work_url = parsed_url;
     let work_outbound = outbound;
     let exchange = state
@@ -8229,6 +8231,7 @@ pub async fn probe_model_capability(
                     work_account_id,
                     work_identity,
                     work_credential,
+                    work_credential_metadata,
                     work_adapter,
                     work_url,
                     work_outbound,
@@ -20823,6 +20826,215 @@ mod credential_enrollment_regression_tests {
             }
         };
         assert!(wait >= std::time::Duration::from_secs(100), "got {wait:?}");
+
+        server.abort();
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    struct ProjectMetadataCredential;
+
+    #[async_trait::async_trait]
+    impl crate::credentials::CredentialStrategy for ProjectMetadataCredential {
+        fn name(&self) -> &'static str {
+            "project_metadata_test"
+        }
+
+        async fn resolve(
+            &self,
+            _account: &db::AccountRow,
+        ) -> std::result::Result<
+            crate::credentials::ResolvedCredential,
+            crate::credentials::CredentialRotationError,
+        > {
+            Ok(crate::credentials::ResolvedCredential {
+                secret: "test-token".into(),
+                metadata: crate::credentials::CredentialMetadata {
+                    project_id: Some("test-project".into()),
+                },
+                expires_at: None,
+                refresh_after: None,
+                rotated: false,
+            })
+        }
+    }
+
+    struct ProjectMetadataTestAdapter;
+
+    impl crate::adapters::Adapter for ProjectMetadataTestAdapter {
+        fn wire_format(&self) -> &'static str {
+            "project-metadata-test"
+        }
+
+        fn build_url(
+            &self,
+            ctx: &crate::adapters::UpstreamContext<'_>,
+        ) -> Result<String, crate::types::ProxyError> {
+            Ok(ctx.provider.base_url.clone())
+        }
+
+        fn apply_auth(
+            &self,
+            ctx: &crate::adapters::UpstreamContext<'_>,
+            request: reqwest::RequestBuilder,
+        ) -> Result<reqwest::RequestBuilder, crate::types::UpstreamFailure> {
+            Ok(request.bearer_auth(&ctx.credential))
+        }
+
+        fn build_body(
+            &self,
+            ctx: &crate::adapters::UpstreamContext<'_>,
+            _request: &crate::types::InternalRequest,
+        ) -> Result<Value, crate::types::UpstreamFailure> {
+            let project_id = ctx
+                .credential_metadata
+                .and_then(|metadata| metadata.project_id.as_deref())
+                .ok_or_else(|| crate::types::UpstreamFailure {
+                    kind: crate::types::FailureKind::PluginFailure,
+                    status: None,
+                    retry_after_secs: None,
+                    message: "missing credential project_id".into(),
+                    quota_reset_at: None,
+                })?;
+            Ok(json!({ "project_id": project_id }))
+        }
+
+        fn classify_error(
+            &self,
+            status: u16,
+            body: &str,
+            _headers: &reqwest::header::HeaderMap,
+        ) -> crate::types::UpstreamFailure {
+            crate::types::UpstreamFailure {
+                kind: crate::types::FailureKind::ServerError,
+                status: Some(status),
+                retry_after_secs: None,
+                message: body.to_owned(),
+                quota_reset_at: None,
+            }
+        }
+
+        fn parse_stream_chunk(
+            &self,
+            _data: &str,
+        ) -> Result<Vec<crate::types::StreamEvent>, crate::types::UpstreamFailure> {
+            Ok(Vec::new())
+        }
+
+        fn parse_full_response(
+            &self,
+            _body: &Value,
+        ) -> Result<Vec<crate::types::StreamEvent>, crate::types::UpstreamFailure> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_test_passes_credential_metadata_to_adapter() {
+        let (state, root) = test_state("provider-test-credential-metadata").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let received_body = Arc::new(parking_lot::Mutex::new(None));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post({
+                let received_body = received_body.clone();
+                move |Json(body): Json<Value>| {
+                    *received_body.lock() = Some(body);
+                    async { (StatusCode::OK, "{}") }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = format!("http://{address}/v1/chat/completions");
+        state.register_plugin_credential_strategy(
+            "test-project",
+            Arc::new(ProjectMetadataCredential),
+        );
+        state.register_plugin_adapter(
+            "plugin:test-project/adapter",
+            Arc::new(ProjectMetadataTestAdapter),
+        );
+        let provider_id = db::insert_provider(
+            &state.pool,
+            &db::NewProvider {
+                name: "credential-metadata-provider",
+                base_url: &base_url,
+                wire_format: WireFormat::Plugin,
+                auth_scheme: AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: json!({}),
+                timeout_ms: 2_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: json!({}),
+                follow_redirects: false,
+                credential_hosts: "127.0.0.1",
+                allow_insecure_tls: true,
+                wire_plugin: "plugin:test-project/adapter",
+                credential_plugin: "plugin:test-project/strategy",
+                model_source_plugin: "",
+                credential_mode: "auth_flow",
+                source_plugin_id: Some("test-project"),
+                source_integration_id: Some("antigravity"),
+            },
+        )
+        .await
+        .unwrap();
+        let encrypted = state.crypto.encrypt("unused-token").unwrap();
+        let account_id = db::insert_account(
+            &state.pool,
+            &provider_id,
+            "metadata-account",
+            &encrypted,
+            "test-token",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: "test-model",
+                display_name: "Test Model",
+                enabled: true,
+                context_window: None,
+                max_output_tokens: Some(64),
+                capabilities: json!({}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+
+        let response = test_provider(
+            State(state.clone()),
+            auth(),
+            Path(provider_id),
+            Json(TestBody {
+                model: Some("test-model".into()),
+                account_id: Some(account_id),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["ok"], true);
+        assert_eq!(
+            received_body.lock().as_ref().unwrap()["project_id"],
+            "test-project"
+        );
 
         server.abort();
         drop(state);
