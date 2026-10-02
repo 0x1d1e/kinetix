@@ -861,7 +861,12 @@ impl PluginManager {
         }
 
         let mut providers = BTreeMap::new();
-        for provider in crate::db::list_providers(&self.inner.pool).await? {
+        let provider_rows = crate::db::list_providers(&self.inner.pool).await?;
+        let provider_names: HashMap<_, _> = provider_rows
+            .iter()
+            .map(|provider| (provider.id.clone(), provider.name.clone()))
+            .collect();
+        for provider in provider_rows {
             let mut uses = Vec::new();
             for (kind, value) in [
                 ("wire adapter", provider.wire_plugin.as_str()),
@@ -890,14 +895,53 @@ impl PluginManager {
             }
         }
 
+        let model_rows = crate::db::list_models(&self.inner.pool).await?;
+        for model in &model_rows {
+            let discovery = serde_json::from_str::<serde_json::Value>(&model.discovery)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let configured_transport = discovery
+                .get("configured_transport")
+                .and_then(serde_json::Value::as_str);
+            let has_model_transport = configured_transport
+                .and_then(super::types::PluginRef::parse)
+                .is_some_and(|reference| reference.plugin_id == id);
+            let has_opaque_state = model.opaque_state_plugin == id;
+            if !has_model_transport && !has_opaque_state {
+                continue;
+            }
+            let Some(provider_name) = provider_names.get(&model.provider_id) else {
+                continue;
+            };
+            let dependency = providers
+                .entry(model.provider_id.clone())
+                .or_insert_with(|| PluginProviderDependency {
+                    id: model.provider_id.clone(),
+                    name: provider_name.clone(),
+                    uses: Vec::new(),
+                });
+            if has_model_transport {
+                dependency
+                    .uses
+                    .push(format!("model transport ({})", model.display_name));
+            }
+            if has_opaque_state {
+                dependency
+                    .uses
+                    .push(format!("opaque state producer ({})", model.display_name));
+            }
+        }
+        for provider in providers.values_mut() {
+            provider.uses.sort();
+            provider.uses.dedup();
+        }
+
         let affected_provider_ids: BTreeSet<_> = providers.keys().cloned().collect();
         let accounts: HashMap<_, _> = crate::db::list_accounts(&self.inner.pool)
             .await?
             .into_iter()
             .map(|account| (account.id, account.provider_id))
             .collect();
-        let models: HashMap<_, _> = crate::db::list_models(&self.inner.pool)
-            .await?
+        let models: HashMap<_, _> = model_rows
             .into_iter()
             .map(|model| (model.id, model.provider_id))
             .collect();
@@ -3294,6 +3338,15 @@ pub struct RollbackPreview {
     pub provides: Vec<Provided>,
 }
 
+fn list_permission_expanded(
+    from: &[String],
+    to: &[String],
+    covers: impl Fn(&str, &str) -> bool,
+) -> bool {
+    to.iter()
+        .any(|requested| !from.iter().any(|previous| covers(previous, requested)))
+}
+
 fn list_permission_diff(from: &[String], to: &[String]) -> PermissionListDiff {
     let from: BTreeSet<&str> = from.iter().map(String::as_str).collect();
     let to: BTreeSet<&str> = to.iter().map(String::as_str).collect();
@@ -3317,6 +3370,16 @@ pub(crate) fn permission_diff(
 ) -> PermissionDiff {
     let network_hosts = list_permission_diff(&from.network_hosts, &to.network_hosts);
     let credential_scopes = list_permission_diff(&from.credential_scopes, &to.credential_scopes);
+    let network_hosts_expanded = list_permission_expanded(
+        &from.network_hosts,
+        &to.network_hosts,
+        super::manifest::host_matches,
+    );
+    let credential_scopes_expanded = list_permission_expanded(
+        &from.credential_scopes,
+        &to.credential_scopes,
+        |previous, requested| previous == "*" || previous == requested,
+    );
     let credential_read = PermissionBoolDiff {
         from: from.credential_read,
         to: to.credential_read,
@@ -3331,8 +3394,8 @@ pub(crate) fn permission_diff(
         to_limits.max_outbound_requests,
     );
     let max_http_body = size_limit_diff(&from_limits.max_http_body, &to_limits.max_http_body);
-    let expanded = !network_hosts.added.is_empty()
-        || !credential_scopes.added.is_empty()
+    let expanded = network_hosts_expanded
+        || credential_scopes_expanded
         || credential_read.expanded
         || memory.expanded
         || storage.expanded
@@ -3932,6 +3995,31 @@ mod tests {
         assert!(!reduced.wall_time_ms.expanded);
         assert!(!reduced.max_outbound_requests.expanded);
         assert!(!reduced.max_http_body.expanded);
+    }
+
+    #[test]
+    fn permission_diff_recognizes_wildcard_reductions() {
+        let from = Permissions {
+            network_hosts: vec!["*.foo.example".into()],
+            credential_scopes: vec!["*".into()],
+            credential_read: false,
+        };
+        let to = Permissions {
+            network_hosts: vec!["api.foo.example".into()],
+            credential_scopes: vec!["provider:foo".into()],
+            credential_read: false,
+        };
+        let limits = super::super::types::Limits::default();
+
+        let reduced = permission_diff(&from, &limits, &to, &limits);
+        assert!(!reduced.expanded);
+        assert_eq!(reduced.network_hosts.added, ["api.foo.example"]);
+        assert_eq!(reduced.network_hosts.removed, ["*.foo.example"]);
+        assert_eq!(reduced.credential_scopes.added, ["provider:foo"]);
+        assert_eq!(reduced.credential_scopes.removed, ["*"]);
+
+        let expanded = permission_diff(&to, &limits, &from, &limits);
+        assert!(expanded.expanded);
     }
 
     #[test]

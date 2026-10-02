@@ -150,7 +150,7 @@ Manage WebAssembly Component plugins (`.kxp` packages).
 | `POST /admin/api/plugins/{id}/integrations/{integration}/provider` | Create or reuse the provider declared by an Integration template. Re-validates outbound URL security and requires every derived plugin capability binding to be enabled and approved. |
 | `GET /admin/api/plugins/auth/callback` | One-time provider callback authenticated by expiring random state. Exchanges the code inside WASM, validates/encrypts returned credential JSON, creates the account, and redirects to Plugins. |
 | `GET /admin/api/plugins/{id}` | Plugin detail: manifest metadata, requested/approved permissions, runtime circuit state, and retained `.kxp` package provenance/history. |
-| `GET /admin/api/plugins/{id}/impact` | List Providers and Routes bound to the plugin and return the current impact fingerprint. |
+| `GET /admin/api/plugins/{id}/impact` | List affected Providers, including model-level plugin transports and opaque-state provenance, dependent Routes, and the current impact fingerprint. |
 | `DELETE /admin/api/plugins/{id}` | Remove a plugin and cascade-delete its permissions, circuit state, and encrypted KV storage. If referenced, requires `{"impact_fingerprint":"..."}` matching the current impact. |
 | `POST /admin/api/plugins/{id}/enable` | Enable an installed plugin. Verifies component linking and registers capabilities. |
 | `POST /admin/api/plugins/{id}/disable` | Disable a plugin. If referenced, requires `{"impact_fingerprint":"..."}` matching the current impact. Bound Providers and Routes remain unchanged and fail closed. |

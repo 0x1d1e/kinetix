@@ -532,16 +532,19 @@ and applies the same distribution trust checks as installation:
 Kinetix then compares the target manifest with the installed manifest (or
 manifest defaults for a first install) and shows changes to network hosts,
 credential scopes, credential-read access, memory, storage, wall time, outbound
-request budget, and HTTP body size. An increase requires explicit approval;
-non-expanding updates may retain grants only when those grants fully matched the
+request budget, and HTTP body size. Authority increases require explicit
+approval. Coverage determines whether permission lists expand: replacing a
+wildcard host or credential scope with a narrower covered value is a reduction
+even when the textual diff shows an addition and removal.
+Non-expanding updates may retain grants only when those grants fully matched the
 previous manifest. Every update remains disabled until explicitly enabled.
 
 Confirmation does not reuse the preview as an authorization token. Kinetix
 downloads and verifies the artifact again before installation. Before disabling
-or removing a plugin, Kinetix lists bound Providers and dependent Routes. A
-mutation with dependencies requires acknowledgment of the current impact
-fingerprint. Bindings remain unchanged; unavailable plugin-backed targets fail
-closed.
+or removing a plugin, Kinetix lists affected Providers, including model-level
+plugin transports and opaque-state provenance, and dependent Routes. A mutation
+with dependencies requires acknowledgment of the current impact fingerprint.
+Bindings remain unchanged; unavailable plugin-backed targets fail closed.
 
 ## Version history and rollback
 

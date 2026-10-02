@@ -182,7 +182,7 @@ kinetix plugin revoke <ID> <PERMISSION>
 | `approve <id>` | Approves all declared permissions for the installed version. |
 | `enable <id>` | Validates exports, checks that all requested permissions are approved, and marks the plugin active in memory and SQLite. |
 | `disable <id> [--force]` | Shows dependent Providers and Routes; `--force` acknowledges the displayed impact. Bound targets remain unchanged and fail closed. |
-| `impact <id>` | Prints the bound Providers, dependent Routes, and current impact fingerprint. |
+| `impact <id>` | Prints affected Providers, including model-level transports and opaque-state provenance, dependent Routes, and the current impact fingerprint. |
 | `catalog list/show` | Shows available releases and safe release/changelog links. |
 | `update [id] [--approve]` | Updates one or all installed catalog plugins. Permission increases are skipped without `--approve`; approved updates re-enable only plugins that were enabled before the update. |
 | `pin <id>` / `unpin <id>` | Pin the installed version against marketplace updates or remove that pin. |

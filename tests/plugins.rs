@@ -505,6 +505,107 @@ async fn plugin_disable_and_remove_require_current_provider_and_route_impact_ack
 }
 
 #[tokio::test]
+async fn plugin_model_transport_dependencies_require_disable_and_remove_acknowledgement() {
+    let (m, pool) = manager().await;
+    m.install(&build_kxp(GOOD_MANIFEST, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+
+    let provider_id = db::insert_provider(
+        &pool,
+        &db::NewProvider {
+            name: "model transport provider",
+            base_url: "https://api.example",
+            wire_format: kinetix::types::WireFormat::Openai,
+            auth_scheme: kinetix::types::AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: serde_json::json!({}),
+            timeout_ms: 30_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: serde_json::json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: false,
+            wire_plugin: "",
+            credential_plugin: "",
+            model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let model_id = db::insert_model(
+        &pool,
+        &db::NewModel {
+            provider_id: &provider_id,
+            upstream_id: "model-x",
+            display_name: "Plugin transport model",
+            enabled: true,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: serde_json::json!({}),
+            prices: serde_json::json!({}),
+            parameters: serde_json::json!({}),
+            thinking_map: serde_json::json!({}),
+            extra_request: serde_json::json!({}),
+            discovery: serde_json::json!({
+                "configured_transport": "plugin:dev.example.foo/foo-adapter"
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    db::set_model_opaque_state_plugin(&pool, &model_id, "dev.example.foo")
+        .await
+        .unwrap();
+    let route_id = db::insert_route(
+        &pool,
+        &db::NewRoute {
+            name: "model transport route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: serde_json::json!({}),
+            portability_policy: "strip",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: None,
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(&pool, &route_id, None, &model_id, 1, 1, "{}", "{}")
+        .await
+        .unwrap();
+
+    let impact = m.dependency_impact("dev.example.foo").await.unwrap();
+    assert_eq!(impact.providers.len(), 1);
+    assert_eq!(impact.providers[0].id, provider_id);
+    assert!(impact.providers[0]
+        .uses
+        .iter()
+        .any(|usage| usage.contains("model transport")));
+    assert!(impact.providers[0]
+        .uses
+        .iter()
+        .any(|usage| usage.contains("opaque state producer")));
+    assert_eq!(impact.routes.len(), 1);
+    assert_eq!(impact.routes[0].id, route_id);
+    assert!(m.disable("dev.example.foo").await.is_err());
+    assert!(m.remove("dev.example.foo").await.is_err());
+    m.disable_with_impact_acknowledgement("dev.example.foo", Some(&impact.fingerprint))
+        .await
+        .unwrap();
+    m.remove_with_impact_acknowledgement("dev.example.foo", Some(&impact.fingerprint))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn expanded_upgrade_clears_previous_approval_and_stays_disabled() {
     let (m, pool) = manager().await;
     m.install(&build_kxp(GOOD_MANIFEST, VALID_COMPONENT), None, &[], false)
@@ -533,6 +634,44 @@ async fn expanded_upgrade_clears_previous_approval_and_stays_disabled() {
     );
     let error = m.enable("dev.example.foo").await.unwrap_err();
     assert!(error.to_string().contains("permissions are not approved"));
+}
+
+#[tokio::test]
+async fn narrower_wildcard_permissions_carry_approval_forward() {
+    let (m, pool) = manager().await;
+    let wildcard = GOOD_MANIFEST
+        .replace(
+            "network_hosts = [\"api.foo.example\"]",
+            "network_hosts = [\"*.foo.example\"]",
+        )
+        .replace(
+            "credential_scopes = [\"provider:foo\"]",
+            "credential_scopes = [\"*\"]",
+        );
+    m.install(&build_kxp(&wildcard, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+
+    let narrower = wildcard
+        .replace("version = \"1.2.0\"", "version = \"1.3.0\"")
+        .replace(
+            "network_hosts = [\"*.foo.example\"]",
+            "network_hosts = [\"api.foo.example\"]",
+        )
+        .replace(
+            "credential_scopes = [\"*\"]",
+            "credential_scopes = [\"provider:foo\"]",
+        );
+    m.install(&build_kxp(&narrower, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+
+    let grants = kinetix::plugins::store::permissions(&pool, "dev.example.foo")
+        .await
+        .unwrap();
+    assert!(!grants.is_empty());
+    m.enable("dev.example.foo").await.unwrap();
 }
 
 #[tokio::test]
