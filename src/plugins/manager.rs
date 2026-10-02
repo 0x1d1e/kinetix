@@ -1280,11 +1280,14 @@ impl PluginManager {
     }
 
     /// Revoke one permission and immediately disable the plugin.
+    ///
+    /// Unlike an operator-requested disable, revocation is a security action
+    /// that must remain available when bindings exist. Bindings are preserved
+    /// and fail closed because the plugin is disabled.
     pub async fn revoke_permission(&self, id: &str, permission: &str) -> Result<()> {
         if self.get(id).await?.is_none() {
             bail!("plugin '{id}' is not installed");
         }
-        self.disable(id).await?;
         store::revoke_permission(&self.inner.pool, id, permission).await
     }
 
@@ -3571,6 +3574,105 @@ mod tests {
         )
         .unwrap();
         (manager, pool, dir)
+    }
+
+    #[tokio::test]
+    async fn permission_revoke_disables_bound_plugin_without_changing_bindings() {
+        let (manager, pool, dir) = concurrency_test_manager().await;
+        crate::db::migrate(&pool).await.unwrap();
+
+        let plugin_id = "dev.example.permission-revoke";
+        let validated = manifest::parse_and_validate(
+            &format!(
+                r#"
+                manifest_version = 1
+                id = "{plugin_id}"
+                name = "Permission revoke test"
+                version = "1.0.0"
+                plugin_api = "1"
+
+                [provides]
+                model_sources = ["permission-revoke-test"]
+
+                [permissions]
+                network_hosts = ["api.example"]
+                "#
+            ),
+            HostPolicy::default(),
+        )
+        .unwrap();
+        let grants = permission_grants(&validated.manifest);
+        store::upsert_plugin(
+            &pool,
+            &validated,
+            &"a".repeat(64),
+            b"test component",
+            "unsigned",
+            "test.kxp",
+            "test",
+            Some(&grants),
+        )
+        .await
+        .unwrap();
+        store::set_enabled(&pool, plugin_id, true).await.unwrap();
+
+        let provider_id = crate::db::insert_provider(
+            &pool,
+            &crate::db::NewProvider {
+                name: "Bound to permission revoke test",
+                base_url: "https://example.com",
+                wire_format: crate::types::WireFormat::Plugin,
+                auth_scheme: crate::types::AuthScheme::Bearer,
+                custom_header_name: None,
+                custom_param_name: None,
+                extra_headers: serde_json::json!({}),
+                timeout_ms: 30_000,
+                capability_mode: "permissive",
+                models_path: None,
+                rate_limit_rules: serde_json::json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "plugin:dev.example.permission-revoke/adapter",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode: "manual",
+                source_plugin_id: None,
+                source_integration_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let impact = manager.dependency_impact(plugin_id).await.unwrap();
+        assert!(impact.has_dependencies());
+        assert!(impact
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id));
+
+        manager
+            .revoke_permission(plugin_id, "network_hosts")
+            .await
+            .unwrap();
+
+        let plugin = manager.get(plugin_id).await.unwrap().unwrap();
+        assert!(!plugin.status().is_enabled());
+        assert!(store::permissions(&pool, plugin_id)
+            .await
+            .unwrap()
+            .is_empty());
+        let provider = crate::db::get_provider(&pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            provider.wire_plugin,
+            "plugin:dev.example.permission-revoke/adapter"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

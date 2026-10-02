@@ -319,13 +319,26 @@ pub async fn replace_permissions(pool: &Pool, id: &str, grants: &[PermissionGran
     Ok(())
 }
 
-/// Revoke one approved permission grant.
+/// Revoke one approved permission grant and disable the plugin atomically.
 pub async fn revoke_permission(pool: &Pool, id: &str, permission: &str) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin plugin permission revocation")?;
+    let disabled = sqlx::query("UPDATE plugins SET enabled = 0, updated_at = ? WHERE id = ?")
+        .bind(crate::db::now_iso())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    if disabled.rows_affected() == 0 {
+        bail!("plugin '{id}' is not installed");
+    }
     sqlx::query("DELETE FROM plugin_permissions WHERE plugin_id = ? AND permission = ?")
         .bind(id)
         .bind(permission)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
