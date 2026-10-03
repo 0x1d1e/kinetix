@@ -6,6 +6,9 @@
 //! component, all-or-nothing permissions, and removal (which cascades state).
 
 use std::sync::Arc;
+use std::time::Duration;
+
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use kinetix::crypto::Crypto;
 use kinetix::db::{self, Pool};
@@ -82,6 +85,35 @@ async fn manager() -> (PluginManager, Pool) {
     )
     .unwrap();
     (manager, pool)
+}
+
+async fn manager_with_single_connection() -> (PluginManager, Pool, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "kinetix-plugin-single-connection-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let options = SqliteConnectOptions::new()
+        .filename(dir.join("t.db"))
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(10))
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    db::migrate(&pool).await.unwrap();
+    let manager = PluginManager::new(
+        pool.clone(),
+        Arc::new(Crypto::new(&[9u8; 32])),
+        HostPolicy::default(),
+        dir.join("plugin-packages"),
+    )
+    .unwrap();
+    (manager, pool, dir)
 }
 
 /// Build a `.kxp` archive in memory.
@@ -660,6 +692,26 @@ async fn dependency_impact_requires_current_acknowledgement_for_disable_and_remo
 }
 
 #[tokio::test]
+async fn lifecycle_impact_reads_work_with_a_single_connection_pool() {
+    let (m, pool, dir) = manager_with_single_connection().await;
+    m.install(&build_kxp(GOOD_MANIFEST, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), m.disable("dev.example.foo", None))
+        .await
+        .expect("disable must use its transaction connection for impact reads")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), m.remove("dev.example.foo", None))
+        .await
+        .expect("remove must use its transaction connection for impact reads")
+        .unwrap();
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn concurrent_provider_and_route_bindings_block_disable_and_remove() {
     let (m, pool) = manager().await;
     m.install(&build_kxp(GOOD_MANIFEST, VALID_COMPONENT), None, &[], false)
@@ -958,13 +1010,18 @@ async fn scoped_permission_approval_grants_only_the_requested_subset() {
         )
         .await
         .unwrap();
-    assert_eq!(grants.len(), 1);
+    assert_eq!(grants.len(), 2);
+    assert!(grants.iter().any(|grant| grant.permission == "limits"));
     let perms = kinetix::plugins::store::permissions(&pool, "dev.example.foo")
         .await
         .unwrap();
-    assert_eq!(perms.len(), 1);
-    assert_eq!(perms[0].permission, "network_hosts");
-    assert_eq!(perms[0].value_json, "[\"api.foo.example\"]");
+    assert_eq!(perms.len(), 2);
+    let network_hosts = perms
+        .iter()
+        .find(|grant| grant.permission == "network_hosts")
+        .unwrap();
+    assert_eq!(network_hosts.value_json, "[\"api.foo.example\"]");
+    assert!(perms.iter().any(|grant| grant.permission == "limits"));
 
     // A host not declared by the manifest cannot be approved.
     let err = m
@@ -977,6 +1034,34 @@ async fn scoped_permission_approval_grants_only_the_requested_subset() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not declared"), "{err}");
+}
+
+#[tokio::test]
+async fn full_explicit_scoped_approval_includes_limits_and_allows_runtime_use() {
+    let (m, pool) = manager().await;
+    let manifest = GOOD_MANIFEST.replace(
+        "credential_scopes = [\"provider:foo\"]",
+        "credential_scopes = [\"provider:foo\"]\ncredential_read = true",
+    );
+    m.install(&build_kxp(&manifest, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+
+    let grants = m
+        .approve_permissions_scoped(
+            "dev.example.foo",
+            Some(vec!["api.foo.example".to_string()]),
+            Some(vec!["provider:foo".to_string()]),
+            Some(true),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grants.len(), 4);
+    assert!(grants.iter().any(|grant| grant.permission == "limits"));
+    m.enable("dev.example.foo").await.unwrap();
+    assert!(m.is_usable("dev.example.foo").await);
+
+    pool.close().await;
 }
 
 #[tokio::test]

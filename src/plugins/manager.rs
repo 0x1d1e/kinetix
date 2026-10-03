@@ -871,7 +871,7 @@ impl PluginManager {
             .await
             .context("begin plugin disable")?;
         let result = async {
-            let impact = self.dependency_impact(id).await?;
+            let impact = dependency_impact_on_connection(&mut *tx, id).await?;
             require_impact_acknowledgement(&impact, acknowledged_impact)?;
             store::set_enabled_in_transaction(&mut tx, id, false).await
         }
@@ -949,7 +949,7 @@ impl PluginManager {
             .await
             .context("begin plugin removal")?;
         let result = async {
-            let impact = self.dependency_impact(id).await?;
+            let impact = dependency_impact_on_connection(&mut *tx, id).await?;
             require_impact_acknowledgement(&impact, acknowledged_impact)?;
             store::delete_plugin_in_transaction(&mut tx, id).await
         }
@@ -981,81 +981,8 @@ impl PluginManager {
 
     /// Return directly bound providers and Routes that target their Models.
     pub async fn dependency_impact(&self, id: &str) -> Result<PluginDependencyImpact> {
-        let _ = self
-            .get(id)
-            .await?
-            .ok_or_else(|| anyhow!("plugin '{id}' is not installed"))?;
-        let all_providers = crate::db::list_providers(&self.inner.pool).await?;
-        let mut providers = BTreeMap::new();
-        for provider in all_providers {
-            let mut bindings = Vec::new();
-            for (name, value) in [
-                ("wire_plugin", provider.wire_plugin.as_str()),
-                ("credential_plugin", provider.credential_plugin.as_str()),
-                ("model_source_plugin", provider.model_source_plugin.as_str()),
-            ] {
-                if super::types::PluginRef::parse(value)
-                    .is_some_and(|reference| reference.plugin_id == id)
-                {
-                    bindings.push(name.to_string());
-                }
-            }
-            if provider.source_plugin_id.as_deref() == Some(id) {
-                bindings.push("source_plugin".to_string());
-            }
-            if !bindings.is_empty() {
-                bindings.sort();
-                providers.insert(
-                    provider.id.clone(),
-                    PluginProviderImpact {
-                        id: provider.id,
-                        name: provider.name,
-                        bindings,
-                    },
-                );
-            }
-        }
-
-        let models = crate::db::list_models(&self.inner.pool).await?;
-        let model_providers: HashMap<String, String> = models
-            .into_iter()
-            .map(|model| (model.id, model.provider_id))
-            .collect();
-        let mut routes = BTreeMap::<String, (String, BTreeSet<String>, BTreeSet<String>)>::new();
-        for route in crate::db::list_routes(&self.inner.pool).await? {
-            for target in crate::db::route_targets(&self.inner.pool, &route.id).await? {
-                let Some(provider_id) = model_providers.get(&target.model_id) else {
-                    continue;
-                };
-                if !providers.contains_key(provider_id) {
-                    continue;
-                }
-                let entry = routes
-                    .entry(route.id.clone())
-                    .or_insert_with(|| (route.name.clone(), BTreeSet::new(), BTreeSet::new()));
-                entry.1.insert(target.model_id);
-                entry.2.insert(provider_id.clone());
-            }
-        }
-        let routes: Vec<PluginRouteImpact> = routes
-            .into_iter()
-            .map(|(id, (name, model_ids, provider_ids))| PluginRouteImpact {
-                id,
-                name,
-                model_ids: model_ids.into_iter().collect(),
-                provider_ids: provider_ids.into_iter().collect(),
-            })
-            .collect();
-        let providers: Vec<PluginProviderImpact> = providers.into_values().collect();
-        let fingerprint = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&(
-            id, &providers, &routes,
-        ))?));
-        Ok(PluginDependencyImpact {
-            plugin_id: id.to_string(),
-            providers,
-            routes,
-            fingerprint,
-        })
+        let mut connection = self.inner.pool.acquire().await?;
+        dependency_impact_on_connection(&mut *connection, id).await
     }
 
     pub async fn set_version_pin(&self, id: &str, pinned: bool) -> Result<String> {
@@ -1259,6 +1186,13 @@ impl PluginManager {
                 });
             }
         }
+        // Limits are a required part of every complete permission grant set.
+        // Scoped approvals narrow only the explicitly selectable permission
+        // categories, while host-enforced limits remain exactly manifest-bound.
+        grants.push(PermissionGrant {
+            permission: "limits".into(),
+            value_json: serde_json::to_string(&manifest.limits)?,
+        });
 
         store::replace_permissions(&self.inner.pool, id, &grants).await?;
         Ok(grants)
@@ -3303,6 +3237,107 @@ impl PluginDependencyImpact {
     pub fn has_dependencies(&self) -> bool {
         !self.providers.is_empty() || !self.routes.is_empty()
     }
+}
+
+async fn dependency_impact_on_connection(
+    connection: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> Result<PluginDependencyImpact> {
+    let installed: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM plugins WHERE id = ?)")
+        .bind(id)
+        .fetch_one(&mut *connection)
+        .await?;
+    if installed == 0 {
+        bail!("plugin '{id}' is not installed");
+    }
+
+    let all_providers =
+        sqlx::query_as::<_, crate::db::ProviderRow>("SELECT * FROM providers ORDER BY created_at")
+            .fetch_all(&mut *connection)
+            .await?;
+    let mut providers = BTreeMap::new();
+    for provider in all_providers {
+        let mut bindings = Vec::new();
+        for (name, value) in [
+            ("wire_plugin", provider.wire_plugin.as_str()),
+            ("credential_plugin", provider.credential_plugin.as_str()),
+            ("model_source_plugin", provider.model_source_plugin.as_str()),
+        ] {
+            if super::types::PluginRef::parse(value)
+                .is_some_and(|reference| reference.plugin_id == id)
+            {
+                bindings.push(name.to_string());
+            }
+        }
+        if provider.source_plugin_id.as_deref() == Some(id) {
+            bindings.push("source_plugin".to_string());
+        }
+        if !bindings.is_empty() {
+            bindings.sort();
+            providers.insert(
+                provider.id.clone(),
+                PluginProviderImpact {
+                    id: provider.id,
+                    name: provider.name,
+                    bindings,
+                },
+            );
+        }
+    }
+
+    let models =
+        sqlx::query_as::<_, crate::db::ModelRow>("SELECT * FROM models ORDER BY created_at")
+            .fetch_all(&mut *connection)
+            .await?;
+    let model_providers: HashMap<String, String> = models
+        .into_iter()
+        .map(|model| (model.id, model.provider_id))
+        .collect();
+    let mut routes = BTreeMap::<String, (String, BTreeSet<String>, BTreeSet<String>)>::new();
+    for route in
+        sqlx::query_as::<_, crate::db::RouteRow>("SELECT * FROM routes ORDER BY created_at")
+            .fetch_all(&mut *connection)
+            .await?
+    {
+        let targets = sqlx::query_as::<_, crate::db::RouteTargetRow>(
+            "SELECT * FROM route_targets WHERE route_id = ? ORDER BY priority, weight DESC",
+        )
+        .bind(&route.id)
+        .fetch_all(&mut *connection)
+        .await?;
+        for target in targets {
+            let Some(provider_id) = model_providers.get(&target.model_id) else {
+                continue;
+            };
+            if !providers.contains_key(provider_id) {
+                continue;
+            }
+            let entry = routes
+                .entry(route.id.clone())
+                .or_insert_with(|| (route.name.clone(), BTreeSet::new(), BTreeSet::new()));
+            entry.1.insert(target.model_id);
+            entry.2.insert(provider_id.clone());
+        }
+    }
+    let routes: Vec<PluginRouteImpact> = routes
+        .into_iter()
+        .map(|(id, (name, model_ids, provider_ids))| PluginRouteImpact {
+            id,
+            name,
+            model_ids: model_ids.into_iter().collect(),
+            provider_ids: provider_ids.into_iter().collect(),
+        })
+        .collect();
+    let providers: Vec<PluginProviderImpact> = providers.into_values().collect();
+    let fingerprint = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&(
+        id, &providers, &routes,
+    ))?));
+    Ok(PluginDependencyImpact {
+        plugin_id: id.to_string(),
+        providers,
+        routes,
+        fingerprint,
+    })
 }
 
 fn require_impact_acknowledgement(

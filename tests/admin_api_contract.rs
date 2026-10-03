@@ -24,6 +24,14 @@ impl Drop for Server {
 
 impl Server {
     async fn new() -> Self {
+        Self::build(false).await
+    }
+
+    async fn with_plugins() -> Self {
+        Self::build(true).await
+    }
+
+    async fn build(with_plugins: bool) -> Self {
         let root =
             std::env::temp_dir().join(format!("kinetix-admin-contract-{}", uuid::Uuid::new_v4()));
         let paths = Paths {
@@ -62,15 +70,26 @@ impl Server {
             paths,
             generated_admin_password: None,
         });
-        let state = AppState::new(
+        let crypto = Arc::new(Crypto::new(&[42; 32]));
+        let mut state = AppState::new(
             config,
             pool.clone(),
             Arc::new(Registry::new()),
-            Arc::new(Crypto::new(&[42; 32])),
+            crypto,
             reqwest::Client::new(),
             kinetix::logqueue::UsageLogQueue::new(pool, 16),
             0,
         );
+        if with_plugins {
+            let manager = kinetix::plugins::PluginManager::new(
+                state.pool.clone(),
+                state.crypto.clone(),
+                kinetix::plugins::HostPolicy::default(),
+                state.config.paths.plugin_packages_dir(),
+            )
+            .unwrap();
+            state = state.with_plugins(Arc::new(manager));
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let router = kinetix::router::build(state.clone());
@@ -122,6 +141,25 @@ impl Server {
     }
 }
 
+fn build_plugin_package(manifest: &str) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, data) in [
+        ("plugin.toml", manifest.as_bytes()),
+        (
+            "plugin.wasm",
+            include_bytes!("fixtures/plugin-v1.component.wasm").as_slice(),
+        ),
+        ("README.md", b"# Test plugin".as_slice()),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, data).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
 async fn error(
     response: reqwest::Response,
     status: StatusCode,
@@ -146,6 +184,56 @@ async fn error(
         );
     }
     body
+}
+
+#[tokio::test]
+async fn explicit_plugin_approval_includes_limits_and_enables_runtime() {
+    let server = Server::with_plugins().await;
+    let id = "dev.example.explicit-approval";
+    let manifest = format!(
+        r#"
+manifest_version = 1
+id = "{id}"
+name = "Explicit approval test"
+version = "1.0.0"
+plugin_api = "1"
+
+[provides]
+model_sources = ["foo-models"]
+routing_facts = ["foo-facts"]
+
+[permissions]
+network_hosts = ["api.foo.example"]
+credential_scopes = ["provider:foo"]
+credential_read = true
+"#
+    );
+    server
+        .state
+        .plugin_manager()
+        .unwrap()
+        .install(&build_plugin_package(&manifest), None, &[], false)
+        .await
+        .unwrap();
+
+    let approved = server
+        .post(
+            &format!("/plugins/{id}/permissions/approve"),
+            &json!({
+                "network_hosts": ["api.foo.example"],
+                "credential_scopes": ["provider:foo"],
+                "credential_read": true
+            }),
+        )
+        .await;
+    let grants = approved["approved"].as_array().unwrap();
+    assert_eq!(grants.len(), 4);
+    assert!(grants.iter().any(|grant| grant["permission"] == "limits"));
+
+    server
+        .post(&format!("/plugins/{id}/enable"), &json!({}))
+        .await;
+    assert!(server.state.plugin_manager().unwrap().is_usable(id).await);
 }
 
 #[tokio::test]
