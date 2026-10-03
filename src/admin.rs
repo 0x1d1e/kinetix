@@ -15122,6 +15122,30 @@ pub struct PluginInstallBody {
     pub allow_untrusted_signature: bool,
 }
 
+async fn plugin_install_package_bytes(
+    state: &AppState,
+    body: &PluginInstallBody,
+) -> Result<(Vec<u8>, String), ApiError> {
+    if let Some(b64) = &body.package_base64 {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .map_err(|error| ApiError::bad(format!("invalid package_base64: {error}")))?;
+        Ok((bytes, "upload".to_string()))
+    } else if let Some(url) = &body.url {
+        let bytes = crate::plugins::catalog::download_package_from_url(&state.http, url)
+            .await
+            .map_err(|error| ApiError::bad(error.to_string()))?;
+        Ok((bytes, format!("url:{}", url.trim())))
+    } else if let Some(path) = &body.path {
+        let bytes = std::fs::read(path)
+            .map_err(|error| ApiError::bad(format!("cannot read {path}: {error}")))?;
+        Ok((bytes, format!("file:{path}")))
+    } else {
+        Err(ApiError::bad("provide package_base64, url, or path"))
+    }
+}
+
 fn plugin_bad(e: anyhow::Error) -> ApiError {
     ApiError::bad(e.to_string())
 }
@@ -15938,6 +15962,7 @@ pub async fn plugin_catalog(
         if let Some(inst) = installed {
             value["installed"] = json!(true);
             value["installed_version"] = json!(inst.version);
+            value["pinned_version"] = json!(inst.pinned_version);
             value["update_available"] = json!(crate::plugins::catalog::is_update_available(
                 &inst.version,
                 &plugin.latest_version
@@ -15945,6 +15970,7 @@ pub async fn plugin_catalog(
         } else {
             value["installed"] = json!(false);
             value["installed_version"] = json!(null);
+            value["pinned_version"] = json!(null);
             value["update_available"] = json!(false);
         }
         plugins.push(value);
@@ -16122,19 +16148,13 @@ pub async fn preview_catalog_plugin(
     let verified = verify_catalog_package(&state, manager, &id).await?;
 
     let current = manager.get(&id).await.map_err(ApiError::internal)?;
-    let (current_version, current_permissions) = match current {
-        Some(row) => {
-            let manifest = row
-                .manifest()
-                .ok_or_else(|| ApiError::bad("installed plugin manifest is unreadable"))?;
-            (Some(row.version), manifest.permissions)
-        }
-        None => (None, crate::plugins::Permissions::default()),
-    };
-
+    let current_version = current.as_ref().map(|row| row.version.clone());
+    let permission_diff = crate::plugins::manager::permission_diff_from_installed(
+        current.as_ref(),
+        &verified.validated.manifest,
+    )
+    .map_err(plugin_bad)?;
     let target_permissions = verified.validated.manifest.permissions.clone();
-    let permission_diff =
-        crate::plugins::manager::permission_diff(&current_permissions, &target_permissions);
 
     Ok(Json(json!({
         "id": verified.plugin.id,
@@ -16158,11 +16178,19 @@ pub async fn preview_catalog_plugin(
     })))
 }
 
-/// `POST /admin/api/plugins/catalog/{id}/install` — install a trusted catalog package.
+#[derive(Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogPluginInstallBody {
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// `POST /admin/api/plugins/catalog/{id}/install` — install the previewed trusted catalog package.
 pub async fn install_catalog_plugin(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Path(id): Path<String>,
+    body: Option<Json<CatalogPluginInstallBody>>,
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
     let verified = verify_catalog_package(&state, manager, &id).await?;
@@ -16171,6 +16199,11 @@ pub async fn install_catalog_plugin(
         .distribution
         .as_ref()
         .ok_or_else(|| ApiError::bad("catalog plugin has no installable distribution"))?;
+    crate::plugins::catalog::require_preview_sha256(
+        body.and_then(|Json(body)| body.sha256).as_deref(),
+        &distribution.sha256,
+    )
+    .map_err(|error| ApiError::bad(error.to_string()))?;
     let source = format!(
         "catalog:{}@{}",
         verified.plugin.id, verified.plugin.latest_version
@@ -16185,6 +16218,8 @@ pub async fn install_catalog_plugin(
         )
         .await
         .map_err(plugin_bad)?;
+    state.unregister_plugin_capabilities(&outcome.id);
+    register_enabled_plugin_capabilities(&state, &outcome.id).await;
 
     let _ = db::insert_audit(
         &state.pool,
@@ -16194,8 +16229,8 @@ pub async fn install_catalog_plugin(
         &outcome.id,
         &outcome.id,
         &format!(
-            "Installed trusted catalog plugin {} v{} (SHA-256 {}). Installed disabled pending permission review.",
-            outcome.id, outcome.version, outcome.package_sha256
+            "Installed trusted catalog plugin {} v{} (SHA-256 {}, enabled: {}).",
+            outcome.id, outcome.version, outcome.package_sha256, outcome.enabled
         ),
     )
     .await;
@@ -16206,9 +16241,15 @@ pub async fn install_catalog_plugin(
         "sha256": outcome.package_sha256,
         "signature": outcome.signature.as_str(),
         "provides": outcome.provides,
-        "enabled": false,
+        "enabled": outcome.enabled,
+        "approval_preserved": outcome.approval_preserved,
+        "permission_diff": outcome.permission_diff,
         "source": source,
-        "note": "trusted catalog package installed disabled; review permissions before enabling",
+        "note": if outcome.enabled {
+            "non-expanding update retained its approved permissions and enabled state"
+        } else {
+            "plugin is disabled; review permissions before enabling"
+        },
     })))
 }
 
@@ -16298,6 +16339,33 @@ pub async fn update_plugin_settings(
     Ok(Json(settings))
 }
 
+/// `POST /admin/api/plugins/install/preview` — verify a package and show its permission delta.
+pub async fn preview_install_plugin(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Json(body): Json<PluginInstallBody>,
+) -> ApiResult {
+    let manager = plugin_manager(&state)?;
+    let (bytes, _) = plugin_install_package_bytes(&state, &body).await?;
+    let trusted: Vec<[u8; 32]> = body
+        .trusted_keys
+        .iter()
+        .filter_map(|key| decode_key(key))
+        .collect();
+    let preview = manager
+        .preview_install(
+            &bytes,
+            body.sha256.as_deref(),
+            &trusted,
+            body.allow_untrusted_signature,
+        )
+        .await
+        .map_err(plugin_bad)?;
+    Ok(Json(
+        serde_json::to_value(preview).map_err(ApiError::internal)?,
+    ))
+}
+
 /// `POST /admin/api/plugins/install` — install (or upgrade) a package.
 pub async fn install_plugin(
     State(state): State<AppState>,
@@ -16305,24 +16373,7 @@ pub async fn install_plugin(
     Json(body): Json<PluginInstallBody>,
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
-    let (bytes, source) = if let Some(b64) = &body.package_base64 {
-        use base64::Engine;
-        let b = base64::engine::general_purpose::STANDARD
-            .decode(b64.trim())
-            .map_err(|e| ApiError::bad(format!("invalid package_base64: {e}")))?;
-        (b, "upload".to_string())
-    } else if let Some(url_str) = &body.url {
-        let b = crate::plugins::catalog::download_package_from_url(&state.http, url_str)
-            .await
-            .map_err(|e| ApiError::bad(e.to_string()))?;
-        (b, format!("url:{}", url_str.trim()))
-    } else if let Some(path) = &body.path {
-        let b =
-            std::fs::read(path).map_err(|e| ApiError::bad(format!("cannot read {path}: {e}")))?;
-        (b, format!("file:{path}"))
-    } else {
-        return Err(ApiError::bad("provide package_base64, url, or path"));
-    };
+    let (bytes, source) = plugin_install_package_bytes(&state, &body).await?;
 
     let trusted: Vec<[u8; 32]> = body
         .trusted_keys
@@ -16340,6 +16391,8 @@ pub async fn install_plugin(
         )
         .await
         .map_err(plugin_bad)?;
+    state.unregister_plugin_capabilities(&outcome.id);
+    register_enabled_plugin_capabilities(&state, &outcome.id).await;
 
     let _ = db::insert_audit(
         &state.pool,
@@ -16349,11 +16402,12 @@ pub async fn install_plugin(
         &outcome.id,
         &outcome.id,
         &format!(
-            "Installed plugin {} v{} (signature: {}, provides {} capabilities). Installed disabled.",
+            "Installed plugin {} v{} (signature: {}, provides {} capabilities, enabled: {}).",
             outcome.id,
             outcome.version,
             outcome.signature.as_str(),
-            outcome.provides.len()
+            outcome.provides.len(),
+            outcome.enabled
         ),
     )
     .await;
@@ -16364,8 +16418,14 @@ pub async fn install_plugin(
         "sha256": outcome.package_sha256,
         "signature": outcome.signature.as_str(),
         "provides": outcome.provides,
-        "enabled": false,
-        "note": "installed-disabled; enable is a separate operation",
+        "enabled": outcome.enabled,
+        "approval_preserved": outcome.approval_preserved,
+        "permission_diff": outcome.permission_diff,
+        "note": if outcome.enabled {
+            "non-expanding update retained its approved permissions and enabled state"
+        } else {
+            "installed disabled pending permission review; enable is a separate operation"
+        },
     })))
 }
 
@@ -17825,14 +17885,39 @@ pub async fn enable_plugin(
     Ok(Json(json!({ "ok": true, "id": id, "enabled": true })))
 }
 
-/// `POST /admin/api/plugins/{id}/disable`.
-pub async fn disable_plugin(
+#[derive(Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PluginImpactAcknowledgement {
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+}
+
+/// `GET /admin/api/plugins/{id}/impact` — preview provider and Route dependencies.
+pub async fn plugin_dependency_impact(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Path(id): Path<String>,
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
-    manager.disable(&id).await.map_err(ApiError::internal)?;
+    let impact = manager.dependency_impact(&id).await.map_err(plugin_bad)?;
+    Ok(Json(
+        serde_json::to_value(impact).map_err(ApiError::internal)?,
+    ))
+}
+
+/// `POST /admin/api/plugins/{id}/disable`.
+pub async fn disable_plugin(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+    body: Option<Json<PluginImpactAcknowledgement>>,
+) -> ApiResult {
+    let manager = plugin_manager(&state)?;
+    let acknowledged = body.and_then(|Json(body)| body.fingerprint);
+    manager
+        .disable(&id, acknowledged.as_deref())
+        .await
+        .map_err(plugin_bad)?;
     state.unregister_plugin_capabilities(&id);
     let _ = db::insert_audit(
         &state.pool,
@@ -17852,9 +17937,14 @@ pub async fn remove_plugin(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Path(id): Path<String>,
+    body: Option<Json<PluginImpactAcknowledgement>>,
 ) -> ApiResult {
     let manager = plugin_manager(&state)?;
-    manager.remove(&id).await.map_err(ApiError::internal)?;
+    let acknowledged = body.and_then(|Json(body)| body.fingerprint);
+    manager
+        .remove(&id, acknowledged.as_deref())
+        .await
+        .map_err(plugin_bad)?;
     state.unregister_plugin_capabilities(&id);
     let _ = db::insert_audit(
         &state.pool,
@@ -17867,6 +17957,40 @@ pub async fn remove_plugin(
     )
     .await;
     Ok(Json(json!({ "ok": true, "id": id })))
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PluginVersionPinBody {
+    pub pinned: bool,
+}
+
+/// `PUT /admin/api/plugins/{id}/version-pin` — pin to the installed version or unpin.
+pub async fn set_plugin_version_pin(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+    Json(body): Json<PluginVersionPinBody>,
+) -> ApiResult {
+    let manager = plugin_manager(&state)?;
+    let version = manager
+        .set_version_pin(&id, body.pinned)
+        .await
+        .map_err(plugin_bad)?;
+    let action = if body.pinned {
+        "plugin_version_pinned"
+    } else {
+        "plugin_version_unpinned"
+    };
+    let message = if body.pinned {
+        format!("Pinned plugin to version {version}.")
+    } else {
+        "Removed plugin version pin.".to_string()
+    };
+    let _ = db::insert_audit(&state.pool, "admin", action, "plugin", &id, &id, &message).await;
+    Ok(Json(
+        json!({ "ok": true, "id": id, "pinned_version": if body.pinned { Some(version) } else { None } }),
+    ))
 }
 
 /// `POST /admin/api/plugins/{id}/validate` — re-instantiate and self-check.

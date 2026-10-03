@@ -20,8 +20,11 @@ import {
   Kinetix,
   PluginCatalogEntry,
   PluginCatalogPreview,
+  PluginDependencyImpact,
   PluginDetail,
-  PluginInstallResult,
+  PluginInstallInput,
+  PluginInstallPreview,
+  PluginPermissionDiff,
   PluginPermissionResponse,
   PluginRollbackPreview,
   PluginSettingState,
@@ -80,6 +83,73 @@ function prettyCapability(capability: string): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+function safeHttpsLink(value?: string | null): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+const PermissionDiffReview: React.FC<{ diff: PluginPermissionDiff }> = ({ diff }) => {
+  const lists = [
+    ['Network hosts', diff.network_hosts],
+    ['Credential scopes', diff.credential_scopes],
+  ] as const;
+  const limits = [
+    ['Memory', diff.limits.memory],
+    ['Wall time', diff.limits.wall_time_ms],
+    ['Outbound requests', diff.limits.max_outbound_requests],
+    ['HTTP body', diff.limits.max_http_body],
+    ['Storage', diff.limits.storage],
+  ] as const;
+
+  return (
+    <div className="space-y-3">
+      <p className={`text-sm font-heading font-bold ${diff.increased ? 'text-[var(--danger-text)]' : 'text-[var(--success-text)]'}`}>
+        {diff.increased ? 'Authority increases. Approval is required before enabling.' : 'No authority increase.'}
+      </p>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        {lists.map(([label, change]) => (
+          <div key={label} className="p-3 border border-[var(--ink)]/20 bg-[var(--surface)]">
+            <h4 className="text-xs font-heading font-bold mb-1">{label}</h4>
+            {change.added.length === 0 && change.removed.length === 0 ? (
+              <p className="text-xs font-mono text-[var(--ink)]/55">No change</p>
+            ) : (
+              <div className="space-y-1 text-xs font-mono break-all">
+                {change.added.map((value) => <div key={`add-${label}-${value}`}>+ {value}</div>)}
+                {change.removed.map((value) => <div key={`remove-${label}-${value}`}>- {value}</div>)}
+              </div>
+            )}
+          </div>
+        ))}
+        <div className="p-3 border border-[var(--ink)]/20 bg-[var(--surface)]">
+          <h4 className="text-xs font-heading font-bold mb-1">Credential plaintext</h4>
+          <p className="text-xs font-mono">
+            {diff.credential_read.from ? 'enabled' : 'disabled'} → {diff.credential_read.to ? 'enabled' : 'disabled'}
+            {!diff.credential_read.changed && ' (unchanged)'}
+          </p>
+        </div>
+        <div className="p-3 border border-[var(--ink)]/20 bg-[var(--surface)] md:col-span-2">
+          <h4 className="text-xs font-heading font-bold mb-2">Runtime and request limits</h4>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-xs font-mono">
+            {limits.map(([label, change]) => (
+              <div key={label} className="flex justify-between gap-2">
+                <span>{label}</span>
+                <span className={change.increased ? 'text-[var(--danger-text)] font-bold' : ''}>
+                  {change.from} → {change.to}{!change.changed && ' (unchanged)'}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 export const PluginsView: React.FC = () => {
   const [plugins, setPlugins] = useState<PluginSummary[]>([]);
   const [catalog, setCatalog] = useState<PluginCatalogEntry[]>([]);
@@ -91,7 +161,14 @@ export const PluginsView: React.FC = () => {
   const [settingDrafts, setSettingDrafts] = useState<Record<string, string | boolean>>({});
   const [rollbackPreview, setRollbackPreview] = useState<PluginRollbackPreview | null>(null);
   const [catalogPreview, setCatalogPreview] = useState<PluginCatalogPreview | null>(null);
-  const [pluginToRemove, setPluginToRemove] = useState<string | null>(null);
+  const [installPreview, setInstallPreview] = useState<PluginInstallPreview | null>(null);
+  const [installDraft, setInstallDraft] = useState<PluginInstallInput | null>(null);
+  const [lifecycleReview, setLifecycleReview] = useState<{
+    action: 'disable' | 'remove';
+    id: string;
+    impact: PluginDependencyImpact;
+  } | null>(null);
+  const [impactAcknowledged, setImpactAcknowledged] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [connectionDrafts, setConnectionDrafts] = useState<Record<string, Record<string, string>>>({});
@@ -274,23 +351,48 @@ export const PluginsView: React.FC = () => {
     }
   };
 
-  const removePlugin = async (id: string): Promise<boolean> => {
-    setBusy('remove');
+  const reviewLifecycleAction = async (action: 'disable' | 'remove', id: string) => {
+    setBusy(`impact:${id}`);
     setError(null);
     setNotice(null);
     try {
-      await Kinetix.removePlugin(id);
-      setSelectedId(null);
-      setDetail(null);
-      setPermissions(null);
-      setSettings([]);
-      setSettingDrafts({});
-      setNotice('Plugin removed.');
-      await refresh(null);
-      return true;
+      const impact = await Kinetix.pluginDependencyImpact(id);
+      setImpactAcknowledged(false);
+      setLifecycleReview({ action, id, impact });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-      return false;
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const confirmLifecycleAction = async () => {
+    if (!lifecycleReview) return;
+    const review = lifecycleReview;
+    const hasImpact = review.impact.providers.length > 0 || review.impact.routes.length > 0;
+    if (hasImpact && !impactAcknowledged) return;
+    setBusy(review.action);
+    setError(null);
+    setNotice(null);
+    try {
+      if (review.action === 'disable') {
+        await Kinetix.disablePlugin(review.id, hasImpact ? review.impact.fingerprint : undefined);
+        setNotice('Plugin disabled. Existing Provider and Route bindings remain fail-closed.');
+        setLifecycleReview(null);
+        await refresh(selectedId);
+      } else {
+        await Kinetix.removePlugin(review.id, hasImpact ? review.impact.fingerprint : undefined);
+        setSelectedId(null);
+        setDetail(null);
+        setPermissions(null);
+        setSettings([]);
+        setSettingDrafts({});
+        setNotice('Plugin removed. Existing Provider and Route bindings remain fail-closed.');
+        setLifecycleReview(null);
+        await refresh(null);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(null);
     }
@@ -405,15 +507,33 @@ export const PluginsView: React.FC = () => {
     setError(null);
     setNotice(null);
     try {
-      const outcome = await Kinetix.installCatalogPlugin(preview.id);
+      const outcome = await Kinetix.installCatalogPlugin(preview.id, preview.sha256);
+      if (
+        approveAndEnable &&
+        !outcome.approval_preserved &&
+        JSON.stringify(outcome.permission_diff) !== JSON.stringify(preview.permission_diff)
+      ) {
+        setCatalogPreview(null);
+        await refresh(outcome.id);
+        setError('Plugin was installed disabled, but its permission delta changed since preview. Review it again before approval.');
+        return;
+      }
       if (approveAndEnable) {
-        await Kinetix.approvePluginPermissions(outcome.id);
-        await Kinetix.enablePlugin(outcome.id);
-        setNotice(`Installed, approved, and enabled ${outcome.id} v${outcome.version}.`);
+        if (!outcome.approval_preserved) {
+          await Kinetix.approvePluginPermissions(outcome.id);
+        }
+        if (!outcome.enabled) {
+          await Kinetix.enablePlugin(outcome.id);
+        }
+        setNotice(`Installed and enabled ${outcome.id} v${outcome.version}.`);
+      } else if (outcome.enabled && outcome.approval_preserved) {
+        setNotice(`Updated ${outcome.id} v${outcome.version}; prior approval and enabled state were preserved.`);
+      } else if (outcome.approval_preserved) {
+        setNotice(`Updated ${outcome.id} v${outcome.version}; prior approval was preserved and the plugin remains disabled.`);
+      } else if (preview.current_version) {
+        setNotice(`Updated ${outcome.id} v${outcome.version} disabled. Review and approve its permissions before enabling it.`);
       } else {
-        setNotice(
-          `Installed ${outcome.id} v${outcome.version} from the trusted catalog. Review permissions before enabling it.`,
-        );
+        setNotice(`Installed ${outcome.id} v${outcome.version} from the trusted catalog. Review permissions before enabling it.`);
       }
       setCatalogPreview(null);
       await refresh(outcome.id);
@@ -434,7 +554,7 @@ export const PluginsView: React.FC = () => {
       setError('Enter a valid .kxp download URL.');
       return;
     }
-    setBusy('install');
+    setBusy('install-preview');
     setError(null);
     setNotice(null);
     try {
@@ -442,35 +562,72 @@ export const PluginsView: React.FC = () => {
         .split(/[\n,]/)
         .map((value) => value.trim())
         .filter(Boolean);
-
-      let outcome: PluginInstallResult;
-      if (installTab === 'upload' && packageFile) {
-        const package_base64 = await fileAsBase64(packageFile);
-        outcome = await Kinetix.installPlugin({
-          package_base64,
-          sha256: sha256.trim() || undefined,
-          trusted_keys: keys,
-          allow_untrusted_signature: allowUntrusted,
-        });
-      } else {
-        outcome = await Kinetix.installPlugin({
-          url: installUrl.trim(),
-          sha256: sha256.trim() || undefined,
-          trusted_keys: keys,
-          allow_untrusted_signature: allowUntrusted,
-        });
-      }
-
-      setNotice(
-        `Installed ${outcome.id} v${outcome.version}. Review permissions before enabling it.`,
-      );
+      const input: PluginInstallInput = installTab === 'upload' && packageFile
+        ? {
+            package_base64: await fileAsBase64(packageFile),
+            sha256: sha256.trim() || undefined,
+            trusted_keys: keys,
+            allow_untrusted_signature: allowUntrusted,
+          }
+        : {
+            url: installUrl.trim(),
+            sha256: sha256.trim() || undefined,
+            trusted_keys: keys,
+            allow_untrusted_signature: allowUntrusted,
+          };
+      const preview = await Kinetix.previewPluginInstall(input);
+      setInstallDraft({ ...input, sha256: input.sha256 || preview.package_sha256 });
+      setInstallPreview(preview);
       setShowInstall(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const confirmInstall = async (approveAndEnable: boolean) => {
+    if (!installPreview || !installDraft) return;
+    const preview = installPreview;
+    setBusy('install');
+    setError(null);
+    setNotice(null);
+    try {
+      const outcome = await Kinetix.installPlugin(installDraft);
+      if (
+        approveAndEnable &&
+        !outcome.approval_preserved &&
+        JSON.stringify(outcome.permission_diff) !== JSON.stringify(preview.permission_diff)
+      ) {
+        setInstallPreview(null);
+        setInstallDraft(null);
+        await refresh(preview.id);
+        setError('Plugin was installed disabled, but its permission delta changed since preview. Review it again before approval.');
+        return;
+      }
+      if (approveAndEnable) {
+        if (!outcome.approval_preserved) {
+          await Kinetix.approvePluginPermissions(outcome.id);
+        }
+        if (!outcome.enabled) {
+          await Kinetix.enablePlugin(outcome.id);
+        }
+        setNotice(`Installed and enabled ${outcome.id} v${outcome.version}.`);
+      } else if (outcome.enabled && outcome.approval_preserved) {
+        setNotice(`Updated ${outcome.id} v${outcome.version}; prior approval and enabled state were preserved.`);
+      } else if (outcome.approval_preserved) {
+        setNotice(`Updated ${outcome.id} v${outcome.version}; prior approval was preserved and the plugin remains disabled.`);
+      } else {
+        setNotice(`Installed ${outcome.id} v${outcome.version}. Review permissions before enabling it.`);
+      }
+      setInstallPreview(null);
+      setInstallDraft(null);
       setPackageFile(null);
       setInstallUrl('');
       setSha256('');
       setTrustedKeys('');
       setAllowUntrusted(false);
-      await refresh(outcome.id);
+      await refresh(preview.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -696,13 +853,13 @@ export const PluginsView: React.FC = () => {
               <SketchButton
                 type="submit"
                 variant="primary"
-                disabled={busy === 'install' || (installTab === 'upload' ? !packageFile : !installUrl.trim())}
+                disabled={busy !== null || (installTab === 'upload' ? !packageFile : !installUrl.trim())}
                 className="gap-2"
               >
                 <Upload className="w-4 h-4" />
-                {busy === 'install' ? 'Installing…' : 'Install package'}
+                {busy === 'install-preview' ? 'Reviewing package…' : 'Review package'}
               </SketchButton>
-              <SketchButton type="button" variant="secondary" onClick={() => setShowInstall(false)}>
+              <SketchButton type="button" variant="secondary" disabled={busy !== null} onClick={() => setShowInstall(false)}>
                 Cancel
               </SketchButton>
             </div>
@@ -710,46 +867,150 @@ export const PluginsView: React.FC = () => {
       </Modal>
 
       <Modal
-        open={pluginToRemove !== null}
-        onClose={() => setPluginToRemove(null)}
-        title="Remove plugin?"
-        className="max-w-lg"
+        open={installPreview !== null}
+        onClose={() => {
+          if (busy !== 'install') {
+            setInstallPreview(null);
+            setInstallDraft(null);
+          }
+        }}
+        title={installPreview
+          ? installPreview.current_version
+            ? `Review update: v${installPreview.current_version} to v${installPreview.target_version}`
+            : `Review install: v${installPreview.target_version}`
+          : 'Review plugin package'}
       >
-        <div className="space-y-4 p-5">
-          {error && (
-            <div role="alert" className="p-3 bg-[var(--tint-red)] border border-[var(--marker-red)] text-sm font-mono text-[var(--danger-text)]">
-              {error}
+        {installPreview && (
+          <div className="space-y-4 p-5">
+            {error && <div role="alert" className="p-3 bg-[var(--tint-red)] border border-[var(--marker-red)] text-sm font-mono text-[var(--danger-text)]">{error}</div>}
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="font-heading font-bold">{installPreview.name}</h3>
+                <code className="text-xs font-mono break-all">{installPreview.id}</code>
+              </div>
+              <SketchBadge variant={installPreview.signature === 'verified' ? 'green' : 'yellow'}>
+                {installPreview.signature}
+              </SketchBadge>
             </div>
-          )}
-          <p className="text-sm font-body">
-            This removes the installed package and its host-managed plugin state:
-          </p>
-          <code className="block break-all bg-[var(--erased)] p-3 text-sm">{pluginToRemove}</code>
-          <div className="flex justify-end gap-2">
-            <SketchButton
-              type="button"
-              variant="secondary"
-              onClick={() => setPluginToRemove(null)}
-            >
-              Cancel
-            </SketchButton>
-            <SketchButton
-              type="button"
-              variant="danger"
-              disabled={busy !== null || pluginToRemove === null}
-              onClick={() => {
-                if (!pluginToRemove) return;
-                void removePlugin(pluginToRemove).then((removed) => {
-                  if (removed) setPluginToRemove(null);
-                });
-              }}
-              className="gap-2"
-            >
-              <Trash2 className="w-4 h-4" />
-              {busy === 'remove' ? 'Removing…' : 'Remove plugin'}
-            </SketchButton>
+            <PermissionDiffReview diff={installPreview.permission_diff} />
+            <div className="p-3 bg-[var(--erased)]/60 border border-dashed border-[var(--ink)]/25">
+              <div className="text-xs font-mono break-all">SHA-256: {installPreview.package_sha256}</div>
+              <div className="mt-1 text-xs font-mono text-[var(--ink)]/65">
+                Requested capabilities: {installPreview.provides.map((item) => prettyCapability(item.capability)).join(', ') || 'none'}
+              </div>
+            </div>
+            <div className="flex gap-2 flex-wrap">
+              {!installPreview.current_version || installPreview.permission_diff.increased ? (
+                <>
+                  <SketchButton variant="primary" disabled={busy !== null} onClick={() => void confirmInstall(true)}>
+                    {busy === 'install' ? 'Installing…' : installPreview.current_version ? 'Approve changes & enable update' : 'Approve permissions & install enabled'}
+                  </SketchButton>
+                  <SketchButton variant="secondary" disabled={busy !== null} onClick={() => void confirmInstall(false)}>
+                    {installPreview.current_version ? 'Update disabled for review' : 'Install disabled'}
+                  </SketchButton>
+                </>
+              ) : (
+                <SketchButton variant="primary" disabled={busy !== null} onClick={() => void confirmInstall(false)}>
+                  {busy === 'install' ? 'Updating…' : `Update to v${installPreview.target_version} without expanding authority`}
+                </SketchButton>
+              )}
+              <SketchButton
+                variant="secondary"
+                disabled={busy !== null}
+                onClick={() => {
+                  setInstallPreview(null);
+                  setInstallDraft(null);
+                }}
+              >
+                Cancel
+              </SketchButton>
+            </div>
           </div>
-        </div>
+        )}
+      </Modal>
+
+      <Modal
+        open={lifecycleReview !== null}
+        onClose={() => {
+          if (busy === null) {
+            setLifecycleReview(null);
+            setImpactAcknowledged(false);
+          }
+        }}
+        title={lifecycleReview?.action === 'disable' ? 'Review plugin disable' : 'Review plugin removal'}
+        className="max-w-2xl"
+      >
+        {lifecycleReview && (() => {
+          const impact = lifecycleReview.impact;
+          const hasImpact = impact.providers.length > 0 || impact.routes.length > 0;
+          return (
+            <div className="space-y-4 p-5">
+              <p className="text-sm font-body text-[var(--ink)]/75">
+                {lifecycleReview.action === 'disable'
+                  ? `Disabling ${impact.plugin_id} makes its bound Provider capabilities unavailable. Bindings are retained and fail closed.`
+                  : `Removing ${impact.plugin_id} deletes its plugin state. Existing Provider and Route bindings are retained and fail closed.`}
+              </p>
+              <div className="space-y-3 max-h-[50vh] overflow-y-auto">
+                <section>
+                  <h3 className="font-heading font-bold text-sm">Affected Providers ({impact.providers.length})</h3>
+                  {impact.providers.length === 0 ? (
+                    <p className="text-sm text-[var(--ink)]/60">None</p>
+                  ) : (
+                    <ul className="mt-1 space-y-1 text-sm">
+                      {impact.providers.map((provider) => (
+                        <li key={provider.id} className="border-l-2 border-[var(--ink)]/25 pl-2">
+                          <strong>{provider.name}</strong> <code className="text-xs">{provider.id}</code>
+                          <div className="text-xs text-[var(--ink)]/65">Bindings: {provider.bindings.join(', ')}</div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </section>
+                <section>
+                  <h3 className="font-heading font-bold text-sm">Affected Routes ({impact.routes.length})</h3>
+                  {impact.routes.length === 0 ? (
+                    <p className="text-sm text-[var(--ink)]/60">None</p>
+                  ) : (
+                    <ul className="mt-1 space-y-1 text-sm">
+                      {impact.routes.map((route) => (
+                        <li key={route.id} className="border-l-2 border-[var(--ink)]/25 pl-2">
+                          <strong>{route.name}</strong> <code className="text-xs">{route.id}</code>
+                          <div className="text-xs text-[var(--ink)]/65">
+                            Models: {route.model_ids.join(', ')} · Providers: {route.provider_ids.join(', ')}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </section>
+              </div>
+              {hasImpact && (
+                <label className="flex items-start gap-2 border border-[var(--marker-red)] bg-[var(--tint-red)] p-3 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={impactAcknowledged}
+                    onChange={(event) => setImpactAcknowledged(event.target.checked)}
+                    className="mt-1"
+                  />
+                  <span>I reviewed these affected resources and acknowledge they will remain bound but unavailable until corrected.</span>
+                </label>
+              )}
+              {!hasImpact && <p className="text-sm text-[var(--success-text)]">No Provider or Route dependencies found.</p>}
+              <div className="flex justify-end gap-2">
+                <SketchButton variant="secondary" disabled={busy !== null} onClick={() => setLifecycleReview(null)}>Cancel</SketchButton>
+                <SketchButton
+                  variant="danger"
+                  disabled={busy !== null || (hasImpact && !impactAcknowledged)}
+                  onClick={() => void confirmLifecycleAction()}
+                >
+                  {busy === lifecycleReview.action
+                    ? lifecycleReview.action === 'disable' ? 'Disabling…' : 'Removing…'
+                    : lifecycleReview.action === 'disable' ? 'Disable plugin' : 'Remove plugin'}
+                </SketchButton>
+              </div>
+            </div>
+          );
+        })()}
       </Modal>
 
       {catalog.length > 0 && (
@@ -870,6 +1131,25 @@ export const PluginsView: React.FC = () => {
                     {entry.note && (
                       <p className="mt-3 text-xs font-body text-[var(--ink)]/60">{entry.note}</p>
                     )}
+                    {entry.pinned_version && hasUpdate && (
+                      <p className="mt-2 text-xs font-mono text-amber-800">
+                        Updates blocked: pinned to v{entry.pinned_version}. Unpin from the installed plugin details to update.
+                      </p>
+                    )}
+                    {(safeHttpsLink(entry.release_url) || safeHttpsLink(entry.changelog_url)) && (
+                      <div className="mt-3 flex gap-4 text-xs font-heading font-bold">
+                        {safeHttpsLink(entry.release_url) && (
+                          <a className="underline underline-offset-2" href={safeHttpsLink(entry.release_url)!} target="_blank" rel="noopener noreferrer">
+                            Release
+                          </a>
+                        )}
+                        {safeHttpsLink(entry.changelog_url) && (
+                          <a className="underline underline-offset-2" href={safeHttpsLink(entry.changelog_url)!} target="_blank" rel="noopener noreferrer">
+                            Changelog
+                          </a>
+                        )}
+                      </div>
+                    )}
                     <div className="mt-3 flex items-center justify-between gap-3 flex-wrap">
                       <div className="text-xs font-mono text-[var(--ink)]/55">
                         Artifact: {entry.artifact_name}
@@ -880,15 +1160,17 @@ export const PluginsView: React.FC = () => {
                         <SketchButton
                           variant="primary"
                           className="gap-2"
-                          disabled={busy !== null}
+                          disabled={busy !== null || Boolean(entry.pinned_version && hasUpdate)}
                           onClick={() => void reviewCatalogInstall(entry)}
                         >
                           <ShieldCheck className="w-4 h-4" />
                           {busy === `catalog-preview:${entry.id}`
                             ? 'Verifying…'
-                            : hasUpdate
-                              ? `Review update to v${entry.latest_version}`
-                              : 'Review install'}
+                            : entry.pinned_version && hasUpdate
+                              ? `Pinned to v${entry.pinned_version}`
+                              : hasUpdate
+                                ? `Review update to v${entry.latest_version}`
+                                : 'Review install'}
                         </SketchButton>
                       ) : (
                         <SketchBadge variant="yellow">
@@ -934,51 +1216,8 @@ export const PluginsView: React.FC = () => {
             <SketchBadge variant="green">Signature verified</SketchBadge>
           </div>
 
-          <div className="mt-4 grid grid-cols-1 lg:grid-cols-3 gap-4">
-            <div>
-              <h4 className="font-heading font-bold text-sm mb-2">Network hosts</h4>
-              {catalogPreview.permission_diff.network_hosts.added.length === 0 &&
-              catalogPreview.permission_diff.network_hosts.removed.length === 0 ? (
-                <p className="text-xs font-mono text-[var(--ink)]/55">No change</p>
-              ) : (
-                <div className="space-y-1 text-xs font-mono">
-                  {catalogPreview.permission_diff.network_hosts.added.map((value) => (
-                    <div key={`catalog-host-add-${value}`}>+ {value}</div>
-                  ))}
-                  {catalogPreview.permission_diff.network_hosts.removed.map((value) => (
-                    <div key={`catalog-host-remove-${value}`}>− {value}</div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div>
-              <h4 className="font-heading font-bold text-sm mb-2">Credential scopes</h4>
-              {catalogPreview.permission_diff.credential_scopes.added.length === 0 &&
-              catalogPreview.permission_diff.credential_scopes.removed.length === 0 ? (
-                <p className="text-xs font-mono text-[var(--ink)]/55">No change</p>
-              ) : (
-                <div className="space-y-1 text-xs font-mono">
-                  {catalogPreview.permission_diff.credential_scopes.added.map((value) => (
-                    <div key={`catalog-scope-add-${value}`}>+ {value}</div>
-                  ))}
-                  {catalogPreview.permission_diff.credential_scopes.removed.map((value) => (
-                    <div key={`catalog-scope-remove-${value}`}>− {value}</div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div>
-              <h4 className="font-heading font-bold text-sm mb-2">Credential plaintext</h4>
-              <p className="text-xs font-mono">
-                {catalogPreview.permission_diff.credential_read.changed
-                  ? `${catalogPreview.permission_diff.credential_read.from ? 'enabled' : 'disabled'} → ${catalogPreview.permission_diff.credential_read.to ? 'enabled' : 'disabled'}`
-                  : catalogPreview.permission_diff.credential_read.to
-                    ? 'enabled (unchanged)'
-                    : 'disabled (unchanged)'}
-              </p>
-            </div>
+          <div className="mt-4">
+            <PermissionDiffReview diff={catalogPreview.permission_diff} />
           </div>
 
           <div className="mt-4 p-3 bg-[var(--erased)]/60 border border-dashed border-[var(--ink)]/25">
@@ -989,26 +1228,43 @@ export const PluginsView: React.FC = () => {
           </div>
 
           <div className="mt-4 flex gap-2 flex-wrap items-center">
-            <SketchButton
-              variant="primary"
-              disabled={busy !== null}
-              onClick={() => void confirmCatalogInstall(true)}
-            >
-              <CheckCircle2 className="w-4 h-4" />
-              {busy === `catalog:${catalogPreview.id}`
-                ? 'Installing…'
-                : catalogPreview.current_version
-                  ? `Update & Enable (v${catalogPreview.target_version})`
-                  : `Install & Enable (v${catalogPreview.target_version})`}
-            </SketchButton>
-            <SketchButton
-              variant="secondary"
-              disabled={busy !== null}
-              onClick={() => void confirmCatalogInstall(false)}
-            >
-              <PackagePlus className="w-4 h-4" />
-              Install Disabled (Review Later)
-            </SketchButton>
+            {!catalogPreview.current_version || catalogPreview.permission_diff.increased ? (
+              <>
+                <SketchButton
+                  variant="primary"
+                  disabled={busy !== null}
+                  onClick={() => void confirmCatalogInstall(true)}
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  {busy === `catalog:${catalogPreview.id}`
+                    ? 'Installing…'
+                    : catalogPreview.current_version
+                      ? `Approve authority increase & enable (v${catalogPreview.target_version})`
+                      : `Approve permissions & install enabled (v${catalogPreview.target_version})`}
+                </SketchButton>
+                <SketchButton
+                  variant="secondary"
+                  disabled={busy !== null}
+                  onClick={() => void confirmCatalogInstall(false)}
+                >
+                  <PackagePlus className="w-4 h-4" />
+                  {catalogPreview.current_version ? 'Update disabled for review' : 'Install disabled'}
+                </SketchButton>
+              </>
+            ) : (
+              <SketchButton
+                variant="primary"
+                disabled={busy !== null}
+                onClick={() => void confirmCatalogInstall(false)}
+              >
+                <PackagePlus className="w-4 h-4" />
+                {busy === `catalog:${catalogPreview.id}`
+                  ? 'Updating…'
+                  : plugins.find((plugin) => plugin.id === catalogPreview.id)?.status === 'enabled'
+                    ? `Update and retain enabled state (v${catalogPreview.target_version})`
+                    : `Update and retain disabled state (v${catalogPreview.target_version})`}
+              </SketchButton>
+            )}
             <SketchButton
               variant="secondary"
               disabled={busy !== null}
@@ -1058,6 +1314,7 @@ export const PluginsView: React.FC = () => {
               </div>
               <div className="mt-2 text-xs font-mono text-[var(--ink)]/70">
                 v{plugin.version} · API {plugin.plugin_api_major}
+                {plugin.pinned_version && <span className="ml-2 text-amber-800">Pinned v{plugin.pinned_version}</span>}
               </div>
             </button>
           ))}
@@ -1077,6 +1334,9 @@ export const PluginsView: React.FC = () => {
                       <SketchBadge variant={selected.signature === 'verified' ? 'green' : 'yellow'}>
                         {selected.signature}
                       </SketchBadge>
+                      {selected.pinned_version && (
+                        <SketchBadge variant="yellow">Pinned v{selected.pinned_version}</SketchBadge>
+                      )}
                     </div>
                     <div className="font-mono text-xs text-[var(--ink)]/60 mt-1 break-all">{selected.id}</div>
                     <div className="font-mono text-xs text-[var(--ink)]/60 mt-1 break-all">
@@ -1097,17 +1357,22 @@ export const PluginsView: React.FC = () => {
                     >
                       Validate
                     </SketchButton>
+                    <SketchButton
+                      variant="secondary"
+                      disabled={busy !== null}
+                      onClick={() => void mutate(
+                        'version-pin',
+                        () => Kinetix.setPluginVersionPin(selected.id, !selected.pinned_version),
+                        selected.pinned_version ? 'Plugin version unpinned.' : `Plugin pinned to v${selected.version}.`,
+                      )}
+                    >
+                      {selected.pinned_version ? 'Unpin version' : 'Pin current version'}
+                    </SketchButton>
                     {selected.status === 'enabled' ? (
                       <SketchButton
                         variant="secondary"
                         disabled={busy !== null}
-                        onClick={() =>
-                          void mutate(
-                            'disable',
-                            () => Kinetix.disablePlugin(selected.id),
-                            'Plugin disabled.',
-                          )
-                        }
+                        onClick={() => void reviewLifecycleAction('disable', selected.id)}
                         className="gap-2"
                       >
                         <PowerOff className="w-4 h-4" /> Disable
@@ -1516,51 +1781,8 @@ export const PluginsView: React.FC = () => {
                     </SketchBadge>
                   </div>
 
-                  <div className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-4">
-                    <div>
-                      <h5 className="font-heading font-bold text-sm mb-2">Network hosts</h5>
-                      {rollbackPreview.permission_diff.network_hosts.added.length === 0 &&
-                      rollbackPreview.permission_diff.network_hosts.removed.length === 0 ? (
-                        <p className="text-xs font-mono text-[var(--ink)]/55">No change</p>
-                      ) : (
-                        <div className="space-y-1 text-xs font-mono">
-                          {rollbackPreview.permission_diff.network_hosts.added.map((value) => (
-                            <div key={`host-add-${value}`}>+ {value}</div>
-                          ))}
-                          {rollbackPreview.permission_diff.network_hosts.removed.map((value) => (
-                            <div key={`host-remove-${value}`}>− {value}</div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-
-                    <div>
-                      <h5 className="font-heading font-bold text-sm mb-2">Credential scopes</h5>
-                      {rollbackPreview.permission_diff.credential_scopes.added.length === 0 &&
-                      rollbackPreview.permission_diff.credential_scopes.removed.length === 0 ? (
-                        <p className="text-xs font-mono text-[var(--ink)]/55">No change</p>
-                      ) : (
-                        <div className="space-y-1 text-xs font-mono">
-                          {rollbackPreview.permission_diff.credential_scopes.added.map((value) => (
-                            <div key={`scope-add-${value}`}>+ {value}</div>
-                          ))}
-                          {rollbackPreview.permission_diff.credential_scopes.removed.map((value) => (
-                            <div key={`scope-remove-${value}`}>− {value}</div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="mt-4 p-3 bg-[var(--erased)]/60 border border-dashed border-[var(--ink)]/25 text-sm">
-                    Plaintext credential access:{' '}
-                    <strong>
-                      {rollbackPreview.permission_diff.credential_read.changed
-                        ? `${rollbackPreview.permission_diff.credential_read.from ? 'enabled' : 'disabled'} → ${rollbackPreview.permission_diff.credential_read.to ? 'enabled' : 'disabled'}`
-                        : rollbackPreview.permission_diff.credential_read.to
-                          ? 'enabled (unchanged)'
-                          : 'disabled (unchanged)'}
-                    </strong>
+                  <div className="mt-4">
+                    <PermissionDiffReview diff={rollbackPreview.permission_diff} />
                   </div>
 
                   <div className="mt-4 flex gap-2 flex-wrap">
@@ -1688,15 +1910,13 @@ export const PluginsView: React.FC = () => {
                   <div className="flex-1">
                     <h4 className="font-heading font-bold">Remove plugin</h4>
                     <p className="text-sm font-body text-[var(--ink)]/70">
-                      Removes the installed plugin and its host-managed plugin state.
+                      Removes plugin state. Provider and Route bindings are retained and may become unavailable.
                     </p>
                   </div>
                   <SketchButton
                     variant="danger"
                     disabled={busy !== null}
-                    onClick={() => {
-                      setPluginToRemove(selected.id);
-                    }}
+                    onClick={() => void reviewLifecycleAction('remove', selected.id)}
                     className="gap-2"
                   >
                     <Trash2 className="w-4 h-4" /> Remove

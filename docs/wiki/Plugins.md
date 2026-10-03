@@ -527,15 +527,25 @@ and applies the same distribution trust checks as installation:
 - manifest id and version match;
 - Ed25519 signature from the separately trusted publisher key.
 
-Kinetix then compares the target manifest with the currently active manifest
-(or an empty permission set for a first install) and shows semantic changes to
-`network_hosts`, `credential_scopes`, and `credential_read`.
+Kinetix compares the target manifest with the currently active manifest and
+shows added/removed `network_hosts` and `credential_scopes`, changes to
+`credential_read`, and increases/decreases for memory, wall time, outbound
+requests, HTTP body size, and storage limits. The same diff is available for
+local package previews and in the CLI.
 
 Confirmation does not reuse the preview as an authorization token. Kinetix
-downloads and verifies the artifact again before installation, then installs it
-disabled with permission grants cleared.
+downloads and verifies the artifact again before installation, and the
+catalog install request includes the previewed package SHA so changed releases
+are rejected. New installs and updates that expand authority remain disabled
+with no grants until the operator reviews and approves permissions. A non-expanding update preserves the prior
+grants and enabled state only when the old grants exactly matched the old
+manifest. If the plugin was already disabled, it stays disabled.
 
 ## Version history and rollback
+
+A version pin records the currently installed version and blocks updates to a
+different version until unpinned. Catalog entries may include explicit release
+or changelog URLs; Kinetix exposes links only when supplied by the catalog.
 
 Kinetix retains accepted package bytes independently from the active plugin row.
 The dashboard shows every retained version, its SHA-256, provenance source, and
@@ -552,12 +562,9 @@ Rolling back is deliberately a reactivation, not a pointer swap:
 7. activate it through the normal plugin upsert path.
 
 Before rollback, the dashboard requests a retained-package preview. Kinetix
-re-hashes and revalidates the target package, then computes a semantic
-permission delta for:
-
-- added/removed `network_hosts`;
-- added/removed `credential_scopes`;
-- changes to `credential_read`.
+re-hashes and revalidates the target package, then computes the same semantic
+diff across network hosts, credential scopes, credential-read access, and all
+runtime/request limits.
 
 The reactivated package is always **disabled** and all permission grants are
 cleared even when the diff is empty. An operator must review and approve the
@@ -565,27 +572,34 @@ rolled-back manifest before it can be enabled again.
 
 ## Operating Plugins
 
+Before disabling or removing a plugin, Kinetix previews Providers bound through
+plugin capabilities and Routes reaching Models from those Providers. Both
+operations refuse to proceed while referenced unless the caller acknowledges
+the current impact fingerprint. Provider bindings and Route targets are
+retained and fail closed after disable or removal; Kinetix never substitutes a
+native capability.
+
 ### CLI Workflow
 
 ```bash
-# 1. Install package (installed-disabled by default)
+# Install packages; review the exact authority delta printed for updates.
 kinetix plugin install /path/to/dev.kinetix.antigravity-oauth-0.1.0.kxp \
   --allow-untrusted-signature
 
-# 2. View manifest and requested permissions
+# New installs and expanding updates require approval before enablement.
 kinetix plugin show dev.kinetix.antigravity-oauth
-
-# 3. Approve declared permissions (all-or-nothing)
 kinetix plugin approve dev.kinetix.antigravity-oauth
-
-# 4. Enable the plugin
 kinetix plugin enable dev.kinetix.antigravity-oauth
-
-# 5. Verify exports and linking
 kinetix plugin validate dev.kinetix.antigravity-oauth
 
-# 6. List active plugins
-kinetix plugin list
+# Pin the installed version to prevent updates; unpin before changing version.
+kinetix plugin pin dev.kinetix.antigravity-oauth
+kinetix plugin unpin dev.kinetix.antigravity-oauth
+
+# Review bindings before disabling/removing. --force acknowledges that preview.
+kinetix plugin impact dev.kinetix.antigravity-oauth
+kinetix plugin disable dev.kinetix.antigravity-oauth --force
+kinetix plugin remove dev.kinetix.antigravity-oauth --force
 ```
 
 ### Binding to Providers

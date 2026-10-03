@@ -344,7 +344,7 @@ async fn enable_requires_explicit_permission_approval() {
 }
 
 #[tokio::test]
-async fn upgrade_disables_plugin_and_clears_previous_approvals() {
+async fn non_expanding_upgrade_preserves_valid_approval_and_enabled_state() {
     let (m, pool) = manager().await;
     let kxp = build_kxp(GOOD_MANIFEST, VALID_COMPONENT);
     m.install(&kxp, None, &[], false).await.unwrap();
@@ -355,16 +355,20 @@ async fn upgrade_disables_plugin_and_clears_previous_approvals() {
 
     let upgraded = GOOD_MANIFEST.replace("version = \"1.2.0\"", "version = \"1.3.0\"");
     let upgraded_kxp = build_kxp(&upgraded, VALID_COMPONENT);
-    m.install(&upgraded_kxp, None, &[], false).await.unwrap();
+    let outcome = m.install(&upgraded_kxp, None, &[], false).await.unwrap();
 
     let row = m.get("dev.example.foo").await.unwrap().unwrap();
     assert_eq!(row.version, "1.3.0");
-    assert_eq!(row.enabled, 0);
-    assert!(
+    assert_eq!(row.enabled, 1);
+    assert!(outcome.approval_preserved);
+    assert!(outcome.enabled);
+    assert!(!outcome.permission_diff.increased);
+    assert_eq!(
         kinetix::plugins::store::permissions(&pool, "dev.example.foo")
             .await
             .unwrap()
-            .is_empty()
+            .len(),
+        2
     );
 
     let packages = kinetix::plugins::store::list_packages(&pool, "dev.example.foo")
@@ -373,6 +377,189 @@ async fn upgrade_disables_plugin_and_clears_previous_approvals() {
     assert_eq!(packages.len(), 2);
     assert!(packages.iter().any(|p| p.version == "1.2.0"));
     assert!(packages.iter().any(|p| p.version == "1.3.0"));
+}
+
+#[tokio::test]
+async fn expanding_upgrade_clears_approval_and_disables_plugin() {
+    let (m, pool) = manager().await;
+    m.install(&build_kxp(GOOD_MANIFEST, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+    kinetix::plugins::store::set_enabled(&pool, "dev.example.foo", true)
+        .await
+        .unwrap();
+
+    let expanded = GOOD_MANIFEST
+        .replace("version = \"1.2.0\"", "version = \"1.3.0\"")
+        .replace("memory = \"64MiB\"", "memory = \"128MiB\"")
+        .replace(
+            "network_hosts = [\"api.foo.example\"]",
+            "network_hosts = [\"api.foo.example\", \"new.foo.example\"]",
+        );
+    let outcome = m
+        .install(&build_kxp(&expanded, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+
+    let row = m.get("dev.example.foo").await.unwrap().unwrap();
+    assert_eq!(row.enabled, 0);
+    assert!(!outcome.approval_preserved);
+    assert!(!outcome.enabled);
+    assert!(outcome.permission_diff.increased);
+    assert_eq!(
+        outcome.permission_diff.network_hosts.added,
+        vec!["new.foo.example".to_string()]
+    );
+    assert!(outcome.permission_diff.limits.memory.increased);
+    assert!(
+        kinetix::plugins::store::permissions(&pool, "dev.example.foo")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn pinned_plugin_rejects_different_version_until_unpinned() {
+    let (m, _pool) = manager().await;
+    m.install(&build_kxp(GOOD_MANIFEST, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        m.set_version_pin("dev.example.foo", true).await.unwrap(),
+        "1.2.0"
+    );
+
+    let upgraded = GOOD_MANIFEST.replace("version = \"1.2.0\"", "version = \"1.3.0\"");
+    let err = m
+        .install(&build_kxp(&upgraded, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("pinned to version 1.2.0"), "{err}");
+    assert_eq!(
+        m.get("dev.example.foo")
+            .await
+            .unwrap()
+            .unwrap()
+            .pinned_version
+            .as_deref(),
+        Some("1.2.0")
+    );
+
+    m.set_version_pin("dev.example.foo", false).await.unwrap();
+    assert_eq!(
+        m.install(&build_kxp(&upgraded, VALID_COMPONENT), None, &[], false)
+            .await
+            .unwrap()
+            .version,
+        "1.3.0"
+    );
+}
+
+#[tokio::test]
+async fn dependency_impact_requires_current_acknowledgement_for_disable_and_remove() {
+    let (m, pool) = manager().await;
+    m.install(&build_kxp(GOOD_MANIFEST, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+    m.enable("dev.example.foo").await.unwrap();
+
+    let provider_id = db::insert_provider(
+        &pool,
+        &db::NewProvider {
+            name: "Plugin-backed",
+            base_url: "https://foo.example",
+            wire_format: kinetix::types::WireFormat::Openai,
+            auth_scheme: kinetix::types::AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: serde_json::json!({}),
+            timeout_ms: 30_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: serde_json::json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: false,
+            wire_plugin: "",
+            credential_plugin: "",
+            model_source_plugin: "plugin:dev.example.foo/foo-models",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let model_id = db::insert_model(
+        &pool,
+        &db::NewModel {
+            provider_id: &provider_id,
+            upstream_id: "foo-model",
+            display_name: "Foo model",
+            enabled: true,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: serde_json::json!({}),
+            prices: serde_json::json!({}),
+            parameters: serde_json::json!({}),
+            thinking_map: serde_json::json!({}),
+            extra_request: serde_json::json!({}),
+            discovery: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let route_id = db::insert_route(
+        &pool,
+        &db::NewRoute {
+            name: "Foo Route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: serde_json::json!([]),
+            portability_policy: "strict",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: None,
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::insert_route_target(&pool, &route_id, None, &model_id, 0, 1, "{}", "{}")
+        .await
+        .unwrap();
+
+    let impact = m.dependency_impact("dev.example.foo").await.unwrap();
+    assert_eq!(impact.providers.len(), 1);
+    assert_eq!(impact.providers[0].id, provider_id);
+    assert_eq!(impact.routes.len(), 1);
+    assert_eq!(impact.routes[0].id, route_id);
+    assert_eq!(impact.routes[0].model_ids, vec![model_id]);
+
+    // A preview fingerprint cannot authorize a mutation after bindings change.
+    db::clear_route_targets(&pool, &route_id).await.unwrap();
+    assert!(m
+        .disable("dev.example.foo", Some(&impact.fingerprint))
+        .await
+        .is_err());
+    let refreshed = m.dependency_impact("dev.example.foo").await.unwrap();
+    assert!(refreshed.routes.is_empty());
+    assert_ne!(refreshed.fingerprint, impact.fingerprint);
+    assert!(m.disable("dev.example.foo", None).await.is_err());
+    assert_eq!(m.get("dev.example.foo").await.unwrap().unwrap().enabled, 1);
+
+    m.disable("dev.example.foo", Some(&refreshed.fingerprint))
+        .await
+        .unwrap();
+    assert_eq!(m.get("dev.example.foo").await.unwrap().unwrap().enabled, 0);
+    assert!(m.remove("dev.example.foo", None).await.is_err());
+    m.remove("dev.example.foo", Some(&refreshed.fingerprint))
+        .await
+        .unwrap();
+    assert!(m.get("dev.example.foo").await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -486,7 +673,7 @@ async fn reinstall_from_retained_package_recovers_after_removal() {
 
     // Remove the plugin: the active row (and cascaded permissions) go away, but
     // the content-addressed package provenance is retained.
-    m.remove("dev.example.foo").await.unwrap();
+    m.remove("dev.example.foo", None).await.unwrap();
     assert!(m.get("dev.example.foo").await.unwrap().is_none());
     assert_eq!(
         kinetix::plugins::store::list_packages(&pool, "dev.example.foo")
@@ -707,7 +894,7 @@ async fn removing_a_plugin_cascades_stored_state() {
             .unwrap()
             > 0
     );
-    m.remove("dev.example.foo").await.unwrap();
+    m.remove("dev.example.foo", None).await.unwrap();
     assert!(m.get("dev.example.foo").await.unwrap().is_none());
     // KV rows are gone via ON DELETE CASCADE.
     assert_eq!(

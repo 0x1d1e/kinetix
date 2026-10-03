@@ -357,7 +357,10 @@ export interface PluginCatalogEntry {
   trust_status?: 'trusted' | 'unavailable' | 'discovery_only' | string;
   installed?: boolean;
   installed_version?: string | null;
+  pinned_version?: string | null;
   update_available?: boolean;
+  release_url?: string | null;
+  changelog_url?: string | null;
   distribution?: {
     url: string;
     sha256: string;
@@ -455,6 +458,7 @@ export interface PluginSummary {
   id: string;
   name: string;
   version: string;
+  pinned_version?: string | null;
   plugin_api_major: number;
   compatibility: PluginCompatibility;
   sha256: string;
@@ -501,12 +505,39 @@ export interface PluginPermissionBoolDiff {
   from: boolean;
   to: boolean;
   changed: boolean;
+  increased: boolean;
+}
+
+export interface PluginPermissionSizeDiff {
+  from: string;
+  to: string;
+  from_bytes: number;
+  to_bytes: number;
+  changed: boolean;
+  increased: boolean;
+}
+
+export interface PluginPermissionNumberDiff<T extends number> {
+  from: T;
+  to: T;
+  changed: boolean;
+  increased: boolean;
+}
+
+export interface PluginPermissionLimitDiff {
+  memory: PluginPermissionSizeDiff;
+  wall_time_ms: PluginPermissionNumberDiff<number>;
+  max_outbound_requests: PluginPermissionNumberDiff<number>;
+  max_http_body: PluginPermissionSizeDiff;
+  storage: PluginPermissionSizeDiff;
 }
 
 export interface PluginPermissionDiff {
   network_hosts: PluginPermissionListDiff;
   credential_scopes: PluginPermissionListDiff;
   credential_read: PluginPermissionBoolDiff;
+  limits: PluginPermissionLimitDiff;
+  increased: boolean;
 }
 
 export interface PluginRollbackPreview {
@@ -540,6 +571,38 @@ export interface PluginDetail extends PluginSummary {
   packages?: PluginPackage[];
 }
 
+export interface PluginDependencyProvider {
+  id: string;
+  name: string;
+  bindings: string[];
+}
+
+export interface PluginDependencyRoute {
+  id: string;
+  name: string;
+  model_ids: string[];
+  provider_ids: string[];
+}
+
+export interface PluginDependencyImpact {
+  plugin_id: string;
+  providers: PluginDependencyProvider[];
+  routes: PluginDependencyRoute[];
+  fingerprint: string;
+}
+
+export interface PluginInstallPreview {
+  id: string;
+  name: string;
+  current_version: string | null;
+  target_version: string;
+  package_sha256: string;
+  signature: string;
+  permissions: PluginPermissions;
+  permission_diff: PluginPermissionDiff;
+  provides: PluginCapability[];
+}
+
 export interface PluginInstallInput {
   package_base64?: string;
   url?: string;
@@ -555,6 +618,8 @@ export interface PluginInstallResult {
   signature: string;
   provides: PluginCapability[];
   enabled: boolean;
+  approval_preserved?: boolean;
+  permission_diff?: PluginPermissionDiff;
   note?: string;
 }
 
@@ -757,9 +822,10 @@ export const Kinetix = {
     api.get<PluginCatalogPreview>(
       `/admin/api/plugins/catalog/${encodeURIComponent(id)}/preview`,
     ),
-  installCatalogPlugin: (id: string) =>
+  installCatalogPlugin: (id: string, sha256: string) =>
     api.post<PluginInstallResult>(
       `/admin/api/plugins/catalog/${encodeURIComponent(id)}/install`,
+      { sha256 },
     ),
   plugin: (id: string) =>
     api.get<PluginDetail>(`/admin/api/plugins/${encodeURIComponent(id)}`),
@@ -776,6 +842,8 @@ export const Kinetix = {
       `/admin/api/plugins/${encodeURIComponent(id)}/settings`,
       { values },
     ),
+  previewPluginInstall: (body: PluginInstallInput) =>
+    api.post<PluginInstallPreview>('/admin/api/plugins/install/preview', body),
   installPlugin: (body: PluginInstallInput) =>
     api.post<PluginInstallResult>('/admin/api/plugins/install', body),
   setupPluginIntegrationProvider: (pluginId: string, integrationId: string, connectionValues: Record<string, string> = {}) =>
@@ -817,9 +885,19 @@ export const Kinetix = {
     api.post<{ ok: boolean; id: string; enabled: boolean }>(
       `/admin/api/plugins/${encodeURIComponent(id)}/enable`,
     ),
-  disablePlugin: (id: string) =>
+  disablePlugin: (id: string, fingerprint?: string) =>
     api.post<{ ok: boolean; id: string; enabled: boolean }>(
       `/admin/api/plugins/${encodeURIComponent(id)}/disable`,
+      fingerprint ? { fingerprint } : {},
+    ),
+  pluginDependencyImpact: (id: string) =>
+    api.get<PluginDependencyImpact>(
+      `/admin/api/plugins/${encodeURIComponent(id)}/impact`,
+    ),
+  setPluginVersionPin: (id: string, pinned: boolean) =>
+    api.put<{ ok: boolean; id: string; pinned_version: string | null }>(
+      `/admin/api/plugins/${encodeURIComponent(id)}/version-pin`,
+      { pinned },
     ),
   validatePlugin: (id: string) =>
     api.post<{ ok: boolean; id: string; provides: PluginCapability[] }>(
@@ -838,9 +916,10 @@ export const Kinetix = {
     api.post<PluginInstallResult>(
       `/admin/api/plugins/${encodeURIComponent(id)}/packages/${encodeURIComponent(sha256)}/reinstall`,
     ),
-  removePlugin: (id: string) =>
+  removePlugin: (id: string, fingerprint?: string) =>
     api.del<{ ok: boolean; id: string }>(
       `/admin/api/plugins/${encodeURIComponent(id)}`,
+      fingerprint ? { fingerprint } : {},
     ),
 
   // --- audit ---------------------------------------------------------------

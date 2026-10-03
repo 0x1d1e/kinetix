@@ -424,21 +424,53 @@ pub enum PluginAction {
     /// List installed plugins.
     List,
     /// Show one plugin's manifest, permissions, and runtime state.
-    Show { id: String },
+    Show {
+        id: String,
+    },
     /// Enable an installed plugin.
-    Enable { id: String },
-    /// Disable a plugin (new requests stop referencing it).
-    Disable { id: String },
+    Enable {
+        id: String,
+    },
+    /// Preview provider and Route dependencies for a plugin.
+    Impact {
+        id: String,
+    },
+    /// Pin or unpin the currently installed version.
+    Pin {
+        id: String,
+    },
+    Unpin {
+        id: String,
+    },
+    /// Disable a plugin, refusing referenced bindings unless --force acknowledges the preview.
+    Disable {
+        id: String,
+        #[arg(long)]
+        force: bool,
+    },
     /// Validate a plugin by instantiating it (self-check).
-    Validate { id: String },
-    /// Remove a plugin and its stored state.
-    Remove { id: String },
+    Validate {
+        id: String,
+    },
+    /// Remove a plugin, refusing referenced bindings unless --force acknowledges the preview.
+    Remove {
+        id: String,
+        #[arg(long)]
+        force: bool,
+    },
     /// List approved permission grants.
-    Permissions { id: String },
+    Permissions {
+        id: String,
+    },
     /// Approve the plugin's currently declared permission set (all-or-nothing).
-    Approve { id: String },
+    Approve {
+        id: String,
+    },
     /// Revoke one permission grant (KV state is retained).
-    Revoke { id: String, permission: String },
+    Revoke {
+        id: String,
+        permission: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1517,6 +1549,23 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                 if sig_status != crate::plugins::package::SignatureStatus::Verified {
                     bail!("catalog package is not signed by trusted publisher key");
                 }
+                let current = manager.get(&plugin.id).await?;
+                if let Some(pinned) = current
+                    .as_ref()
+                    .and_then(|row| row.pinned_version.as_deref())
+                {
+                    if pinned != validated.manifest.version {
+                        bail!(
+                            "plugin '{}' is pinned to version {pinned}; unpin it before updating",
+                            plugin.id
+                        );
+                    }
+                }
+                let permission_diff = crate::plugins::manager::permission_diff_from_installed(
+                    current.as_ref(),
+                    &validated.manifest,
+                )?;
+                print_plugin_permission_diff(&permission_diff)?;
 
                 let source = format!("catalog:{}@{}", plugin.id, plugin.latest_version);
                 let outcome = manager
@@ -1524,11 +1573,12 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                     .await?;
 
                 println!(
-                    "installed {} v{} (signature: {}); {} capabilities",
+                    "installed {} v{} (signature: {}); {} capabilities; enabled: {}",
                     outcome.id,
                     outcome.version,
                     outcome.signature.as_str(),
-                    outcome.provides.len()
+                    outcome.provides.len(),
+                    outcome.enabled
                 );
                 for p in &outcome.provides {
                     println!("  provides {:?} = {}", p.capability, p.name);
@@ -1559,10 +1609,16 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                 if approve || enable {
                     let grants = manager.approve_permissions(&outcome.id).await?;
                     println!("approved {} grant(s) for '{}'", grants.len(), outcome.id);
-                } else {
+                } else if !outcome.approval_preserved {
                     println!("\nInstalled disabled pending permission review. Run:");
                     println!("  kinetix plugin approve {}", outcome.id);
                     println!("  kinetix plugin enable {}", outcome.id);
+                } else if outcome.enabled {
+                    println!(
+                        "Non-expanding update retained approved permissions and enabled state."
+                    );
+                } else {
+                    println!("Non-expanding update retained approved permissions; plugin remains disabled.");
                 }
 
                 if enable {
@@ -1602,6 +1658,15 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                     }
                 }
 
+                let pkg = crate::plugins::package::read_package(&bytes)?;
+                let validated = crate::plugins::package::validate_manifest(&pkg, manager.policy())?;
+                let current = manager.get(&validated.manifest.id).await?;
+                let permission_diff = crate::plugins::manager::permission_diff_from_installed(
+                    current.as_ref(),
+                    &validated.manifest,
+                )?;
+                print_plugin_permission_diff(&permission_diff)?;
+
                 let outcome = manager
                     .install_from_source(
                         &bytes,
@@ -1612,11 +1677,12 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                     )
                     .await?;
                 println!(
-                    "installed {} v{} (signature: {}); {} capabilities",
+                    "installed {} v{} (signature: {}); {} capabilities; enabled: {}",
                     outcome.id,
                     outcome.version,
                     outcome.signature.as_str(),
-                    outcome.provides.len()
+                    outcome.provides.len(),
+                    outcome.enabled
                 );
                 for p in &outcome.provides {
                     println!("  provides {:?} = {}", p.capability, p.name);
@@ -1625,6 +1691,16 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                 if approve || enable {
                     let grants = manager.approve_permissions(&outcome.id).await?;
                     println!("approved {} grant(s) for '{}'", grants.len(), outcome.id);
+                } else if !outcome.approval_preserved {
+                    println!("\nInstalled disabled pending permission review. Run:");
+                    println!("  kinetix plugin approve {}", outcome.id);
+                    println!("  kinetix plugin enable {}", outcome.id);
+                } else if outcome.enabled {
+                    println!(
+                        "Non-expanding update retained approved permissions and enabled state."
+                    );
+                } else {
+                    println!("Non-expanding update retained approved permissions; plugin remains disabled.");
                 }
 
                 if enable {
@@ -1752,6 +1828,12 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                 if let Some(note) = &p.note {
                     println!("Note:         {}", note);
                 }
+                if let Some(url) = &p.release_url {
+                    println!("Release:      {}", url);
+                }
+                if let Some(url) = &p.changelog_url {
+                    println!("Changelog:    {}", url);
+                }
                 Ok(())
             }
         },
@@ -1793,6 +1875,18 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                     continue;
                 }
 
+                if inst
+                    .pinned_version
+                    .as_deref()
+                    .is_some_and(|pinned| pinned != cat_entry.latest_version.as_str())
+                {
+                    println!(
+                        "{}: pinned to v{}; unpin before updating",
+                        inst.id,
+                        inst.pinned_version.as_deref().unwrap_or_default()
+                    );
+                    continue;
+                }
                 println!(
                     "Updating {} from v{} to v{}...",
                     inst.id, inst.version, cat_entry.latest_version
@@ -1822,6 +1916,18 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                 if sig_status != crate::plugins::package::SignatureStatus::Verified {
                     bail!("signature verification failed for {}", inst.id);
                 }
+                let validated = crate::plugins::package::validate_manifest(&pkg, manager.policy())?;
+                if validated.manifest.id != cat_entry.id
+                    || validated.manifest.version != cat_entry.latest_version
+                {
+                    bail!("catalog package identity/version mismatch for {}", inst.id);
+                }
+                let current = manager.get(&inst.id).await?;
+                let permission_diff = crate::plugins::manager::permission_diff_from_installed(
+                    current.as_ref(),
+                    &validated.manifest,
+                )?;
+                print_plugin_permission_diff(&permission_diff)?;
 
                 let source = format!("catalog:{}@{}", cat_entry.id, cat_entry.latest_version);
                 let was_enabled = inst.status().is_enabled();
@@ -1831,19 +1937,27 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
                     .await?;
 
                 println!(
-                    "  Installed {} v{} (installed-disabled pending permission approval)",
-                    outcome.id, outcome.version
+                    "  Installed {} v{} (enabled: {})",
+                    outcome.id, outcome.version, outcome.enabled
                 );
 
                 if approve {
                     let grants = manager.approve_permissions(&outcome.id).await?;
                     println!("  Approved {} permission grant(s)", grants.len());
-                    if was_enabled {
+                    if was_enabled && !outcome.enabled {
                         manager.enable(&outcome.id).await?;
                         println!("  Re-enabled {}", outcome.id);
                     }
+                } else if outcome.approval_preserved {
+                    if outcome.enabled {
+                        println!(
+                            "  Non-expanding update retained prior approval and enabled state."
+                        );
+                    } else {
+                        println!("  Non-expanding update retained prior approval; plugin remains disabled.");
+                    }
                 } else {
-                    println!("  To review permissions and re-enable:");
+                    println!("  To review permissions and enable:");
                     println!("    kinetix plugin approve {}", outcome.id);
                     if was_enabled {
                         println!("    kinetix plugin enable {}", outcome.id);
@@ -1888,8 +2002,31 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
             println!("enabled '{id}'");
             Ok(())
         }
-        PluginAction::Disable { id } => {
-            manager.disable(&id).await?;
+        PluginAction::Impact { id } => {
+            let impact = manager.dependency_impact(&id).await?;
+            print_plugin_dependency_impact(&impact)?;
+            Ok(())
+        }
+        PluginAction::Pin { id } => {
+            let version = manager.set_version_pin(&id, true).await?;
+            println!("pinned '{id}' to v{version}");
+            Ok(())
+        }
+        PluginAction::Unpin { id } => {
+            let version = manager.set_version_pin(&id, false).await?;
+            println!("removed version pin for '{id}' (installed v{version})");
+            Ok(())
+        }
+        PluginAction::Disable { id, force } => {
+            let impact = manager.dependency_impact(&id).await?;
+            print_plugin_dependency_impact(&impact)?;
+            if impact.has_dependencies() && !force {
+                bail!("refusing to disable a referenced plugin; review the impact and retry with --force");
+            }
+            let acknowledged = impact
+                .has_dependencies()
+                .then_some(impact.fingerprint.as_str());
+            manager.disable(&id, acknowledged).await?;
             println!("disabled '{id}'");
             Ok(())
         }
@@ -1898,8 +2035,16 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
             println!("'{id}' validates; provides {} capabilities", provides.len());
             Ok(())
         }
-        PluginAction::Remove { id } => {
-            manager.remove(&id).await?;
+        PluginAction::Remove { id, force } => {
+            let impact = manager.dependency_impact(&id).await?;
+            print_plugin_dependency_impact(&impact)?;
+            if impact.has_dependencies() && !force {
+                bail!("refusing to remove a referenced plugin; review the impact and retry with --force");
+            }
+            let acknowledged = impact
+                .has_dependencies()
+                .then_some(impact.fingerprint.as_str());
+            manager.remove(&id, acknowledged).await?;
             println!("removed '{id}'");
             Ok(())
         }
@@ -1920,6 +2065,31 @@ async fn cmd_plugin(cli: &Cli, args: PluginArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn print_plugin_permission_diff(diff: &crate::plugins::manager::PermissionDiff) -> Result<()> {
+    println!(
+        "Permission diff ({}):",
+        if diff.increased {
+            "increased authority requires approval before enable"
+        } else {
+            "no authority increase"
+        }
+    );
+    println!("{}", serde_json::to_string_pretty(diff)?);
+    Ok(())
+}
+
+fn print_plugin_dependency_impact(
+    impact: &crate::plugins::manager::PluginDependencyImpact,
+) -> Result<()> {
+    println!(
+        "Dependency impact ({} provider(s), {} Route(s)):\n{}",
+        impact.providers.len(),
+        impact.routes.len(),
+        serde_json::to_string_pretty(impact)?
+    );
+    Ok(())
 }
 
 /// Decode a base64 or hex Ed25519 public key.
