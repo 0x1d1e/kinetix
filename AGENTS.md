@@ -26,7 +26,7 @@ Keep protocol frontends, canonical representation, routing, adapters, plugin exe
 - Backend validation is authoritative. Dashboard, import, CLI, and API paths must enforce the same semantic invariants.
 - Never expose upstream credentials, decrypted secrets, internal provider URLs, account identities, or private routing topology downstream.
 - Treat plugin input/output as untrusted and fail closed at the host boundary.
-- Public WIT/plugin-contract changes require compatibility handling and matching tests.
+- Public WIT/plugin-contract changes require compatibility handling and matching tests. `wit/` is canonical; mirror it into `kinetix-plugins` with its `scripts/sync_host_contract.py`.
 - Existing migrations are immutable. Schema changes use a new timestamped migration.
 - Keep async data-plane work non-blocking and queues bounded.
 - Provider-specific behavior must be backed by official documentation or observed upstream behavior. Similar projects such as 9Router, pi-free, and OmniRoute are useful implementation references, not authority.
