@@ -216,7 +216,7 @@
     {
       "id": "plugin.request.mixed_contract",
       "runner": "cargo",
-      "summary": "Canonical plugin request contract preserves vision, tool identity and reasoning"
+      "summary": "Canonical plugin request contract preserves vision, tool identity, reasoning and deferred-tool metadata"
     },
     {
       "id": "plugin.response.parallel_contract",
@@ -1025,10 +1025,10 @@
           ]
         ],
         [
-          "text / image / tool call / tool result / reasoning",
+          "text / image / tool call / tool result / reasoning / defer_loading",
           "preserved in canonical request",
           "same",
-          "Mixed semantic state is contract-tested before a real guest is involved.",
+          "Mixed request state and deferred-tool metadata are contract-tested before a real guest is involved.",
           [
             "plugin.request.mixed_contract"
           ]

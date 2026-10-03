@@ -59,7 +59,8 @@
         "required": [
           "path"
         ]
-      }
+      },
+      "defer_loading": true
     }
   ],
   "tool_choice": {

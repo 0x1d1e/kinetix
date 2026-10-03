@@ -52,7 +52,8 @@ fn mixed_vision_tools_and_reasoning_match_v1_plugin_request_contract() {
                     "properties": {"path": {"type": "string"}},
                     "required": ["path"]
                 }
-            }
+            },
+            "defer_loading": true
         }]
     });
 
@@ -73,4 +74,23 @@ fn mixed_vision_tools_and_reasoning_match_v1_plugin_request_contract() {
     let actual: Value = serde_json::from_str(&request_to_json(&req)).expect("plugin request JSON");
     let expected: Value = serde_json::from_str(MIXED).expect("fixture JSON");
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn explicit_tool_loading_flags_survive_and_unknown_stays_omitted() {
+    let body = json!({
+        "model": "plugin-model",
+        "messages": [{"role": "user", "content": "continue"}],
+        "tools": [
+            {"name": "deferred", "defer_loading": true},
+            {"name": "eager", "defer_loading": false},
+            {"name": "unspecified"}
+        ]
+    });
+    let req = frontends::decode(FrontendFormat::OpenAi, body).expect("decode tool flags");
+    let actual: Value = serde_json::from_str(&request_to_json(&req)).expect("plugin request JSON");
+
+    assert_eq!(actual["tools"][0]["defer_loading"], true);
+    assert_eq!(actual["tools"][1]["defer_loading"], false);
+    assert!(actual["tools"][2].get("defer_loading").is_none());
 }

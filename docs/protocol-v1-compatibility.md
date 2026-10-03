@@ -108,7 +108,7 @@ not a claim that every field of every upstream vendor API is implemented.
 | Field / behavior | Native / same-format | Translated / other path | Contract | Evidence |
 |---|---|---|---|---|
 | canonical request schema/version | kinetix.plugin.request v1 | same | Host serializes canonical requests before guest adapter translation. | `plugin.request.mixed_contract` |
-| text / image / tool call / tool result / reasoning | preserved in canonical request | same | Mixed semantic state is contract-tested before a real guest is involved. | `plugin.request.mixed_contract` |
+| text / image / tool call / tool result / reasoning / defer_loading | preserved in canonical request | same | Mixed request state and deferred-tool metadata are contract-tested before a real guest is involved. | `plugin.request.mixed_contract` |
 | parallel tool ids / arguments | versioned canonical events | same | Response fixture verifies distinct tool indexes and ids. | `plugin.response.parallel_contract` |
 | thinking signature / usage / finish | versioned canonical events | same | Malformed/incompatible plugin responses fail closed. | `plugin.response.parallel_contract` |
 | real .kxp guest execution | manual release acceptance | manual release acceptance | KINETIX_PLUGIN_E2E_PACKAGE keeps normal core CI hermetic. | `plugin.release.real_guest` |
@@ -159,7 +159,7 @@ not a claim that every field of every upstream vendor API is implemented.
 | `messages.count_tokens.native_exact` | http | Native Anthropic token count accepts system/messages/tools and is exact |
 | `messages.count_tokens.translated_estimated` | http | Translated token count accepts system/messages/tools and is explicitly estimated |
 | `models.visible` | http | Models endpoint enforces auth, key-scoped visibility, and provider-model/alias/route selector discovery |
-| `plugin.request.mixed_contract` | cargo | Canonical plugin request contract preserves vision, tool identity and reasoning |
+| `plugin.request.mixed_contract` | cargo | Canonical plugin request contract preserves vision, tool identity, reasoning and deferred-tool metadata |
 | `plugin.response.parallel_contract` | cargo | Canonical plugin response contract preserves parallel tool ids and reasoning signatures |
 | `plugin.release.real_guest` | manual | Release-only external .kxp execution exercises the real plugin host |
 | `chat.image.variants` | http | Chat image URL and data-URL variants translate explicitly |
