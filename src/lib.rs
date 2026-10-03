@@ -51,6 +51,7 @@ pub mod outbound;
 pub mod passthrough;
 pub mod paths;
 pub mod pipeline;
+pub mod plugin_lifecycle;
 pub mod plugins;
 pub mod pool;
 pub(crate) mod pre_dispatch;

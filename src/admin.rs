@@ -14792,80 +14792,24 @@ fn plugin_bad(e: anyhow::Error) -> ApiError {
     ApiError::bad(e.to_string())
 }
 
+fn plugin_host_unavailable() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "plugin host is not available".into(),
+        None,
+    )
+}
+
 fn plugin_manager(
     state: &AppState,
 ) -> Result<&std::sync::Arc<crate::plugins::PluginManager>, ApiError> {
-    state.plugin_manager().ok_or_else(|| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "plugin host is not available".into(),
-            None,
-        )
-    })
+    state.plugin_manager().ok_or_else(plugin_host_unavailable)
 }
 
-/// Register the runtime capability objects an enabled plugin provides (§6.0).
-///
-/// A plugin that declares a `credential_strategies` capability gets a
-/// `PluginCredentialStrategy` so a provider bound to it resolves through the
-/// plugin; a plugin that declares `provider_adapters` gets a plugin-backed
-/// adapter for each declared name. Registration is idempotent — enabling an
-/// already-enabled plugin simply re-registers the same object.
-pub(crate) async fn register_enabled_plugin_capabilities(state: &AppState, id: &str) {
-    let Some(manager) = state.plugin_manager().cloned() else {
-        return;
-    };
-    let crypto = state.crypto.clone();
-    let pool = state.pool.clone();
-    // `enable` has already succeeded, so the row exists and is enabled.
-    let (provides, cached_routing_facts) = match manager.get(id).await {
-        Ok(Some(row)) if row.status().is_enabled() => {
-            let Some(manifest) = row.manifest() else {
-                return;
-            };
-            let cached_routing_facts = manifest.routing_facts_mode == "cached"
-                && !manifest.provides.routing_facts.is_empty();
-            (manifest.provides, cached_routing_facts)
-        }
-        _ => return,
-    };
-    if cached_routing_facts {
-        state
-            .provider_work
-            .activate_auxiliary_scope(&format!("plugin:{id}"));
-    }
-    if !provides.credential_strategies.is_empty() {
-        let strategy: std::sync::Arc<dyn crate::credentials::CredentialStrategy> =
-            std::sync::Arc::new(crate::plugins::credential::PluginCredentialStrategy::new(
-                manager.clone(),
-                pool,
-                crypto,
-                id,
-            ));
-        state.register_plugin_credential_strategy(id, strategy);
-    }
-    // ProviderAdapter registration (§6.3, §7.1): a plugin adapter is a pure
-    // translation library — core still owns the outbound streaming send. The
-    // `plugin-adapter` world imports no network capability, so registering it
-    // does not widen the plugin's authority.
-    if !provides.provider_adapters.is_empty() {
-        if let Err(e) = crate::plugins::adapter::register_declared_adapters(
-            &state.adapters,
-            (*manager).clone(),
-            id,
-            &provides,
-        )
-        .await
-        {
-            tracing::warn!(
-                plugin = %id,
-                error = %e,
-                "plugin declares provider_adapters but its adapter world could not be loaded; bound providers will fail closed"
-            );
-        }
-    }
-
-    auto_provision_plugin_providers(state, id).await;
+fn plugin_lifecycle(
+    state: &AppState,
+) -> Result<crate::plugin_lifecycle::PluginLifecycle<'_>, ApiError> {
+    crate::plugin_lifecycle::PluginLifecycle::new(state).ok_or_else(plugin_host_unavailable)
 }
 
 async fn reconcile_provider_account_mode(
@@ -15834,8 +15778,8 @@ pub async fn install_catalog_plugin(
     Path(id): Path<String>,
     body: Option<Json<CatalogPluginInstallBody>>,
 ) -> ApiResult {
-    let manager = plugin_manager(&state)?;
-    let verified = verify_catalog_package(&state, manager, &id).await?;
+    let lifecycle = plugin_lifecycle(&state)?;
+    let verified = verify_catalog_package(&state, lifecycle.manager(), &id).await?;
     let distribution = verified
         .plugin
         .distribution
@@ -15850,8 +15794,8 @@ pub async fn install_catalog_plugin(
         "catalog:{}@{}",
         verified.plugin.id, verified.plugin.latest_version
     );
-    let outcome = manager
-        .install_from_source(
+    let outcome = lifecycle
+        .install(
             &verified.bytes,
             Some(&distribution.sha256),
             &verified.keys,
@@ -15860,8 +15804,6 @@ pub async fn install_catalog_plugin(
         )
         .await
         .map_err(plugin_bad)?;
-    state.unregister_plugin_capabilities(&outcome.id);
-    register_enabled_plugin_capabilities(&state, &outcome.id).await;
 
     let _ = db::insert_audit(
         &state.pool,
@@ -16014,7 +15956,7 @@ pub async fn install_plugin(
     _auth: AdminAuth,
     Json(body): Json<PluginInstallBody>,
 ) -> ApiResult {
-    let manager = plugin_manager(&state)?;
+    let lifecycle = plugin_lifecycle(&state)?;
     let (bytes, source) = plugin_install_package_bytes(&state, &body).await?;
 
     let trusted: Vec<[u8; 32]> = body
@@ -16023,8 +15965,8 @@ pub async fn install_plugin(
         .filter_map(|k| decode_key(k))
         .collect();
 
-    let outcome = manager
-        .install_from_source(
+    let outcome = lifecycle
+        .install(
             &bytes,
             body.sha256.as_deref(),
             &trusted,
@@ -16033,8 +15975,6 @@ pub async fn install_plugin(
         )
         .await
         .map_err(plugin_bad)?;
-    state.unregister_plugin_capabilities(&outcome.id);
-    register_enabled_plugin_capabilities(&state, &outcome.id).await;
 
     let _ = db::insert_audit(
         &state.pool,
@@ -17416,13 +17356,10 @@ pub async fn reinstall_plugin_package(
     _auth: AdminAuth,
     Path((id, sha256)): Path<(String, String)>,
 ) -> ApiResult {
-    let manager = plugin_manager(&state)?;
-    let outcome = manager
-        .install_retained(&id, sha256.trim())
+    let outcome = plugin_lifecycle(&state)?
+        .reinstall(&id, sha256.trim())
         .await
         .map_err(plugin_bad)?;
-    state.unregister_plugin_capabilities(&outcome.id);
-    register_enabled_plugin_capabilities(&state, &outcome.id).await;
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -17473,14 +17410,10 @@ pub async fn rollback_plugin(
     Path(id): Path<String>,
     Json(body): Json<PluginRollbackBody>,
 ) -> ApiResult {
-    let manager = plugin_manager(&state)?;
-    let outcome = manager
+    let outcome = plugin_lifecycle(&state)?
         .rollback(&id, body.sha256.trim())
         .await
         .map_err(plugin_bad)?;
-    // The rollback activated a different package disabled: drop the previous
-    // package's registered capabilities so nothing stale keeps serving.
-    state.unregister_plugin_capabilities(&id);
 
     let _ = db::insert_audit(
         &state.pool,
@@ -17514,9 +17447,10 @@ pub async fn enable_plugin(
     _auth: AdminAuth,
     Path(id): Path<String>,
 ) -> ApiResult {
-    let manager = plugin_manager(&state)?;
-    manager.enable(&id).await.map_err(plugin_bad)?;
-    register_enabled_plugin_capabilities(&state, &id).await;
+    plugin_lifecycle(&state)?
+        .enable(&id)
+        .await
+        .map_err(plugin_bad)?;
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -17557,13 +17491,12 @@ pub async fn disable_plugin(
     Path(id): Path<String>,
     body: Option<Json<PluginImpactAcknowledgement>>,
 ) -> ApiResult {
-    let manager = plugin_manager(&state)?;
+    let lifecycle = plugin_lifecycle(&state)?;
     let acknowledged = body.and_then(|Json(body)| body.fingerprint);
-    manager
+    lifecycle
         .disable(&id, acknowledged.as_deref())
         .await
         .map_err(plugin_bad)?;
-    state.unregister_plugin_capabilities(&id);
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -17584,13 +17517,12 @@ pub async fn remove_plugin(
     Path(id): Path<String>,
     body: Option<Json<PluginImpactAcknowledgement>>,
 ) -> ApiResult {
-    let manager = plugin_manager(&state)?;
+    let lifecycle = plugin_lifecycle(&state)?;
     let acknowledged = body.and_then(|Json(body)| body.fingerprint);
-    manager
+    lifecycle
         .remove(&id, acknowledged.as_deref())
         .await
         .map_err(plugin_bad)?;
-    state.unregister_plugin_capabilities(&id);
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -17722,12 +17654,10 @@ pub async fn revoke_plugin_permissions(
     if permission.is_empty() {
         return Err(ApiError::bad("provide a permission to revoke"));
     }
-    let manager = plugin_manager(&state)?;
-    manager
+    plugin_lifecycle(&state)?
         .revoke_permission(&id, permission)
         .await
         .map_err(plugin_bad)?;
-    state.unregister_plugin_capabilities(&id);
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -28993,6 +28923,70 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn plugin_lifecycle_keeps_runtime_adapters_in_sync_with_transitions() {
+        let (state, root) = test_state_with_plugins("plugin-lifecycle-sync").await;
+        let manifest = format!(
+            r#"
+manifest_version = 1
+id = "plugin.other"
+name = "Lifecycle Adapter"
+version = "0.1.0"
+plugin_api = "{}.0.0"
+
+[provides]
+provider_adapters = ["session-echo"]
+
+[limits]
+memory = "128MiB"
+storage = "2MiB"
+"#,
+            2
+        );
+        let mut archive = tar::Builder::new(Vec::new());
+        for (path, data) in [
+            ("plugin.toml", manifest.as_bytes()),
+            (
+                "plugin.wasm",
+                include_bytes!("../tests/fixtures/plugin-api-v2-session-echo.component.wasm")
+                    .as_slice(),
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, data).unwrap();
+        }
+        let package = archive.into_inner().unwrap();
+        let transport =
+            crate::adapters::TargetTransport::parse("plugin:plugin.other/session-echo").unwrap();
+        let lifecycle = crate::plugin_lifecycle::PluginLifecycle::new(&state).unwrap();
+        let registered = || state.adapters.for_transport(&transport).is_ok();
+
+        lifecycle
+            .install(&package, None, &[], false, "upload")
+            .await
+            .unwrap();
+        assert!(!registered(), "installed plugins start disabled");
+        lifecycle
+            .manager()
+            .approve_permissions("plugin.other")
+            .await
+            .unwrap();
+        lifecycle.enable("plugin.other").await.unwrap();
+        assert!(registered());
+        lifecycle.disable("plugin.other", None).await.unwrap();
+        assert!(!registered());
+        lifecycle.enable("plugin.other").await.unwrap();
+        assert!(registered());
+        lifecycle.remove("plugin.other", None).await.unwrap();
+        assert!(!registered());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn config_import_preserves_plugin_native_provider_until_plugin_reconciliation() {
         let (source, source_root) = test_state("plugin-native-export-source").await;
         let provider_id = db::insert_provider(
@@ -29335,10 +29329,10 @@ storage = "2MiB"
         assert!(target.adapters.for_transport(&transport).is_err());
 
         manager.approve_permissions("plugin.test").await.unwrap();
-        manager.enable("plugin.test").await.unwrap();
-        register_enabled_plugin_capabilities(&target, "plugin.test").await;
-        // Simulate a later startup registration after the renamed adapter is active.
-        register_enabled_plugin_capabilities(&target, "plugin.test").await;
+        let lifecycle = crate::plugin_lifecycle::PluginLifecycle::new(&target).unwrap();
+        lifecycle.enable("plugin.test").await.unwrap();
+        // Simulate a later startup activation after the renamed adapter is active.
+        lifecycle.activate_persisted().await.unwrap();
 
         assert!(target.adapters.for_transport(&transport).is_ok());
         let providers = db::list_providers(&target.pool).await.unwrap();
