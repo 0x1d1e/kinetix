@@ -73,7 +73,7 @@ Account responses include `status_reason`, `status_changed_at`, and `retry_at`. 
 | --- | --- |
 | `GET /admin/api/routes` | List with resolved targets and policy fields. |
 | `POST /admin/api/routes` | Create (name, strategy, fallback triggers, `portability_policy`, `cache_affinity`, `max_attempts`, targets). |
-| `PUT /admin/api/routes/{id}` | Update (replaces targets). |
+| `PUT /admin/api/routes/{id}` | Update (replaces targets atomically). `404` for an unknown id. |
 | `DELETE /admin/api/routes/{id}` | Delete. |
 | `POST /admin/api/routes/validate` | Validate a proposed Route against persisted provider, model, account, plugin, alias, and execution-profile metadata. Returns `valid` plus structured errors and warnings; does not save the Route. |
 | `POST /admin/api/routes/dry-run` | Simulate a representative request; returns candidate ordering, predicate outcomes, capability states, eligibility reasons, and the would-be selection without contacting an upstream. |

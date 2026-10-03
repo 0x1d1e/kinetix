@@ -1230,7 +1230,6 @@ async fn cmd_route(cli: &Cli, args: RouteArgs) -> Result<()> {
             max_attempts,
             targets,
         } => {
-            let mut resolved_targets = Vec::with_capacity(targets.len());
             let mut validation_targets = Vec::with_capacity(targets.len());
             for (index, spec) in targets.iter().enumerate() {
                 let (provider_name, upstream) = spec
@@ -1241,81 +1240,37 @@ async fn cmd_route(cli: &Cli, args: RouteArgs) -> Result<()> {
                     .await?
                     .with_context(|| format!("no model {upstream} on provider {provider_name}"))?;
                 validation_targets.push(crate::route_validation::RouteTargetConfig {
-                    model_id: model.id.clone(),
+                    model_id: model.id,
                     account_id: None,
                     priority: index as i64 + 1,
                     weight: 1,
                     predicate: serde_json::json!({}),
                     param_overrides: serde_json::json!({}),
                 });
-                resolved_targets.push(model.id);
             }
 
             let state = route_tool_state(config, pool.clone(), crypto).await?;
-            let validation = crate::route_validation::validate(
+            let id = crate::routes::save(
                 &state,
-                &crate::route_validation::RouteConfig {
-                    id: None,
-                    name: name.clone(),
-                    strategy: strategy.clone(),
-                    portability_policy: portability_policy.clone(),
-                    fallback_triggers: serde_json::json!({
-                        "on429": true,
-                        "onQuota": true,
-                        "on5xx": true,
-                        "onTimeout": true,
-                    }),
-                    max_attempts: Some(max_attempts),
-                    max_concurrent_requests: None,
-                    enabled: true,
-                    targets: validation_targets,
-                },
-            )
-            .await?;
-            if !validation.valid {
-                let errors = validation
-                    .issues
-                    .iter()
-                    .filter(|issue| issue.severity == "error")
-                    .map(|issue| format!("{}: {}", issue.code, issue.message))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                bail!("Route validation failed: {errors}");
-            }
-
-            let id = db::insert_route(
-                &pool,
-                &db::NewRoute {
-                    name: &name,
-                    description: &description,
-                    strategy: &strategy,
-                    fallback_triggers: serde_json::json!({
-                        "on429": true,
-                        "onQuota": true,
-                        "on5xx": true,
-                        "onTimeout": true,
-                    }),
-                    portability_policy: &portability_policy,
+                &crate::routes::RouteWrite {
+                    config: crate::route_validation::RouteConfig {
+                        id: None,
+                        name,
+                        strategy,
+                        portability_policy,
+                        fallback_triggers: serde_json::Value::Null,
+                        max_attempts: Some(max_attempts),
+                        max_concurrent_requests: None,
+                        enabled: true,
+                        targets: validation_targets,
+                    },
+                    description,
                     sticky_routing: false,
                     cache_affinity,
-                    max_attempts: Some(max_attempts),
-                    max_concurrent_requests: None,
+                    enabled: None,
                 },
             )
             .await?;
-            for (index, model_id) in resolved_targets.iter().enumerate() {
-                db::insert_route_target(
-                    &pool,
-                    &id,
-                    None,
-                    model_id,
-                    index as i64 + 1,
-                    1,
-                    "{}",
-                    "{}",
-                )
-                .await?;
-            }
             println!("route created: {id}");
             Ok(())
         }

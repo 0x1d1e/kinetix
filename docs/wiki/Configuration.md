@@ -120,6 +120,11 @@ targets = [
 ]
 ```
 
+Seeded Routes pass the same structural checks as Admin API and import writes
+(strategy, portability policy, fallback triggers, limits, predicates, at least
+one target). Targets naming unknown models are skipped with a warning; an
+invalid Route fails bootstrap.
+
 ## Moving configuration between installs
 
 Use the admin API's user-authored export/import:

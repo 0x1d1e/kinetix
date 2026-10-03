@@ -9623,28 +9623,6 @@ fn route_validation_error(validation: &route_validation::RouteValidation) -> Api
     )
 }
 
-fn validate_route_structure(body: &RouteBody) -> Result<(), ApiError> {
-    let validation = route_validation::validate_structure(&route_validation_config(body, None));
-    if !validation.valid {
-        return Err(route_validation_error(&validation));
-    }
-    Ok(())
-}
-
-async fn validate_route_body(
-    state: &AppState,
-    body: &RouteBody,
-    id: Option<&str>,
-) -> Result<route_validation::RouteValidation, ApiError> {
-    let validation = route_validation::validate(state, &route_validation_config(body, id))
-        .await
-        .map_err(ApiError::internal)?;
-    if !validation.valid {
-        return Err(route_validation_error(&validation));
-    }
-    Ok(validation)
-}
-
 #[derive(Clone, Deserialize, schemars::JsonSchema)]
 pub struct RouteTargetBody {
     pub account_id: Option<String>,
@@ -9661,33 +9639,33 @@ pub struct RouteTargetBody {
     pub param_overrides: Value,
 }
 
+fn route_write(body: &RouteBody, id: Option<&str>) -> crate::routes::RouteWrite {
+    crate::routes::RouteWrite {
+        config: route_validation_config(body, id),
+        description: body.description.clone(),
+        sticky_routing: body.sticky_routing,
+        cache_affinity: body.cache_affinity,
+        enabled: None,
+    }
+}
+
+fn route_write_error(error: crate::routes::RouteWriteError) -> ApiError {
+    use crate::routes::RouteWriteError;
+    match error {
+        RouteWriteError::Invalid(validation) => route_validation_error(&validation),
+        RouteWriteError::NotFound(_) => ApiError::not_found(error.to_string()),
+        RouteWriteError::Storage(_) | RouteWriteError::Validation(_) => ApiError::internal(error),
+    }
+}
+
 pub async fn create_route(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Json(body): Json<RouteBody>,
 ) -> ApiResult {
-    validate_route_body(&state, &body, None).await?;
-    let id = db::insert_route(
-        &state.pool,
-        &db::NewRoute {
-            name: &body.name,
-            description: &body.description,
-            strategy: &body.strategy,
-            fallback_triggers: if body.fallback_triggers.is_null() {
-                json!({"on429": true, "onQuota": true, "on5xx": true, "onTimeout": true})
-            } else {
-                body.fallback_triggers.clone()
-            },
-            portability_policy: &body.portability_policy,
-            sticky_routing: body.sticky_routing,
-            cache_affinity: body.cache_affinity,
-            max_attempts: body.max_attempts,
-            max_concurrent_requests: body.max_concurrent_requests.filter(|limit| *limit > 0),
-        },
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    write_route_targets(&state.pool, &id, &body.targets).await?;
+    let id = crate::routes::save(&state, &route_write(&body, None))
+        .await
+        .map_err(route_write_error)?;
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -9712,25 +9690,9 @@ pub async fn update_route(
     Path(id): Path<String>,
     Json(body): Json<RouteBody>,
 ) -> ApiResult {
-    validate_route_body(&state, &body, Some(&id)).await?;
-    db::update_route(
-        &state.pool,
-        &id,
-        &body.description,
-        &body.strategy,
-        body.fallback_triggers.clone(),
-        &body.portability_policy,
-        body.sticky_routing,
-        body.cache_affinity,
-        body.max_attempts,
-        body.max_concurrent_requests.filter(|limit| *limit > 0),
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    db::clear_route_targets(&state.pool, &id)
+    crate::routes::save(&state, &route_write(&body, Some(&id)))
         .await
-        .map_err(ApiError::internal)?;
-    write_route_targets(&state.pool, &id, &body.targets).await?;
+        .map_err(route_write_error)?;
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -9747,38 +9709,6 @@ pub async fn update_route(
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true })))
-}
-
-async fn write_route_targets(
-    pool: &Pool,
-    route_id: &str,
-    targets: &[RouteTargetBody],
-) -> Result<(), ApiError> {
-    for t in targets {
-        let predicate = if t.predicate.is_null() {
-            "{}".to_string()
-        } else {
-            t.predicate.to_string()
-        };
-        let overrides = if t.param_overrides.is_null() {
-            "{}".to_string()
-        } else {
-            t.param_overrides.to_string()
-        };
-        db::insert_route_target(
-            pool,
-            route_id,
-            t.account_id.as_deref(),
-            &t.model_id,
-            t.priority,
-            t.weight,
-            &predicate,
-            &overrides,
-        )
-        .await
-        .map_err(ApiError::internal)?;
-    }
-    Ok(())
 }
 
 pub async fn delete_route(
@@ -12664,30 +12594,6 @@ fn imported_provider_mode<'a>(
         })
 }
 
-async fn write_route_targets_in_transaction(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    route_id: &str,
-    targets: &[RouteTargetBody],
-) -> Result<(), ApiError> {
-    for target in targets {
-        sqlx::query(
-            "INSERT INTO route_targets (id, route_id, account_id, model_id, priority, weight, param_overrides, predicate) VALUES (?,?,?,?,?,?,?,?)",
-        )
-        .bind(format!("tgt_{}", uuid::Uuid::new_v4().simple()))
-        .bind(route_id)
-        .bind(target.account_id.as_deref())
-        .bind(&target.model_id)
-        .bind(target.priority)
-        .bind(target.weight)
-        .bind(target.param_overrides.to_string())
-        .bind(target.predicate.to_string())
-        .execute(&mut **tx)
-        .await
-        .map_err(ApiError::internal)?;
-    }
-    Ok(())
-}
-
 fn account_export_enabled(status: &str, status_reason: &str) -> Option<bool> {
     if !matches!(status, "healthy" | "cooldown" | "exhausted" | "disabled") {
         return None;
@@ -14172,8 +14078,13 @@ async fn import_config_apply(
             max_concurrent_requests: r["max_concurrent_requests"].as_i64(),
             targets: target_bodies,
         };
-        if let Err(error) = validate_route_structure(&route_body) {
-            problems.push(format!("route '{name}': {}", error.1));
+        let validation =
+            route_validation::validate_structure(&route_validation_config(&route_body, None));
+        if !validation.valid {
+            problems.push(format!(
+                "route '{name}': {}",
+                crate::routes::RouteWriteError::Invalid(validation)
+            ));
         }
         if r.get("enabled").is_some_and(|value| !value.is_null()) && !r["enabled"].is_boolean() {
             problems.push(format!("route '{name}': enabled must be a boolean"));
@@ -14965,69 +14876,12 @@ async fn import_config_apply(
         }
         let mut body = body;
         body.targets = target_bodies;
-        validate_route_structure(&body)?;
-        let rid = match route_ids.get(name).cloned() {
-            Some(route_id) => {
-                sqlx::query(
-                    "UPDATE routes SET description=?, strategy=?, fallback_triggers=?, continuity_policy='strip', portability_policy=?, sticky_routing=?, cache_affinity=?, max_attempts=?, max_concurrent_requests=? WHERE id=?",
-                )
-                .bind(&body.description)
-                .bind(&body.strategy)
-                .bind(body.fallback_triggers.to_string())
-                .bind(&body.portability_policy)
-                .bind(body.sticky_routing as i64)
-                .bind(body.cache_affinity as i64)
-                .bind(body.max_attempts)
-                .bind(body.max_concurrent_requests.filter(|limit| *limit > 0))
-                .bind(&route_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(ApiError::internal)?;
-                sqlx::query("DELETE FROM route_targets WHERE route_id=?")
-                    .bind(&route_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(ApiError::internal)?;
-                write_route_targets_in_transaction(&mut tx, &route_id, &body.targets).await?;
-                route_id
-            }
-            None => {
-                let id = format!("route_{}", uuid::Uuid::new_v4().simple());
-                let fallback_triggers = if body.fallback_triggers.is_null() {
-                    json!({"on429": true, "onQuota": true, "on5xx": true, "onTimeout": true})
-                } else {
-                    body.fallback_triggers.clone()
-                };
-                sqlx::query(
-                    "INSERT INTO routes (id, name, description, strategy, fallback_triggers, continuity_policy, portability_policy, sticky_routing, cache_affinity, max_attempts, max_concurrent_requests, enabled, created_at) VALUES (?,?,?,?,?,'strip',?,?,?,?,?,1,?)",
-                )
-                .bind(&id)
-                .bind(name)
-                .bind(&body.description)
-                .bind(&body.strategy)
-                .bind(fallback_triggers.to_string())
-                .bind(&body.portability_policy)
-                .bind(body.sticky_routing as i64)
-                .bind(body.cache_affinity as i64)
-                .bind(body.max_attempts)
-                .bind(body.max_concurrent_requests.filter(|limit| *limit > 0))
-                .bind(db::now_iso())
-                .execute(&mut *tx)
-                .await
-                .map_err(ApiError::internal)?;
-                write_route_targets_in_transaction(&mut tx, &id, &body.targets).await?;
-                id
-            }
-        };
-        route_ids.insert(name.to_string(), rid.clone());
-        if let Some(enabled) = r["enabled"].as_bool() {
-            sqlx::query("UPDATE routes SET enabled=? WHERE id=?")
-                .bind(enabled as i64)
-                .bind(&rid)
-                .execute(&mut *tx)
-                .await
-                .map_err(ApiError::internal)?;
-        }
+        let mut write = route_write(&body, route_ids.get(name).map(String::as_str));
+        write.enabled = r["enabled"].as_bool();
+        let rid = crate::routes::write(&mut tx, &write)
+            .await
+            .map_err(route_write_error)?;
+        route_ids.insert(name.to_string(), rid);
     }
 
     // Aliases (upsert by alias name).
@@ -25155,6 +25009,96 @@ mod credential_enrollment_regression_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(state.registry.resolve("fast").is_some());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn route_update_normalizes_defaults_and_rejects_missing_routes() {
+        let (state, root) = test_state("route-update-write").await;
+        let provider_id = insert_provider(
+            &state,
+            "route-update-write",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let model_id =
+            insert_transport_test_model(&state, &provider_id, "route-model", json!({})).await;
+        db::insert_account(
+            &state.pool,
+            &provider_id,
+            "route-account",
+            "encrypted-test-secret",
+            "masked",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let app = crate::router::build(state.clone());
+        let send = |method: &str, uri: &str, body: Value| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("x-kinetix-admin-token", "test-admin")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let body = json!({
+            "name": "main",
+            "targets": [{"model_id": model_id, "predicate": null}],
+        });
+
+        let response = app
+            .clone()
+            .oneshot(send("PUT", "/admin/api/routes/route_missing", body.clone()))
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            String::from_utf8_lossy(&text)
+        );
+        assert!(db::list_routes(&state.pool).await.unwrap().is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(send("POST", "/admin/api/routes", body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let route_id = created["id"].as_str().unwrap().to_string();
+        let response = app
+            .clone()
+            .oneshot(send("PUT", &format!("/admin/api/routes/{route_id}"), body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let route = db::list_routes(&state.pool).await.unwrap().remove(0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&route.fallback_triggers).unwrap(),
+            json!({"on429": true, "onQuota": true, "on5xx": true, "onTimeout": true})
+        );
+        let targets = db::route_targets(&state.pool, &route_id).await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].predicate, "{}");
 
         let _ = std::fs::remove_dir_all(root);
     }

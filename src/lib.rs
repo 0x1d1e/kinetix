@@ -63,6 +63,7 @@ pub mod ratelimit;
 pub mod registry;
 pub mod route_validation;
 pub mod router;
+pub mod routes;
 pub mod server;
 pub mod sse;
 pub mod stream_outcome;

@@ -173,39 +173,7 @@ pub async fn seed_if_empty(
     // Routes.
     let mut route_ids: std::collections::HashMap<String, String> = Default::default();
     for c in &cfg.routes {
-        if c.max_concurrent_requests.is_some_and(|limit| limit < 0) {
-            anyhow::bail!(
-                "route '{}' max_concurrent_requests must be positive or omitted",
-                c.name
-            );
-        }
-        let route_id = db::insert_route(
-            pool,
-            &db::NewRoute {
-                name: &c.name,
-                description: &c.description,
-                strategy: if c.strategy.is_empty() { "priority" } else { &c.strategy },
-                fallback_triggers: c
-                    .fallback_triggers
-                    .as_ref()
-                    .map(|v| toml_json(Some(v)))
-                    .unwrap_or_else(|| json!({"on429": true, "onQuota": true, "on5xx": true, "onTimeout": true})),
-                portability_policy: if c.portability_policy.is_empty() {
-                    if c.continuity_policy.as_deref() == Some("error") {
-                        "reject"
-                    } else {
-                        "strip_with_warning"
-                    }
-                } else {
-                    &c.portability_policy
-                },
-                sticky_routing: c.sticky_routing,
-                cache_affinity: c.cache_affinity,
-                max_attempts: c.max_attempts,
-                max_concurrent_requests: c.max_concurrent_requests.filter(|value| *value > 0),
-            },
-        )
-        .await?;
+        let mut targets = Vec::with_capacity(c.targets.len());
         for t in &c.targets {
             let account_id = match t.account.as_deref() {
                 Some(label) => Some(account_ids.get(label).cloned().ok_or_else(|| {
@@ -217,29 +185,61 @@ pub async fn seed_if_empty(
                 })?),
                 None => None,
             };
-            let model_id = model_ids.get(&t.model).cloned();
-            if let Some(model_id) = model_id {
-                let predicate = toml_json(t.predicate.as_ref()).to_string();
-                let overrides = toml_json(t.param_overrides.as_ref()).to_string();
-                db::insert_route_target(
-                    pool,
-                    &route_id,
-                    account_id.as_deref(),
-                    &model_id,
-                    t.priority,
-                    t.weight.unwrap_or(1),
-                    &predicate,
-                    &overrides,
-                )
-                .await?;
-            } else {
+            let Some(model_id) = model_ids.get(&t.model).cloned() else {
                 tracing::warn!(
                     "route '{}' target references unknown model '{}'",
                     c.name,
                     t.model
                 );
-            }
+                continue;
+            };
+            targets.push(crate::route_validation::RouteTargetConfig {
+                model_id,
+                account_id,
+                priority: t.priority,
+                weight: t.weight.unwrap_or(1),
+                predicate: toml_json(t.predicate.as_ref()),
+                param_overrides: toml_json(t.param_overrides.as_ref()),
+            });
         }
+        let write = crate::routes::RouteWrite {
+            config: crate::route_validation::RouteConfig {
+                id: None,
+                name: c.name.clone(),
+                strategy: if c.strategy.is_empty() {
+                    "priority".into()
+                } else {
+                    c.strategy.clone()
+                },
+                portability_policy: if c.portability_policy.is_empty() {
+                    if c.continuity_policy.as_deref() == Some("error") {
+                        "reject".into()
+                    } else {
+                        "strip_with_warning".into()
+                    }
+                } else {
+                    c.portability_policy.clone()
+                },
+                fallback_triggers: c
+                    .fallback_triggers
+                    .as_ref()
+                    .map(|v| toml_json(Some(v)))
+                    .unwrap_or(serde_json::Value::Null),
+                max_attempts: c.max_attempts,
+                max_concurrent_requests: c.max_concurrent_requests,
+                enabled: true,
+                targets,
+            },
+            description: c.description.clone(),
+            sticky_routing: c.sticky_routing,
+            cache_affinity: c.cache_affinity,
+            enabled: None,
+        };
+        let mut tx = pool.begin().await?;
+        let route_id = crate::routes::write(&mut tx, &write)
+            .await
+            .map_err(|error| anyhow::anyhow!("route '{}': {error}", c.name))?;
+        tx.commit().await?;
         route_ids.insert(c.name.clone(), route_id);
     }
 

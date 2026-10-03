@@ -669,7 +669,11 @@ async fn dependency_impact_requires_current_acknowledgement_for_disable_and_remo
     assert_eq!(impact.routes[0].model_ids, vec![model_id]);
 
     // A preview fingerprint cannot authorize a mutation after bindings change.
-    db::clear_route_targets(&pool, &route_id).await.unwrap();
+    sqlx::query("DELETE FROM route_targets WHERE route_id = ?")
+        .bind(&route_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     assert!(m
         .disable("dev.example.foo", Some(&impact.fingerprint))
         .await

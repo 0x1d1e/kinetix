@@ -3797,43 +3797,6 @@ pub async fn insert_route(pool: &Pool, c: &NewRoute<'_>) -> Result<String> {
     Ok(id)
 }
 
-pub async fn update_route(
-    pool: &Pool,
-    id: &str,
-    description: &str,
-    strategy: &str,
-    fallback_triggers: Value,
-    portability_policy: &str,
-    sticky_routing: bool,
-    cache_affinity: bool,
-    max_attempts: Option<i64>,
-    max_concurrent_requests: Option<i64>,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE routes SET description=?, strategy=?, fallback_triggers=?, continuity_policy='strip', portability_policy=?, sticky_routing=?, cache_affinity=?, max_attempts=?, max_concurrent_requests=? WHERE id=?",
-    )
-    .bind(description)
-    .bind(strategy)
-    .bind(fallback_triggers.to_string())
-    .bind(portability_policy)
-    .bind(sticky_routing as i64)
-    .bind(cache_affinity as i64)
-    .bind(max_attempts)
-    .bind(max_concurrent_requests)
-    .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-pub async fn clear_route_targets(pool: &Pool, route_id: &str) -> Result<()> {
-    sqlx::query("DELETE FROM route_targets WHERE route_id = ?")
-        .bind(route_id)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
 pub async fn insert_route_target(
     pool: &Pool,
     route_id: &str,
