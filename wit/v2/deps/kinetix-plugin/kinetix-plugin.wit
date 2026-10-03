@@ -199,13 +199,15 @@ interface host-clock {
 /// Host-side credential use without plaintext exposure.
 interface host-credential {
   use types.{credential-ref, http-request, plugin-error};
-  /// Sign/authorize a request with the scoped credential, returning the
-  /// request with auth applied. The secret never crosses to the guest.
+  /// Legacy request authorization. A returned bearer header exposes plaintext:
+  /// hosts must require declared and approved `credential_read` for such a
+  /// result, or deny the call. Prefer injection inside host-http.send for
+  /// opaque credential use. See docs/wasm-capability-security-v1.md.
   sign: func(req: http-request, credential: credential-ref) -> result<http-request, plugin-error>;
   /// Acquire an opaque lease handle the plugin may attach to host-http calls.
   lease: func(credential: credential-ref) -> result<string, plugin-error>;
   /// Read the plaintext credential. Only available when the plugin's manifest
-  /// declares the `credential_read` permission — a materially higher-risk grant
+  /// declares and the host explicitly approves `credential_read`, a higher-risk
   /// grant for protocols that place the secret in a request body rather than
   /// an auth header (e.g. an OAuth refresh-token exchange). WASM linear memory
   /// cannot be reliably zeroized, so this grant is flagged in permission review.
