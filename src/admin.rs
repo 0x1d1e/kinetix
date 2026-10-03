@@ -12,20 +12,20 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 
-use crate::adapters::{
-    normalize_plugin_reasoning_capability, normalize_plugin_reasoning_capability_v1,
-    normalize_reasoning_capability, parse_plugin_opaque_state_capability, plugin_capability_flags,
-    plugin_capability_flags_v1, plugin_identity, plugin_identity_hint,
-    plugin_opaque_state_capability, plugin_provider_variant, plugin_reasoning_support,
-    reasoning_metadata_declared, thinking_map_for_reasoning_with_wire, ModelCapabilityFlags,
-    UpstreamContext,
-};
+use crate::adapters::UpstreamContext;
 use crate::app::AppState;
 use crate::auth::{self, AdminAuth, SESSION_COOKIE};
 use crate::crypto;
 use crate::db::{self, Pool};
 use crate::frontends::FrontendFormat;
 use crate::limits;
+use crate::model_capabilities::{
+    normalize_plugin_reasoning_capability, normalize_plugin_reasoning_capability_v1,
+    normalize_reasoning_capability, parse_plugin_opaque_state_capability, plugin_capability_flags,
+    plugin_capability_flags_v1, plugin_identity, plugin_identity_hint,
+    plugin_opaque_state_capability, plugin_provider_variant, plugin_reasoning_support,
+    reasoning_metadata_declared, thinking_map_for_reasoning_with_wire, ModelCapabilityFlags,
+};
 use crate::pipeline;
 use crate::route_validation;
 use crate::types::{AuthScheme, Prices, ThinkingMap, WireFormat};
@@ -2240,7 +2240,7 @@ struct DiscoveredObservation {
     model: crate::adapters::DiscoveredModel,
     #[cfg_attr(not(test), allow(dead_code))]
     reasoning_support: Option<bool>,
-    reasoning: Option<crate::adapters::ReasoningCapability>,
+    reasoning: Option<crate::model_capabilities::ReasoningCapability>,
     thinking_map: Option<ThinkingMap>,
     capabilities: ModelCapabilityFlags,
     model_capabilities: Option<Value>,
@@ -2489,13 +2489,13 @@ fn discovered_observation_with_catalog(
     wire: WireFormat,
     catalog: Option<crate::model_catalog::CatalogResolution>,
 ) -> DiscoveredObservation {
-    fn has_reasoning_details(capability: &crate::adapters::ReasoningCapability) -> bool {
+    fn has_reasoning_details(capability: &crate::model_capabilities::ReasoningCapability) -> bool {
         capability.mode.is_some() || !capability.levels.is_empty() || capability.default.is_some()
     }
 
     let model_capabilities = fallback_metadata
         .as_ref()
-        .and_then(crate::adapters::validated_model_capabilities_v3);
+        .and_then(crate::model_capabilities::validated_model_capabilities_v3);
     let plugin_identity_metadata = fallback_metadata.as_ref().and_then(plugin_identity);
     let provider_variant = fallback_metadata.as_ref().and_then(plugin_provider_variant);
     let opaque_state = fallback_metadata
@@ -17905,7 +17905,7 @@ mod reasoning_discovery_control_plane_tests {
         let reasoning = observation.reasoning.unwrap();
         assert_eq!(
             reasoning.mode,
-            Some(crate::adapters::ReasoningCapabilityMode::Level)
+            Some(crate::model_capabilities::ReasoningCapabilityMode::Level)
         );
         assert_eq!(reasoning.default.as_deref(), Some("high"));
         assert_eq!(reasoning.upstream_format, "provider_declared");
@@ -17918,7 +17918,7 @@ mod reasoning_discovery_control_plane_tests {
             (json!({"supported": true}), None),
             (
                 json!({"supported": true, "mode": "toggle", "can_disable": true}),
-                Some(crate::adapters::ReasoningCapabilityMode::Toggle),
+                Some(crate::model_capabilities::ReasoningCapabilityMode::Toggle),
             ),
         ] {
             let observation = discovered_observation(

@@ -1658,7 +1658,7 @@ mod tests {
         assert!(capabilities["reasoning"].get("levels").is_none());
         assert!(capabilities["reasoning"].get("mode").is_none());
 
-        let flags = crate::adapters::plugin_capability_flags_v1(&capabilities)
+        let flags = crate::model_capabilities::plugin_capability_flags_v1(&capabilities)
             .expect("models.dev capability envelope should remain valid v1");
         assert_eq!(flags.reasoning, Some(true));
         assert_eq!(flags.tool_calling, Some(true));
@@ -1681,8 +1681,9 @@ mod tests {
         assert_eq!(capabilities["reasoning"]["levels"], json!(["low", "high"]));
         assert_eq!(capabilities["reasoning"]["can_disable"], true);
 
-        let reasoning = crate::adapters::normalize_plugin_reasoning_capability_v1(&capabilities)
-            .expect("filtered effort list should remain executable");
+        let reasoning =
+            crate::model_capabilities::normalize_plugin_reasoning_capability_v1(&capabilities)
+                .expect("filtered effort list should remain executable");
         assert_eq!(
             reasoning.levels,
             vec!["low".to_string(), "high".to_string()]

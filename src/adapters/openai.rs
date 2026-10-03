@@ -875,8 +875,9 @@ mod tests {
         let metadata = serde_json::json!({
             "supportedThinkingEfforts": ["none", "low", "extra_high"]
         });
-        let capability = crate::adapters::normalize_reasoning_capability(&metadata).unwrap();
-        let map = crate::adapters::thinking_map_for_reasoning_with_wire(
+        let capability =
+            crate::model_capabilities::normalize_reasoning_capability(&metadata).unwrap();
+        let map = crate::model_capabilities::thinking_map_for_reasoning_with_wire(
             &capability,
             crate::types::WireFormat::Openai,
         )
@@ -919,8 +920,9 @@ mod tests {
                 "supported_efforts": ["minimal", "low", "high"]
             }
         });
-        let capability = crate::adapters::normalize_reasoning_capability(&metadata).unwrap();
-        assert!(crate::adapters::thinking_map_for_reasoning(&capability).is_none());
+        let capability =
+            crate::model_capabilities::normalize_reasoning_capability(&metadata).unwrap();
+        assert!(crate::model_capabilities::thinking_map_for_reasoning(&capability).is_none());
 
         let p = provider();
         let mut m = model();
@@ -954,8 +956,9 @@ mod tests {
                 }
             }
         });
-        let capability = crate::adapters::normalize_reasoning_capability(&metadata).unwrap();
-        let map = crate::adapters::thinking_map_for_reasoning(&capability).unwrap();
+        let capability =
+            crate::model_capabilities::normalize_reasoning_capability(&metadata).unwrap();
+        let map = crate::model_capabilities::thinking_map_for_reasoning(&capability).unwrap();
 
         assert_eq!(map.levels.get("off"), Some(&serde_json::json!("none")));
         assert_eq!(

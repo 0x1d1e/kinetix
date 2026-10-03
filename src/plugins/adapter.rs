@@ -17,9 +17,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::adapters::{
-    parse_plugin_opaque_state_capability, Adapter, DiscoveredModel, OpaqueStateCapabilityKind,
-    OpaqueStateCapabilityV1, OpaqueStatePlaceholderStrategy, UpstreamContext,
+use crate::adapters::{Adapter, DiscoveredModel, UpstreamContext};
+use crate::model_capabilities::{
+    parse_plugin_opaque_state_capability, OpaqueStateCapabilityKind, OpaqueStateCapabilityV1,
+    OpaqueStatePlaceholderStrategy,
 };
 use crate::plugins::manager::PluginManager;
 use crate::plugins::runtime::PluginFault;

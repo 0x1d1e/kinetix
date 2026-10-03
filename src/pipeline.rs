@@ -5265,7 +5265,7 @@ fn evaluate_request_eligibility(
 }
 
 fn capability_eligibility(
-    capabilities: &crate::adapters::ModelCapabilityFlags,
+    capabilities: &crate::model_capabilities::ModelCapabilityFlags,
     needs: &crate::types::CapabilityNeeds,
     strict: bool,
 ) -> CapabilityEligibility {
@@ -5369,7 +5369,7 @@ fn dry_run_provider_accepts_frontend(provider: &db::ProviderRow, frontend: &str)
 
 fn provider_satisfies_needs(
     provider: &db::ProviderRow,
-    capabilities: &crate::adapters::ModelCapabilityFlags,
+    capabilities: &crate::model_capabilities::ModelCapabilityFlags,
     needs: &crate::types::CapabilityNeeds,
 ) -> bool {
     integration_feature_ceiling_satisfies_needs(provider, needs)
@@ -5377,7 +5377,7 @@ fn provider_satisfies_needs(
 }
 
 fn profile_satisfies_needs(
-    capabilities: &crate::adapters::ModelCapabilityFlags,
+    capabilities: &crate::model_capabilities::ModelCapabilityFlags,
     needs: &crate::types::CapabilityNeeds,
     strict: bool,
 ) -> bool {
@@ -7882,7 +7882,7 @@ mod route_policy_tests {
             reasoning: false,
             structured_output: false,
         };
-        let unknown = crate::adapters::ModelCapabilityFlags::default();
+        let unknown = crate::model_capabilities::ModelCapabilityFlags::default();
         let permissive = capability_eligibility(&unknown, &needs, false);
         assert!(permissive.eligible);
         assert_eq!(permissive.details["vision"]["status"], "unknown");
@@ -7894,7 +7894,7 @@ mod route_policy_tests {
             ["required vision capability is unknown under strict capability mode"]
         );
 
-        let unsupported = crate::adapters::ModelCapabilityFlags {
+        let unsupported = crate::model_capabilities::ModelCapabilityFlags {
             vision: Some(false),
             ..Default::default()
         };
@@ -11286,12 +11286,14 @@ mod route_policy_tests {
             }
         });
         let capability =
-            crate::adapters::normalize_plugin_reasoning_capability_v1(&metadata).unwrap();
-        assert!(crate::adapters::thinking_map_for_reasoning_with_wire(
-            &capability,
-            crate::types::WireFormat::Plugin,
-        )
-        .is_none());
+            crate::model_capabilities::normalize_plugin_reasoning_capability_v1(&metadata).unwrap();
+        assert!(
+            crate::model_capabilities::thinking_map_for_reasoning_with_wire(
+                &capability,
+                crate::types::WireFormat::Plugin,
+            )
+            .is_none()
+        );
 
         let mut target = target();
         target.provider.wire_format = "plugin".into();
@@ -11368,8 +11370,8 @@ mod route_policy_tests {
             }
         });
         let capability =
-            crate::adapters::normalize_plugin_reasoning_capability_v1(&metadata).unwrap();
-        let map = crate::adapters::thinking_map_for_reasoning_with_wire(
+            crate::model_capabilities::normalize_plugin_reasoning_capability_v1(&metadata).unwrap();
+        let map = crate::model_capabilities::thinking_map_for_reasoning_with_wire(
             &capability,
             crate::types::WireFormat::Openai,
         )
