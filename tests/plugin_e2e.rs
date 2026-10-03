@@ -460,7 +460,8 @@ async fn anthropic_messages_frontend_passes_thinking_and_tool_continuation_to_pl
         "tools": [{
             "name": "lookup",
             "description": "Look up a city",
-            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+            "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+            "defer_loading": true
         }],
         "messages": [
             {"role": "user", "content": "continue the tool turn"},
@@ -547,6 +548,7 @@ async fn anthropic_messages_frontend_passes_thinking_and_tool_continuation_to_pl
         "is_error": false
     })));
     assert_eq!(canonical["tools"][0]["name"], "lookup");
+    assert_eq!(canonical["tools"][0]["defer_loading"], true);
     drop(received);
 
     // Antigravity uses this declared signature kind for both Gemini and Claude,

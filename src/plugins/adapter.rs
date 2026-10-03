@@ -529,9 +529,17 @@ pub fn request_to_json(req: &InternalRequest) -> String {
     let tools: Vec<Value> = req
         .tools
         .iter()
-        .map(
-            |t| json!({ "name": t.name, "description": t.description, "parameters": t.parameters }),
-        )
+        .map(|t| {
+            let mut tool = json!({
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters
+            });
+            if let Some(defer_loading) = t.defer_loading {
+                tool["defer_loading"] = json!(defer_loading);
+            }
+            tool
+        })
         .collect();
     let tool_choice = {
         let (mode, name) = match req.tool_choice {
