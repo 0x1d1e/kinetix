@@ -205,47 +205,93 @@ pub fn is_available(account: &AccountRow) -> bool {
     effective_status(account) == AccountStatus::Healthy
 }
 
-/// Order accounts by priority while using account weight to choose the order
-/// within each priority tier. Sampling is without replacement so every account
-/// remains available for fallback while higher-weight accounts lead more often.
-pub fn order_accounts(mut accounts: Vec<AccountRow>, preferred: Option<&str>) -> Vec<AccountRow> {
+/// How sibling accounts are ordered. Live requests draw weighted picks at
+/// random; dry runs derive them from a stable seed so a simulation is
+/// reproducible and never consumes live randomness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountOrdering {
+    Live,
+    Simulated(u64),
+}
+
+impl AccountOrdering {
+    /// A seed for one independent sub-decision identified by `key`.
+    pub(crate) fn derive(self, key: &[u8]) -> Self {
+        match self {
+            Self::Live => Self::Live,
+            Self::Simulated(seed) => Self::Simulated(stable_hash(seed, key)),
+        }
+    }
+
+    pub(crate) fn seed(self) -> Option<u64> {
+        match self {
+            Self::Live => None,
+            Self::Simulated(seed) => Some(seed),
+        }
+    }
+}
+
+/// Order accounts by priority tier. Within a tier, weight biases which account
+/// leads while every sibling is retained for fallback.
+pub(crate) fn order_accounts(
+    mut accounts: Vec<AccountRow>,
+    ordering: AccountOrdering,
+) -> Vec<AccountRow> {
     use rand::Rng;
 
-    accounts.sort_by_key(|a| a.priority);
-
+    accounts.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.id.cmp(&right.id))
+    });
     let mut rng = rand::thread_rng();
-    let mut start = 0usize;
+    let mut start = 0;
     while start < accounts.len() {
         let priority = accounts[start].priority;
         let mut end = start + 1;
         while end < accounts.len() && accounts[end].priority == priority {
             end += 1;
         }
-
-        for i in start..end {
-            let total: i64 = accounts[i..end].iter().map(|a| a.weight.max(1)).sum();
-            let mut pick = rng.gen_range(0..total);
-            let mut selected = i;
-            for (offset, account) in accounts[i..end].iter().enumerate() {
-                pick -= account.weight.max(1);
-                if pick < 0 {
-                    selected = i + offset;
+        for index in start..end {
+            let total: u64 = accounts[index..end]
+                .iter()
+                .map(|account| crate::pre_dispatch::normalized_weight(account.weight))
+                .sum();
+            let pick = match ordering {
+                AccountOrdering::Live => rng.gen_range(0..total),
+                AccountOrdering::Simulated(seed) => {
+                    let identity = accounts[index..end]
+                        .iter()
+                        .map(|account| account.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    stable_hash(seed ^ index as u64, identity.as_bytes()) % total
+                }
+            };
+            let mut cumulative = 0;
+            let mut selected = index;
+            for (offset, account) in accounts[index..end].iter().enumerate() {
+                cumulative += crate::pre_dispatch::normalized_weight(account.weight);
+                if pick < cumulative {
+                    selected = index + offset;
                     break;
                 }
             }
-            accounts.swap(i, selected);
+            accounts.swap(index, selected);
         }
         start = end;
     }
-
-    if let Some(preferred) = preferred {
-        if let Some(pos) = accounts.iter().position(|a| a.id == preferred) {
-            let account = accounts.remove(pos);
-            accounts.insert(0, account);
-        }
-    }
-
     accounts
+}
+
+/// FNV-1a over `bytes`, seeded. Stable across processes and releases so dry
+/// runs reproduce the same ordering.
+pub(crate) fn stable_hash(seed: u64, bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0xcbf29ce484222325_u64 ^ seed, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
 }
 
 /// Mark an account rate-limited for `cooldown` seconds.
@@ -500,7 +546,7 @@ mod tests {
 
         let mut heavy_first = 0usize;
         for _ in 0..2000 {
-            let ordered = order_accounts(vec![light.clone(), heavy.clone()], None);
+            let ordered = order_accounts(vec![light.clone(), heavy.clone()], AccountOrdering::Live);
             if ordered[0].id == "heavy" {
                 heavy_first += 1;
             }
@@ -510,5 +556,35 @@ mod tests {
             heavy_first > 1500,
             "weight 9 account should lead most selections, got {heavy_first}/2000"
         );
+    }
+
+    #[test]
+    fn simulated_ordering_is_reproducible_and_keeps_priority_tiers() {
+        let accounts: Vec<_> = [("a", 2), ("b", 1), ("c", 1), ("d", 1)]
+            .into_iter()
+            .map(|(id, priority)| {
+                let mut row = account("healthy", None, None);
+                row.id = id.into();
+                row.priority = priority;
+                row
+            })
+            .collect();
+        let ids = |ordering| -> Vec<String> {
+            order_accounts(accounts.clone(), ordering)
+                .into_iter()
+                .map(|account| account.id)
+                .collect()
+        };
+        let first = ids(AccountOrdering::Simulated(7));
+        let mut reversed = accounts.clone();
+        reversed.reverse();
+        let from_reversed: Vec<_> = order_accounts(reversed, AccountOrdering::Simulated(7))
+            .into_iter()
+            .map(|account| account.id)
+            .collect();
+        assert_eq!(first, from_reversed);
+        assert_eq!(first.last().map(String::as_str), Some("a"));
+        let seeds_differ = (0..32).any(|seed| ids(AccountOrdering::Simulated(seed)) != first);
+        assert!(seeds_differ, "the seed must influence the in-tier order");
     }
 }

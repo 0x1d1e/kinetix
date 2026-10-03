@@ -27,7 +27,7 @@ use crate::opaque_state::{
     OpaqueClientScope, OpaqueLookupResult, OpaqueStateStore, OpaqueStateTarget,
 };
 use crate::passthrough;
-use crate::pool;
+use crate::pool::{self, AccountOrdering};
 use crate::predicate::{self, PluginFacts, RequestFacts, TargetFacts, TargetPredicate};
 use crate::registry::{Resolved, ResolvedTarget};
 use crate::stream_outcome::{CommitState, StreamOutcome, StreamTermination};
@@ -388,7 +388,7 @@ fn token_count_exact_target(
             if !provider.connection_policy_attested() {
                 return Ok(None);
             }
-            let account = select_accounts(&snap, &provider_id, None)?
+            let account = select_accounts(&snap, &provider_id, AccountOrdering::Live)
                 .into_iter()
                 .find(|account| {
                     matches!(
@@ -808,30 +808,8 @@ pub(crate) async fn run_with_disconnect(
             provider_id,
             model_id,
         } => {
-            let model = snap
-                .models
-                .get(&model_id)
-                .cloned()
-                .ok_or_else(|| ProxyError::not_found("model not found"))?;
-            let provider = snap
-                .providers
-                .get(&provider_id)
-                .cloned()
-                .ok_or_else(|| ProxyError::not_found("provider not found"))?;
-            let accounts = select_accounts(&snap, &provider_id, None)?;
-            let targets: Vec<ResolvedTarget> = accounts
-                .into_iter()
-                .map(|account| ResolvedTarget {
-                    account,
-                    model: model.clone(),
-                    provider: provider.clone(),
-                    route_target_id: None,
-                    priority: 1,
-                    weight: 1,
-                    predicate: TargetPredicate::default(),
-                    param_overrides: Value::Null,
-                })
-                .collect();
+            let targets =
+                direct_model_targets(&snap, &provider_id, &model_id, AccountOrdering::Live)?;
             (targets, None, Vec::new())
         }
         Resolved::Route { route, targets } => {
@@ -993,7 +971,7 @@ pub(crate) async fn run_with_disconnect(
     // Every Route strategy runs only after predicates, access, capabilities,
     // execution profiles, and context limits have reduced the candidate set.
     if let Some(route) = &route {
-        let ordering = order_route_targets(state, route, targets).await;
+        let ordering = order_route_targets(state, route, targets, AccountOrdering::Live).await;
         targets = ordering.targets;
         if route.strategy == "adaptive" {
             for target in &targets {
@@ -1120,14 +1098,7 @@ pub(crate) async fn run_with_disconnect(
     let dispatch_plan = crate::pre_dispatch::plan_dispatch(
         &dispatch_candidates,
         route.is_some(),
-        if route
-            .as_ref()
-            .is_some_and(|route| route.strategy == "weighted")
-        {
-            crate::pre_dispatch::DispatchStrategy::Weighted
-        } else {
-            crate::pre_dispatch::DispatchStrategy::Ordered
-        },
+        dispatch_strategy(route.as_ref()),
         affinity_candidate_id.as_deref(),
         false,
     );
@@ -4207,16 +4178,16 @@ fn account_skip_detail(target: &ResolvedTarget, status: pool::AccountStatus) -> 
     detail
 }
 
-/// Select healthy accounts for a provider's pool (single-model route).
-/// Select candidate accounts for a provider from the request's snapshot.
+/// Candidate accounts for a provider from the request's snapshot, limited to
+/// healthy accounts unless none are healthy.
 ///
 /// Health state is refreshed into the snapshot by the background reload loop,
 /// so no database I/O happens on the request path here (NFR-1.7).
 fn select_accounts(
     snap: &crate::registry::Snapshot,
     provider_id: &str,
-    preferred: Option<&str>,
-) -> Result<Vec<db::AccountRow>, ProxyError> {
+    ordering: AccountOrdering,
+) -> Vec<db::AccountRow> {
     let accounts: Vec<db::AccountRow> = snap
         .accounts
         .values()
@@ -4232,42 +4203,56 @@ fn select_accounts(
     // Keep unavailable rows only when the whole pool is unavailable so the
     // attempt loop can report the actual account state. Half-open probing is
     // circuit-only in pool::should_probe().
-    if available.is_empty() {
-        return Ok(pool::order_accounts(accounts, preferred));
-    }
-
-    Ok(pool::order_accounts(available, preferred))
-}
-
-fn select_accounts_for_simulation(
-    snap: &crate::registry::Snapshot,
-    provider_id: &str,
-    seed: u64,
-) -> Vec<db::AccountRow> {
-    let accounts: Vec<_> = snap
-        .accounts
-        .values()
-        .filter(|account| account.provider_id == provider_id)
-        .cloned()
-        .collect();
-    let available: Vec<_> = accounts
-        .iter()
-        .filter(|account| {
-            matches!(
-                pool::effective_status(account),
-                pool::AccountStatus::Healthy
-            )
-        })
-        .cloned()
-        .collect();
-    order_accounts_for_simulation(
+    pool::order_accounts(
         if available.is_empty() {
             accounts
         } else {
             available
         },
-        seed,
+        ordering,
     )
+}
+
+/// Targets for a direct (non-Route) model request: one per account in the
+/// model's provider pool.
+fn direct_model_targets(
+    snap: &crate::registry::Snapshot,
+    provider_id: &str,
+    model_id: &str,
+    ordering: AccountOrdering,
+) -> Result<Vec<ResolvedTarget>, ProxyError> {
+    let model = snap
+        .models
+        .get(model_id)
+        .cloned()
+        .ok_or_else(|| ProxyError::not_found("model not found"))?;
+    let provider = snap
+        .providers
+        .get(provider_id)
+        .cloned()
+        .ok_or_else(|| ProxyError::not_found("provider not found"))?;
+    Ok(select_accounts(snap, provider_id, ordering)
+        .into_iter()
+        .map(|account| ResolvedTarget {
+            account,
+            model: model.clone(),
+            provider: provider.clone(),
+            route_target_id: None,
+            priority: 1,
+            weight: 1,
+            predicate: TargetPredicate::default(),
+            param_overrides: Value::Null,
+        })
+        .collect())
+}
+
+/// The pre-dispatch strategy a Route's ordered candidates are planned with.
+fn dispatch_strategy(route: Option<&db::RouteRow>) -> crate::pre_dispatch::DispatchStrategy {
+    if route.is_some_and(|route| route.strategy == "weighted") {
+        crate::pre_dispatch::DispatchStrategy::Weighted
+    } else {
+        crate::pre_dispatch::DispatchStrategy::Ordered
+    }
 }
 
 /// Gather plugin routing facts for a request (§6.4).
@@ -4397,16 +4382,13 @@ async fn gather_plugin_facts(
 /// retaining every sibling for fallback.
 fn order_route_account_candidates(
     targets: Vec<ResolvedTarget>,
-    simulation_seed: Option<u64>,
+    ordering: AccountOrdering,
 ) -> Vec<ResolvedTarget> {
     let accounts: Vec<_> = targets
         .iter()
         .map(|target| target.account.clone())
         .collect();
-    let accounts = match simulation_seed {
-        Some(seed) => order_accounts_for_simulation(accounts, seed),
-        None => pool::order_accounts(accounts, None),
-    };
+    let accounts = pool::order_accounts(accounts, ordering);
     let mut by_account: std::collections::HashMap<String, ResolvedTarget> = targets
         .into_iter()
         .map(|target| (target.account.id.clone(), target))
@@ -4416,57 +4398,6 @@ fn order_route_account_candidates(
         .into_iter()
         .filter_map(|account| by_account.remove(&account.id))
         .collect()
-}
-
-fn order_accounts_for_simulation(
-    mut accounts: Vec<db::AccountRow>,
-    seed: u64,
-) -> Vec<db::AccountRow> {
-    accounts.sort_by(|left, right| {
-        left.priority
-            .cmp(&right.priority)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    let mut start = 0;
-    while start < accounts.len() {
-        let priority = accounts[start].priority;
-        let mut end = start + 1;
-        while end < accounts.len() && accounts[end].priority == priority {
-            end += 1;
-        }
-        for index in start..end {
-            let total: u64 = accounts[index..end]
-                .iter()
-                .map(|account| crate::pre_dispatch::normalized_weight(account.weight))
-                .sum();
-            let identity = accounts[index..end]
-                .iter()
-                .map(|account| account.id.as_str())
-                .collect::<Vec<_>>()
-                .join("|");
-            let pick = stable_route_hash(seed ^ index as u64, identity.as_bytes()) % total;
-            let mut cumulative = 0;
-            let mut selected = index;
-            for (offset, account) in accounts[index..end].iter().enumerate() {
-                cumulative += crate::pre_dispatch::normalized_weight(account.weight);
-                if pick < cumulative {
-                    selected = index + offset;
-                    break;
-                }
-            }
-            accounts.swap(index, selected);
-        }
-        start = end;
-    }
-    accounts
-}
-
-fn stable_route_hash(seed: u64, bytes: &[u8]) -> u64 {
-    bytes
-        .iter()
-        .fold(0xcbf29ce484222325_u64 ^ seed, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        })
 }
 
 fn adaptive_account_dispatchable(target: &ResolvedTarget) -> bool {
@@ -4480,28 +4411,12 @@ fn adaptive_account_dispatchable(target: &ResolvedTarget) -> bool {
 /// Order logical route targets according to the route strategy (FR-12.5), then
 /// flatten each target's account pool. A provider with N accounts therefore
 /// does not receive N times the configured route weight or round-robin share.
+/// Simulated ordering reads round-robin counters without advancing them.
 async fn order_route_targets(
     state: &AppState,
     route: &db::RouteRow,
     targets: Vec<ResolvedTarget>,
-) -> OrderedRouteTargets {
-    order_route_targets_inner(state, route, targets, None).await
-}
-
-async fn order_route_targets_for_simulation(
-    state: &AppState,
-    route: &db::RouteRow,
-    targets: Vec<ResolvedTarget>,
-    seed: u64,
-) -> OrderedRouteTargets {
-    order_route_targets_inner(state, route, targets, Some(seed)).await
-}
-
-async fn order_route_targets_inner(
-    state: &AppState,
-    route: &db::RouteRow,
-    targets: Vec<ResolvedTarget>,
-    simulation_seed: Option<u64>,
+    ordering: AccountOrdering,
 ) -> OrderedRouteTargets {
     // Freeze adaptive telemetry for this ordering pass. acquire() still
     // performs the authoritative live capacity check immediately before
@@ -4567,19 +4482,17 @@ async fn order_route_targets_inner(
     }
 
     for group in &mut groups {
-        let seed = simulation_seed.map(|seed| {
-            let key = group
-                .first()
-                .and_then(|target| target.route_target_id.as_deref())
-                .unwrap_or("direct");
-            stable_route_hash(seed, key.as_bytes())
-        });
-        *group = order_route_account_candidates(std::mem::take(group), seed);
+        let key = group
+            .first()
+            .and_then(|target| target.route_target_id.as_deref())
+            .unwrap_or("direct");
+        let group_ordering = ordering.derive(key.as_bytes());
+        *group = order_route_account_candidates(std::mem::take(group), group_ordering);
     }
 
     match route.strategy.as_str() {
         "round-robin" => {
-            let n = if simulation_seed.is_some() {
+            let n = if ordering.seed().is_some() {
                 state.rr_counter_snapshot(&route.id)
             } else {
                 state.rr_counter(&route.id).fetch_add(1, Ordering::Relaxed)
@@ -4597,8 +4510,10 @@ async fn order_route_targets_inner(
                 .map(|target| crate::pre_dispatch::normalized_weight(target.weight))
                 .sum();
             if total > 0 {
-                let mut pick = simulation_seed
-                    .map(|seed| stable_route_hash(seed, route.id.as_bytes()) % total)
+                let mut pick = ordering
+                    .derive(route.id.as_bytes())
+                    .seed()
+                    .map(|seed| seed % total)
                     .unwrap_or_else(|| rand::thread_rng().gen_range(0..total));
                 let mut index = 0;
                 for (i, group) in groups.iter().enumerate() {
@@ -7491,43 +7406,18 @@ pub async fn dry_run(
         structured_output: descriptor.has_structured_output,
     };
 
-    let simulation_seed = stable_route_hash(
+    let ordering = AccountOrdering::Simulated(pool::stable_hash(
         descriptor.input_tokens.unwrap_or_default() ^ u64::from(descriptor.has_tools),
         requested_model.as_bytes(),
-    );
+    ));
     let (targets, route) = match resolved {
         Resolved::Single {
             provider_id,
             model_id,
-        } => {
-            let model = snap
-                .models
-                .get(&model_id)
-                .cloned()
-                .ok_or_else(|| ProxyError::not_found("model not found"))?;
-            let provider = snap
-                .providers
-                .get(&provider_id)
-                .cloned()
-                .ok_or_else(|| ProxyError::not_found("provider not found"))?;
-            let accounts = select_accounts_for_simulation(&snap, &provider_id, simulation_seed);
-            (
-                accounts
-                    .into_iter()
-                    .map(|account| ResolvedTarget {
-                        account,
-                        model: model.clone(),
-                        provider: provider.clone(),
-                        route_target_id: None,
-                        priority: 1,
-                        weight: 1,
-                        predicate: TargetPredicate::default(),
-                        param_overrides: Value::Null,
-                    })
-                    .collect::<Vec<_>>(),
-                None,
-            )
-        }
+        } => (
+            direct_model_targets(&snap, &provider_id, &model_id, ordering)?,
+            None,
+        ),
         Resolved::Route { route, targets } => (targets, Some(route)),
     };
 
@@ -7567,10 +7457,9 @@ pub async fn dry_run(
     let dry_run_traffic = adaptive_route.then(|| snapshot_traffic_targets(state, &hard_eligible));
     let mut affinity_candidate_id = None;
     let route_rank = if let Some(route) = &route {
-        let ordered =
-            order_route_targets_for_simulation(state, route, hard_eligible, simulation_seed)
-                .await
-                .targets;
+        let ordered = order_route_targets(state, route, hard_eligible, ordering)
+            .await
+            .targets;
         if let (Some(session), true) = (
             descriptor.session.as_deref(),
             route.cache_affinity != 0 || route.sticky_routing != 0,
@@ -7746,14 +7635,7 @@ pub async fn dry_run(
     let dispatch_plan = crate::pre_dispatch::plan_dispatch(
         &dispatch_candidates,
         route.is_some(),
-        if route
-            .as_ref()
-            .is_some_and(|route| route.strategy == "weighted")
-        {
-            crate::pre_dispatch::DispatchStrategy::Weighted
-        } else {
-            crate::pre_dispatch::DispatchStrategy::Ordered
-        },
+        dispatch_strategy(route.as_ref()),
         affinity_candidate_id.as_deref(),
         true,
     );
@@ -8768,8 +8650,13 @@ mod route_policy_tests {
             .observe_headers("prov_test", "acc_preferred", &headers)
             .unwrap();
 
-        let ordering =
-            order_route_targets(&state, &route_row, vec![preferred.clone(), fallback]).await;
+        let ordering = order_route_targets(
+            &state,
+            &route_row,
+            vec![preferred.clone(), fallback],
+            AccountOrdering::Live,
+        )
+        .await;
         assert_eq!(ordering.targets[0].account.id, "acc_preferred");
         assert_eq!(
             state
@@ -8851,6 +8738,7 @@ mod route_policy_tests {
             &state,
             &route_row,
             vec![a_unavailable.clone(), a_healthy.clone(), b_healthy.clone()],
+            AccountOrdering::Live,
         )
         .await;
         let account_ids: Vec<_> = ordered
