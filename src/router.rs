@@ -249,6 +249,10 @@ pub(crate) fn admin_routes() -> crate::admin_contract::reference::AdminRouter {
             post(admin::install_catalog_plugin),
         )
         .route("/plugins/install", post(admin::install_plugin))
+        .route(
+            "/plugins/install/preview",
+            post(admin::preview_install_plugin),
+        )
         .route("/plugins/auth/start", post(admin::start_plugin_auth))
         .route(
             "/plugins/auth/complete",
@@ -266,6 +270,11 @@ pub(crate) fn admin_routes() -> crate::admin_contract::reference::AdminRouter {
         )
         .route("/plugins/{id}/enable", post(admin::enable_plugin))
         .route("/plugins/{id}/disable", post(admin::disable_plugin))
+        .route("/plugins/{id}/impact", get(admin::plugin_dependency_impact))
+        .route(
+            "/plugins/{id}/version-pin",
+            put(admin::set_plugin_version_pin),
+        )
         .route("/plugins/{id}/validate", post(admin::validate_plugin))
         .route("/plugins/{id}/rollback", post(admin::rollback_plugin))
         .route(

@@ -39,6 +39,10 @@ pub struct CatalogPlugin {
     #[serde(default)]
     pub note: Option<String>,
     #[serde(default)]
+    pub release_url: Option<String>,
+    #[serde(default)]
+    pub changelog_url: Option<String>,
+    #[serde(default)]
     pub distribution: Option<CatalogDistribution>,
 }
 
@@ -81,6 +85,7 @@ pub fn embedded_catalog() -> Result<Catalog> {
             catalog.schema_version
         );
     }
+    validate_catalog_links(&catalog)?;
     Ok(catalog)
 }
 
@@ -120,6 +125,7 @@ pub async fn fetch_remote_catalog(client: &reqwest::Client, url: &str) -> Result
             catalog.schema_version
         );
     }
+    validate_catalog_links(&catalog)?;
     Ok(catalog)
 }
 
@@ -132,7 +138,33 @@ pub fn read_cached_catalog(cache_path: &Path) -> Result<Catalog> {
             catalog.schema_version
         );
     }
+    validate_catalog_links(&catalog)?;
     Ok(catalog)
+}
+
+pub fn require_preview_sha256(expected: Option<&str>, actual: &str) -> Result<()> {
+    if expected.is_some_and(|expected| !actual.eq_ignore_ascii_case(expected)) {
+        bail!("catalog package changed since preview; review the current package again");
+    }
+    Ok(())
+}
+
+fn validate_catalog_links(catalog: &Catalog) -> Result<()> {
+    for plugin in &catalog.plugins {
+        for (label, link) in [
+            ("release_url", plugin.release_url.as_deref()),
+            ("changelog_url", plugin.changelog_url.as_deref()),
+        ] {
+            let Some(link) = link else { continue };
+            let parsed = url::Url::parse(link).map_err(|error| {
+                anyhow!("catalog {} for '{}' is invalid: {error}", label, plugin.id)
+            })?;
+            if parsed.scheme() != "https" || parsed.host_str().is_none() {
+                bail!("catalog {} for '{}' must be an HTTPS URL", label, plugin.id);
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn write_cached_catalog(cache_path: &Path, catalog: &Catalog) -> Result<()> {
@@ -452,6 +484,14 @@ mod tests {
                 id
             );
         }
+    }
+
+    #[test]
+    fn catalog_install_rejects_a_package_changed_since_preview() {
+        let actual = "a1".repeat(32);
+        assert!(require_preview_sha256(Some(&actual.to_uppercase()), &actual).is_ok());
+        assert!(require_preview_sha256(Some(&"b2".repeat(32)), &actual).is_err());
+        assert!(require_preview_sha256(None, &actual).is_ok());
     }
 
     #[test]
