@@ -22,7 +22,7 @@ launcher.
 | --- | --- |
 | **Virtual Keys** | Create keys (the full key is shown once), edit limits/budgets, edit the IP allowlist inline, revoke (hard-delete with a confirmation). |
 | **Routes & Fallback** | Create/edit Routes with strategy, portability policy, cache affinity, and targets; run a Route Dry Run. |
-| **Upstream Providers** | Add/edit providers (wire format, auth scheme, custom header/param, timeout, capability mode, credential-host binding, redirects, plain-HTTP dev toggle, models path, extra headers), attach an API key + account label, Test Ping, Fetch Models (discovery with fuzzy search), import discovered models, edit/delete models. |
+| **Upstream Providers** | Add/edit providers (wire format, auth scheme, custom header/param, timeout, compatibility policy (`capability_mode`), credential-host binding, redirects, plain-HTTP dev toggle, models path, extra headers), attach an API key + account label, Test Ping, Fetch Models (discovery with fuzzy search), import discovered models, edit/delete models. |
 | **Accounts & Pools** | Add/rotate credentials, edit priority/weight/soft quota/quota type, clear cooldown, delete. |
 | **Model Aliases** | Add/remove aliases pointing at a model or a Route. |
 | **Usage & Spend** | Spend vs budgets, a Today / 24h / 7d / 30d window, and per-day JSONL/CSV exports (list, export, delete). |

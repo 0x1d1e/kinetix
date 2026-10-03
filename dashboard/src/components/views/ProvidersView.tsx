@@ -2009,7 +2009,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
       {/* Add Provider Modal */}
       {showAddProviderModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
-          <div className="w-full max-w-lg">
+          <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto">
             <WobblyCard decoration="tape" className="bg-[var(--paper)] p-6 relative">
               <button
                 onClick={() => setShowAddProviderModal(false)}
@@ -2222,16 +2222,21 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                     </div>
                     <div>
                       <label className="block text-sm font-heading font-bold text-[var(--ink)] mb-1">
-                        Capability Mode
+                        Compatibility Policy
                       </label>
                       <select
                         value={capabilityMode}
                         onChange={(e) => setCapabilityMode(e.target.value as any)}
                         className="w-full bg-[var(--surface)] border-2 border-[var(--ink)] px-3 py-2 text-base font-mono sketch-shadow-sm focus:outline-none"
                       >
-                        <option value="permissive">Permissive (never reject on caps)</option>
-                        <option value="strict">Strict (reject unmet caps)</option>
+                        <option value="permissive">Permissive</option>
+                        <option value="strict">Strict</option>
                       </select>
+                      <p className="mt-1 text-xs font-body text-[var(--ink)]/65">
+                        {capabilityMode === 'strict'
+                          ? 'Reject requests requiring lossy compatibility transformations.'
+                          : 'Apply documented safe compatibility transformations.'}
+                      </p>
                     </div>
                     <div className="col-span-2 p-3 border-2 border-dashed border-[var(--ink)]/30 bg-[var(--surface)]/70">
                       <div className="font-heading font-bold text-sm mb-2">Plugin bindings (optional)</div>
