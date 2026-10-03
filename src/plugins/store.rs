@@ -95,13 +95,16 @@ pub async fn upsert_plugin(
     package_path: &str,
     source: &str,
     expected_current_sha256: Option<&str>,
-    preserved_grants: Option<&[PermissionGrant]>,
-) -> Result<bool> {
+    preserved_approval: Option<(&[PermissionGrant], &[PermissionGrant])>,
+) -> Result<PluginUpsertOutcome> {
     let manifest_json = serde_json::to_string(&validated.manifest)?;
     let api_major = validated.manifest.api_major().unwrap_or(0) as i64;
     let now = crate::db::now_iso();
 
-    let mut tx = pool.begin().await.context("begin plugin upsert")?;
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("begin plugin upsert")?;
     let current = sqlx::query_as::<_, (String, Option<String>, i64)>(
         "SELECT package_sha256, pinned_version, enabled FROM plugins WHERE id = ?",
     )
@@ -119,7 +122,28 @@ pub async fn upsert_plugin(
             );
         }
     }
-    let enabled = if preserved_grants.is_some() {
+    let approval_preserved = if let Some((expected_grants, _)) = preserved_approval {
+        let rows = sqlx::query(
+            "SELECT permission, value_json FROM plugin_permissions WHERE plugin_id = ? ORDER BY permission",
+        )
+        .bind(&validated.manifest.id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let current_grants: Vec<PermissionGrant> = rows
+            .into_iter()
+            .map(|row| PermissionGrant {
+                permission: row.get("permission"),
+                value_json: row.get("value_json"),
+            })
+            .collect();
+        permission_grants_equal(expected_grants, &current_grants)
+    } else {
+        false
+    };
+    let preserved_grants = preserved_approval
+        .filter(|_| approval_preserved)
+        .map(|(_, grants)| grants);
+    let enabled = if approval_preserved {
         current.as_ref().map(|row| row.2).unwrap_or(0)
     } else {
         0
@@ -200,13 +224,34 @@ pub async fn upsert_plugin(
     .await?;
 
     tx.commit().await?;
-    Ok(enabled != 0)
+    Ok(PluginUpsertOutcome {
+        enabled: enabled != 0,
+        approval_preserved,
+    })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginUpsertOutcome {
+    pub enabled: bool,
+    pub approval_preserved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionGrant {
     pub permission: String,
     pub value_json: String,
+}
+
+fn permission_grants_equal(left: &[PermissionGrant], right: &[PermissionGrant]) -> bool {
+    let left: std::collections::BTreeSet<_> = left
+        .iter()
+        .map(|grant| (&grant.permission, &grant.value_json))
+        .collect();
+    let right: std::collections::BTreeSet<_> = right
+        .iter()
+        .map(|grant| (&grant.permission, &grant.value_json))
+        .collect();
+    left == right
 }
 
 pub async fn list_plugins(pool: &Pool) -> Result<Vec<PluginRow>> {
@@ -257,6 +302,23 @@ pub async fn set_enabled(pool: &Pool, id: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+pub async fn set_enabled_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    enabled: bool,
+) -> Result<()> {
+    let result = sqlx::query("UPDATE plugins SET enabled = ?, updated_at = ? WHERE id = ?")
+        .bind(if enabled { 1 } else { 0 })
+        .bind(crate::db::now_iso())
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    if result.rows_affected() == 0 {
+        bail!("plugin '{id}' is not installed");
+    }
+    Ok(())
+}
+
 pub async fn set_version_pin(pool: &Pool, id: &str, pinned: bool) -> Result<String> {
     let mut tx = pool
         .begin()
@@ -291,6 +353,20 @@ pub async fn delete_plugin(pool: &Pool, id: &str) -> Result<()> {
         .bind(id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+pub async fn delete_plugin_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+) -> Result<()> {
+    let result = sqlx::query("DELETE FROM plugins WHERE id = ?")
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    if result.rows_affected() == 0 {
+        bail!("plugin '{id}' is not installed");
+    }
     Ok(())
 }
 

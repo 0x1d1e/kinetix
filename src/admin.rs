@@ -29265,6 +29265,10 @@ storage = "2MiB"
             .install(&foreign_package, None, &[], false)
             .await
             .unwrap();
+        foreign_manager
+            .approve_permissions("plugin.other")
+            .await
+            .unwrap();
         foreign_manager.enable("plugin.other").await.unwrap();
         assert!(foreign_manager.is_usable("plugin.other").await);
         assert!(!foreign_manager

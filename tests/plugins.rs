@@ -368,7 +368,7 @@ async fn non_expanding_upgrade_preserves_valid_approval_and_enabled_state() {
             .await
             .unwrap()
             .len(),
-        2
+        3
     );
 
     let packages = kinetix::plugins::store::list_packages(&pool, "dev.example.foo")
@@ -377,6 +377,63 @@ async fn non_expanding_upgrade_preserves_valid_approval_and_enabled_state() {
     assert_eq!(packages.len(), 2);
     assert!(packages.iter().any(|p| p.version == "1.2.0"));
     assert!(packages.iter().any(|p| p.version == "1.3.0"));
+}
+
+#[tokio::test]
+async fn update_does_not_restore_grants_revoked_after_approval_snapshot() {
+    let (m, pool) = manager().await;
+    m.install(&build_kxp(GOOD_MANIFEST, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+    m.enable("dev.example.foo").await.unwrap();
+
+    let old_row = m.get("dev.example.foo").await.unwrap().unwrap();
+    let stale_approval: Vec<_> = kinetix::plugins::store::permissions(&pool, "dev.example.foo")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|grant| kinetix::plugins::store::PermissionGrant {
+            permission: grant.permission,
+            value_json: grant.value_json,
+        })
+        .collect();
+    let upgraded = GOOD_MANIFEST.replace("version = \"1.2.0\"", "version = \"1.3.0\"");
+    let bytes = build_kxp(&upgraded, VALID_COMPONENT);
+    let package = kinetix::plugins::package::read_package(&bytes).unwrap();
+    let validated =
+        kinetix::plugins::package::validate_manifest(&package, HostPolicy::default()).unwrap();
+    let target_grants = kinetix::plugins::manager::permission_grants(&validated.manifest);
+    let signature = kinetix::plugins::package::verify_signature(&package, &[]).unwrap();
+
+    // Model revocation after the update captured its old grants but before its
+    // package upsert transaction starts.
+    m.revoke_permission("dev.example.foo", "network_hosts")
+        .await
+        .unwrap();
+    let outcome = kinetix::plugins::store::upsert_plugin(
+        &pool,
+        &validated,
+        &package.package_sha256,
+        &package.component,
+        signature.as_str(),
+        "dev.example.foo/update.kxp",
+        "test",
+        Some(&old_row.package_sha256),
+        Some((&stale_approval, &target_grants)),
+    )
+    .await
+    .unwrap();
+
+    assert!(!outcome.approval_preserved);
+    assert!(!outcome.enabled);
+    assert_eq!(m.get("dev.example.foo").await.unwrap().unwrap().enabled, 0);
+    assert!(
+        kinetix::plugins::store::permissions(&pool, "dev.example.foo")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -418,6 +475,46 @@ async fn expanding_upgrade_clears_approval_and_disables_plugin() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn limit_only_expansion_requires_approval_before_enable_and_runtime_use() {
+    let (m, pool) = manager().await;
+    let manifest = GOOD_MANIFEST.replace(
+        "[permissions]\nnetwork_hosts = [\"api.foo.example\"]\ncredential_scopes = [\"provider:foo\"]\n\n",
+        "",
+    );
+    m.install(&build_kxp(&manifest, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+    let approved = m.approve_permissions("dev.example.foo").await.unwrap();
+    assert_eq!(approved.len(), 1);
+    assert_eq!(approved[0].permission, "limits");
+    m.enable("dev.example.foo").await.unwrap();
+
+    let expanded = manifest
+        .replace("version = \"1.2.0\"", "version = \"1.3.0\"")
+        .replace("memory = \"64MiB\"", "memory = \"128MiB\"");
+    let outcome = m
+        .install(&build_kxp(&expanded, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+    assert!(outcome.permission_diff.increased);
+    assert!(outcome.permission_diff.limits.memory.increased);
+    assert!(!outcome.approval_preserved);
+    assert!(!outcome.enabled);
+    assert!(
+        kinetix::plugins::store::permissions(&pool, "dev.example.foo")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(m.enable("dev.example.foo").await.is_err());
+
+    kinetix::plugins::store::set_enabled(&pool, "dev.example.foo", true)
+        .await
+        .unwrap();
+    assert!(!m.is_usable("dev.example.foo").await);
 }
 
 #[tokio::test]
@@ -560,6 +657,153 @@ async fn dependency_impact_requires_current_acknowledgement_for_disable_and_remo
         .await
         .unwrap();
     assert!(m.get("dev.example.foo").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn concurrent_provider_and_route_bindings_block_disable_and_remove() {
+    let (m, pool) = manager().await;
+    m.install(&build_kxp(GOOD_MANIFEST, VALID_COMPONENT), None, &[], false)
+        .await
+        .unwrap();
+    m.approve_permissions("dev.example.foo").await.unwrap();
+    m.enable("dev.example.foo").await.unwrap();
+
+    let provider_id = db::insert_provider(
+        &pool,
+        &db::NewProvider {
+            name: "Racing provider",
+            base_url: "https://foo.example",
+            wire_format: kinetix::types::WireFormat::Openai,
+            auth_scheme: kinetix::types::AuthScheme::Bearer,
+            custom_header_name: None,
+            custom_param_name: None,
+            extra_headers: serde_json::json!({}),
+            timeout_ms: 30_000,
+            capability_mode: "permissive",
+            models_path: None,
+            rate_limit_rules: serde_json::json!({}),
+            follow_redirects: false,
+            credential_hosts: "",
+            allow_insecure_tls: false,
+            wire_plugin: "",
+            credential_plugin: "",
+            model_source_plugin: "",
+            credential_mode: "manual",
+            source_plugin_id: None,
+            source_integration_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let model_id = db::insert_model(
+        &pool,
+        &db::NewModel {
+            provider_id: &provider_id,
+            upstream_id: "racing-model",
+            display_name: "Racing model",
+            enabled: true,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: serde_json::json!({}),
+            prices: serde_json::json!({}),
+            parameters: serde_json::json!({}),
+            thinking_map: serde_json::json!({}),
+            extra_request: serde_json::json!({}),
+            discovery: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let route_id = db::insert_route(
+        &pool,
+        &db::NewRoute {
+            name: "Racing route",
+            description: "",
+            strategy: "priority",
+            fallback_triggers: serde_json::json!([]),
+            portability_policy: "strict",
+            sticky_routing: false,
+            cache_affinity: false,
+            max_attempts: None,
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // The lifecycle operation must acquire the SQLite writer lock before
+    // enumerating impact. A binding and Route target committed while it waits
+    // must be visible to both disable and removal checks.
+    let mut writer = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let disabling = {
+        let manager = m.clone();
+        tokio::spawn(async move { manager.disable("dev.example.foo", None).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    sqlx::query("UPDATE providers SET model_source_plugin = ? WHERE id = ?")
+        .bind("plugin:dev.example.foo/foo-models")
+        .bind(&provider_id)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (id, route_id, account_id, model_id, priority, weight, param_overrides, predicate)
+         VALUES ('racing-target-1', ?, NULL, ?, 0, 1, '{}', '{}')",
+    )
+    .bind(&route_id)
+    .bind(&model_id)
+    .execute(&mut *writer)
+    .await
+    .unwrap();
+    sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
+    assert!(disabling.await.unwrap().is_err());
+    assert_eq!(m.get("dev.example.foo").await.unwrap().unwrap().enabled, 1);
+
+    sqlx::query("UPDATE providers SET model_source_plugin = '' WHERE id = ?")
+        .bind(&provider_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM route_targets WHERE id = 'racing-target-1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut writer = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let removing = {
+        let manager = m.clone();
+        tokio::spawn(async move { manager.remove("dev.example.foo", None).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    sqlx::query("UPDATE providers SET model_source_plugin = ? WHERE id = ?")
+        .bind("plugin:dev.example.foo/foo-models")
+        .bind(&provider_id)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (id, route_id, account_id, model_id, priority, weight, param_overrides, predicate)
+         VALUES ('racing-target-2', ?, NULL, ?, 0, 1, '{}', '{}')",
+    )
+    .bind(&route_id)
+    .bind(&model_id)
+    .execute(&mut *writer)
+    .await
+    .unwrap();
+    sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
+    assert!(removing.await.unwrap().is_err());
+    assert!(m.get("dev.example.foo").await.unwrap().is_some());
+    let impact = m.dependency_impact("dev.example.foo").await.unwrap();
+    assert_eq!(impact.providers.len(), 1);
+    assert_eq!(impact.routes.len(), 1);
 }
 
 #[tokio::test]

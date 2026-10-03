@@ -1,4 +1,3 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   Box,
@@ -16,8 +15,9 @@ import {
   Trash2,
   Upload,
 } from 'lucide-react';
-import {
-  Kinetix,
+import type { FC, FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type {
   PluginCatalogEntry,
   PluginCatalogPreview,
   PluginDependencyImpact,
@@ -30,10 +30,11 @@ import {
   PluginSettingState,
   PluginSummary,
 } from '../../lib/resources';
-import { Provider } from '../../types';
-import { SketchBadge, SketchButton, WobblyCard } from '../HandDrawnElements';
+import { Kinetix } from '../../lib/resources';
+import type { Provider } from '../../types';
 import { ConnectionParameterFields } from '../ConnectionParameterFields';
 import { useAuthEnrollment } from '../CredentialAuthFlow';
+import { SketchBadge, SketchButton, WobblyCard } from '../HandDrawnElements';
 import { Modal } from '../Modal';
 
 function fileAsBase64(file: File): Promise<string> {
@@ -64,6 +65,7 @@ function requestedGrantPairs(plugin: PluginSummary): Array<[string, string]> {
   if (plugin.permissions.credential_read) {
     out.push(['credential_read', 'true']);
   }
+  out.push(['limits', JSON.stringify(plugin.limits)]);
   return out;
 }
 
@@ -93,7 +95,7 @@ function safeHttpsLink(value?: string | null): string | null {
   }
 }
 
-const PermissionDiffReview: React.FC<{ diff: PluginPermissionDiff }> = ({ diff }) => {
+const PermissionDiffReview: FC<{ diff: PluginPermissionDiff }> = ({ diff }) => {
   const lists = [
     ['Network hosts', diff.network_hosts],
     ['Credential scopes', diff.credential_scopes],
@@ -150,7 +152,7 @@ const PermissionDiffReview: React.FC<{ diff: PluginPermissionDiff }> = ({ diff }
   );
 };
 
-export const PluginsView: React.FC = () => {
+export const PluginsView: FC = () => {
   const [plugins, setPlugins] = useState<PluginSummary[]>([]);
   const [catalog, setCatalog] = useState<PluginCatalogEntry[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
@@ -276,6 +278,8 @@ export const PluginsView: React.FC = () => {
     });
   }, [catalog, catalogCapabilityFilter, catalogQuery]);
 
+  const refreshOnMount = useRef(refresh);
+
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const authResult = params.get('plugin_auth');
@@ -305,10 +309,9 @@ export const PluginsView: React.FC = () => {
       );
     }
 
-    void refresh(null);
+    void refreshOnMount.current(null);
     // Initial load only; later refreshes are explicit so selecting an item does
     // not re-run this effect through the selectedId dependency.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const selectPlugin = async (id: string) => {
@@ -544,7 +547,7 @@ export const PluginsView: React.FC = () => {
     }
   };
 
-  const install = async (e: React.FormEvent) => {
+  const install = async (e: FormEvent) => {
     e.preventDefault();
     if (installTab === 'upload' && !packageFile) {
       setError('Choose a .kxp package first.');
@@ -1094,6 +1097,8 @@ export const PluginsView: React.FC = () => {
               {filteredCatalog.map((entry) => {
                 const installed = plugins.find((plugin) => plugin.id === entry.id);
                 const hasUpdate = Boolean(installed && entry.update_available);
+                const releaseUrl = safeHttpsLink(entry.release_url);
+                const changelogUrl = safeHttpsLink(entry.changelog_url);
 
                 return (
                   <div
@@ -1136,15 +1141,15 @@ export const PluginsView: React.FC = () => {
                         Updates blocked: pinned to v{entry.pinned_version}. Unpin from the installed plugin details to update.
                       </p>
                     )}
-                    {(safeHttpsLink(entry.release_url) || safeHttpsLink(entry.changelog_url)) && (
+                    {(releaseUrl || changelogUrl) && (
                       <div className="mt-3 flex gap-4 text-xs font-heading font-bold">
-                        {safeHttpsLink(entry.release_url) && (
-                          <a className="underline underline-offset-2" href={safeHttpsLink(entry.release_url)!} target="_blank" rel="noopener noreferrer">
+                        {releaseUrl && (
+                          <a className="underline underline-offset-2" href={releaseUrl} target="_blank" rel="noopener noreferrer">
                             Release
                           </a>
                         )}
-                        {safeHttpsLink(entry.changelog_url) && (
-                          <a className="underline underline-offset-2" href={safeHttpsLink(entry.changelog_url)!} target="_blank" rel="noopener noreferrer">
+                        {changelogUrl && (
+                          <a className="underline underline-offset-2" href={changelogUrl} target="_blank" rel="noopener noreferrer">
                             Changelog
                           </a>
                         )}
@@ -1505,6 +1510,7 @@ export const PluginsView: React.FC = () => {
                               return null;
                             }
 
+                            const authFlow = integration.auth_flow;
                             const compatibleProviders = providers.filter(
                               (provider) =>
                                 provider.credentialPlugin ===
@@ -1527,7 +1533,7 @@ export const PluginsView: React.FC = () => {
                                     onClick={() =>
                                       void connectAccount(
                                         selected.id,
-                                        integration.auth_flow!,
+                                        authFlow,
                                         provider.id,
                                       )
                                     }
@@ -1550,7 +1556,7 @@ export const PluginsView: React.FC = () => {
                                           void setupAndConnect(
                                             selected.id,
                                             integration.id,
-                                            integration.auth_flow!,
+                                            authFlow,
                                           )
                                         }
                                       >

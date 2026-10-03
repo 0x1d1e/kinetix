@@ -537,9 +537,10 @@ Confirmation does not reuse the preview as an authorization token. Kinetix
 downloads and verifies the artifact again before installation, and the
 catalog install request includes the previewed package SHA so changed releases
 are rejected. New installs and updates that expand authority remain disabled
-with no grants until the operator reviews and approves permissions. A non-expanding update preserves the prior
-grants and enabled state only when the old grants exactly matched the old
-manifest. If the plugin was already disabled, it stays disabled.
+with no grants until the operator reviews and approves permissions. A
+non-expanding update preserves prior grants and enabled state only when the
+stored grants, including declared limits, exactly match the old manifest. A
+plugin that was already disabled stays disabled.
 
 ## Version history and rollback
 

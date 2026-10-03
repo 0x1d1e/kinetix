@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use dashmap::DashMap;
 use sha2::Digest;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -578,7 +578,7 @@ impl PluginManager {
                     .ok_or_else(|| anyhow!("installed plugin manifest is unreadable"))?;
                 let approved = self.approved_permissions(&row.id).await?;
                 if permission_grants_match(&permission_grants(&old_manifest), &approved) {
-                    Some(permission_grants(&validated.manifest))
+                    Some((approved, permission_grants(&validated.manifest)))
                 } else {
                     None
                 }
@@ -605,7 +605,9 @@ impl PluginManager {
             &package_path,
             source,
             current.as_ref().map(|row| row.package_sha256.as_str()),
-            preserved_grants.as_deref(),
+            preserved_grants
+                .as_ref()
+                .map(|(approved, target)| (approved.as_slice(), target.as_slice())),
         )
         .await?;
 
@@ -617,8 +619,8 @@ impl PluginManager {
             package_sha256: pkg.package_sha256,
             signature: sig,
             provides: validated.manifest.provides.provided(),
-            enabled,
-            approval_preserved: preserved_grants.is_some(),
+            enabled: enabled.enabled,
+            approval_preserved: enabled.approval_preserved,
             permission_diff,
         })
     }
@@ -862,13 +864,23 @@ impl PluginManager {
     }
 
     pub async fn disable(&self, id: &str, acknowledged_impact: Option<&str>) -> Result<()> {
-        let _ = self
-            .get(id)
-            .await?
-            .ok_or_else(|| anyhow!("plugin '{id}' is not installed"))?;
-        let impact = self.dependency_impact(id).await?;
-        require_impact_acknowledgement(&impact, acknowledged_impact)?;
-        store::set_enabled(&self.inner.pool, id, false).await?;
+        let mut tx = self
+            .inner
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .context("begin plugin disable")?;
+        let result = async {
+            let impact = self.dependency_impact(id).await?;
+            require_impact_acknowledgement(&impact, acknowledged_impact)?;
+            store::set_enabled_in_transaction(&mut tx, id, false).await
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = tx.rollback().await;
+            return Err(error);
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -930,13 +942,23 @@ impl PluginManager {
     }
 
     pub async fn remove(&self, id: &str, acknowledged_impact: Option<&str>) -> Result<()> {
-        let _ = self
-            .get(id)
-            .await?
-            .ok_or_else(|| anyhow!("plugin '{id}' is not installed"))?;
-        let impact = self.dependency_impact(id).await?;
-        require_impact_acknowledgement(&impact, acknowledged_impact)?;
-        store::delete_plugin(&self.inner.pool, id).await?;
+        let mut tx = self
+            .inner
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .context("begin plugin removal")?;
+        let result = async {
+            let impact = self.dependency_impact(id).await?;
+            require_impact_acknowledgement(&impact, acknowledged_impact)?;
+            store::delete_plugin_in_transaction(&mut tx, id).await
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = tx.rollback().await;
+            return Err(error);
+        }
+        tx.commit().await?;
         self.inner
             .plugin_semaphores
             .lock()
@@ -3469,6 +3491,10 @@ pub fn permission_grants(manifest: &Manifest) -> Vec<PermissionGrant> {
             value_json: "true".into(),
         });
     }
+    grants.push(PermissionGrant {
+        permission: "limits".into(),
+        value_json: serde_json::to_string(&manifest.limits).unwrap_or_else(|_| "{}".into()),
+    });
     grants
 }
 
@@ -4003,7 +4029,8 @@ credential_read = true
         )
         .unwrap();
         let grants = permission_grants(&m);
-        assert_eq!(grants.len(), 3);
+        assert_eq!(grants.len(), 4);
         assert!(grants.iter().any(|g| g.permission == "credential_read"));
+        assert!(grants.iter().any(|g| g.permission == "limits"));
     }
 }
