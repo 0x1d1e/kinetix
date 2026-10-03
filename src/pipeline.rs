@@ -5825,6 +5825,96 @@ fn capture_opaque_state(
     }
 }
 
+/// The client-visible lifecycle of one dispatched attempt. Every stream driver
+/// records the first upstream model frame and the commit point through this
+/// type so Route Trace, the live view, and the flight recorder agree. Once
+/// committed, the request can no longer retry or fail over.
+struct CommitPoint {
+    state: AppState,
+    request_id: String,
+    started: Instant,
+    first_frame_seen: bool,
+    ttft_ms: Option<i64>,
+    committed: bool,
+}
+
+impl CommitPoint {
+    fn new(state: &AppState, request_id: &str, started: Instant) -> Self {
+        Self {
+            state: state.clone(),
+            request_id: request_id.to_owned(),
+            started,
+            first_frame_seen: false,
+            ttft_ms: None,
+            committed: false,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Record the first client-encodable upstream model frame. TTFT is only
+    /// measured for streamed upstream responses; a complete JSON body has no
+    /// first-frame latency of its own.
+    fn first_frame(&mut self, measure_ttft: bool) {
+        if self.first_frame_seen {
+            return;
+        }
+        self.first_frame_seen = true;
+        if measure_ttft {
+            let ttft_ms = self.started.elapsed().as_millis() as i64;
+            self.ttft_ms = Some(ttft_ms);
+            self.state.live.set_ttft(&self.request_id, ttft_ms);
+            self.state.flight.record(
+                &self.request_id,
+                self.elapsed_ms(),
+                "upstream_first_frame",
+                "first upstream model event",
+            );
+        }
+        self.state.live.mark_streaming(&self.request_id);
+    }
+
+    /// Commit the attempt: the first client bytes are about to be sent.
+    fn commit(&mut self, trace: &mut RouteTrace, detail: &str) {
+        if self.committed {
+            return;
+        }
+        self.committed = true;
+        trace.commit();
+        self.state.live.mark_committed(&self.request_id);
+        self.state
+            .flight
+            .record(&self.request_id, self.elapsed_ms(), "commit", detail);
+    }
+
+    fn is_committed(&self) -> bool {
+        self.committed
+    }
+
+    fn ttft_ms(&self) -> Option<i64> {
+        self.ttft_ms
+    }
+
+    fn termination(
+        &self,
+        outcome: StreamOutcome,
+        failure: Option<(FailureKind, Option<u16>)>,
+    ) -> StreamTermination {
+        StreamTermination::new(
+            outcome,
+            if self.committed {
+                CommitState::PostCommit
+            } else {
+                CommitState::PreCommit
+            },
+            failure.map(|(kind, _)| kind),
+            failure.and_then(|(_, status)| status),
+        )
+    }
+}
+
 /// Emit normalized events to a streaming client. Returns false when the client
 /// disconnected while writing.
 #[allow(clippy::too_many_arguments)]
@@ -5837,13 +5927,11 @@ async fn emit_translated_events(
     started: Instant,
     usage: &mut TokenUsage,
     measure_ttft: bool,
-    ttft_ms: &mut Option<i64>,
-    committed: &mut bool,
+    commit: &mut CommitPoint,
     trace: &mut RouteTrace,
     saw_reasoning: &mut bool,
     saw_tool: &mut bool,
 ) -> bool {
-    let mut streaming_marked = false;
     for ev in events {
         if let StreamEvent::Usage(u) = &ev {
             usage.merge(u);
@@ -5871,33 +5959,10 @@ async fn emit_translated_events(
         }
         let frames = encoder.encode(ev);
         if !frames.is_empty() {
-            if measure_ttft && ttft_ms.is_none() {
-                *ttft_ms = Some(started.elapsed().as_millis() as i64);
-                state.live.set_ttft(&meta.request_id, ttft_ms.unwrap());
-                state.live.mark_streaming(&meta.request_id);
-                state.flight.record(
-                    &meta.request_id,
-                    started.elapsed().as_millis() as u64,
-                    "upstream_first_frame",
-                    "first upstream model event",
-                );
-            } else if !measure_ttft && !streaming_marked {
-                state.live.mark_streaming(&meta.request_id);
-                streaming_marked = true;
-            }
+            commit.first_frame(measure_ttft);
+            commit.commit(trace, "first client bytes");
         }
         for frame in frames {
-            if !*committed {
-                *committed = true;
-                trace.commit();
-                state.live.mark_committed(&meta.request_id);
-                state.flight.record(
-                    &meta.request_id,
-                    started.elapsed().as_millis() as u64,
-                    "commit",
-                    "first client bytes",
-                );
-            }
             if tx.send(Ok(frame)).await.is_err() {
                 return false;
             }
@@ -5929,11 +5994,10 @@ async fn drive_stream(
     encoder.set_include_usage(req.include_usage);
     let mut tool_stream = ToolStreamState::new(&meta.request_id);
     let mut usage = TokenUsage::default();
-    let mut ttft_ms: Option<i64> = None;
+    let mut commit = CommitPoint::new(&state, &meta.request_id, started);
     let mut stream_outcome = StreamOutcome::Completed;
     let mut error_message: Option<String> = None;
     let mut provider_failure: Option<(FailureKind, Option<u16>)> = None;
-    let mut committed = false;
     let mut saw_reasoning = false;
     let mut saw_tool = false;
     let adapter = attempt.adapter.clone();
@@ -5955,8 +6019,7 @@ async fn drive_stream(
             started,
             &mut usage,
             attempt.is_sse,
-            &mut ttft_ms,
-            &mut committed,
+            &mut commit,
             &mut trace,
             &mut saw_reasoning,
             &mut saw_tool,
@@ -5981,8 +6044,8 @@ async fn drive_stream(
             &attempt,
             &model_display,
             started,
-            ttft_ms,
-            stream_termination(stream_outcome, committed, provider_failure),
+            commit.ttft_ms(),
+            commit.termination(stream_outcome, provider_failure),
             usage,
             error_message,
             key,
@@ -6088,8 +6151,7 @@ async fn drive_stream(
                                 started,
                                 &mut usage,
                                 attempt.is_sse,
-                                &mut ttft_ms,
-                                &mut committed,
+                                &mut commit,
                                 &mut trace,
                                 &mut saw_reasoning,
                                 &mut saw_tool,
@@ -6129,7 +6191,7 @@ async fn drive_stream(
     }
 
     if stream_outcome.is_upstream_failure() {
-        if committed {
+        if commit.is_committed() {
             state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
         }
         let message = error_message
@@ -6155,8 +6217,8 @@ async fn drive_stream(
         &attempt,
         &model_display,
         started,
-        ttft_ms,
-        stream_termination(stream_outcome, committed, provider_failure),
+        commit.ttft_ms(),
+        commit.termination(stream_outcome, provider_failure),
         usage,
         error_message,
         key,
@@ -6186,11 +6248,10 @@ async fn drive_stream_passthrough(
     notify: Arc<tokio::sync::Notify>,
 ) {
     let mut usage = TokenUsage::default();
-    let mut ttft_ms: Option<i64> = None;
+    let mut commit = CommitPoint::new(&state, &meta.request_id, started);
     let mut stream_outcome = StreamOutcome::Completed;
     let mut error_message: Option<String> = None;
     let mut provider_failure: Option<(FailureKind, Option<u16>)> = None;
-    let mut committed = false;
     let mut saw_reasoning = false;
     let mut saw_tool = false;
     let adapter = attempt.adapter.clone();
@@ -6222,7 +6283,7 @@ async fn drive_stream_passthrough(
                     break;
                 }
             }
-            _ = keepalive.tick(), if committed => {
+            _ = keepalive.tick(), if commit.is_committed() => {
                 if tx.send(Ok(frontends::sse_comment("keepalive"))).await.is_err() {
                     stream_outcome = output_abort_outcome(&state, &meta, started);
                     break;
@@ -6313,23 +6374,13 @@ async fn drive_stream_passthrough(
                                 }
                             }
 
-                            if !committed {
+                            if !commit.is_committed() {
                                 pending_frames.push(frame);
                                 if !semantic {
                                     continue;
                                 }
-                                committed = true;
-                                trace.commit();
-                                state.live.mark_committed(&meta.request_id);
-                                ttft_ms = Some(started.elapsed().as_millis() as i64);
-                                state.live.set_ttft(&meta.request_id, ttft_ms.unwrap());
-                                state.live.mark_streaming(&meta.request_id);
-                                state.flight.record(
-                                    &meta.request_id,
-                                    started.elapsed().as_millis() as u64,
-                                    "commit",
-                                    "first validated passthrough event",
-                                );
+                                commit.first_frame(true);
+                                commit.commit(&mut trace, "first validated passthrough event");
                                 for buffered in pending_frames.drain(..) {
                                     if tx
                                         .send(Ok(Bytes::from(format!("{buffered}\n\n"))))
@@ -6377,7 +6428,7 @@ async fn drive_stream_passthrough(
         error_message = Some("upstream SSE ended before a terminal event".into());
     }
 
-    if stream_outcome.is_upstream_failure() && committed {
+    if stream_outcome.is_upstream_failure() && commit.is_committed() {
         state.failures_post_commit.fetch_add(1, Ordering::Relaxed);
         let message = error_message
             .as_deref()
@@ -6413,8 +6464,8 @@ async fn drive_stream_passthrough(
         &attempt,
         &model_display,
         started,
-        ttft_ms,
-        stream_termination(stream_outcome, committed, provider_failure),
+        commit.ttft_ms(),
+        commit.termination(stream_outcome, provider_failure),
         usage,
         error_message,
         key,
@@ -6447,23 +6498,6 @@ fn stream_outcome_for_failure(kind: FailureKind) -> StreamOutcome {
         FailureKind::MalformedUpstream => StreamOutcome::ProtocolViolation,
         _ => StreamOutcome::UpstreamError,
     }
-}
-
-fn stream_termination(
-    outcome: StreamOutcome,
-    committed: bool,
-    failure: Option<(FailureKind, Option<u16>)>,
-) -> StreamTermination {
-    StreamTermination::new(
-        outcome,
-        if committed {
-            CommitState::PostCommit
-        } else {
-            CommitState::PreCommit
-        },
-        failure.map(|(kind, _)| kind),
-        failure.and_then(|(_, status)| status),
-    )
 }
 
 fn output_abort_outcome(state: &AppState, meta: &RequestMeta, started: Instant) -> StreamOutcome {
@@ -6525,7 +6559,7 @@ async fn drive_aggregate(
     let mut stream_outcome = StreamOutcome::Completed;
     let mut error_message: Option<String> = None;
     let mut provider_failure: Option<(FailureKind, Option<u16>)> = None;
-    let mut committed = false;
+    let mut commit = CommitPoint::new(&state, &meta.request_id, started);
 
     if let Some(full_events) = attempt.full_events.take() {
         let normalized = tool_stream.normalize(full_events);
@@ -6538,8 +6572,7 @@ async fn drive_aggregate(
             }
             events.push(event);
         }
-        committed = true;
-        trace.commit();
+        commit.commit(&mut trace, "complete aggregated response");
     } else {
         let upstream = attempt.stream.take().expect("validated SSE stream present");
         let prefetched = std::mem::take(&mut attempt.prefetched);
@@ -6658,12 +6691,11 @@ async fn drive_aggregate(
         // Aggregated responses do not commit client bytes until the entire
         // upstream lifecycle is known to be complete.
         if status == "success" {
-            committed = true;
-            trace.commit();
+            commit.commit(&mut trace, "complete aggregated response");
         }
     }
 
-    let termination = stream_termination(stream_outcome, committed, provider_failure);
+    let termination = commit.termination(stream_outcome, provider_failure);
     finalize_log(
         &state,
         &snap,

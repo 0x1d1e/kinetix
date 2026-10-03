@@ -160,6 +160,12 @@ commit, cancellation, usage finalized), correlated with the request id. Retrieve
 via `GET /admin/api/requests/{id}/diagnostics`. Bounded by count/bytes/time so it
 can never grow unbounded.
 
+Every response records exactly one `commit` event, from the same commit point
+the Route Trace uses: streams commit at the first client bytes, non-streamed
+responses once the complete upstream response is validated. Streamed responses
+from a streaming upstream also record `upstream_first_frame` (the TTFT sample)
+just before `commit`.
+
 ## Live in-flight view
 
 `GET /admin/api/requests/live` returns in-flight requests (phase
