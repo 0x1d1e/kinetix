@@ -58,6 +58,7 @@ pub mod predicate;
 pub mod provider_circuit;
 pub mod provider_connection;
 pub mod provider_work;
+pub mod providers;
 pub mod quota;
 pub mod ratelimit;
 pub mod registry;

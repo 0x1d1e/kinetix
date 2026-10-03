@@ -16,6 +16,7 @@ use crate::aliases;
 use crate::config::{CliOverrides, Config};
 use crate::crypto::Crypto;
 use crate::db::{self, Pool};
+use crate::types::{AuthScheme, WireFormat};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -931,7 +932,7 @@ fn crypto_generate_key() -> (String, String) {
 // ---------------------------------------------------------------------------
 
 async fn cmd_provider(cli: &Cli, args: ProviderArgs) -> Result<()> {
-    let (_, pool, crypto) = open(cli).await?;
+    let (config, pool, crypto) = open(cli).await?;
     match args.action {
         ProviderAction::List => {
             for p in db::list_providers(&pool).await? {
@@ -955,23 +956,6 @@ async fn cmd_provider(cli: &Cli, args: ProviderArgs) -> Result<()> {
             account_label,
             connection_parameters,
         } => {
-            let problems = crate::validate::validate_provider_schema(
-                &name,
-                &base_url,
-                &wire_format,
-                &auth_scheme,
-                custom_header_name.as_deref(),
-                custom_param_name.as_deref(),
-            );
-            anyhow::ensure!(problems.is_empty(), "{}", problems.join("; "));
-            let anonymous = auth_scheme == "none";
-            anyhow::ensure!(
-                !anonymous
-                    || (api_key.is_none()
-                        && custom_header_name.is_none()
-                        && custom_param_name.is_none()),
-                "no-auth providers must not configure auth fields"
-            );
             let parameters: Option<crate::provider_connection::ConnectionParameters> =
                 match connection_parameters {
                     Some(path) => Some(serde_json::from_str(
@@ -979,45 +963,120 @@ async fn cmd_provider(cli: &Cli, args: ProviderArgs) -> Result<()> {
                     )?),
                     None => None,
                 };
-            crate::provider_connection::resolve_endpoint(
-                &base_url,
-                models_path.as_deref(),
+            let no_headers = std::collections::BTreeMap::new();
+            let check = crate::providers::check(
+                (&config).into(),
+                &crate::providers::ProviderDraft {
+                    name: &name,
+                    base_url: &base_url,
+                    wire_format: &wire_format,
+                    auth_scheme: &auth_scheme,
+                    custom_header_name: custom_header_name.as_deref(),
+                    custom_param_name: custom_param_name.as_deref(),
+                    extra_headers: &no_headers,
+                    timeout_ms,
+                    models_path: models_path.as_deref(),
+                    credential_hosts: "",
+                    wire_plugin: "",
+                    credential_plugin: "",
+                    model_source_plugin: "",
+                    pricing_scope: None,
+                    configures_credential: api_key.is_some(),
+                    connection: parameters.as_ref(),
+                },
+            );
+            anyhow::ensure!(
+                check.is_valid(),
+                "{}",
+                check.messages().collect::<Vec<_>>().join("; ")
+            );
+            for warning in &check.warnings {
+                eprintln!("warning: {warning}");
+            }
+            let wire = WireFormat::parse(&wire_format).context("invalid wire_format")?;
+            let auth = AuthScheme::parse(&auth_scheme).context("invalid auth_scheme")?;
+            let anonymous = auth == AuthScheme::None;
+            let credential_mode = if anonymous { "none" } else { "manual" };
+            let provider = db::NewProvider {
+                name: &name,
+                base_url: &base_url,
+                wire_format: wire,
+                auth_scheme: auth,
+                custom_header_name: custom_header_name.as_deref(),
+                custom_param_name: custom_param_name.as_deref(),
+                extra_headers: serde_json::json!({}),
+                timeout_ms,
+                capability_mode: "permissive",
+                models_path: models_path.as_deref(),
+                rate_limit_rules: serde_json::json!({}),
+                follow_redirects: false,
+                credential_hosts: "",
+                allow_insecure_tls: false,
+                wire_plugin: "",
+                credential_plugin: "",
+                model_source_plugin: "",
+                credential_mode,
+                source_plugin_id: None,
+                source_integration_id: None,
+            };
+            let pricing_scope = db::conservative_provider_pricing_scope(
+                auth,
+                credential_mode,
+                None,
+                None,
+                "",
+                "",
+                "",
+            );
+            let mut tx = pool.begin().await?;
+            let id = db::insert_provider_in_transaction(&mut tx, &provider, pricing_scope).await?;
+            db::set_provider_connection_parameters_in_transaction(
+                &mut tx,
+                &id,
                 parameters.as_ref(),
             )
-            .map_err(anyhow::Error::msg)?;
-            let id = format!("prov_{}", uuid::Uuid::new_v4().simple());
-            sqlx::query(
-                "INSERT INTO providers
-                 (id, name, base_url, wire_format, auth_scheme, custom_header_name, custom_param_name,
-                  extra_headers, timeout_ms, capability_mode, models_path, rate_limit_rules, enabled,
-                  follow_redirects, credential_hosts, allow_insecure_tls, created_at, credential_mode, connection_parameters)
-                 VALUES (?,?,?,?,?,?,?,'{}',?,'permissive',?,'{}',1,0,'',0,?,?,?)",
-            )
-            .bind(&id)
-            .bind(&name)
-            .bind(&base_url)
-            .bind(&wire_format)
-            .bind(&auth_scheme)
-            .bind(&custom_header_name)
-            .bind(&custom_param_name)
-            .bind(timeout_ms)
-            .bind(&models_path)
-            .bind(db::now_iso())
-            .bind(if anonymous { "none" } else { "manual" })
-            .bind(parameters.map(|parameters| serde_json::to_string(&parameters)).transpose()?)
-            .execute(&pool)
             .await?;
-            println!("provider created: {id}");
-            if anonymous {
-                db::insert_account(&pool, &id, "__kinetix_noauth__", "", "", 1, 1, None, "none")
-                    .await?;
-            }
-            if let Some(key) = api_key {
+            let account_id = if anonymous {
+                db::insert_account_in_transaction(
+                    &mut tx,
+                    &id,
+                    "__kinetix_noauth__",
+                    "",
+                    "",
+                    1,
+                    1,
+                    None,
+                    "none",
+                    None,
+                    true,
+                )
+                .await?;
+                None
+            } else if let Some(key) = api_key {
                 let label = account_label.unwrap_or_else(|| "Primary key".to_string());
-                let acc_id =
-                    insert_account_row(&pool, &crypto, &id, &label, &key, 1, 1, None, "none")
-                        .await?;
-                println!("account created: {acc_id}");
+                Some(
+                    db::insert_account_in_transaction(
+                        &mut tx,
+                        &id,
+                        &label,
+                        &crypto.encrypt(&key)?,
+                        &crate::crypto::mask_secret(&key),
+                        1,
+                        1,
+                        None,
+                        "none",
+                        None,
+                        true,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            tx.commit().await?;
+            println!("provider created: {id}");
+            if let Some(account_id) = account_id {
+                println!("account created: {account_id}");
             }
             Ok(())
         }

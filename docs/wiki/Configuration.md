@@ -120,6 +120,10 @@ targets = [
 ]
 ```
 
+Seeded providers pass the same checks as `POST /admin/api/validate/provider`
+(except plugin-binding resolution), including outbound URL security; an invalid
+provider fails bootstrap.
+
 Seeded Routes pass the same structural checks as Admin API and import writes
 (strategy, portability policy, fallback triggers, limits, predicates, at least
 one target). Targets naming unknown models are skipped with a warning; an

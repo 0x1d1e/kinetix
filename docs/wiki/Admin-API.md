@@ -35,7 +35,7 @@ expose it behind Cloudflare Access plus the in-Kinetix password/session check.
 | Method & path | Purpose |
 | --- | --- |
 | `GET /admin/api/providers` | List with `accounts_count` / `models_count` / `healthy_accounts`. |
-| `POST /admin/api/providers` | Create; optional `api_key` + `account_label` create the first account. Supports plugin capability bindings (`wire_plugin`, `credential_plugin`, `model_source_plugin`). |
+| `POST /admin/api/providers` | Create; rejects (`400`) everything `validate/provider` reports as a problem. Optional `api_key` + `account_label` create the first account. Supports plugin capability bindings (`wire_plugin`, `credential_plugin`, `model_source_plugin`). |
 | `GET /admin/api/providers/{id}` | Full config, plugin provenance, and normalized `credential_enrollment` state. |
 | `PUT /admin/api/providers/{id}` | Update; a non-empty `api_key` rotates the first account's credential. Supports updating plugin bindings. |
 | `DELETE /admin/api/providers/{id}` | Delete. |
@@ -93,7 +93,7 @@ Route creation, updates, and config imports apply the same semantic validation b
 | Method & path | Purpose |
 | --- | --- |
 | `POST /admin/api/validate` | Generic endpoint/connectivity validation (resolved IPs; ASN shown `unknown` when it cannot be resolved). |
-| `POST /admin/api/validate/provider` | Provider schema + outbound security + credential-host binding. |
+| `POST /admin/api/validate/provider` | Provider schema, no-auth consistency, timeout, pricing scope, connection templates, outbound security, plugin bindings, and credential-host binding. Provider create/update enforce all of these; import, CLI `provider add`, and bootstrap seeding enforce all but plugin-binding resolution. |
 | `POST /admin/api/validate/model` | Model metadata; unknown prices/capabilities reported as `unknown` (never assumed). |
 | `POST /admin/api/validate/account` | Account label/credential/quota validation. |
 

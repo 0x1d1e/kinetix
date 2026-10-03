@@ -241,7 +241,7 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
     if let Some(path) = &config.bootstrap_file {
         if path.exists() {
             let boot = crate::config::load_bootstrap(path)?;
-            match bootstrap::seed_if_empty(&pool, &crypto, &boot).await {
+            match bootstrap::seed_if_empty(&pool, &crypto, config.as_ref().into(), &boot).await {
                 Ok(generated) => {
                     for (name, key) in generated {
                         tracing::warn!(key_name = %name, virtual_key = %key, "generated bootstrap virtual key (shown once)");

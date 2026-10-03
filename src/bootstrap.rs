@@ -21,6 +21,7 @@ fn toml_json(value: Option<&toml::Value>) -> serde_json::Value {
 pub async fn seed_if_empty(
     pool: &Pool,
     crypto: &Crypto,
+    policy: crate::providers::OutboundPolicy,
     cfg: &BootstrapConfig,
 ) -> Result<Vec<(String, String)>> {
     let existing = db::list_providers(pool).await?;
@@ -38,19 +39,42 @@ pub async fn seed_if_empty(
     let mut account_ids: std::collections::HashMap<String, String> = Default::default();
 
     for p in &cfg.providers {
-        let wire = WireFormat::parse(&p.wire_format).ok_or_else(|| {
-            anyhow::anyhow!(
-                "invalid wire_format '{}' for provider '{}'",
-                p.wire_format,
-                p.name
-            )
-        })?;
-        if wire == WireFormat::Plugin && p.wire_plugin.as_deref().unwrap_or("").trim().is_empty() {
-            anyhow::bail!(
-                "provider '{}' uses wire_format 'plugin' but has no wire_plugin binding",
-                p.name
-            );
-        }
+        let extra_headers: std::collections::BTreeMap<String, String> = p
+            .extra_headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        let check = crate::providers::check(
+            policy,
+            &crate::providers::ProviderDraft {
+                name: &p.name,
+                base_url: &p.base_url,
+                wire_format: &p.wire_format,
+                auth_scheme: &p.auth_scheme,
+                custom_header_name: p.custom_header_name.as_deref(),
+                custom_param_name: p.custom_param_name.as_deref(),
+                extra_headers: &extra_headers,
+                timeout_ms: i64::try_from(p.timeout_ms).unwrap_or(i64::MAX),
+                models_path: p.models_path.as_deref(),
+                credential_hosts: &p.credential_hosts,
+                wire_plugin: p.wire_plugin.as_deref().unwrap_or(""),
+                credential_plugin: p.credential_plugin.as_deref().unwrap_or(""),
+                model_source_plugin: p.model_source_plugin.as_deref().unwrap_or(""),
+                pricing_scope: None,
+                configures_credential: !p.accounts.is_empty()
+                    || p.credential_mode
+                        .is_some_and(|mode| mode != crate::plugins::CredentialMode::None),
+                connection: p.connection_parameters.as_ref(),
+            },
+        );
+        anyhow::ensure!(
+            check.is_valid(),
+            "provider '{}': {}",
+            p.name,
+            check.messages().collect::<Vec<_>>().join("; ")
+        );
+        let wire = WireFormat::parse(&p.wire_format)
+            .ok_or_else(|| anyhow::anyhow!("invalid wire_format"))?;
         let auth = AuthScheme::parse(&p.auth_scheme)
             .ok_or_else(|| anyhow::anyhow!("invalid auth_scheme"))?;
         let anonymous = auth == AuthScheme::None;
@@ -59,21 +83,11 @@ pub async fn seed_if_empty(
             "auth_scheme 'none' requires credential_mode 'none'"
         );
         anyhow::ensure!(
-            !anonymous || p.accounts.is_empty(),
-            "no-auth providers must not configure account credentials"
-        );
-        anyhow::ensure!(
             anonymous
                 || p.credential_mode
                     .is_none_or(|mode| mode == crate::plugins::CredentialMode::Manual),
             "authenticated bootstrap providers use manual credential enrollment"
         );
-        crate::provider_connection::resolve_endpoint(
-            &p.base_url,
-            p.models_path.as_deref(),
-            p.connection_parameters.as_ref(),
-        )
-        .map_err(anyhow::Error::msg)?;
 
         let id = db::insert_provider(
             pool,

@@ -1,69 +1,27 @@
 //! Validate / Dry Run for configuration edits (FR-8.6, NFR-6.4).
 //!
-//! Before an admin applies a provider/model/account edit, Kinetix can validate
-//! the proposed change without mutating production state. This module covers
+//! Before an admin applies a model/account edit, Kinetix can validate the
+//! proposed change without mutating production state. This module covers
 //! **schema** and **metadata** validation:
 //!
 //! * required fields present and well-typed;
-//! * wire-format / auth-scheme validity and their required companion fields;
 //! * missing/unknown price and capability data (FR-6.3, FR-6.8) — reported as
 //!   `unknown` warnings, never silently treated as zero/known;
 //! * parameter-spec consistency (FR-10.6).
 //!
-//! Outbound security (scheme/TLS/SSRF, credential-host binding) is validated by
-//! the admin layer that owns those helpers; Route Dry Run (candidate ordering,
+//! Provider checks live in `crate::providers`; Route Dry Run (candidate ordering,
 //! predicate outcomes, would-be selection) lives in `pipeline::dry_run` because
 //! it needs the live snapshot and account-health logic.
 
 use serde_json::{json, Value};
 
-use crate::types::{ParamPolicy, Prices, WireFormat};
+use crate::types::{ParamPolicy, Prices};
 
 pub(crate) fn is_auth_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "authorization" | "proxy-authorization" | "x-api-key" | "x-goog-api-key"
     )
-}
-
-/// Schema-level validation of a proposed provider (FR-8.6).
-pub fn validate_provider_schema(
-    name: &str,
-    base_url: &str,
-    wire_format: &str,
-    auth_scheme: &str,
-    custom_header_name: Option<&str>,
-    custom_param_name: Option<&str>,
-) -> Vec<String> {
-    let mut problems = Vec::new();
-    if name.trim().is_empty() {
-        problems.push("provider name is required".into());
-    }
-    if base_url.trim().is_empty() {
-        problems.push("base_url is required".into());
-    }
-    if WireFormat::parse(wire_format).is_none() {
-        problems.push(format!(
-            "unknown wire_format '{wire_format}' (expected openai, anthropic, gemini, or plugin)"
-        ));
-    }
-    match auth_scheme {
-        "bearer" | "none" => {}
-        "custom_header" => {
-            if custom_header_name.unwrap_or("").trim().is_empty() {
-                problems.push("auth_scheme 'custom_header' requires custom_header_name".into());
-            }
-        }
-        "query_param" => {
-            if custom_param_name.unwrap_or("").trim().is_empty() {
-                problems.push("auth_scheme 'query_param' requires custom_param_name".into());
-            }
-        }
-        other => problems.push(format!(
-            "unknown auth_scheme '{other}' (expected none, bearer, custom_header, or query_param)"
-        )),
-    }
-    problems
 }
 
 /// Schema + metadata validation of a proposed model (FR-8.6). Missing prices
@@ -256,19 +214,6 @@ mod tests {
         let params = json!({"temperature": {"supported": true, "min": 2.0, "max": 1.0}});
         let v = validate_model("up", None, None, &json!({}), &json!({}), &params);
         assert_eq!(v["valid"], false);
-    }
-
-    #[test]
-    fn provider_schema_requires_header_for_custom_auth() {
-        let problems =
-            validate_provider_schema("n", "https://x/v1", "openai", "custom_header", None, None);
-        assert!(problems.iter().any(|p| p.contains("custom_header_name")));
-        let problems =
-            validate_provider_schema("n", "https://x/v1", "openai", "bearer", None, None);
-        assert!(problems.is_empty());
-        let problems =
-            validate_provider_schema("n", "https://x/v1", "plugin", "bearer", None, None);
-        assert!(problems.is_empty());
     }
 
     #[test]

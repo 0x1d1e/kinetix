@@ -62,15 +62,6 @@ impl ApiError {
         )
     }
 
-    fn on_field(mut self, field: &str) -> Self {
-        self.3.push(crate::admin_contract::field(
-            field,
-            "invalid_value",
-            &self.1,
-        ));
-        self
-    }
-
     fn fields(message: String, fields: Vec<FieldError>) -> Self {
         Self(StatusCode::BAD_REQUEST, message, None, fields)
     }
@@ -1721,19 +1712,6 @@ fn restore_redacted_headers(
     Ok(())
 }
 
-fn validate_provider_fields(body: &ProviderBody) -> Result<(), ApiError> {
-    if WireFormat::parse(&body.wire_format).is_none() {
-        return Err(ApiError::field("wire_format", "unsupported wire format"));
-    }
-    if AuthScheme::parse(&body.auth_scheme).is_none() {
-        return Err(ApiError::field(
-            "auth_scheme",
-            "unsupported authentication scheme",
-        ));
-    }
-    Ok(())
-}
-
 fn default_timeout() -> i64 {
     120_000
 }
@@ -1741,96 +1719,55 @@ fn default_permissive() -> String {
     "permissive".into()
 }
 
-async fn provider_plugin_binding_problems(state: &AppState, body: &ProviderBody) -> Vec<String> {
-    use crate::plugins::Capability;
-
-    let bindings = [
-        (
-            "wire_plugin",
-            body.wire_plugin.as_str(),
-            Capability::ProviderAdapter,
-        ),
-        (
-            "credential_plugin",
-            body.credential_plugin.as_str(),
-            Capability::CredentialStrategy,
-        ),
-    ];
-
-    let mut problems = Vec::new();
-    for (field, reference, capability) in bindings {
-        let reference = reference.trim();
-        if reference.is_empty() {
-            continue;
-        }
-        if crate::plugins::PluginRef::parse(reference).is_none() {
-            problems.push(format!(
-                "{field} must use plugin:<id>/<capability-name> syntax"
-            ));
-            continue;
-        }
-        let Some(manager) = state.plugin_manager() else {
-            problems.push(format!(
-                "{field} references '{reference}' but the plugin host is unavailable"
-            ));
-            continue;
-        };
-        if manager
-            .resolve_binding(reference, capability)
-            .await
-            .is_none()
-        {
-            problems.push(format!(
-                "{field} reference '{reference}' does not resolve to an installed, enabled, approved plugin providing {}",
-                capability.manifest_key()
-            ));
-        }
+fn provider_draft<'a>(
+    body: &'a ProviderBody,
+    connection: Option<&'a crate::provider_connection::ConnectionParameters>,
+) -> crate::providers::ProviderDraft<'a> {
+    crate::providers::ProviderDraft {
+        name: &body.name,
+        base_url: &body.base_url,
+        wire_format: &body.wire_format,
+        auth_scheme: &body.auth_scheme,
+        custom_header_name: body.custom_header_name.as_deref(),
+        custom_param_name: body.custom_param_name.as_deref(),
+        extra_headers: &body.extra_headers,
+        timeout_ms: body.timeout_ms,
+        models_path: body.models_path.as_deref(),
+        credential_hosts: &body.credential_hosts,
+        wire_plugin: &body.wire_plugin,
+        credential_plugin: &body.credential_plugin,
+        model_source_plugin: &body.model_source_plugin,
+        pricing_scope: body.pricing_scope.as_deref(),
+        configures_credential: body.api_key.as_ref().is_some_and(|key| !key.is_empty()),
+        connection,
     }
-
-    let model_reference = body.model_source_plugin.trim();
-    if !model_reference.is_empty() {
-        if crate::plugins::PluginRef::parse(model_reference).is_none() {
-            problems
-                .push("model_source_plugin must use plugin:<id>/<capability-name> syntax".into());
-        } else if let Some(manager) = state.plugin_manager() {
-            let account_aware = manager
-                .resolve_binding(model_reference, Capability::AccountModelSource)
-                .await
-                .is_some();
-            let legacy = manager
-                .resolve_binding(model_reference, Capability::ModelSource)
-                .await
-                .is_some();
-            if !account_aware && !legacy {
-                problems.push(format!(
-                    "model_source_plugin reference '{model_reference}' does not resolve to an installed, enabled, approved plugin providing account_model_sources or model_sources"
-                ));
-            }
-        } else {
-            problems.push(format!(
-                "model_source_plugin references '{model_reference}' but the plugin host is unavailable"
-            ));
-        }
-    }
-
-    problems
 }
-fn validate_no_auth_body(body: &ProviderBody) -> Result<(), ApiError> {
-    if body.auth_scheme == "none"
-        && (body.api_key.as_ref().is_some_and(|key| !key.is_empty())
-            || !body.credential_plugin.is_empty()
-            || body.custom_header_name.is_some()
-            || body.custom_param_name.is_some()
-            || body
-                .extra_headers
-                .keys()
-                .any(|name| crate::validate::is_auth_header(name)))
-    {
-        return Err(ApiError::bad(
-            "no-auth providers must not configure credentials or auth fields",
-        ));
+
+/// Reject a Provider write with every problem the validation preview would
+/// report for the same body.
+async fn check_provider_body(
+    state: &AppState,
+    body: &ProviderBody,
+    connection: Option<&crate::provider_connection::ConnectionParameters>,
+) -> Result<(), ApiError> {
+    let draft = provider_draft(body, connection);
+    let check = crate::providers::check(state.config.as_ref().into(), &draft);
+    let mut messages: Vec<String> = check.messages().map(str::to_owned).collect();
+    let fields = check
+        .problems
+        .iter()
+        .filter_map(|problem| {
+            problem.field.map(|field| {
+                crate::admin_contract::field(field, "invalid_value", problem.message.as_str())
+            })
+        })
+        .collect();
+    messages.extend(crate::providers::binding_problems(state, &draft).await);
+    if messages.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::fields(messages.join("; "), fields))
     }
-    Ok(())
 }
 
 pub async fn create_provider(
@@ -1839,31 +1776,12 @@ pub async fn create_provider(
     Json(mut body): Json<ProviderBody>,
 ) -> ApiResult {
     restore_redacted_headers(&mut body.extra_headers, None)?;
-    validate_provider_fields(&body)?;
-    validate_outbound_url(&state, &body.base_url).map_err(|error| error.on_field("base_url"))?;
-    validate_no_auth_body(&body)?;
-    crate::provider_connection::resolve_endpoint(&body.base_url, body.models_path.as_deref(), None)
-        .map_err(ApiError::bad)?;
-    if body
-        .connection_values
-        .as_ref()
-        .is_some_and(|values| !values.is_empty())
-    {
-        return Err(ApiError::bad(
-            "connection values require an integration with declared parameters",
-        ));
-    }
-    let binding_problems = provider_plugin_binding_problems(&state, &body).await;
-    if !binding_problems.is_empty() {
-        return Err(ApiError::bad(binding_problems.join("; ")));
-    }
+    let connection =
+        crate::providers::connection_with_values(None, body.connection_values.as_ref())
+            .map_err(ApiError::bad)?;
+    check_provider_body(&state, &body, connection.as_ref()).await?;
     let wire =
         WireFormat::parse(&body.wire_format).ok_or_else(|| ApiError::bad("invalid wire_format"))?;
-    if wire == WireFormat::Plugin && body.wire_plugin.trim().is_empty() {
-        return Err(ApiError::bad(
-            "wire_format 'plugin' requires a wire_plugin binding",
-        ));
-    }
     let auth =
         AuthScheme::parse(&body.auth_scheme).ok_or_else(|| ApiError::bad("invalid auth_scheme"))?;
     let credential_mode = if auth == AuthScheme::None {
@@ -1881,11 +1799,6 @@ pub async fn create_provider(
         &body.model_source_plugin,
     );
     if let Some(scope) = body.pricing_scope.as_deref() {
-        if !matches!(scope, "direct_api" | "integration") {
-            return Err(ApiError::bad(
-                "pricing_scope must be 'direct_api' or 'integration'",
-            ));
-        }
         if scope == "direct_api" && conservative_scope != "direct_api" {
             return Err(ApiError::bad(
                 "pricing_scope 'direct_api' is not allowed for plugin-backed generic providers",
@@ -2127,8 +2040,6 @@ pub async fn update_provider(
     Path(id): Path<String>,
     Json(mut body): Json<ProviderBody>,
 ) -> ApiResult {
-    validate_provider_fields(&body)?;
-    validate_outbound_url(&state, &body.base_url).map_err(|error| error.on_field("base_url"))?;
     let lock = model_reconciliation_lock(&id);
     let _guard = lock.lock().await;
     let existing = db::get_provider(&state.pool, &id)
@@ -2136,28 +2047,16 @@ pub async fn update_provider(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found("provider not found"))?;
     restore_redacted_headers(&mut body.extra_headers, Some(&existing))?;
-    validate_no_auth_body(&body)?;
+    let connection = crate::providers::connection_with_values(
+        existing.connection().map_err(ApiError::bad)?,
+        body.connection_values.as_ref(),
+    )
+    .map_err(ApiError::bad)?;
+    check_provider_body(&state, &body, connection.as_ref()).await?;
     if (existing.auth() == AuthScheme::None) != (body.auth_scheme == "none") {
         return Err(ApiError::bad(
             "changing between anonymous and authenticated providers requires a new provider",
         ));
-    }
-    let mut connection = existing.connection().map_err(ApiError::bad)?;
-    match (&mut connection, &body.connection_values) {
-        (Some(parameters), values) => {
-            if let Some(values) = values {
-                parameters.values = values.clone();
-            }
-            parameters
-                .resolve(&body.base_url, body.models_path.as_deref())
-                .map_err(ApiError::bad)?;
-        }
-        (None, Some(values)) if !values.is_empty() => {
-            return Err(ApiError::bad(
-                "connection values require declared parameters",
-            ))
-        }
-        _ => {}
     }
     if body
         .api_key
@@ -2172,17 +2071,8 @@ pub async fn update_provider(
         serde_json::from_str(&existing.rate_limit_rules).unwrap_or_else(|_| json!({}))
     });
     validate_provider_credential_binding_edit(&state, &existing, &body.credential_plugin).await?;
-    let binding_problems = provider_plugin_binding_problems(&state, &body).await;
-    if !binding_problems.is_empty() {
-        return Err(ApiError::bad(binding_problems.join("; ")));
-    }
     let wire =
         WireFormat::parse(&body.wire_format).ok_or_else(|| ApiError::bad("invalid wire_format"))?;
-    if wire == WireFormat::Plugin && body.wire_plugin.trim().is_empty() {
-        return Err(ApiError::bad(
-            "wire_format 'plugin' requires a wire_plugin binding",
-        ));
-    }
     let integration_protocols = existing
         .integration_protocol_ceiling()
         .map_err(ApiError::internal)?;
@@ -2222,13 +2112,6 @@ pub async fn update_provider(
         &body.credential_plugin,
         &body.model_source_plugin,
     );
-    if let Some(scope) = body.pricing_scope.as_deref() {
-        if !matches!(scope, "direct_api" | "integration") {
-            return Err(ApiError::bad(
-                "pricing_scope must be 'direct_api' or 'integration'",
-            ));
-        }
-    }
     let effective_scope = body
         .pricing_scope
         .as_deref()
@@ -9807,18 +9690,7 @@ pub async fn validate_provider(
     _auth: AdminAuth,
     Json(ProviderValidationBody { provider_id, body }): Json<ProviderValidationBody>,
 ) -> ApiResult {
-    let mut problems = crate::validate::validate_provider_schema(
-        &body.name,
-        &body.base_url,
-        &body.wire_format,
-        &body.auth_scheme,
-        body.custom_header_name.as_deref(),
-        body.custom_param_name.as_deref(),
-    );
-    if let Err(ApiError(_, problem, _, _)) = validate_no_auth_body(&body) {
-        problems.push(problem);
-    }
-    let mut connection = if let Some(id) = provider_id {
+    let declared = if let Some(id) = provider_id {
         db::get_provider(&state.pool, &id)
             .await
             .map_err(ApiError::internal)?
@@ -9828,49 +9700,25 @@ pub async fn validate_provider(
     } else {
         None
     };
-    if let Some(values) = &body.connection_values {
-        if let Some(parameters) = &mut connection {
-            parameters.values = values.clone();
-        } else if !values.is_empty() {
-            problems.push("connection values require declared parameters".into());
-        }
-    }
-    let resolved = match crate::provider_connection::resolve_endpoint(
-        &body.base_url,
-        body.models_path.as_deref(),
-        connection.as_ref(),
-    ) {
-        Ok((base, _)) => base,
-        Err(problem) => {
-            problems.push(problem);
-            body.base_url.clone()
-        }
-    };
-    problems.extend(provider_plugin_binding_problems(&state, &body).await);
-    if body.wire_format == "plugin" && body.wire_plugin.trim().is_empty() {
-        problems.push("wire_format 'plugin' requires a wire_plugin binding".into());
-    }
-    let mut warnings: Vec<String> = Vec::new();
-    let mut security: Value = Value::String("not_checked".into());
-    if body.base_url.trim().is_empty() {
-        // already reported as a schema problem
+    let mut problems = Vec::new();
+    let connection =
+        match crate::providers::connection_with_values(declared, body.connection_values.as_ref()) {
+            Ok(connection) => connection,
+            Err(problem) => {
+                problems.push(problem);
+                None
+            }
+        };
+    let draft = provider_draft(&body, connection.as_ref());
+    let check = crate::providers::check(state.config.as_ref().into(), &draft);
+    problems.extend(check.messages().map(str::to_owned));
+    problems.extend(crate::providers::binding_problems(&state, &draft).await);
+    let security = if check.outbound_passed == Some(true) {
+        "passed"
     } else {
-        match validate_outbound_url(&state, &resolved) {
-            Ok(()) => security = Value::String("passed".into()),
-            Err(ApiError(_, msg, _, _)) => problems.push(msg),
-        }
-    }
-    if body.wire_format == "anthropic"
-        && !body
-            .extra_headers
-            .keys()
-            .any(|k| k.eq_ignore_ascii_case("anthropic-version"))
-    {
-        warnings.push(
-            "anthropic wire format: set an 'anthropic-version' extra header (Kinetix adds no hidden defaults)"
-                .into(),
-        );
-    }
+        "not_checked"
+    };
+    let warnings = check.warnings;
     // Credential-host binding (NFR-3.11): the credential is bound to the
     // provider's base host plus any explicitly authorized hosts. Flag malformed
     // entries (a scheme/path/port is not a host) so a misconfigured binding is
@@ -9883,14 +9731,7 @@ pub async fn validate_provider(
     }
     for entry in body.credential_hosts.split(',') {
         let host = entry.trim();
-        if host.is_empty() {
-            continue;
-        }
-        if host.contains('/') || host.contains(' ') || host.contains("://") {
-            problems.push(format!(
-                "credential_hosts entry '{host}' is not a bare host (drop the scheme/path)"
-            ));
-        } else {
+        if !host.is_empty() && !host.contains('/') && !host.contains(' ') {
             binding.push(host.to_string());
         }
     }
@@ -10947,31 +10788,9 @@ fn sanitize_account_label(label: &str) -> String {
     cleaned.trim().chars().take(120).collect()
 }
 
-/// Guardrail for admin-supplied endpoints (NFR-3.9): HTTPS by default, and
-/// loopback/link-local/private/metadata ranges blocked unless explicitly allowed.
+/// Guardrail for admin-supplied endpoints; see [`crate::providers::check_outbound_url`].
 fn validate_outbound_url(state: &AppState, url: &str) -> Result<(), ApiError> {
-    let parsed = url::Url::parse(url).map_err(|e| ApiError::bad(format!("invalid URL: {e}")))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| ApiError::bad("URL must have a host"))?;
-    // TLS is mandatory except in the explicit, visibly-marked dev mode
-    // (NFR-3.12). KINETIX_ALLOW_INSECURE_TLS is that override — the
-    // private-upstreams flag must NOT silently disable TLS.
-    if parsed.scheme() != "https" && !state.config.allow_insecure_tls {
-        return Err(ApiError::bad(
-            "endpoint must use https (set KINETIX_ALLOW_INSECURE_TLS=true to override for local development)",
-        ));
-    }
-    // The private-upstreams flag only relaxes the blocked-host check (NFR-3.9).
-    if state.config.allow_private_upstreams {
-        return Ok(());
-    }
-    if crate::net::is_blocked_host(host) {
-        return Err(ApiError::bad(format!(
-            "host '{host}' resolves to a blocked private/metadata range; set KINETIX_ALLOW_PRIVATE_UPSTREAMS=true to allow"
-        )));
-    }
-    Ok(())
+    crate::providers::check_outbound_url(state.config.as_ref().into(), url).map_err(ApiError::bad)
 }
 
 /// Whether an IP literal falls in a blocked private/link-local/metadata range
@@ -13197,59 +13016,54 @@ async fn import_config_apply(
                 .push(json!({ "kind": "provider", "name": name, "reason": "duplicate entry" }));
             problems.push(format!("provider '{name}' appears more than once"));
         }
-        for problem in crate::validate::validate_provider_schema(
+        let connection = match p.get("connection_parameters").filter(|raw| !raw.is_null()) {
+            Some(raw) => match serde_json::from_value::<
+                crate::provider_connection::ConnectionParameters,
+            >(raw.clone())
+            {
+                Ok(parameters) => Some(parameters),
+                Err(_) => {
+                    problems.push(format!("provider '{name}': invalid connection_parameters"));
+                    None
+                }
+            },
+            None => None,
+        };
+        let header_names: std::collections::BTreeMap<String, String> = p["extra_headers"]
+            .as_object()
+            .map(|headers| {
+                headers
+                    .keys()
+                    .map(|header| (header.clone(), String::new()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let draft = crate::providers::ProviderDraft {
             name,
             base_url,
-            p["wire_format"].as_str().unwrap_or(""),
-            p["auth_scheme"].as_str().unwrap_or("bearer"),
-            p["custom_header_name"].as_str(),
-            p["custom_param_name"].as_str(),
-        ) {
+            wire_format: p["wire_format"].as_str().unwrap_or(""),
+            auth_scheme: p["auth_scheme"].as_str().unwrap_or("bearer"),
+            custom_header_name: p["custom_header_name"].as_str(),
+            custom_param_name: p["custom_param_name"].as_str(),
+            extra_headers: &header_names,
+            timeout_ms: match p.get("timeout_ms") {
+                None | Some(Value::Null) => default_timeout(),
+                Some(value) => value.as_i64().unwrap_or(0),
+            },
+            models_path: p["models_path"].as_str(),
+            credential_hosts: p["credential_hosts"].as_str().unwrap_or(""),
+            wire_plugin: p["wire_plugin"].as_str().unwrap_or(""),
+            credential_plugin: p["credential_plugin"].as_str().unwrap_or(""),
+            model_source_plugin: p["model_source_plugin"].as_str().unwrap_or(""),
+            pricing_scope: match p.get("pricing_scope") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_str().unwrap_or("")),
+            },
+            configures_credential: p["credential_mode"] != "none",
+            connection: connection.as_ref(),
+        };
+        for problem in crate::providers::check(state.config.as_ref().into(), &draft).messages() {
             problems.push(format!("provider '{name}': {problem}"));
-        }
-        if let Some(raw) = p.get("connection_parameters").filter(|raw| !raw.is_null()) {
-            match serde_json::from_value::<crate::provider_connection::ConnectionParameters>(
-                raw.clone(),
-            ) {
-                Ok(parameters) => {
-                    if let Err(problem) = parameters.resolve(base_url, p["models_path"].as_str()) {
-                        problems.push(format!("provider '{name}': {problem}"));
-                    }
-                }
-                Err(_) => {
-                    problems.push(format!("provider '{name}': invalid connection_parameters"))
-                }
-            }
-        } else if base_url.contains(['{', '}'])
-            || p["models_path"]
-                .as_str()
-                .is_some_and(|path| path.contains(['{', '}']))
-        {
-            problems.push(format!(
-                "provider '{name}': URL templates require connection_parameters"
-            ));
-        }
-        if p["auth_scheme"] == "none"
-            && (p["credential_mode"] != "none"
-                || !p["credential_plugin"].as_str().unwrap_or("").is_empty()
-                || !p["custom_header_name"].is_null()
-                || !p["custom_param_name"].is_null()
-                || p["extra_headers"].as_object().is_some_and(|headers| {
-                    headers
-                        .keys()
-                        .any(|name| crate::validate::is_auth_header(name))
-                }))
-        {
-            problems.push(format!(
-                "provider '{name}': no-auth requires credential_mode 'none' without auth fields"
-            ));
-        }
-        if p.get("timeout_ms").is_some_and(|value| !value.is_null())
-            && !p["timeout_ms"].as_i64().is_some_and(|timeout| timeout > 0)
-        {
-            problems.push(format!(
-                "provider '{name}': timeout_ms must be a positive integer"
-            ));
         }
         if p.get("enabled").is_some_and(|value| !value.is_null()) && !p["enabled"].is_boolean() {
             problems.push(format!("provider '{name}': enabled must be a boolean"));
@@ -13264,26 +13078,6 @@ async fn import_config_apply(
         {
             problems.push(format!(
                 "provider '{name}': rate_limit_rules must be an object"
-            ));
-        }
-        if let Err(e) = validate_outbound_url(&state, base_url) {
-            problems.push(format!("provider '{name}': {}", e.1));
-        }
-        if WireFormat::parse(p["wire_format"].as_str().unwrap_or("")).is_none() {
-            problems.push(format!(
-                "provider '{name}': invalid wire_format '{}'",
-                p["wire_format"].as_str().unwrap_or("")
-            ));
-        }
-        if let Some(scope) = p.get("pricing_scope").and_then(Value::as_str) {
-            if !matches!(scope, "direct_api" | "integration") {
-                problems.push(format!(
-                    "provider '{name}': pricing_scope must be 'direct_api' or 'integration'"
-                ));
-            }
-        } else if p.get("pricing_scope").is_some() && !p["pricing_scope"].is_null() {
-            problems.push(format!(
-                "provider '{name}': pricing_scope must be 'direct_api' or 'integration'"
             ));
         }
         let existing_provider = existing_providers
@@ -25009,6 +24803,64 @@ mod credential_enrollment_regression_tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(state.registry.resolve("fast").is_some());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn provider_create_enforces_the_same_checks_as_provider_validation() {
+        let (state, root) = test_state("provider-write-checks").await;
+        let app = crate::router::build(state.clone());
+        let send = |uri: &str, body: Value| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("x-kinetix-admin-token", "test-admin")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let valid = json!({
+            "name": "checked",
+            "base_url": "https://api.example.com/v1",
+            "wire_format": "openai",
+        });
+        for (field, value) in [
+            ("name", json!(" ")),
+            ("auth_scheme", json!("custom_header")),
+            ("timeout_ms", json!(0)),
+            ("credential_hosts", json!("https://other.example.com/path")),
+            ("pricing_scope", json!("free")),
+        ] {
+            let mut body = valid.clone();
+            body[field] = value;
+            let response = app
+                .clone()
+                .oneshot(send("/admin/api/validate/provider", body.clone()))
+                .await
+                .unwrap();
+            let preview: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(preview["valid"], false, "{field}: {preview}");
+            let response = app
+                .clone()
+                .oneshot(send("/admin/api/providers", body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+        }
+        assert!(db::list_providers(&state.pool).await.unwrap().is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(send("/admin/api/providers", valid))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         let _ = std::fs::remove_dir_all(root);
     }
