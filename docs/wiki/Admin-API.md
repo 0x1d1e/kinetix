@@ -85,7 +85,7 @@ Route creation, updates, and config imports apply the same semantic validation b
 | Method & path | Purpose |
 | --- | --- |
 | `GET /admin/api/aliases` | List. |
-| `POST /admin/api/aliases` | Create (`alias`, `target_type`, `target_id`/`target`). |
+| `POST /admin/api/aliases` | Create or update by name (`alias`, `target_type` = `model` or `route`, `target_id`, optional `description`). Rejects blank names and missing targets. |
 | `DELETE /admin/api/aliases/{id}` | Delete. |
 
 ## Validate / Dry Run

@@ -3604,38 +3604,6 @@ pub async fn get_alias(pool: &Pool, alias: &str) -> Result<Option<AliasRow>> {
     )
 }
 
-pub async fn upsert_alias(
-    pool: &Pool,
-    alias: &str,
-    target_type: &str,
-    target_id: &str,
-    description: &str,
-) -> Result<String> {
-    if let Some(existing) = get_alias(pool, alias).await? {
-        sqlx::query("UPDATE aliases SET target_type=?, target_id=?, description=? WHERE id=?")
-            .bind(target_type)
-            .bind(target_id)
-            .bind(description)
-            .bind(&existing.id)
-            .execute(pool)
-            .await?;
-        return Ok(existing.id);
-    }
-    let id = format!("alias_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(
-        "INSERT INTO aliases (id, alias, target_type, target_id, description, created_at) VALUES (?,?,?,?,?,?)",
-    )
-    .bind(&id)
-    .bind(alias)
-    .bind(target_type)
-    .bind(target_id)
-    .bind(description)
-    .bind(now_iso())
-    .execute(pool)
-    .await?;
-    Ok(id)
-}
-
 pub async fn delete_alias(pool: &Pool, id: &str) -> Result<()> {
     sqlx::query("DELETE FROM aliases WHERE id = ?")
         .bind(id)

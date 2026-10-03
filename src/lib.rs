@@ -22,6 +22,7 @@ pub mod admin;
 pub mod admin_contract;
 pub mod admission;
 pub mod alerts;
+pub mod aliases;
 pub mod alloc;
 pub mod api;
 pub mod app;

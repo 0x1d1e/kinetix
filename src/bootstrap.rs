@@ -250,14 +250,23 @@ pub async fn seed_if_empty(
             _ => model_ids.get(&a.target).cloned(),
         };
         if let Some(target_id) = target_id {
-            db::upsert_alias(
-                pool,
-                &a.alias,
-                &a.target_type,
-                &target_id,
-                "Seeded from bootstrap config",
+            match crate::aliases::upsert(
+                &mut *pool.acquire().await?,
+                crate::aliases::AliasWrite {
+                    alias: &a.alias,
+                    target_type: &a.target_type,
+                    target_id: &target_id,
+                    description: "Seeded from bootstrap config",
+                },
             )
-            .await?;
+            .await
+            {
+                Ok(_) => {}
+                Err(crate::aliases::AliasWriteError::Invalid(message)) => {
+                    tracing::warn!("skipping bootstrap alias: {message}");
+                }
+                Err(error) => return Err(error.into()),
+            }
         } else {
             tracing::warn!(
                 "alias '{}' references unknown target '{}'",

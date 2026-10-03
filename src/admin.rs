@@ -10140,15 +10140,19 @@ pub async fn create_alias(
     _auth: AdminAuth,
     Json(body): Json<AliasBody>,
 ) -> ApiResult {
-    let id = db::upsert_alias(
-        &state.pool,
-        &body.alias,
-        &body.target_type,
-        &body.target_id,
-        &body.description,
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let id = crate::aliases::upsert(
+        &mut tx,
+        crate::aliases::AliasWrite {
+            alias: &body.alias,
+            target_type: &body.target_type,
+            target_id: &body.target_id,
+            description: &body.description,
+        },
     )
     .await
-    .map_err(ApiError::internal)?;
+    .map_err(alias_write_error)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -10165,6 +10169,13 @@ pub async fn create_alias(
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "id": id })))
+}
+
+fn alias_write_error(error: crate::aliases::AliasWriteError) -> ApiError {
+    match error {
+        crate::aliases::AliasWriteError::Invalid(message) => ApiError::bad(message),
+        crate::aliases::AliasWriteError::Storage(error) => ApiError::internal(error),
+    }
 }
 
 pub async fn delete_alias(
@@ -15034,34 +15045,17 @@ async fn import_config_apply(
         };
         let Some(tid) = tid else { continue };
         let description = a["description"].as_str().unwrap_or("");
-        if let Some(id) = sqlx::query_scalar::<_, String>("SELECT id FROM aliases WHERE alias=?")
-            .bind(alias)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(ApiError::internal)?
-        {
-            sqlx::query("UPDATE aliases SET target_type=?, target_id=?, description=? WHERE id=?")
-                .bind(ttype)
-                .bind(&tid)
-                .bind(description)
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(ApiError::internal)?;
-        } else {
-            sqlx::query(
-                "INSERT INTO aliases (id, alias, target_type, target_id, description, created_at) VALUES (?,?,?,?,?,?)",
-            )
-            .bind(format!("alias_{}", uuid::Uuid::new_v4().simple()))
-            .bind(alias)
-            .bind(ttype)
-            .bind(&tid)
-            .bind(description)
-            .bind(db::now_iso())
-            .execute(&mut *tx)
-            .await
-            .map_err(ApiError::internal)?;
-        }
+        crate::aliases::upsert(
+            &mut tx,
+            crate::aliases::AliasWrite {
+                alias,
+                target_type: ttype,
+                target_id: &tid,
+                description,
+            },
+        )
+        .await
+        .map_err(alias_write_error)?;
     }
 
     let next_registry = crate::registry::Registry::build_snapshot_in_transaction(&mut tx)
@@ -25118,6 +25112,54 @@ mod credential_enrollment_regression_tests {
     }
 
     #[tokio::test]
+    async fn alias_create_enforces_target_invariants() {
+        let (state, root) = test_state("alias-invariants").await;
+        let provider_id = insert_provider(
+            &state,
+            "alias-invariants",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        let model_id =
+            insert_transport_test_model(&state, &provider_id, "alias-model", json!({})).await;
+        let app = crate::router::build(state.clone());
+        let post = |body: Value| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/admin/api/aliases")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("x-kinetix-admin-token", "test-admin")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        for body in [
+            json!({"alias": "fast", "target_type": "model", "target_id": "model_missing"}),
+            json!({"alias": "fast", "target_type": "route", "target_id": model_id}),
+            json!({"alias": "fast", "target_type": "provider", "target_id": model_id}),
+            json!({"alias": "", "target_type": "model", "target_id": model_id}),
+        ] {
+            let response = app.clone().oneshot(post(body.clone())).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        assert!(db::list_aliases(&state.pool).await.unwrap().is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(post(
+                json!({"alias": "fast", "target_type": "model", "target_id": model_id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.registry.resolve("fast").is_some());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn account_update_rejects_runtime_and_unknown_statuses() {
         let (state, root) = test_state("invalid-account-status").await;
         let provider_id = insert_provider(
@@ -27251,12 +27293,14 @@ mod credential_enrollment_regression_tests {
         )
         .await
         .unwrap();
-        db::upsert_alias(
-            &state.pool,
-            "snapshot-model-alias",
-            "model",
-            &old_model_id,
-            "snapshot test",
+        crate::aliases::upsert(
+            &mut state.pool.acquire().await.unwrap(),
+            crate::aliases::AliasWrite {
+                alias: "snapshot-model-alias",
+                target_type: "model",
+                target_id: &old_model_id,
+                description: "snapshot test",
+            },
         )
         .await
         .unwrap();

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::aliases;
 use crate::config::{CliOverrides, Config};
 use crate::crypto::Crypto;
 use crate::db::{self, Pool};
@@ -1392,7 +1393,16 @@ async fn cmd_alias(cli: &Cli, args: AliasArgs) -> Result<()> {
                         .id
                 }
             };
-            db::upsert_alias(&pool, &alias, &target_type, &target_id, &description).await?;
+            aliases::upsert(
+                &mut *pool.acquire().await?,
+                aliases::AliasWrite {
+                    alias: &alias,
+                    target_type: &target_type,
+                    target_id: &target_id,
+                    description: &description,
+                },
+            )
+            .await?;
             println!("alias '{alias}' set");
             Ok(())
         }
