@@ -515,15 +515,7 @@ fn valid_capability_prices(prices: Option<&serde_json::Value>) -> bool {
     let Some(prices) = prices.as_object() else {
         return false;
     };
-    [
-        "input_per_1m",
-        "output_per_1m",
-        "cached_per_1m",
-        "cache_write_per_1m",
-        "thinking_per_1m",
-    ]
-    .iter()
-    .all(|key| {
+    crate::types::Prices::FIELDS.iter().all(|key| {
         let Some(value) = prices.get(*key) else {
             return true;
         };

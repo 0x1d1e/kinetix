@@ -27,6 +27,12 @@ use crate::model_capabilities::{
     reasoning_metadata_declared, thinking_map_for_reasoning_with_wire, ModelCapabilityFlags,
 };
 use crate::pipeline;
+use crate::price_provenance::{
+    accept_price_fields, automatic_price_provenance, automatic_prices_for_provider_scope,
+    discovery_prices, has_automatic_price_observation, merge_automatic_price_observation,
+    operator_price_edit, operator_price_provenance, pin_price_fields, without_catalog_prices,
+    LayeredPrices, PriceProvenance, PLUGIN_DOCUMENT, PROVIDER_METADATA,
+};
 use crate::route_validation;
 use crate::types::{AuthScheme, Prices, ThinkingMap, WireFormat};
 
@@ -2377,60 +2383,6 @@ fn capability_source(
     }
 }
 
-fn valid_discovery_price(value: Option<&Value>) -> Option<f64> {
-    value
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite() && *value >= 0.0)
-}
-
-fn discovery_prices(metadata: &Value) -> Prices {
-    let Some(prices) = metadata.get("prices") else {
-        return Prices::default();
-    };
-    Prices {
-        input_per_1m: valid_discovery_price(prices.get("input_per_1m")),
-        output_per_1m: valid_discovery_price(prices.get("output_per_1m")),
-        cached_per_1m: valid_discovery_price(prices.get("cached_per_1m")),
-        cache_write_per_1m: valid_discovery_price(prices.get("cache_write_per_1m")),
-        thinking_per_1m: valid_discovery_price(prices.get("thinking_per_1m")),
-    }
-}
-
-fn overlay_prices(base: &mut Prices, overlay: &Prices) {
-    if overlay.input_per_1m.is_some() {
-        base.input_per_1m = overlay.input_per_1m;
-    }
-    if overlay.output_per_1m.is_some() {
-        base.output_per_1m = overlay.output_per_1m;
-    }
-    if overlay.cached_per_1m.is_some() {
-        base.cached_per_1m = overlay.cached_per_1m;
-    }
-    if overlay.cache_write_per_1m.is_some() {
-        base.cache_write_per_1m = overlay.cache_write_per_1m;
-    }
-    if overlay.thinking_per_1m.is_some() {
-        base.thinking_per_1m = overlay.thinking_per_1m;
-    }
-}
-
-fn price_source(
-    provider: Option<f64>,
-    plugin: Option<f64>,
-    catalog: Option<f64>,
-    catalog_source: Option<&str>,
-) -> Option<String> {
-    if provider.is_some() {
-        Some("provider_metadata".to_string())
-    } else if plugin.is_some() {
-        Some("plugin_capabilities_json".to_string())
-    } else if catalog.is_some() {
-        catalog_source.map(str::to_string)
-    } else {
-        None
-    }
-}
-
 const MAX_RAW_DISCOVERY_METADATA_BYTES: usize = 4 * 1024 * 1024;
 
 fn bounded_raw_metadata(metadata: Option<&Value>) -> (Option<Value>, bool) {
@@ -2524,12 +2476,7 @@ fn discovered_observation_with_catalog(
     let mut catalog_model_type = None;
     let mut catalog_model_type_source = None;
 
-    let mut catalog_prices = Prices::default();
-    let mut catalog_input_price_source = None;
-    let mut catalog_output_price_source = None;
-    let mut catalog_cached_price_source = None;
-    let mut catalog_cache_write_price_source = None;
-    let mut catalog_thinking_price_source = None;
+    let mut layered_prices = LayeredPrices::default();
 
     let mut catalog_reasoning = None;
     let mut catalog_detailed_reasoning = None;
@@ -2579,22 +2526,7 @@ fn discovered_observation_with_catalog(
             let canonical_subscription_price = suppress_canonical_prices
                 && layer.kind == crate::model_catalog::CatalogLayerKind::Canonical;
             if !canonical_subscription_price {
-                if layer_prices.input_per_1m.is_some() {
-                    catalog_input_price_source = Some(source.clone());
-                }
-                if layer_prices.output_per_1m.is_some() {
-                    catalog_output_price_source = Some(source.clone());
-                }
-                if layer_prices.cached_per_1m.is_some() {
-                    catalog_cached_price_source = Some(source.clone());
-                }
-                if layer_prices.cache_write_per_1m.is_some() {
-                    catalog_cache_write_price_source = Some(source.clone());
-                }
-                if layer_prices.thinking_per_1m.is_some() {
-                    catalog_thinking_price_source = Some(source.clone());
-                }
-                overlay_prices(&mut catalog_prices, layer_prices);
+                layered_prices.layer(layer_prices, &source);
             }
         }
 
@@ -2622,49 +2554,13 @@ fn discovered_observation_with_catalog(
         .map(provider_capability_flags)
         .unwrap_or_default();
 
-    let provider_prices = provider_metadata
-        .as_ref()
-        .map(discovery_prices)
-        .unwrap_or_default();
-    let plugin_prices = fallback_metadata
-        .as_ref()
-        .map(discovery_prices)
-        .unwrap_or_default();
-    let mut prices = catalog_prices.clone();
-    overlay_prices(&mut prices, &plugin_prices);
-    overlay_prices(&mut prices, &provider_prices);
-    let price_sources = json!({
-        "input_per_1m": price_source(
-            provider_prices.input_per_1m,
-            plugin_prices.input_per_1m,
-            catalog_prices.input_per_1m,
-            catalog_input_price_source.as_deref(),
-        ),
-        "output_per_1m": price_source(
-            provider_prices.output_per_1m,
-            plugin_prices.output_per_1m,
-            catalog_prices.output_per_1m,
-            catalog_output_price_source.as_deref(),
-        ),
-        "cached_per_1m": price_source(
-            provider_prices.cached_per_1m,
-            plugin_prices.cached_per_1m,
-            catalog_prices.cached_per_1m,
-            catalog_cached_price_source.as_deref(),
-        ),
-        "cache_write_per_1m": price_source(
-            provider_prices.cache_write_per_1m,
-            plugin_prices.cache_write_per_1m,
-            catalog_prices.cache_write_per_1m,
-            catalog_cache_write_price_source.as_deref(),
-        ),
-        "thinking_per_1m": price_source(
-            provider_prices.thinking_per_1m,
-            plugin_prices.thinking_per_1m,
-            catalog_prices.thinking_per_1m,
-            catalog_thinking_price_source.as_deref(),
-        ),
-    });
+    if let Some(metadata) = &fallback_metadata {
+        layered_prices.layer(&discovery_prices(metadata), PLUGIN_DOCUMENT);
+    }
+    if let Some(metadata) = &provider_metadata {
+        layered_prices.layer(&discovery_prices(metadata), PROVIDER_METADATA);
+    }
+    let (prices, price_sources) = layered_prices.finish();
     let modalities = provider_metadata
         .as_ref()
         .and_then(normalized_modalities)
@@ -3185,7 +3081,7 @@ fn preserve_last_known_catalog_observation(
         .get("price_sources")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    for field in PRICE_FIELDS {
+    for field in Prices::FIELDS {
         let previous_source = previous_price_sources.get(field);
         let current_source = observation.price_sources.get(field);
         if !provenance_mentions_models_dev(previous_source)
@@ -3193,11 +3089,9 @@ fn preserve_last_known_catalog_observation(
         {
             continue;
         }
-        set_price_field(
-            &mut observation.prices,
-            field,
-            price_field(&previous_prices, field),
-        );
+        observation
+            .prices
+            .set_field(field, previous_prices.field(field));
         if let Some(source) = previous_source {
             set_provenance_field(&mut observation.price_sources, field, source);
         }
@@ -4100,358 +3994,6 @@ fn reconciliation_fields(reconciliation: &Value) -> Vec<String> {
         .collect()
 }
 
-const PRICE_FIELDS: [&str; 5] = [
-    "input_per_1m",
-    "output_per_1m",
-    "cached_per_1m",
-    "cache_write_per_1m",
-    "thinking_per_1m",
-];
-
-fn price_field(prices: &Prices, field: &str) -> Option<f64> {
-    match field {
-        "input_per_1m" => prices.input_per_1m,
-        "output_per_1m" => prices.output_per_1m,
-        "cached_per_1m" => prices.cached_per_1m,
-        "cache_write_per_1m" => prices.cache_write_per_1m,
-        "thinking_per_1m" => prices.thinking_per_1m,
-        _ => None,
-    }
-}
-
-fn set_price_field(prices: &mut Prices, field: &str, value: Option<f64>) {
-    match field {
-        "input_per_1m" => prices.input_per_1m = value,
-        "output_per_1m" => prices.output_per_1m = value,
-        "cached_per_1m" => prices.cached_per_1m = value,
-        "cache_write_per_1m" => prices.cache_write_per_1m = value,
-        "thinking_per_1m" => prices.thinking_per_1m = value,
-        _ => {}
-    }
-}
-
-fn effective_price_fields(discovery: &Value, current: &Prices) -> serde_json::Map<String, Value> {
-    let mut fields = discovery
-        .pointer("/effective_pricing/fields")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let legacy_source = discovery
-        .pointer("/effective_pricing/source")
-        .and_then(Value::as_str)
-        .unwrap_or("operator");
-    let legacy_metadata = discovery
-        .pointer("/effective_pricing/metadata")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    for field in PRICE_FIELDS {
-        if price_field(current, field).is_some() && !fields.contains_key(field) {
-            fields.insert(
-                field.to_string(),
-                json!({
-                    "source": legacy_source,
-                    "metadata": legacy_metadata,
-                }),
-            );
-        }
-    }
-    fields
-}
-
-fn set_price_field_provenance(
-    fields: &mut serde_json::Map<String, Value>,
-    field: &str,
-    source: &str,
-    metadata: Value,
-) {
-    fields.insert(
-        field.to_string(),
-        json!({
-            "source": source,
-            "metadata": metadata,
-        }),
-    );
-}
-
-fn price_field_operator_owned(
-    fields: &serde_json::Map<String, Value>,
-    current: &Prices,
-    field: &str,
-) -> bool {
-    if let Some(source) = fields
-        .get(field)
-        .and_then(|value| value.get("source"))
-        .and_then(Value::as_str)
-    {
-        return !is_automatic_price_source(source);
-    }
-    // Legacy configured prices predate per-field provenance and are operator
-    // owned. An absent value without provenance remains probe/sync-refinable.
-    price_field(current, field).is_some()
-}
-
-fn has_automatic_price_observation(observed: &Prices, discovery: &Value) -> bool {
-    observed.is_configured()
-        || PRICE_FIELDS.iter().any(|field| {
-            discovery
-                .pointer(&format!("/price_sources/{field}"))
-                .is_some_and(Value::is_null)
-        })
-}
-
-fn effective_price_source(fields: &serde_json::Map<String, Value>, prices: &Prices) -> String {
-    let sources: std::collections::BTreeSet<&str> = PRICE_FIELDS
-        .iter()
-        .filter(|field| price_field(prices, field).is_some())
-        .filter_map(|field| {
-            fields
-                .get(*field)
-                .and_then(|value| value.get("source"))
-                .and_then(Value::as_str)
-        })
-        .collect();
-    match sources.len() {
-        0 => "untracked".into(),
-        1 => sources
-            .into_iter()
-            .next()
-            .unwrap_or("untracked")
-            .to_string(),
-        _ => "mixed".into(),
-    }
-}
-
-fn operator_price_provenance(prices: &Prices) -> (String, Value) {
-    let mut fields = serde_json::Map::new();
-    for field in PRICE_FIELDS {
-        if price_field(prices, field).is_some() {
-            set_price_field_provenance(
-                &mut fields,
-                field,
-                "operator",
-                json!({ "configured_by": "admin" }),
-            );
-        }
-    }
-    (
-        effective_price_source(&fields, prices),
-        json!({ "fields": fields }),
-    )
-}
-
-fn effective_price_metadata(fields: &serde_json::Map<String, Value>, observation: &Value) -> Value {
-    let catalog_contributes = fields.values().any(|field| {
-        field
-            .get("source")
-            .and_then(Value::as_str)
-            .is_some_and(crate::model_catalog::is_external_catalog_price_source)
-    });
-    let mut metadata = json!({ "fields": fields });
-    if catalog_contributes {
-        metadata["catalog_source_state"] = observation
-            .pointer("/catalog/source_state")
-            .cloned()
-            .unwrap_or(Value::Null);
-    }
-    metadata
-}
-
-fn catalog_provider_price_identity(observation: &Value) -> Value {
-    let Some(provider) = observation
-        .pointer("/catalog/provider")
-        .and_then(Value::as_object)
-    else {
-        return Value::Null;
-    };
-    let mut identity = serde_json::Map::new();
-    for field in ["reference", "provider_id", "model_id"] {
-        if let Some(value) = provider.get(field) {
-            identity.insert(field.to_string(), value.clone());
-        }
-    }
-    if identity.is_empty() {
-        Value::Null
-    } else {
-        Value::Object(identity)
-    }
-}
-
-fn automatic_price_provenance(prices: &Prices, observation: &Value) -> (String, Value) {
-    let provider_observed_at = observation.get("last_seen").cloned().unwrap_or(Value::Null);
-    let catalog_source_state = observation
-        .pointer("/catalog/source_state")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let catalog_observed_at = catalog_source_state
-        .get("retrieved_at")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let mut fields = serde_json::Map::new();
-
-    for field in PRICE_FIELDS {
-        if price_field(prices, field).is_none() {
-            continue;
-        }
-        let source = observation
-            .pointer(&format!("/price_sources/{field}"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| automatic_price_source(observation));
-        let (observed_at, source_state, catalog_provider) =
-            if crate::model_catalog::is_external_catalog_price_source(&source) {
-                (
-                    catalog_observed_at.clone(),
-                    catalog_source_state.clone(),
-                    catalog_provider_price_identity(observation),
-                )
-            } else {
-                (provider_observed_at.clone(), Value::Null, Value::Null)
-            };
-        set_price_field_provenance(
-            &mut fields,
-            field,
-            &source,
-            json!({
-                "observed_at": observed_at,
-                "catalog_source_state": source_state,
-                "catalog_provider": catalog_provider,
-            }),
-        );
-    }
-
-    let source = effective_price_source(&fields, prices);
-    let metadata = effective_price_metadata(&fields, observation);
-    (source, metadata)
-}
-
-fn automatic_prices_for_provider_scope(
-    prices: &Prices,
-    observation: &Value,
-    pricing_scope: &str,
-) -> Prices {
-    if pricing_scope != "integration" {
-        return prices.clone();
-    }
-    let mut effective = prices.clone();
-    for field in PRICE_FIELDS {
-        if price_field(&effective, field).is_none() {
-            continue;
-        }
-        let source = observation
-            .pointer(&format!("/price_sources/{field}"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| automatic_price_source(observation));
-        if crate::model_catalog::is_external_catalog_price_source(&source) {
-            set_price_field(&mut effective, field, None);
-        }
-    }
-    effective
-}
-
-fn merge_automatic_price_observation(
-    current: &Prices,
-    observed: &Prices,
-    observation: &Value,
-    ownership: &Value,
-) -> (Prices, serde_json::Map<String, Value>, bool) {
-    let mut effective = current.clone();
-    // Ownership is stored on the model's top-level discovery envelope, while
-    // fresh automatic values live under latest_observation. Keep those two
-    // concerns separate so reconciliation snapshots cannot hide operator pins.
-    let mut fields = effective_price_fields(ownership, current);
-    let mut preserved_manual = false;
-    let provider_observed_at = observation.get("last_seen").cloned().unwrap_or(Value::Null);
-    let catalog_source_state = observation
-        .pointer("/catalog/source_state")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let catalog_observed_at = catalog_source_state
-        .get("retrieved_at")
-        .cloned()
-        .unwrap_or(Value::Null);
-
-    for field in PRICE_FIELDS {
-        let observed_value = price_field(observed, field);
-        let authoritative_absence = observed_value.is_none()
-            && observation
-                .pointer(&format!("/price_sources/{field}"))
-                .is_some_and(Value::is_null);
-        if observed_value.is_none() && !authoritative_absence {
-            continue;
-        }
-        if price_field_operator_owned(&fields, current, field) {
-            preserved_manual = true;
-            continue;
-        }
-        let Some(value) = observed_value else {
-            set_price_field(&mut effective, field, None);
-            fields.remove(field);
-            continue;
-        };
-        set_price_field(&mut effective, field, Some(value));
-        let source = observation
-            .pointer(&format!("/price_sources/{field}"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| automatic_price_source(observation));
-        let (observed_at, source_state, catalog_provider) =
-            if crate::model_catalog::is_external_catalog_price_source(&source) {
-                (
-                    catalog_observed_at.clone(),
-                    catalog_source_state.clone(),
-                    catalog_provider_price_identity(observation),
-                )
-            } else {
-                (provider_observed_at.clone(), Value::Null, Value::Null)
-            };
-        set_price_field_provenance(
-            &mut fields,
-            field,
-            &source,
-            json!({
-                "observed_at": observed_at,
-                "catalog_source_state": source_state,
-                "catalog_provider": catalog_provider,
-            }),
-        );
-    }
-    (effective, fields, preserved_manual)
-}
-
-fn automatic_price_source(discovery: &Value) -> String {
-    let mut sources = std::collections::BTreeSet::new();
-    if let Some(values) = discovery.get("price_sources").and_then(Value::as_object) {
-        for source in values.values().filter_map(Value::as_str) {
-            sources.insert(source.to_string());
-        }
-    }
-    if sources.len() == 1 {
-        sources
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| "discovery".into())
-    } else if sources.is_empty() {
-        "discovery".into()
-    } else {
-        "mixed".into()
-    }
-}
-
-fn is_automatic_price_source(source: &str) -> bool {
-    matches!(
-        source,
-        "provider_metadata"
-            | "plugin_capabilities_json"
-            | "models.dev"
-            | "bundled_catalog"
-            | "mixed"
-            | "discovery"
-    ) || source.starts_with("models.dev:")
-        || source.starts_with("bundled_catalog:")
-}
-
 fn merge_selected_capability_overrides(
     discovery: &Value,
     capabilities: &Value,
@@ -4513,36 +4055,6 @@ fn merge_operator_thinking_map_override(
         .unwrap_or_default();
     overrides.insert("thinking_map".into(), thinking_map.clone());
     overrides
-}
-
-fn pin_selected_price_fields(
-    discovery: &Value,
-    current: &Prices,
-    selected: &[String],
-) -> serde_json::Map<String, Value> {
-    let mut fields = effective_price_fields(discovery, current);
-    let pinned_at = db::now_iso();
-    for field in selected {
-        let Some(price_field_name) = field.strip_prefix("prices.") else {
-            continue;
-        };
-        let previous_source = fields
-            .get(price_field_name)
-            .and_then(|value| value.get("source"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| "untracked".to_string());
-        set_price_field_provenance(
-            &mut fields,
-            price_field_name,
-            "operator_pin",
-            json!({
-                "pinned_at": pinned_at,
-                "previous_source": previous_source,
-            }),
-        );
-    }
-    fields
 }
 
 fn operator_parameter_support_overrides(parameters: &Value) -> Value {
@@ -4695,26 +4207,15 @@ pub async fn update_model_reconciliation(
                 );
             }
 
-            let mut pinned_price_source = String::new();
-            let mut pinned_price_metadata = Value::Null;
-            if has_price_pins {
-                let fields = pin_selected_price_fields(&discovery, &current_prices, &pins);
-                pinned_price_source = if current_prices.is_configured() {
-                    effective_price_source(&fields, &current_prices)
-                } else {
-                    "operator_pin".to_string()
-                };
-                pinned_price_metadata = json!({ "fields": fields });
-            }
-            let pricing = if has_price_pins {
-                Some(db::ModelPricingMutation {
+            let pinned_provenance =
+                has_price_pins.then(|| pin_price_fields(&discovery, &current_prices, &pins));
+            let pricing = pinned_provenance
+                .as_ref()
+                .map(|provenance| db::ModelPricingMutation {
                     prices: &current_prices,
-                    source: &pinned_price_source,
-                    metadata: &pinned_price_metadata,
-                })
-            } else {
-                None
-            };
+                    source: &provenance.source,
+                    metadata: &provenance.metadata,
+                });
             let discovery_patch = Value::Object(discovery_patch);
             db::commit_model_operator_mutation(
                 &state.pool,
@@ -4829,14 +4330,7 @@ pub async fn update_model_reconciliation(
                         let value = observed
                             .pointer(&format!("/prices/{key}"))
                             .and_then(Value::as_f64);
-                        match key {
-                            "input_per_1m" => prices.input_per_1m = value,
-                            "output_per_1m" => prices.output_per_1m = value,
-                            "cached_per_1m" => prices.cached_per_1m = value,
-                            "cache_write_per_1m" => prices.cache_write_per_1m = value,
-                            "thinking_per_1m" => prices.thinking_per_1m = value,
-                            _ => {}
-                        }
+                        prices.set_field(key, value);
                         accepted_prices = true;
                     }
                     _ => {}
@@ -4909,41 +4403,16 @@ pub async fn update_model_reconciliation(
             object.insert("decision_at".into(), json!(db::now_iso()));
             accepted_discovery.insert("reconciliation".into(), reconciliation.clone());
 
-            let mut price_source = String::new();
-            let mut price_metadata = Value::Null;
-            if accepted_prices {
-                let mut fields = effective_price_fields(&discovery, &row.prices());
-                for selected_field in selected
-                    .iter()
-                    .filter_map(|field| field.strip_prefix("prices."))
-                {
-                    let accepted_from = observed
-                        .pointer(&format!("/price_sources/{selected_field}"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    set_price_field_provenance(
-                        &mut fields,
-                        selected_field,
-                        "operator_accept",
-                        json!({ "accepted_from": accepted_from }),
-                    );
-                }
-                price_source = if prices.is_configured() {
-                    effective_price_source(&fields, &prices)
-                } else {
-                    "operator_accept".to_string()
-                };
-                price_metadata = json!({ "fields": fields });
-            }
-            let pricing = if accepted_prices {
-                Some(db::ModelPricingMutation {
+            let price_provenance = accepted_prices.then(|| {
+                accept_price_fields(&discovery, &row.prices(), &prices, &observed, &selected)
+            });
+            let pricing = price_provenance
+                .as_ref()
+                .map(|provenance| db::ModelPricingMutation {
                     prices: &prices,
-                    source: &price_source,
-                    metadata: &price_metadata,
-                })
-            } else {
-                None
-            };
+                    source: &provenance.source,
+                    metadata: &provenance.metadata,
+                });
             let capabilities = normalize_model_capabilities(&capabilities);
             let thinking_map = serde_json::to_value(&thinking_map).map_err(ApiError::internal)?;
             let discovery_patch = Value::Object(accepted_discovery);
@@ -5014,7 +4483,7 @@ fn models_dev_pricing_patch(
         .flatten()
         .filter(|provider| provider.source == crate::model_catalog::CatalogSource::ModelsDev);
 
-    for field in PRICE_FIELDS {
+    for field in Prices::FIELDS {
         let existing_source = sources.get(field).and_then(Value::as_str);
         if matches!(
             existing_source,
@@ -5023,15 +4492,15 @@ fn models_dev_pricing_patch(
             continue;
         }
 
-        let value = provider_prices.and_then(|provider| price_field(&provider.prices, field));
+        let value = provider_prices.and_then(|provider| provider.prices.field(field));
         if let Some(value) = value {
-            set_price_field(&mut observed, field, Some(value));
+            observed.set_field(field, Some(value));
             sources.insert(
                 field.to_string(),
                 Value::String("models.dev:provider".to_string()),
             );
         } else if existing_source.is_some_and(|source| source.starts_with("models.dev")) {
-            set_price_field(&mut observed, field, None);
+            observed.set_field(field, None);
             sources.insert(field.to_string(), Value::Null);
         }
     }
@@ -5127,20 +4596,18 @@ async fn apply_provider_pricing_sync(
         }
 
         let current = row.prices();
-        let (effective, fields, preserved_manual) =
+        let merge =
             merge_automatic_price_observation(&current, &observed, &observation, &discovery);
-        if preserved_manual {
+        if merge.preserved_manual {
             skipped_manual.push(row.id.clone());
         }
-        let source = effective_price_source(&fields, &effective);
-        let metadata = effective_price_metadata(&fields, &observation);
         updated.push(row.id.clone());
         staged.push(StagedProviderPricing {
             model_id: row.id,
             latest_observation: observation,
-            effective: Some(effective),
-            source,
-            metadata,
+            effective: Some(merge.prices),
+            source: merge.provenance.source,
+            metadata: merge.provenance.metadata,
         });
     }
 
@@ -6011,190 +5478,6 @@ mod model_lifecycle_regression_tests {
             assert!(result.is_err(), "{label}");
             assert_eq!(state, before, "{label}");
         }
-    }
-
-    #[test]
-    fn stale_catalog_observation_preserves_effective_automatic_price() {
-        let current = Prices {
-            output_per_1m: Some(5.0),
-            ..Default::default()
-        };
-        let observed = Prices {
-            output_per_1m: Some(5.0),
-            ..Default::default()
-        };
-        let discovery = json!({
-            "price_sources": {
-                "output_per_1m": "models.dev:provider"
-            },
-            "effective_pricing": {
-                "source": "models.dev:provider",
-                "fields": {
-                    "output_per_1m": {"source": "models.dev:provider", "metadata": {}}
-                }
-            },
-            "catalog": {
-                "source_state": {
-                    "source": "models.dev",
-                    "retrieved_at": "2026-09-26T00:00:00Z",
-                    "freshness": "stale"
-                }
-            }
-        });
-
-        let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &discovery, &discovery);
-        assert_eq!(effective.output_per_1m, Some(5.0));
-        assert!(!preserved_manual);
-        assert_eq!(fields["output_per_1m"]["source"], "models.dev:provider");
-    }
-
-    #[test]
-    fn pinned_price_field_survives_later_automatic_observation() {
-        let current = Prices {
-            output_per_1m: Some(5.0),
-            ..Default::default()
-        };
-        let mut discovery = json!({
-            "price_sources": {
-                "output_per_1m": "models.dev:provider"
-            },
-            "effective_pricing": {
-                "source": "models.dev:provider",
-                "fields": {
-                    "output_per_1m": {
-                        "source": "models.dev:provider",
-                        "metadata": {}
-                    }
-                }
-            }
-        });
-        let selected = vec!["prices.output_per_1m".to_string()];
-        let pinned = pin_selected_price_fields(&discovery, &current, &selected);
-        discovery.as_object_mut().unwrap().insert(
-            "effective_pricing".into(),
-            json!({
-                "source": "operator_pin",
-                "fields": pinned
-            }),
-        );
-        let observed = Prices {
-            output_per_1m: Some(6.0),
-            ..Default::default()
-        };
-
-        let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &discovery, &discovery);
-        assert_eq!(effective.output_per_1m, Some(5.0));
-        assert!(preserved_manual);
-        assert_eq!(fields["output_per_1m"]["source"], "operator_pin");
-    }
-
-    #[test]
-    fn mixed_price_ownership_preserves_manual_input_and_updates_automatic_output() {
-        let current = Prices {
-            input_per_1m: Some(1.0),
-            output_per_1m: Some(4.0),
-            ..Default::default()
-        };
-        let observed = Prices {
-            input_per_1m: Some(1.5),
-            output_per_1m: Some(5.0),
-            ..Default::default()
-        };
-        let discovery = json!({
-            "last_seen": "2026-09-27T00:00:00Z",
-            "price_sources": {
-                "input_per_1m": "models.dev:provider",
-                "output_per_1m": "models.dev:provider"
-            },
-            "effective_pricing": {
-                "source": "mixed",
-                "fields": {
-                    "input_per_1m": {"source": "operator", "metadata": {}},
-                    "output_per_1m": {"source": "models.dev:provider", "metadata": {}}
-                }
-            },
-            "catalog": {
-                "source_state": {
-                    "source": "models.dev",
-                    "retrieved_at": "2026-09-27T00:00:00Z",
-                    "freshness": "fresh"
-                }
-            }
-        });
-        let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &discovery, &discovery);
-        assert_eq!(effective.input_per_1m, Some(1.0));
-        assert_eq!(effective.output_per_1m, Some(5.0));
-        assert!(preserved_manual);
-        assert_eq!(fields["input_per_1m"]["source"], "operator");
-        assert_eq!(fields["output_per_1m"]["source"], "models.dev:provider");
-    }
-
-    #[test]
-    fn authoritative_price_absence_clears_automatic_field() {
-        let current = Prices {
-            output_per_1m: Some(5.0),
-            ..Default::default()
-        };
-        let observed = Prices::default();
-        let discovery = json!({
-            "price_sources": {
-                "output_per_1m": null
-            },
-            "effective_pricing": {
-                "source": "models.dev:provider",
-                "fields": {
-                    "output_per_1m": {"source": "models.dev:provider", "metadata": {}}
-                }
-            },
-            "catalog": {
-                "source_state": {
-                    "source": "models.dev",
-                    "retrieved_at": "2026-09-27T01:00:00Z",
-                    "freshness": "fresh"
-                }
-            }
-        });
-
-        assert!(has_automatic_price_observation(&observed, &discovery));
-        let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &discovery, &discovery);
-
-        assert_eq!(effective.output_per_1m, None);
-        assert!(!preserved_manual);
-        assert!(!fields.contains_key("output_per_1m"));
-    }
-
-    #[test]
-    fn authoritative_price_absence_preserves_operator_field() {
-        let current = Prices {
-            output_per_1m: Some(7.0),
-            ..Default::default()
-        };
-        let observed = Prices::default();
-        let discovery = json!({
-            "price_sources": {
-                "output_per_1m": null
-            },
-            "effective_pricing": {
-                "source": "operator",
-                "fields": {
-                    "output_per_1m": {
-                        "source": "operator",
-                        "metadata": {"configured_by": "admin"}
-                    }
-                }
-            }
-        });
-
-        let (effective, fields, preserved_manual) =
-            merge_automatic_price_observation(&current, &observed, &discovery, &discovery);
-
-        assert_eq!(effective.output_per_1m, Some(7.0));
-        assert!(preserved_manual);
-        assert_eq!(fields["output_per_1m"]["source"], "operator");
     }
 
     #[test]
@@ -8870,10 +8153,10 @@ pub async fn create_model(
     };
     let pricing = pricing_values
         .as_ref()
-        .map(|(source, metadata)| db::ModelPricingMutation {
+        .map(|provenance| db::ModelPricingMutation {
             prices: &effective_prices,
-            source,
-            metadata,
+            source: &provenance.source,
+            metadata: &provenance.metadata,
         });
     let initial_observation_data = initial_latest_observation.as_ref().map(|observation| {
         model_discovery_observation(observation, &provider_id, &body.upstream_id)
@@ -8969,29 +8252,10 @@ pub async fn update_model(
         transport_override.as_deref(),
     )?;
     let previous_prices = model.prices();
-    let mut price_fields = effective_price_fields(&existing_discovery, &previous_prices);
-    for field in PRICE_FIELDS {
-        let previous = price_field(&previous_prices, field);
-        let next = price_field(&prices, field);
-        if previous != next {
-            if next.is_some() {
-                set_price_field_provenance(
-                    &mut price_fields,
-                    field,
-                    "operator",
-                    json!({ "configured_by": "admin" }),
-                );
-            } else {
-                price_fields.remove(field);
-            }
-        }
-    }
-    let price_source = if prices.is_configured() {
-        effective_price_source(&price_fields, &prices)
-    } else {
-        "operator".to_string()
-    };
-    let price_metadata = json!({ "fields": price_fields });
+    let PriceProvenance {
+        source: price_source,
+        metadata: price_metadata,
+    } = operator_price_edit(&existing_discovery, &previous_prices, &prices, "admin");
 
     validate_thinking_map(&body.thinking_map)?;
     let existing_caps = normalize_model_capabilities(
@@ -10890,10 +10154,10 @@ fn portable_model_ownership(
         })
         .or_else(|| {
             prices.is_configured().then(|| {
-                let (source, metadata) = operator_price_provenance(prices);
+                let provenance = operator_price_provenance(prices);
                 json!({
-                    "source": source,
-                    "metadata": portable_price_provenance_metadata(&metadata),
+                    "source": provenance.source,
+                    "metadata": portable_price_provenance_metadata(&provenance.metadata),
                 })
             })
         })
@@ -10911,7 +10175,7 @@ fn portable_model_ownership(
 #[derive(Clone)]
 struct ImportedModelOwnership {
     discovery_patch: Value,
-    pricing: Option<(String, Value)>,
+    pricing: Option<PriceProvenance>,
 }
 
 fn parse_imported_model_ownership(model: &Value) -> Result<Option<ImportedModelOwnership>, String> {
@@ -10960,7 +10224,7 @@ fn parse_imported_model_ownership(model: &Value) -> Result<Option<ImportedModelO
             if !metadata.is_object() {
                 return Err("ownership.effective_pricing.metadata must be an object".to_string());
             }
-            Some((source, metadata))
+            Some(PriceProvenance { source, metadata })
         }
     };
     if prices.is_configured() && pricing.is_none() {
@@ -10981,54 +10245,12 @@ fn filter_imported_ownership_pricing_for_scope(
     if pricing_scope != "integration" {
         return (prices.clone(), ownership.clone(), Vec::new());
     }
-    let Some((fallback_source, metadata)) = ownership.pricing.as_ref() else {
+    let Some(provenance) = ownership.pricing.as_ref() else {
         return (prices.clone(), ownership.clone(), Vec::new());
     };
-
-    let mut effective = prices.clone();
-    let mut filtered_metadata = metadata.clone();
-    let mut fields = filtered_metadata
-        .get("fields")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let mut suppressed = Vec::new();
-
-    for field in PRICE_FIELDS {
-        if price_field(&effective, field).is_none() {
-            continue;
-        }
-        let source = fields
-            .get(field)
-            .and_then(|value| value.get("source"))
-            .and_then(Value::as_str)
-            .unwrap_or(fallback_source);
-        if crate::model_catalog::is_external_catalog_price_source(source) {
-            set_price_field(&mut effective, field, None);
-            fields.remove(field);
-            suppressed.push(field.to_string());
-        }
-    }
-
-    filtered_metadata["fields"] = Value::Object(fields.clone());
-    let catalog_still_contributes = fields.values().any(|field| {
-        field
-            .get("source")
-            .and_then(Value::as_str)
-            .is_some_and(crate::model_catalog::is_external_catalog_price_source)
-    });
-    if !catalog_still_contributes {
-        if let Some(metadata) = filtered_metadata.as_object_mut() {
-            metadata.remove("catalog_source_state");
-            metadata.remove("catalog_provider");
-        }
-    }
-
+    let (effective, provenance, suppressed) = without_catalog_prices(prices, provenance);
     let mut filtered = ownership.clone();
-    filtered.pricing = Some((
-        effective_price_source(&fields, &effective),
-        filtered_metadata,
-    ));
+    filtered.pricing = Some(provenance);
     (effective, filtered, suppressed)
 }
 
@@ -14457,36 +13679,21 @@ async fn import_config_apply(
             let (price_source, price_metadata, discovery_patch) = if let Some(ownership) =
                 imported_ownership.as_ref()
             {
-                let (source, metadata) = ownership
+                let PriceProvenance { source, metadata } = ownership
                     .pricing
                     .clone()
-                    .unwrap_or_else(|| ("untracked".to_string(), json!({ "fields": {} })));
+                    .unwrap_or_else(PriceProvenance::untracked);
                 (source, metadata, ownership.discovery_patch.clone())
             } else {
-                let mut price_fields =
-                    effective_price_fields(&existing_discovery, &previous_prices);
-                for field in PRICE_FIELDS {
-                    let previous = price_field(&previous_prices, field);
-                    let next = price_field(&prices, field);
-                    if previous != next {
-                        if next.is_some() {
-                            set_price_field_provenance(
-                                &mut price_fields,
-                                field,
-                                "operator",
-                                json!({ "configured_by": "config_import" }),
-                            );
-                        } else {
-                            price_fields.remove(field);
-                        }
-                    }
-                }
-                let price_source = if prices.is_configured() {
-                    effective_price_source(&price_fields, &prices)
-                } else {
-                    "operator".to_string()
-                };
-                let price_metadata = json!({ "fields": price_fields });
+                let PriceProvenance {
+                    source: price_source,
+                    metadata: price_metadata,
+                } = operator_price_edit(
+                    &existing_discovery,
+                    &previous_prices,
+                    &prices,
+                    "config_import",
+                );
 
                 let existing_caps = normalize_model_capabilities(
                     &serde_json::from_str::<Value>(&existing.capabilities)
@@ -14575,14 +13782,13 @@ async fn import_config_apply(
                             .then(|| operator_price_provenance(&prices)),
                     )
                 };
-            let pricing =
-                pricing_values
-                    .as_ref()
-                    .map(|(source, metadata)| db::ModelPricingMutation {
-                        prices: &prices,
-                        source,
-                        metadata,
-                    });
+            let pricing = pricing_values
+                .as_ref()
+                .map(|provenance| db::ModelPricingMutation {
+                    prices: &prices,
+                    source: &provenance.source,
+                    metadata: &provenance.metadata,
+                });
             let (id, _) = db::commit_model_creation_in_transaction(
                 &mut tx,
                 &db::ModelCreation {
@@ -21891,27 +21097,19 @@ mod credential_enrollment_regression_tests {
             .to_string();
         let observation = latest_reconciliation_observation(&discovery);
         let observed: Prices = serde_json::from_value(observation["prices"].clone()).unwrap();
-        let (effective, fields, preserved_manual) = merge_automatic_price_observation(
+        let merge = merge_automatic_price_observation(
             &imported.prices(),
             &observed,
             observation,
             &discovery,
         );
-        assert!(!preserved_manual);
-        let source = effective_price_source(&fields, &effective);
-        let metadata = json!({
-            "fields": fields,
-            "catalog_source_state": observation
-                .pointer("/catalog/source_state")
-                .cloned()
-                .unwrap_or(Value::Null),
-        });
+        assert!(!merge.preserved_manual);
         let reused_version = db::commit_effective_model_pricing(
             &state.pool,
             &model_id,
-            &effective,
-            &source,
-            &metadata,
+            &merge.prices,
+            &merge.provenance.source,
+            &merge.provenance.metadata,
         )
         .await
         .unwrap()
@@ -22621,9 +21819,10 @@ mod credential_enrollment_regression_tests {
                 }
             }
         });
-        let (source_a, metadata_a) = automatic_price_provenance(&prices, &observation_a);
+        let provenance_a = automatic_price_provenance(&prices, &observation_a);
         assert_eq!(
-            metadata_a
+            provenance_a
+                .metadata
                 .pointer("/fields/input_per_1m/metadata/catalog_provider/provider_id")
                 .and_then(Value::as_str),
             Some("provider-a")
@@ -22632,8 +21831,8 @@ mod credential_enrollment_regression_tests {
             &state.pool,
             &model_id,
             &prices,
-            &source_a,
-            &metadata_a,
+            &provenance_a.source,
+            &provenance_a.metadata,
         )
         .await
         .unwrap()
@@ -22643,13 +21842,13 @@ mod credential_enrollment_regression_tests {
         observation_same["catalog"]["source_state"]["retrieved_at"] = json!("2026-09-28T01:00:00Z");
         observation_same["catalog"]["source_state"]["freshness"] = json!("stale");
         observation_same["catalog"]["source_state"]["etag"] = json!("b");
-        let (source_same, metadata_same) = automatic_price_provenance(&prices, &observation_same);
+        let provenance_same = automatic_price_provenance(&prices, &observation_same);
         let version_same = db::commit_effective_model_pricing(
             &state.pool,
             &model_id,
             &prices,
-            &source_same,
-            &metadata_same,
+            &provenance_same.source,
+            &provenance_same.metadata,
         )
         .await
         .unwrap()
@@ -22662,13 +21861,13 @@ mod credential_enrollment_regression_tests {
             "provider_id": "provider-b",
             "model_id": "shared-model"
         });
-        let (source_b, metadata_b) = automatic_price_provenance(&prices, &observation_b);
+        let provenance_b = automatic_price_provenance(&prices, &observation_b);
         let version_b = db::commit_effective_model_pricing(
             &state.pool,
             &model_id,
             &prices,
-            &source_b,
-            &metadata_b,
+            &provenance_b.source,
+            &provenance_b.metadata,
         )
         .await
         .unwrap()
@@ -23863,15 +23062,18 @@ mod credential_enrollment_regression_tests {
             output_per_1m: Some(6.0),
             ..Prices::default()
         };
-        let (effective, fields, preserved_manual) = merge_automatic_price_observation(
+        let merge = merge_automatic_price_observation(
             &pinned.prices(),
             &observed,
             observation,
             &pinned_discovery,
         );
-        assert_eq!(effective.output_per_1m, Some(5.0));
-        assert!(preserved_manual);
-        assert_eq!(fields["output_per_1m"]["source"], "operator_pin");
+        assert_eq!(merge.prices.output_per_1m, Some(5.0));
+        assert!(merge.preserved_manual);
+        assert_eq!(
+            merge.provenance.metadata["fields"]["output_per_1m"]["source"],
+            "operator_pin"
+        );
 
         drop(state);
         let _ = std::fs::remove_dir_all(root);

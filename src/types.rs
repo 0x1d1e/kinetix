@@ -144,6 +144,38 @@ pub struct Prices {
 }
 
 impl Prices {
+    /// Wire/storage names of every price field, in canonical order.
+    pub const FIELDS: [&'static str; 5] = [
+        "input_per_1m",
+        "output_per_1m",
+        "cached_per_1m",
+        "cache_write_per_1m",
+        "thinking_per_1m",
+    ];
+
+    pub fn field(&self, name: &str) -> Option<f64> {
+        match name {
+            "input_per_1m" => self.input_per_1m,
+            "output_per_1m" => self.output_per_1m,
+            "cached_per_1m" => self.cached_per_1m,
+            "cache_write_per_1m" => self.cache_write_per_1m,
+            "thinking_per_1m" => self.thinking_per_1m,
+            _ => None,
+        }
+    }
+
+    /// Set one field by name; unknown names are ignored.
+    pub fn set_field(&mut self, name: &str, value: Option<f64>) {
+        match name {
+            "input_per_1m" => self.input_per_1m = value,
+            "output_per_1m" => self.output_per_1m = value,
+            "cached_per_1m" => self.cached_per_1m = value,
+            "cache_write_per_1m" => self.cache_write_per_1m = value,
+            "thinking_per_1m" => self.thinking_per_1m = value,
+            _ => {}
+        }
+    }
+
     pub fn is_configured(&self) -> bool {
         self.input_per_1m.is_some() || self.output_per_1m.is_some()
     }

@@ -1775,65 +1775,6 @@ async fn provider_price_guards(
     Ok(guards)
 }
 
-fn clear_price_field(prices: &mut Prices, field: &str) {
-    match field {
-        "input_per_1m" => prices.input_per_1m = None,
-        "output_per_1m" => prices.output_per_1m = None,
-        "cached_per_1m" => prices.cached_per_1m = None,
-        "cache_write_per_1m" => prices.cache_write_per_1m = None,
-        "thinking_per_1m" => prices.thinking_per_1m = None,
-        _ => {}
-    }
-}
-
-fn effective_source_after_revocation(
-    fields: &serde_json::Map<String, Value>,
-    previous_source: &str,
-    prices: &Prices,
-) -> String {
-    let sources: std::collections::BTreeSet<&str> = fields
-        .values()
-        .filter_map(|field| field.get("source").and_then(Value::as_str))
-        .collect();
-    match sources.len() {
-        1 => sources
-            .into_iter()
-            .next()
-            .unwrap_or("untracked")
-            .to_string(),
-        n if n > 1 => "mixed".to_string(),
-        _ if prices.is_configured()
-            && !crate::model_catalog::is_external_catalog_price_source(previous_source) =>
-        {
-            previous_source.to_string()
-        }
-        _ => "untracked".to_string(),
-    }
-}
-
-fn effective_pricing_needs_scope_repair(
-    effective: Option<&serde_json::Map<String, Value>>,
-) -> bool {
-    let previous_source = effective
-        .and_then(|value| value.get("source"))
-        .and_then(Value::as_str)
-        .unwrap_or("untracked");
-    let fields = effective
-        .and_then(|value| value.get("fields"))
-        .and_then(Value::as_object);
-    let has_external_catalog_field = fields.is_some_and(|fields| {
-        fields.values().any(|field| {
-            field
-                .get("source")
-                .and_then(Value::as_str)
-                .is_some_and(crate::model_catalog::is_external_catalog_price_source)
-        })
-    });
-    let legacy_external_catalog_snapshot = !has_external_catalog_field
-        && crate::model_catalog::is_external_catalog_price_source(previous_source);
-    has_external_catalog_field || legacy_external_catalog_snapshot
-}
-
 async fn providers_needing_pricing_scope_repair(pool: &Pool) -> Result<Vec<String>> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT providers.id, models.discovery
@@ -1850,7 +1791,7 @@ async fn providers_needing_pricing_scope_repair(pool: &Pool) -> Result<Vec<Strin
         let effective = discovery
             .get("effective_pricing")
             .and_then(Value::as_object);
-        if effective_pricing_needs_scope_repair(effective) {
+        if crate::price_provenance::effective_pricing_needs_scope_repair(effective) {
             provider_ids.insert(provider_id);
         }
     }
@@ -1875,78 +1816,26 @@ async fn revoke_external_catalog_effective_pricing_in_transaction(
 
     for row in rows {
         let model_id: String = row.try_get("id")?;
-        let mut prices: Prices =
+        let prices: Prices =
             serde_json::from_str(&row.try_get::<String, _>("prices")?).unwrap_or_default();
         let discovery: Value = serde_json::from_str(&row.try_get::<String, _>("discovery")?)
             .unwrap_or_else(|_| serde_json::json!({}));
         let effective = discovery
             .get("effective_pricing")
             .and_then(Value::as_object);
-        let previous_source = effective
-            .and_then(|value| value.get("source"))
-            .and_then(Value::as_str)
-            .unwrap_or("untracked");
-        let mut fields = effective
-            .and_then(|value| value.get("fields"))
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        if !effective_pricing_needs_scope_repair(effective) {
+        if !crate::price_provenance::effective_pricing_needs_scope_repair(effective) {
             continue;
         }
-
-        let external_catalog_fields: Vec<String> = fields
-            .iter()
-            .filter_map(|(field, provenance)| {
-                provenance
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .is_some_and(crate::model_catalog::is_external_catalog_price_source)
-                    .then_some(field.clone())
-            })
-            .collect();
-        let legacy_external_catalog_snapshot = external_catalog_fields.is_empty()
-            && crate::model_catalog::is_external_catalog_price_source(previous_source);
-
-        if legacy_external_catalog_snapshot {
-            for field in [
-                "input_per_1m",
-                "output_per_1m",
-                "cached_per_1m",
-                "cache_write_per_1m",
-                "thinking_per_1m",
-            ] {
-                clear_price_field(&mut prices, field);
-            }
-            fields.clear();
-        } else {
-            for field in external_catalog_fields {
-                clear_price_field(&mut prices, &field);
-                fields.remove(&field);
-            }
-        }
-
-        let mut metadata = effective
-            .and_then(|value| value.get("metadata"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        if !metadata.is_object() {
-            metadata = serde_json::json!({});
-        }
-        metadata["fields"] = Value::Object(fields.clone());
-        if !fields.values().any(|field| {
-            field
-                .get("source")
-                .and_then(Value::as_str)
-                .is_some_and(crate::model_catalog::is_external_catalog_price_source)
-        }) {
-            if let Some(object) = metadata.as_object_mut() {
-                object.remove("catalog_source_state");
-            }
-        }
-        let source = effective_source_after_revocation(&fields, previous_source, &prices);
-        apply_effective_model_pricing_transaction(tx, &model_id, &prices, &source, &metadata)
-            .await?;
+        let (prices, provenance) =
+            crate::price_provenance::revoke_catalog_pricing(&prices, effective);
+        apply_effective_model_pricing_transaction(
+            tx,
+            &model_id,
+            &prices,
+            &provenance.source,
+            &provenance.metadata,
+        )
+        .await?;
     }
     Ok(())
 }

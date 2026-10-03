@@ -57,6 +57,7 @@ pub mod plugins;
 pub mod pool;
 pub(crate) mod pre_dispatch;
 pub mod predicate;
+pub mod price_provenance;
 pub mod provider_circuit;
 pub mod provider_connection;
 pub mod provider_work;
