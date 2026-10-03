@@ -17766,9 +17766,9 @@ pub async fn preview_plugin_rollback(
 }
 
 /// `POST /admin/api/plugins/{id}/packages/{sha256}/reinstall` — reinstall a
-/// retained package after the plugin was removed. The bytes are re-hashed and
-/// re-validated; the plugin is installed disabled and permissions must be
-/// re-approved before it can be enabled.
+/// retained package. The bytes are re-hashed and re-validated and follow the
+/// same approval rules as an upload: a non-expanding package over an approved
+/// install keeps its enabled state, anything else is installed disabled.
 pub async fn reinstall_plugin_package(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -17779,6 +17779,8 @@ pub async fn reinstall_plugin_package(
         .install_retained(&id, sha256.trim())
         .await
         .map_err(plugin_bad)?;
+    state.unregister_plugin_capabilities(&outcome.id);
+    register_enabled_plugin_capabilities(&state, &outcome.id).await;
     let _ = db::insert_audit(
         &state.pool,
         "admin",
@@ -17787,8 +17789,8 @@ pub async fn reinstall_plugin_package(
         &outcome.id,
         &outcome.id,
         &format!(
-            "Reinstalled retained plugin package v{} (SHA-256 {}). Plugin is disabled and permissions must be re-approved.",
-            outcome.version, outcome.package_sha256
+            "Reinstalled retained plugin package v{} (SHA-256 {}, enabled: {}).",
+            outcome.version, outcome.package_sha256, outcome.enabled
         ),
     )
     .await;
@@ -17799,7 +17801,8 @@ pub async fn reinstall_plugin_package(
         "sha256": outcome.package_sha256,
         "signature": outcome.signature.as_str(),
         "provides": outcome.provides,
-        "enabled": false,
+        "enabled": outcome.enabled,
+        "approval_preserved": outcome.approval_preserved,
     })))
 }
 

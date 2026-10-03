@@ -1542,3 +1542,199 @@ async fn adapter_classifies_quota_exhaustion() {
     assert_eq!(v["kind"], "quota_exhausted");
     assert_eq!(v["retry_after_secs"], 2 * 3600 + 7 * 60 + 23);
 }
+
+fn fixture_package_version(id: &str, version: &str, provides: &str, component: &[u8]) -> Vec<u8> {
+    let manifest = format!(
+        "manifest_version = 1\nid = {id:?}\nname = \"Lifecycle fixture\"\nversion = {version:?}\nplugin_api = \"2\"\n\n[provides]\n{provides}\n"
+    );
+    let mut builder = tar::Builder::new(Vec::new());
+    for (path, data) in [
+        ("plugin.toml", manifest.as_bytes()),
+        ("plugin.wasm", component),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, path, data).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+/// Reinstalling a retained package over an enabled plugin must leave the
+/// runtime capability registry describing the package the database now
+/// activates, through the same admin API an operator uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reinstalling_a_retained_package_resyncs_runtime_capabilities() {
+    use base64::Engine;
+    const PLUGIN_ID: &str = "dev.kinetix.lifecycle-fixture";
+    const ADMIN_TOKEN: &str = "test-admin";
+    let component = include_bytes!("fixtures/plugin-api-v2-session-echo.component.wasm");
+    let with_adapter = fixture_package_version(
+        PLUGIN_ID,
+        "0.1.0",
+        "provider_adapters = [\"session-echo\"]",
+        component,
+    );
+    let without_adapter = fixture_package_version(
+        PLUGIN_ID,
+        "0.2.0",
+        "credential_strategies = [\"session-echo\"]",
+        component,
+    );
+
+    let root = std::env::temp_dir().join(format!(
+        "kinetix-plugin-lifecycle-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let paths = Paths {
+        config_dir: root.join("config"),
+        data_dir: root.join("data"),
+        state_dir: root.join("state"),
+    };
+    paths.ensure_dirs().unwrap();
+    let database_url = paths.database_url();
+    let pool = db::connect(&database_url).await.unwrap();
+    db::migrate(&pool).await.unwrap();
+    let crypto = Arc::new(Crypto::new(&[41u8; 32]));
+    let manager = PluginManager::new(
+        pool.clone(),
+        crypto.clone(),
+        HostPolicy::default(),
+        paths.data_dir.join("plugin-packages"),
+    )
+    .unwrap();
+    let registry = Arc::new(Registry::new());
+    registry.reload(&pool).await.unwrap();
+    let state = AppState::new(
+        Arc::new(Config {
+            bind: "127.0.0.1:0".into(),
+            public_base_url: "http://127.0.0.1".into(),
+            database_url,
+            master_key: [41u8; 32],
+            admin_token: ADMIN_TOKEN.into(),
+            cf_access_aud: None,
+            cf_access_team_domain: None,
+            log_json: false,
+            bootstrap_file: None,
+            allow_private_upstreams: true,
+            max_inflight_inferences: 4,
+            allow_insecure_tls: true,
+            data_dir: paths.data_dir.clone(),
+            shutdown_grace_secs: 1,
+            alert_webhook_url: None,
+            alert_fallback_rate: 1.0,
+            alert_error_rate: 1.0,
+            alert_min_requests: 1,
+            alert_interval_secs: 60,
+            alert_p95_latency_ms: 1_000,
+            ip_rate_limit_per_min: 0,
+            session_ttl_minutes: 60,
+            export_retention_days: 1,
+            paths,
+            generated_admin_password: None,
+        }),
+        pool.clone(),
+        registry,
+        crypto,
+        reqwest::Client::new(),
+        UsageLogQueue::new(pool, 16),
+        0,
+    )
+    .with_plugins(Arc::new(manager));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let gateway = kinetix::router::build(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            kinetix::server::DisconnectAwareListener::new(listener),
+            gateway.into_make_service_with_connect_info::<kinetix::server::ClientConnectionInfo>(),
+        )
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::new();
+    let admin = |path: &str, body: Value| {
+        client
+            .post(format!("http://{addr}/admin/api{path}"))
+            .header("x-kinetix-admin-token", ADMIN_TOKEN)
+            .json(&body)
+            .send()
+    };
+    let install = |package: &[u8]| {
+        json!({
+            "package_base64": base64::engine::general_purpose::STANDARD.encode(package),
+            "allow_untrusted_signature": true,
+        })
+    };
+    let adapter_ref =
+        kinetix::adapters::TargetTransport::Plugin(format!("plugin:{PLUGIN_ID}/session-echo"));
+
+    let first: Value = admin("/plugins/install", install(&with_adapter))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_sha = first["sha256"].as_str().unwrap().to_string();
+    let approved = admin(
+        &format!("/plugins/{PLUGIN_ID}/permissions/approve"),
+        json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(approved.status(), StatusCode::OK);
+    let enabled = admin(&format!("/plugins/{PLUGIN_ID}/enable"), json!({}))
+        .await
+        .unwrap();
+    assert_eq!(
+        enabled.status(),
+        StatusCode::OK,
+        "{}",
+        enabled.text().await.unwrap()
+    );
+    assert!(state.adapters.for_transport(&adapter_ref).is_ok());
+
+    // A non-expanding update keeps the approval and enabled state but stops
+    // declaring the adapter, so the adapter is unregistered.
+    let update: Value = admin("/plugins/install", install(&without_adapter))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(update["enabled"], true, "{update}");
+    assert!(state.adapters.for_transport(&adapter_ref).is_err());
+
+    // Reinstalling the retained first package re-activates the adapter.
+    let reinstall = admin(
+        &format!("/plugins/{PLUGIN_ID}/packages/{first_sha}/reinstall"),
+        json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reinstall.status(), StatusCode::OK);
+    let reinstall: Value = reinstall.json().await.unwrap();
+    let row = state
+        .plugin_manager()
+        .unwrap()
+        .get(PLUGIN_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.package_sha256, first_sha);
+    assert_eq!(reinstall["enabled"], json!(row.enabled != 0), "{reinstall}");
+    assert_eq!(
+        state.adapters.for_transport(&adapter_ref).is_ok(),
+        row.enabled != 0,
+        "runtime adapter registry must match the active package"
+    );
+    assert!(
+        !state.plugin_credentials.contains_key(PLUGIN_ID),
+        "the reinstalled package declares no credential strategy"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
