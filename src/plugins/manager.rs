@@ -871,7 +871,7 @@ impl PluginManager {
             .await
             .context("begin plugin disable")?;
         let result = async {
-            let impact = dependency_impact_on_connection(&mut *tx, id).await?;
+            let impact = dependency_impact_on_connection(&mut tx, id).await?;
             require_impact_acknowledgement(&impact, acknowledged_impact)?;
             store::set_enabled_in_transaction(&mut tx, id, false).await
         }
@@ -949,7 +949,7 @@ impl PluginManager {
             .await
             .context("begin plugin removal")?;
         let result = async {
-            let impact = dependency_impact_on_connection(&mut *tx, id).await?;
+            let impact = dependency_impact_on_connection(&mut tx, id).await?;
             require_impact_acknowledgement(&impact, acknowledged_impact)?;
             store::delete_plugin_in_transaction(&mut tx, id).await
         }
@@ -982,7 +982,7 @@ impl PluginManager {
     /// Return directly bound providers and Routes that target their Models.
     pub async fn dependency_impact(&self, id: &str) -> Result<PluginDependencyImpact> {
         let mut connection = self.inner.pool.acquire().await?;
-        dependency_impact_on_connection(&mut *connection, id).await
+        dependency_impact_on_connection(&mut connection, id).await
     }
 
     pub async fn set_version_pin(&self, id: &str, pinned: bool) -> Result<String> {
