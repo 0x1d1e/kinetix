@@ -689,6 +689,7 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
         price_sources: m.price_sources || {},
         raw_metadata: m.raw_metadata ?? null,
         raw_metadata_truncated: m.raw_metadata_truncated ?? false,
+        plugin_identity: m.plugin_identity || null,
         canonical_identity: m.canonical_identity || null,
         canonical_model_id: m.canonical_model_id || null,
         canonical_match: m.canonical_match || null,
@@ -1579,7 +1580,10 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                               </span>
                             </div>
                             <span className="text-xs font-mono text-[var(--ink)]/70">
-                              Context: {m.contextWindow?.toLocaleString() ?? 'unknown'} tokens • Max Output: {m.maxOutputTokens ?? 'unknown'}
+                              Context: {m.contextWindow?.toLocaleString() ?? 'unknown'} tokens •{' '}
+                              <span className="whitespace-nowrap">
+                                Max Output: {m.maxOutputTokens?.toLocaleString() ?? 'unknown'}
+                              </span>
                             </span>
                           </div>
 
@@ -1951,10 +1955,15 @@ export const ProvidersView: React.FC<ProvidersViewProps> = ({
                                     })}
                                   </div>
                                   <div className="mt-2 pt-2 border-t border-[var(--ink)]/20 text-[var(--ink)]/70">
-                                    Catalog: {sourceState?.freshness || 'unknown'}
+                                    Pricing catalog: {sourceState?.freshness || 'unknown'}
                                     {' · '}retrieved {formatPricingTimestamp(sourceState?.retrieved_at)}
                                     {sourceState?.source ? ` · ${sourceState.source}` : ''}
                                   </div>
+                                  <p className="mt-2 text-[var(--ink)]/70 font-body">
+                                    Unknown prices do not mean free usage. Direct API rates do not
+                                    describe subscription billing. Refresh discovery to update model
+                                    limits and capabilities; pricing sync updates prices only.
+                                  </p>
                                 </>
                               );
                             })()}

@@ -84,6 +84,18 @@ Resource IDs are opaque persisted identifiers, not names or array positions.
 Use IDs returned by the API; renaming, filtering, pagination, and registry reloads
 do not change them.
 
+## Model discovery and pricing
+
+Discovery returns `plugin_identity` as a validated plugin identity hint, even when
+no catalog entry is available. `canonical_identity` remains the catalog-verified
+resolution. Preserve both when importing a discovered model so later catalog
+lookups can reuse the hint without treating it as verified metadata.
+
+Pricing sync updates price observations and catalog provenance only. Refresh
+model discovery and review/accept observed changes to update existing model
+limits and capabilities. Unknown prices do not mean free usage; direct API rates
+are not automatically used for subscription integrations.
+
 ## Bounds and secrets
 
 The URI limit is 8192 bytes. Bodies are limited to 1 MiB, including requests

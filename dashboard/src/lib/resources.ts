@@ -98,6 +98,10 @@ export interface DiscoveredModel {
   price_sources?: Record<string, string | null> | null;
   raw_metadata?: unknown | null;
   raw_metadata_truncated?: boolean;
+  plugin_identity?: {
+    canonical_model_id: string;
+    variant?: DiscoveredModel['provider_variant'];
+  } | null;
   canonical_identity?: {
     status: 'resolved' | 'ambiguous' | 'unresolved';
     upstream_model_id: string;

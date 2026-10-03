@@ -2258,6 +2258,7 @@ struct DiscoveredObservation {
     raw_metadata_truncated: bool,
     transport: Option<String>,
     transport_source: Option<String>,
+    plugin_identity: Option<Value>,
     canonical_identity: Option<Value>,
     canonical_model_id: Option<String>,
     canonical_match: Option<String>,
@@ -2763,6 +2764,7 @@ fn discovered_observation_with_catalog(
         raw_metadata_truncated,
         transport,
         transport_source,
+        plugin_identity: plugin_identity_metadata,
         canonical_identity,
         canonical_model_id,
         canonical_match,
@@ -3817,6 +3819,7 @@ pub(crate) async fn reconcile_provider_id(
                         "price_sources": &observation.price_sources,
                         "raw_metadata": &observation.raw_metadata,
                         "raw_metadata_truncated": observation.raw_metadata_truncated,
+                        "plugin_identity": &observation.plugin_identity,
                         "canonical_identity": &observation.canonical_identity,
                         "canonical_model_id": &observation.canonical_model_id,
                         "canonical_match": &observation.canonical_match,
@@ -3865,6 +3868,7 @@ pub(crate) async fn reconcile_provider_id(
             "price_sources": &observation.price_sources,
             "raw_metadata": &observation.raw_metadata,
             "raw_metadata_truncated": observation.raw_metadata_truncated,
+            "plugin_identity": &observation.plugin_identity,
             "canonical_identity": &observation.canonical_identity,
             "canonical_model_id": &observation.canonical_model_id,
             "canonical_match": &observation.canonical_match,
@@ -4571,8 +4575,20 @@ async fn apply_provider_pricing_sync(
     for row in models {
         let discovery = discovery_object(&row);
         let mut observation = latest_reconciliation_observation(&discovery).clone();
-        let resolution =
-            crate::model_catalog::resolve(&provider.base_url, &row.upstream_id, Some(models_dev));
+        let canonical_hint = observation
+            .pointer("/plugin_identity/canonical_model_id")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                observation
+                    .get("canonical_model_id")
+                    .and_then(Value::as_str)
+            });
+        let resolution = crate::model_catalog::resolve_with_hint(
+            &provider.base_url,
+            &row.upstream_id,
+            canonical_hint,
+            Some(models_dev),
+        );
         let pricing_patch =
             models_dev_pricing_patch(&observation, &resolution, direct_api_pricing_eligible);
         apply_top_level_discovery_patch(&mut observation, &pricing_patch);
@@ -22297,6 +22313,136 @@ mod credential_enrollment_regression_tests {
             None
         );
 
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pricing_sync_retains_cold_catalog_plugin_identity_without_reconciling_metadata() {
+        let (state, root) = test_state("plugin-identity-pricing-sync").await;
+        let provider_id = insert_provider(
+            &state,
+            "identity-hint-provider",
+            crate::plugins::CredentialMode::Manual,
+            None,
+            None,
+        )
+        .await;
+        db::update_provider_pricing_scope(&state.pool, &provider_id, "integration")
+            .await
+            .unwrap();
+        let provider = db::get_provider(&state.pool, &provider_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let canonical_id = "google/identity-hint-test";
+        let plugin_metadata = json!({
+            "schema_version": 2,
+            "identity": {"canonical_model_id": canonical_id},
+            "vision": {"input": true}
+        });
+        let model = crate::adapters::DiscoveredModel {
+            id: "identity-hint-test-tiered".into(),
+            display_name: None,
+            context_window: Some(250000),
+            max_output_tokens: Some(64000),
+        };
+        let cold = discovered_observation_with_catalog(
+            model.clone(),
+            None,
+            Some(plugin_metadata.clone()),
+            WireFormat::Plugin,
+            Some(crate::model_catalog::resolve_with_hint(
+                &provider.base_url,
+                &model.id,
+                Some(canonical_id),
+                None,
+            )),
+        );
+        assert!(cold.canonical_model_id.is_none());
+        assert_eq!(
+            cold.plugin_identity.as_ref().unwrap()["canonical_model_id"],
+            canonical_id
+        );
+        let model_id = db::insert_model(
+            &state.pool,
+            &db::NewModel {
+                provider_id: &provider_id,
+                upstream_id: &model.id,
+                display_name: "Identity Hint Test",
+                enabled: true,
+                context_window: Some(250000),
+                max_output_tokens: Some(64000),
+                capabilities: json!({"vision": true}),
+                prices: json!({}),
+                parameters: json!({}),
+                thinking_map: json!({}),
+                extra_request: json!({}),
+                discovery: json!({"latest_observation": {
+                    "plugin_identity": cold.plugin_identity,
+                    "canonical_model_id": cold.canonical_model_id,
+                    "context_window": 250000,
+                    "capabilities": {"vision": true},
+                    "prices": {}, "price_sources": {}
+                }}),
+            },
+        )
+        .await
+        .unwrap();
+        let catalog = crate::model_catalog::ModelsDevCatalog::from_parts(
+            json!({canonical_id: {
+                "id": canonical_id, "tool_call": true,
+                "modalities": {"input": ["text"], "output": ["text"]},
+                "limit": {"context": 1048576, "output": 65536},
+                "cost": {"input": 1.0, "output": 2.0}
+            }}),
+            json!({}),
+        )
+        .unwrap();
+        apply_provider_pricing_sync(&state, &provider, &catalog)
+            .await
+            .unwrap();
+        let row = db::get_model(&state.pool, &model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let discovery = discovery_object(&row);
+        assert_eq!(
+            discovery.pointer("/latest_observation/catalog/canonical/canonical_model_id"),
+            Some(&json!(canonical_id))
+        );
+        assert_eq!(
+            discovery.pointer("/latest_observation/plugin_identity/canonical_model_id"),
+            Some(&json!(canonical_id))
+        );
+        assert_eq!(row.context_window, Some(250000));
+        assert_eq!(row.prices().input_per_1m, None);
+        assert_eq!(row.prices().output_per_1m, None);
+        assert_eq!(
+            discovery.pointer("/latest_observation/capabilities"),
+            Some(&json!({"vision": true}))
+        );
+        let enriched = discovered_observation_with_catalog(
+            model,
+            None,
+            Some(plugin_metadata),
+            WireFormat::Plugin,
+            Some(crate::model_catalog::resolve_with_hint(
+                &provider.base_url,
+                &row.upstream_id,
+                Some(canonical_id),
+                Some(&catalog),
+            )),
+        );
+        assert_eq!(enriched.canonical_model_id.as_deref(), Some(canonical_id));
+        assert_eq!(enriched.model.context_window, Some(250000));
+        assert_eq!(enriched.capabilities.vision, Some(true));
+        assert_eq!(enriched.capabilities.tool_calling, Some(true));
+        assert_eq!(
+            enriched.capability_sources["context_window"],
+            "upstream_discovery"
+        );
+        assert_eq!(enriched.prices.input_per_1m, None);
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }
