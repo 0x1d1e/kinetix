@@ -296,9 +296,9 @@ provider capability detection.
 Gemini's `thoughtSignature` is the canonical hidden-state example: the model
 returns it beside a `functionCall`, and requires it back on the *same*
 historical function-call part when the conversation is continued. An OpenAI
-Chat Completions or Anthropic Messages client never sees it and therefore never
-returns it, which is why multi-turn Gemini tool calling through those frontends
-previously failed with `Function call is missing a thought_signature in
+Chat Completions or Anthropic Messages tool-use block has no corresponding
+per-function-call signature field, which is why multi-turn Gemini tool calling
+through those frontends previously failed with `Function call is missing a thought_signature in
 functionCall parts.`
 
 Kinetix keeps this state host-side instead of pushing it through the client:
@@ -328,6 +328,12 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   are looked up. A compatible value is restored onto the exact historical part
   before dispatch. An explicit client/canonical signature is never overwritten,
   and a missing/unknown id is never given an invented signature.
+  For targets that explicitly declare Gemini-style opaque state, including
+  model-scoped plugin producers, translated thinking blocks may accompany
+  restored tool calls. Each signed block must match a compatible stored
+  signature; unsigned summaries are allowed alongside compatible restored
+  calls. Foreign or unverified signatures and unsupported redacted thinking
+  still enter portability handling. A transport name alone never grants replay.
 - **Scope and compatibility.** Replay is scoped to the originating virtual key.
   A stored value is only reused when the target's provider id, protocol family,
   producer, and **exact originating model** all match; the account may change

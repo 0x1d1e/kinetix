@@ -166,6 +166,25 @@ async fn anthropic_plugin_upstream(
 struct AnthropicTranslationPluginAdapter;
 
 impl Adapter for AnthropicTranslationPluginAdapter {
+    fn opaque_state_target(
+        &self,
+        model: &db::ModelRow,
+    ) -> Option<kinetix::opaque_state::OpaqueStateTarget> {
+        if model.opaque_state_plugin != "dev.kinetix.anthropic-echo-fixture" {
+            return None;
+        }
+        let discovery: Value = serde_json::from_str(&model.discovery).ok()?;
+        let family = discovery["opaque_state"]["family"].as_str()?;
+        Some(kinetix::opaque_state::OpaqueStateTarget {
+            kind: kinetix::opaque_state::OpaqueStateKind::GeminiThoughtSignature,
+            provider_id: model.provider_id.clone(),
+            family: family.to_owned(),
+            producer: "plugin:dev.kinetix.anthropic-echo-fixture:gemini-thought-signature:v1"
+                .into(),
+            model_id: model.upstream_id.clone(),
+        })
+    }
+
     fn wire_format(&self) -> &'static str {
         "anthropic-translation-plugin-fixture"
     }
@@ -424,7 +443,7 @@ async fn anthropic_messages_frontend_passes_thinking_and_tool_continuation_to_pl
 
     let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_addr = gateway_listener.local_addr().unwrap();
-    let gateway = kinetix::router::build(state);
+    let gateway = kinetix::router::build(state.clone());
     let gateway_server = tokio::spawn(async move {
         axum::serve(
             kinetix::server::DisconnectAwareListener::new(gateway_listener),
@@ -528,6 +547,145 @@ async fn anthropic_messages_frontend_passes_thinking_and_tool_continuation_to_pl
         "is_error": false
     })));
     assert_eq!(canonical["tools"][0]["name"], "lookup");
+    drop(received);
+
+    // Antigravity uses this declared signature kind for both Gemini and Claude,
+    // even though neither is a native Anthropic transport. Capture the exact
+    // scoped tool state the host would persist on the preceding response.
+    for (family, upstream_id) in [
+        ("gemini", "gemini-3-flash"),
+        ("claude", "claude-opus-4-6-thinking"),
+    ] {
+        let id = db::insert_model(&state.pool, &db::NewModel {
+            provider_id: &provider_id, upstream_id, display_name: upstream_id,
+            enabled: true, context_window: Some(8192), max_output_tokens: Some(1024),
+            capabilities: json!({"text": true, "reasoning": true, "tools": true}),
+            prices: json!({}), parameters: json!({}), thinking_map: json!({}), extra_request: json!({}),
+            discovery: json!({"opaque_state": {"kind": "gemini_thought_signature", "family": family, "encoding_version": 1}}),
+        }).await.unwrap();
+        db::set_model_opaque_state_plugin(&state.pool, &id, PLUGIN_ID)
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+        let model = db::get_model(&state.pool, &id).await.unwrap().unwrap();
+        let target = AnthropicTranslationPluginAdapter
+            .opaque_state_target(&model)
+            .unwrap();
+        let call_id = format!("toolu_{family}_prior");
+        let signature = format!("opaque-{family}-signature");
+        state.opaque_state.capture_tool_signature(
+            &kinetix::opaque_state::OpaqueClientScope::for_key("anthropic-plugin-test-key"),
+            &target,
+            None,
+            &call_id,
+            "lookup",
+            &signature,
+        );
+        state.opaque_state.flush().await;
+        let mut continuation = request.clone();
+        continuation["model"] = json!(upstream_id);
+        continuation["messages"][1]["content"] = json!([
+            {"type": "thinking", "thinking": "historical reasoning summary", "signature": signature},
+            {"type": "tool_use", "id": call_id, "name": "lookup", "input": {"city": "Paris"}}
+        ]);
+        continuation["messages"][2]["content"][0]["tool_use_id"] = json!(call_id);
+        let response = reqwest::Client::new()
+            .post(format!("http://{gateway_addr}/v1/messages"))
+            .header(AUTHORIZATION, format!("Bearer {CLIENT_KEY}"))
+            .json(&continuation)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{family} same-model continuation: {body}"
+        );
+        let received = mock.0.lock().await;
+        let parts = received.last().unwrap()["messages"][1]["parts"]
+            .as_array()
+            .unwrap();
+        assert!(parts.contains(&json!({"type": "thinking", "text": "historical reasoning summary", "signature": signature})));
+        assert!(parts
+            .iter()
+            .any(|part| part["type"] == "tool_call" && part["signature"] == signature));
+        drop(received);
+        let mut unsigned_summary = continuation.clone();
+        unsigned_summary["messages"][1]["content"][0] =
+            json!({"type": "thinking", "thinking": "historical reasoning summary"});
+        let response = reqwest::Client::new()
+            .post(format!("http://{gateway_addr}/v1/messages"))
+            .header(AUTHORIZATION, format!("Bearer {CLIENT_KEY}"))
+            .json(&unsigned_summary)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{family} captured tool state with unsigned summary: {body}"
+        );
+        let before = mock.0.lock().await.len();
+        for incompatible in [
+            json!({"type": "thinking", "thinking": "foreign reasoning", "signature": "foreign-signature"}),
+            json!({"type": "redacted_thinking", "data": "opaque-redacted-thinking"}),
+        ] {
+            continuation["messages"][1]["content"][0] = incompatible;
+            let response = reqwest::Client::new()
+                .post(format!("http://{gateway_addr}/v1/messages"))
+                .header(AUTHORIZATION, format!("Bearer {CLIENT_KEY}"))
+                .json(&continuation)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(response
+                .text()
+                .await
+                .unwrap()
+                .contains("non-portable provider continuation state"));
+        }
+        assert_eq!(
+            mock.0.lock().await.len(),
+            before,
+            "incompatible thinking must not reach plugin egress"
+        );
+    }
+    let before = mock.0.lock().await.len();
+    for (model, call_id) in [
+        ("claude-opus-4-6-thinking", "toolu_gemini_prior"),
+        ("gemini-3-flash", "toolu_never_captured"),
+    ] {
+        let mut continuation = request.clone();
+        continuation["model"] = json!(model);
+        continuation["messages"][1]["content"] = json!([
+            {"type": "thinking", "thinking": "historical reasoning", "signature": "opaque-gemini-signature"},
+            {"type": "tool_use", "id": call_id, "name": "lookup", "input": {"city": "Paris"}}
+        ]);
+        continuation["messages"][2]["content"][0]["tool_use_id"] = json!(call_id);
+        let response = reqwest::Client::new()
+            .post(format!("http://{gateway_addr}/v1/messages"))
+            .header(AUTHORIZATION, format!("Bearer {CLIENT_KEY}"))
+            .json(&continuation)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("non-portable provider continuation state"));
+    }
+    assert_eq!(
+        mock.0.lock().await.len(),
+        before,
+        "cross-model or unknown state must not reach plugin egress"
+    );
 
     gateway_server.abort();
     upstream_server.abort();

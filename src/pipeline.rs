@@ -1442,14 +1442,6 @@ pub(crate) async fn run_with_disconnect(
         let preserves_anthropic_thinking = format == FrontendFormat::Anthropic
             && adapter.wire_format() == "anthropic"
             && history_is_compatible;
-        // Evaluate inline opaque state before hydration so a signature about to
-        // be restored for a compatible target is not mistaken for client state.
-        let inline_opaque = request_has_nonportable_inline_state(
-            &target_req,
-            preserves_anthropic_thinking,
-            cross_provider || cross_format,
-        );
-
         // Resolve host-owned stored continuation state for this candidate
         // target. Compatible signatures are restored only after portability is
         // settled (below); incompatible stored state feeds the portability
@@ -1463,6 +1455,19 @@ pub(crate) async fn run_with_disconnect(
             adapter.as_ref(),
         )
         .await?;
+
+        // Resolve before checking inline thinking, but still before hydration.
+        // A translated frontend may replay a signed thinking block from this
+        // plugin/Gemini target. The transport name cannot establish its origin;
+        // a matching scoped, producer/model-compatible stored signature can.
+        let inline_opaque = request_has_nonportable_inline_state(
+            &target_req,
+            preserves_anthropic_thinking,
+            cross_provider || cross_format,
+            adapter
+                .opaque_state_target(&target.model)
+                .map(|_| &opaque_report),
+        );
 
         // `opaque_report.nonportable()` must independently enter portability
         // handling: stored state can be incompatible with a target even when
@@ -4656,14 +4661,27 @@ fn request_has_nonportable_inline_state(
     req: &InternalRequest,
     preserves_anthropic_thinking: bool,
     include_generic_opaque: bool,
+    compatible_opaque_state: Option<&OpaqueHydrationReport>,
 ) -> bool {
     req.messages.iter().any(|message| {
         message.parts.iter().any(|part| match part {
             crate::types::Part::Thinking { signature, .. } => {
-                !preserves_anthropic_thinking
-                    || !signature
-                        .as_deref()
-                        .is_some_and(|signature| !signature.is_empty())
+                let translated = compatible_opaque_state.is_some_and(|report| {
+                    report.restored > 0
+                        && !report.nonportable()
+                        && match signature.as_deref() {
+                            None => true, // A Gemini thought summary need not carry opaque state.
+                            Some(signature) => report
+                                .restorations
+                                .iter()
+                                .any(|(_, known)| !signature.is_empty() && signature == known),
+                        }
+                });
+                !translated
+                    && (!preserves_anthropic_thinking
+                        || !signature
+                            .as_deref()
+                            .is_some_and(|signature| !signature.is_empty()))
             }
             crate::types::Part::RedactedThinking { .. } => !preserves_anthropic_thinking,
             crate::types::Part::ToolCall {
@@ -10919,7 +10937,9 @@ mod route_policy_tests {
         )
         .unwrap();
 
-        assert!(!request_has_nonportable_inline_state(&req, false, true));
+        assert!(!request_has_nonportable_inline_state(
+            &req, false, true, None
+        ));
         assert!(!trace.warnings.is_empty());
         let raw: Value = serde_json::from_str(req.raw_body.as_deref().unwrap()).unwrap();
         assert_eq!(raw["messages"][0]["content"].as_array().unwrap().len(), 1);
@@ -11178,7 +11198,7 @@ mod route_policy_tests {
             ..Default::default()
         };
 
-        let inline = request_has_nonportable_inline_state(&req, false, true);
+        let inline = request_has_nonportable_inline_state(&req, false, true, None);
         assert!(inline);
         apply_portability(
             &mut req, &route, &target, inline, &report, None, false, &mut trace,
