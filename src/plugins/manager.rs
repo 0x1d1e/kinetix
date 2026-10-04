@@ -355,6 +355,15 @@ impl PluginManager {
         }
     }
 
+    /// WASM component instantiations per plugin id (#199 idle contract).
+    pub fn wasm_instantiations(&self) -> Vec<(String, u64)> {
+        self.inner.runtime.instantiations()
+    }
+
+    pub fn wasm_instantiations_for(&self, id: &str) -> u64 {
+        self.inner.runtime.instantiations_for(id)
+    }
+
     pub fn metrics_for_plugin(&self, id: &str) -> PluginMetricsSnapshot {
         use std::sync::atomic::Ordering::Relaxed;
 

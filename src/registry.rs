@@ -5,7 +5,7 @@
 //! In-flight requests keep the `Arc<Registry>` snapshot they started with.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -26,6 +26,9 @@ pub struct Registry {
     publication: Arc<tokio::sync::Mutex<()>>,
     config_imports: Arc<tokio::sync::Mutex<()>>,
     revision: Arc<AtomicU64>,
+    /// `registry_revision.revision` observed before building the active
+    /// database-backed snapshot; `-1` until the first successful reload.
+    loaded_db_revision: Arc<AtomicI64>,
     lifecycle: Arc<parking_lot::Mutex<()>>,
 }
 
@@ -148,6 +151,7 @@ impl Registry {
             publication: Arc::new(tokio::sync::Mutex::new(())),
             config_imports: Arc::new(tokio::sync::Mutex::new(())),
             revision: Arc::new(AtomicU64::new(0)),
+            loaded_db_revision: Arc::new(AtomicI64::new(-1)),
             lifecycle: Arc::new(parking_lot::Mutex::new(())),
         }
     }
@@ -166,6 +170,19 @@ impl Registry {
 
     pub async fn reload(&self, pool: &Pool) -> Result<()> {
         self.publication().await.reload(pool).await
+    }
+
+    /// Rebuild the snapshot only when the control-plane revision changed since
+    /// the last database-backed reload. Returns whether a reload ran. This is
+    /// the steady-state poll: an unchanged registry costs one single-row read.
+    pub async fn reload_if_changed(&self, pool: &Pool) -> Result<bool> {
+        let publication = self.publication().await;
+        let db_revision = db::registry_revision(pool).await?;
+        if db_revision == self.loaded_db_revision.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        publication.reload_at(pool, db_revision).await?;
+        Ok(true)
     }
 
     /// Build a registry snapshot without making it active.
@@ -233,13 +250,13 @@ impl Registry {
 
     /// Atomically activate a fully built immutable snapshot while publication
     /// is serialized by `RegistryPublication`.
-    fn activate(&self, mut snapshot: Snapshot, expected_revision: Option<u64>) {
+    fn activate(&self, mut snapshot: Snapshot, expected_revision: Option<u64>) -> bool {
         let _lifecycle = self.lifecycle.lock();
         let mut current = self.inner.write();
         if expected_revision
             .is_some_and(|revision| self.revision.load(Ordering::Acquire) != revision)
         {
-            return;
+            return false;
         }
         if expected_revision.is_none() {
             self.revision.fetch_add(1, Ordering::AcqRel);
@@ -295,6 +312,7 @@ impl Registry {
         }
 
         *current = Arc::new(snapshot);
+        true
     }
 
     fn snapshot_from_rows(
@@ -675,16 +693,27 @@ impl Registry {
 impl RegistryPublication<'_> {
     /// Build and publish a fresh snapshot while holding the publication lock.
     pub(crate) async fn reload(self, pool: &Pool) -> Result<()> {
+        let db_revision = db::registry_revision(pool).await?;
+        self.reload_at(pool, db_revision).await
+    }
+
+    /// Build and publish a snapshot read after observing `db_revision`, so a
+    /// concurrent write is at worst reloaded once more, never missed.
+    async fn reload_at(self, pool: &Pool, db_revision: i64) -> Result<()> {
         let revision = self.registry.revision.fetch_add(1, Ordering::AcqRel) + 1;
         let snapshot = Registry::build_snapshot(pool).await?;
-        self.registry.activate(snapshot, Some(revision));
+        if self.registry.activate(snapshot, Some(revision)) {
+            self.registry
+                .loaded_db_revision
+                .store(db_revision, Ordering::Release);
+        }
         Ok(())
     }
 
     /// Publish a snapshot staged from a transaction after that transaction has
     /// committed. The lock excludes concurrent reloads until activation.
     pub(crate) fn activate(self, snapshot: Snapshot) {
-        self.registry.activate(snapshot, None);
+        let _ = self.registry.activate(snapshot, None);
     }
 }
 

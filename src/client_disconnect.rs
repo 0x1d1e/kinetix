@@ -8,11 +8,15 @@ use tokio::{
     sync::watch,
     time::{sleep, Duration},
 };
+use tokio_util::sync::CancellationToken;
 
 struct Inner {
     disconnected_at: watch::Sender<Option<Instant>>,
     connection_closed: watch::Sender<bool>,
     monitor: Mutex<Option<TcpStream>>,
+    /// Process abort token. Firing it (graceful-shutdown deadline) cancels
+    /// uncommitted work exactly like a client disconnect.
+    abort: CancellationToken,
 }
 
 /// Cancellation signal for work that has not committed a response yet.
@@ -34,7 +38,7 @@ impl fmt::Debug for ClientDisconnect {
 }
 
 impl ClientDisconnect {
-    pub(crate) fn new(monitor: TcpStream) -> Self {
+    pub(crate) fn new(monitor: TcpStream, abort: CancellationToken) -> Self {
         let (disconnected_at, _) = watch::channel(None);
         let (connection_closed, _) = watch::channel(false);
         Self {
@@ -42,6 +46,7 @@ impl ClientDisconnect {
                 disconnected_at,
                 connection_closed,
                 monitor: Mutex::new(Some(monitor)),
+                abort,
             }),
         }
     }
@@ -54,6 +59,7 @@ impl ClientDisconnect {
                 disconnected_at,
                 connection_closed,
                 monitor: Mutex::new(None),
+                abort: CancellationToken::new(),
             }),
         }
     }
@@ -101,16 +107,23 @@ impl ClientDisconnect {
         });
     }
 
-    /// Wait until the peer has closed or reset its connection.
+    /// Wait until the peer has closed or reset its connection, or the process
+    /// abort token fired.
     pub async fn cancelled(&self) {
         let mut disconnected_at = self.inner.disconnected_at.subscribe();
         if disconnected_at.borrow().is_some() {
             return;
         }
-        let _ = disconnected_at.changed().await;
+        tokio::select! {
+            _ = disconnected_at.changed() => {}
+            _ = self.inner.abort.cancelled() => self.signal(),
+        }
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
+        if self.inner.abort.is_cancelled() {
+            self.signal();
+        }
         self.inner.disconnected_at.borrow().is_some()
     }
 

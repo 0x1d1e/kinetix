@@ -220,6 +220,8 @@ pub struct ProviderWorkCoordinator {
     flight_registration: Arc<parking_lot::Mutex<()>>,
     lifecycle: Arc<parking_lot::Mutex<()>>,
     metrics: Arc<WorkMetrics>,
+    /// Owns detached single-flight work so shutdown drains, then aborts it.
+    process: crate::process::ProcessLifecycle,
     #[cfg(test)]
     test_generations: Arc<DashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
 }
@@ -230,6 +232,11 @@ impl ProviderWorkCoordinator {
             lifecycle,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn with_process(mut self, process: crate::process::ProcessLifecycle) -> Self {
+        self.process = process;
+        self
     }
 
     #[cfg(test)]
@@ -529,12 +536,31 @@ impl ProviderWorkCoordinator {
         let coordinator = self.clone();
         let cleanup_key = flight_key.clone();
         let cleanup_flight = erased.clone();
-        tokio::spawn(async move {
+        let process = self.process.clone();
+        process.spawn_owned(async move {
+            struct Cleanup {
+                coordinator: ProviderWorkCoordinator,
+                key: FlightKey,
+                flight: Arc<dyn Any + Send + Sync>,
+                tracked: bool,
+            }
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    if self.tracked {
+                        self.coordinator.remove_flight(&self.key, &self.flight);
+                    }
+                }
+            }
+            // Runs on completion and on shutdown abort, so an aborted flight
+            // never stays registered; waiters observe `Aborted`.
+            let _cleanup = Cleanup {
+                coordinator,
+                key: cleanup_key,
+                flight: cleanup_flight,
+                tracked,
+            };
             let output = work().await;
             let _ = tx.send(Some(output));
-            if tracked {
-                coordinator.remove_flight(&cleanup_key, &cleanup_flight);
-            }
         });
         (flight_key, erased, true, tracked)
     }

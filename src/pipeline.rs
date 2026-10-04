@@ -1159,6 +1159,14 @@ pub(crate) async fn run_with_disconnect(
     let mut auth_retried_accounts = std::collections::HashSet::new();
     let mut last_precommit_failure: Option<LastPrecommitFailure> = None;
 
+    // Every candidate Provider is demanded, including ones skipped below, so
+    // demand-driven health probes keep evaluating a cooling-down Provider.
+    for target in &pending_targets {
+        state
+            .integrations
+            .note_demand(&crate::integrations::provider_key(&target.provider.id));
+    }
+
     while let Some(target_owned) = pending_targets.pop_front() {
         let target = &target_owned;
         if let (Some(skip), Some(target_id)) = (
@@ -1518,17 +1526,15 @@ pub(crate) async fn run_with_disconnect(
             } else if inline_opaque || opaque_report.nonportable() {
                 // A direct target with no Route policy must not silently drop
                 // known non-portable continuation state (§24).
-                return Err(
-                    finish_policy_rejection(
-                        state,
-                        &meta,
-                        &mut trace,
-                        Some(target.account.label.clone()),
-                        "non-portable provider continuation state cannot be sent to this direct target",
-                        started,
-                    )
-                    .await,
-                );
+                return Err(finish_policy_rejection(
+                    state,
+                    &meta,
+                    &mut trace,
+                    Some(target.account.label.clone()),
+                    "non-portable provider continuation state cannot be sent to this direct target",
+                    started,
+                )
+                .await);
             }
         }
 
@@ -4315,6 +4321,11 @@ async fn gather_plugin_facts(
         // on its background schedule. No guest call, no network, no wall time on
         // the request path — the determinism guarantee.
         if manifest.routing_facts_mode == "cached" {
+            // Reading the snapshot keeps the background refresher scheduling
+            // this plugin; without recent demand it stays idle (#199).
+            state
+                .integrations
+                .note_demand(&crate::integrations::plugin_key(&row.id));
             match manager.cached_facts(&row.id).await {
                 Ok(entries) => {
                     for (name, value, observed, max_age) in entries {
@@ -5476,7 +5487,10 @@ async fn stream_response(
         };
 
         let passthrough = attempt.passthrough;
-        tokio::spawn(async move {
+        // Tracked so graceful shutdown drains committed streams; the driver
+        // observes the abort token itself so it always finalizes accounting.
+        let lifecycle = state.lifecycle.clone();
+        lifecycle.spawn_tracked(async move {
             if passthrough {
                 drive_stream_passthrough(
                     state,
@@ -6005,6 +6019,7 @@ async fn drive_stream(
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut idle_deadline = tokio::time::Instant::now() + attempt.idle_timeout;
 
+    let shutdown_abort = state.lifecycle.abort_token();
     'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
             record_cancel(&state, &meta, started);
@@ -6024,6 +6039,13 @@ async fn drive_stream(
                     stream_outcome = output_abort_outcome(&state, &meta, started);
                     break;
                 }
+            }
+            _ = shutdown_abort.cancelled() => {
+                // Graceful-shutdown deadline (#199): end the stream with an
+                // explicit error and account it instead of being dropped.
+                stream_outcome = StreamOutcome::GatewayAbort;
+                error_message = Some(SHUTDOWN_ABORT_MESSAGE.into());
+                break 'outer;
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
                 stream_outcome = StreamOutcome::Timeout;
@@ -6138,6 +6160,10 @@ async fn drive_stream(
         for frame in encoder.error_frame(message) {
             let _ = tx.send(Ok(frame)).await;
         }
+    } else if shutdown_abort.is_cancelled() && stream_outcome == StreamOutcome::GatewayAbort {
+        for frame in encoder.error_frame(SHUTDOWN_ABORT_MESSAGE) {
+            let _ = tx.send(Ok(frame)).await;
+        }
     } else if stream_outcome == StreamOutcome::Completed {
         for frame in encoder.finalize() {
             if tx.send(Ok(frame)).await.is_err() {
@@ -6207,6 +6233,7 @@ async fn drive_stream_passthrough(
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut idle_deadline = tokio::time::Instant::now() + attempt.idle_timeout;
 
+    let shutdown_abort = state.lifecycle.abort_token();
     'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
             record_cancel(&state, &meta, started);
@@ -6226,6 +6253,13 @@ async fn drive_stream_passthrough(
                     stream_outcome = output_abort_outcome(&state, &meta, started);
                     break;
                 }
+            }
+            _ = shutdown_abort.cancelled() => {
+                // Graceful-shutdown deadline (#199): end the stream with an
+                // explicit error and account it instead of being dropped.
+                stream_outcome = StreamOutcome::GatewayAbort;
+                error_message = Some(SHUTDOWN_ABORT_MESSAGE.into());
+                break 'outer;
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
                 stream_outcome = StreamOutcome::Timeout;
@@ -6392,6 +6426,11 @@ async fn drive_stream_passthrough(
                 let _ = tx.send(Ok(frame)).await;
             }
         }
+    } else if shutdown_abort.is_cancelled() && stream_outcome == StreamOutcome::GatewayAbort {
+        let mut encoder = Encoder::new(format, encoder_ctx);
+        for frame in encoder.error_frame(SHUTDOWN_ABORT_MESSAGE) {
+            let _ = tx.send(Ok(frame)).await;
+        }
     }
 
     finalize_log(
@@ -6411,6 +6450,10 @@ async fn drive_stream_passthrough(
     )
     .await;
 }
+
+/// Terminal stream error sent when the graceful-shutdown deadline cuts a
+/// stream short.
+const SHUTDOWN_ABORT_MESSAGE: &str = "gateway shutting down";
 
 /// Flips a disconnect flag (and wakes waiters) when the response body is
 /// dropped, i.e. when the client stops reading (FR-2.9, NFR-1.10).

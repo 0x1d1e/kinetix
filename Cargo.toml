@@ -24,6 +24,7 @@ hyper = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "blocking"] }
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 async-stream = "0.3"
 async-trait = "0.1"
 bytes = "1"
@@ -75,6 +76,7 @@ pbkdf2 = "0.12.2"
 serde_jcs = "0.2.0"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
 wat = "1"
 
 [features]

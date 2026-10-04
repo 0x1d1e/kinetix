@@ -25,15 +25,23 @@ use crate::opaque_state::OpaqueStateStore;
 use crate::plugins::{HostPolicy, PluginManager};
 use crate::registry::Registry;
 use crate::{alerts, bootstrap, db, export, router};
+use tokio_util::sync::CancellationToken;
 
 /// Listener that makes the client socket's lifetime available to request handlers.
 pub struct DisconnectAwareListener {
     inner: TcpListener,
+    abort: CancellationToken,
 }
 
 impl DisconnectAwareListener {
     pub fn new(inner: TcpListener) -> Self {
-        Self { inner }
+        Self::with_abort(inner, CancellationToken::new())
+    }
+
+    /// Accepted connections observe `abort` as a client disconnect, so the
+    /// graceful-shutdown deadline cancels uncommitted upstream work.
+    pub fn with_abort(inner: TcpListener, abort: CancellationToken) -> Self {
+        Self { inner, abort }
     }
 }
 
@@ -132,7 +140,7 @@ impl Listener for DisconnectAwareListener {
                     continue;
                 }
             };
-            let disconnect = ClientDisconnect::new(monitor);
+            let disconnect = ClientDisconnect::new(monitor, self.abort.clone());
             return (
                 DisconnectAwareIo {
                     stream,
@@ -291,7 +299,7 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
         app,
         Duration::from_secs(config.shutdown_grace_secs),
         shutdown_signal(),
-        state.opaque_state.clone(),
+        ShutdownResources::from_state(&state),
     )
     .await?;
 
@@ -299,20 +307,85 @@ pub async fn run(config: Arc<Config>) -> Result<()> {
     Ok(())
 }
 
+/// Bound on each post-drain flush step so a wedged writer cannot hold the
+/// process past shutdown indefinitely.
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Process-owned resources the shutdown sequence drains, flushes, and closes.
+pub(crate) struct ShutdownResources {
+    pub lifecycle: crate::process::ProcessLifecycle,
+    pub opaque_state: Arc<OpaqueStateStore>,
+    pub log_queue: Option<UsageLogQueue>,
+    pub target_telemetry: Option<crate::target_telemetry::TargetTelemetry>,
+    pub pool: Option<db::Pool>,
+}
+
+impl ShutdownResources {
+    pub(crate) fn from_state(state: &AppState) -> Self {
+        Self {
+            lifecycle: state.lifecycle.clone(),
+            opaque_state: state.opaque_state.clone(),
+            log_queue: Some(state.log_queue.clone()),
+            target_telemetry: Some(state.target_telemetry.clone()),
+            pool: Some(state.pool.clone()),
+        }
+    }
+
+    /// Flush accounting and durability queues, then close the database. Each
+    /// step is bounded by [`SHUTDOWN_FLUSH_TIMEOUT`].
+    async fn flush_and_close(self) {
+        async fn bounded(step: &str, work: impl std::future::Future<Output = ()>) {
+            if tokio::time::timeout(SHUTDOWN_FLUSH_TIMEOUT, work)
+                .await
+                .is_err()
+            {
+                tracing::warn!(step, "shutdown flush step timed out");
+            }
+        }
+        if let Some(queue) = &self.log_queue {
+            bounded("usage_log", queue.flush()).await;
+        }
+        if let Some(telemetry) = &self.target_telemetry {
+            bounded("target_telemetry", telemetry.flush()).await;
+        }
+        // A tool call already returned to a client may still have a queued
+        // opaque-state durability write. Flush it so a restart does not lose a
+        // signature the client was told was accepted.
+        bounded("opaque_state", self.opaque_state.flush()).await;
+        if let Some(pool) = &self.pool {
+            bounded("database", pool.close()).await;
+        }
+    }
+}
+
+/// Serve until `shutdown` resolves, then run the graceful shutdown sequence
+/// (`docs/guarantees.md`):
+///
+/// 1. stop accepting connections and stop scheduling background work;
+/// 2. drain in-flight requests, committed streams, background iterations, and
+///    tracked flights until `grace` elapses;
+/// 3. at the deadline fire the abort token: uncommitted requests are cancelled
+///    (cancelling their upstream calls and recording cancellation accounting),
+///    committed streams end with an explicit error, and remaining tracked
+///    flights are dropped, each given [`crate::process::ABORT_UNWIND`];
+/// 4. flush usage accounting, target telemetry, and opaque state;
+/// 5. close the database.
 async fn serve_with_shutdown<F>(
     listener: tokio::net::TcpListener,
     app: axum::Router,
     grace: Duration,
     shutdown: F,
-    opaque_state: Arc<OpaqueStateStore>,
+    resources: ShutdownResources,
 ) -> Result<()>
 where
     F: std::future::Future<Output = ()>,
 {
+    let lifecycle = resources.lifecycle.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let listener = DisconnectAwareListener::with_abort(listener, lifecycle.abort_token());
     let mut server_task = tokio::spawn(async move {
         axum::serve(
-            DisconnectAwareListener::new(listener),
+            listener,
             app.into_make_service_with_connect_info::<ClientConnectionInfo>(),
         )
         .with_graceful_shutdown(async move {
@@ -323,63 +396,106 @@ where
 
     // Keep serving normally until either the server exits unexpectedly or an
     // OS shutdown signal arrives.
-    tokio::select! {
-        result = &mut server_task => {
-            result.context("server task failed")?.context("server error")?;
-            opaque_state.flush().await;
-            return Ok(());
-        }
-        _ = shutdown => {}
+    let server_exit = tokio::select! {
+        result = &mut server_task => Some(result),
+        _ = shutdown => None,
+    };
+    if let Some(result) = server_exit {
+        lifecycle.begin_shutdown();
+        lifecycle.drain(tokio::time::Instant::now() + grace).await;
+        resources.flush_and_close().await;
+        result
+            .context("server task failed")?
+            .context("server error")?;
+        return Ok(());
     }
 
     tracing::info!(
         grace_secs = grace.as_secs(),
         "shutdown signal received; draining in-flight requests"
     );
+    lifecycle.begin_shutdown();
     let _ = shutdown_tx.send(());
+    let deadline = tokio::time::Instant::now() + grace;
 
-    match tokio::time::timeout(grace, &mut server_task).await {
-        Ok(result) => {
-            result
-                .context("server task failed")?
-                .context("server error")?;
-            tracing::info!("all in-flight requests drained");
+    let server_drain = async {
+        match tokio::time::timeout_at(deadline, &mut server_task).await {
+            Ok(result) => {
+                tracing::info!("all in-flight requests drained");
+                Some(result)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    grace_secs = grace.as_secs(),
+                    "graceful shutdown deadline exceeded; cancelling in-flight requests"
+                );
+                lifecycle.abort();
+                match tokio::time::timeout(crate::process::ABORT_UNWIND, &mut server_task).await {
+                    Ok(result) => Some(result),
+                    Err(_) => {
+                        // A handler that ignores cancellation: stop polling the
+                        // server. Returning from run() then tears down the
+                        // runtime and any connection task still running.
+                        server_task.abort();
+                        let _ = (&mut server_task).await;
+                        tracing::warn!("in-flight requests did not unwind; forcing shutdown");
+                        None
+                    }
+                }
+            }
         }
-        Err(_) => {
-            // run() is the top-level server future. Stop polling the Axum
-            // server now; returning from run() then tears down the process
-            // runtime and any connection tasks still draining.
-            server_task.abort();
-            let _ = server_task.await;
-            tracing::warn!(
-                grace_secs = grace.as_secs(),
-                "graceful shutdown deadline exceeded; forcing shutdown"
-            );
-        }
+    };
+    let (server_result, background) = tokio::join!(server_drain, lifecycle.drain(deadline));
+    if background == crate::process::DrainOutcome::Aborted {
+        tracing::warn!("background work aborted at the shutdown deadline");
     }
 
-    // A tool call already returned to a client may still have a queued
-    // opaque-state durability write. Flush it before `run()` returns so a
-    // restart does not lose a signature the client was told was accepted.
-    opaque_state.flush().await;
+    resources.flush_and_close().await;
 
+    if let Some(result) = server_result {
+        result
+            .context("server task failed")?
+            .context("server error")?;
+    }
     Ok(())
 }
 
+/// Longest the credential refresh scheduler sleeps with nothing scheduled. A
+/// new or moved schedule wakes it early through
+/// [`crate::credential_refresh::RefreshCoordinator::schedule_changed`].
+const CREDENTIAL_REFRESH_IDLE_WAIT: Duration = Duration::from_secs(3600);
+/// Minimum spacing between credential refresh passes.
+const CREDENTIAL_REFRESH_MIN_WAIT: Duration = Duration::from_millis(250);
+
+/// Spawn every process-owned background loop through
+/// [`crate::process::ProcessLifecycle`] so graceful shutdown stops scheduling
+/// and drains them. Integration-specific work is demand-driven or next-due
+/// scheduled; an idle integration costs no network calls, probes, or WASM
+/// instantiations (`docs/guarantees.md`).
 pub fn spawn_background_tasks(state: AppState) {
+    let lifecycle = state.lifecycle.clone();
+
     // Proactive credential refresh. Resolve plugin-backed accounts once at
-    // startup to rehydrate lease deadlines, then operate only on coordinator
-    // entries whose refresh_after/derived expiry lead becomes due.
+    // startup to rehydrate lease deadlines, then sleep until the earliest
+    // coordinator deadline (or until a schedule changes) instead of polling.
     {
         let st = state.clone();
-        tokio::spawn(async move {
+        lifecycle.spawn_background(async move {
             st.seed_credential_refreshes().await;
-
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            tick.tick().await; // seed already performed the immediate pass
             loop {
-                tick.tick().await;
+                let now = chrono::Utc::now();
+                let wait = st
+                    .credential_refresh
+                    .next_due(now)
+                    .map(|at| (at - now).to_std().unwrap_or(Duration::ZERO))
+                    .unwrap_or(CREDENTIAL_REFRESH_IDLE_WAIT)
+                    .clamp(CREDENTIAL_REFRESH_MIN_WAIT, CREDENTIAL_REFRESH_IDLE_WAIT);
+                tokio::select! {
+                    biased;
+                    _ = st.lifecycle.stopping() => break,
+                    _ = st.credential_refresh.schedule_changed() => continue,
+                    _ = tokio::time::sleep(wait) => {}
+                }
                 st.refresh_due_credentials().await;
             }
         });
@@ -387,42 +503,49 @@ pub fn spawn_background_tasks(state: AppState) {
 
     // Optional model reconciliation / pricing synchronization. The scheduler
     // only wakes once per minute; per-provider due times and deterministic
-    // jitter are persisted in settings by the lifecycle runner.
+    // jitter are persisted in settings by the lifecycle runner. Both intervals
+    // default to 0 (disabled), in which case a tick reads one settings row.
     {
         let st = state.clone();
-        tokio::spawn(async move {
+        lifecycle.spawn_background(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
+            while st.lifecycle.next_tick(&mut tick).await {
                 crate::admin::run_scheduled_model_lifecycle(&st).await;
             }
         });
     }
 
-    // Frequent registry reload (NFR-2.8: health-state changes visible within 1s;
-    // NFR-2.10: reload only swaps an immutable snapshot).
-    let st = state.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(1000));
-        loop {
-            tick.tick().await;
-            if let Err(e) = st.registry.reload(&st.pool).await {
-                tracing::warn!(error = %e, "registry reload failed; continuing on last snapshot");
+    // Change-driven registry reload (#203). Every registry-affecting write
+    // bumps `registry_revision`; the loop compares one integer per second and
+    // rebuilds the snapshot only when it moved, keeping health-state changes
+    // visible within 1s (NFR-2.8) without a periodic full rebuild.
+    {
+        let st = state.clone();
+        lifecycle.spawn_background(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(1000));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut ticks: u64 = 0;
+            while st.lifecycle.next_tick(&mut tick).await {
+                if let Err(e) = st.registry.reload_if_changed(&st.pool).await {
+                    tracing::warn!(error = %e, "registry reload failed; continuing on last snapshot");
+                }
+                if ticks.is_multiple_of(60) {
+                    st.sticky_sweep(Duration::from_secs(30 * 60));
+                }
+                ticks = ticks.wrapping_add(1);
             }
-            st.sticky_sweep(Duration::from_secs(30 * 60));
-        }
-    });
+        });
+    }
 
     // Scheduled consistent backup with retention (NFR-2.4).
     {
         let st = state.clone();
-        tokio::spawn(async move {
+        lifecycle.spawn_background(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(6 * 3600));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             tick.tick().await; // skip the immediate first tick
-            loop {
-                tick.tick().await;
+            while st.lifecycle.next_tick(&mut tick).await {
                 match db::scheduled_backup(
                     &st.pool,
                     &st.config.database_url,
@@ -448,145 +571,39 @@ pub fn spawn_background_tasks(state: AppState) {
     }
 
     // Cached routing facts (§6.4). Refresh them off the request path on the
-    // manifest-requested cadence. The request path only reads the last
+    // manifest-requested cadence, only for plugins a request read facts from
+    // within the demand window. The request path only reads the last
     // host-stamped snapshot, so no plugin/network wall time enters routing.
     if let Some(manager) = state.plugin_manager().cloned() {
         let st = state.clone();
-        tokio::spawn(async move {
+        lifecycle.spawn_background(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut next_due: std::collections::HashMap<String, tokio::time::Instant> =
                 std::collections::HashMap::new();
-
-            loop {
-                tick.tick().await;
-                let rows = match manager.list().await {
-                    Ok(rows) => rows,
-                    Err(error) => {
-                        tracing::debug!(error = %error, "listing plugins for cached routing fact refresh failed");
-                        continue;
-                    }
-                };
-
-                let now = tokio::time::Instant::now();
-                let mut active = std::collections::HashSet::new();
-                let mut due = Vec::new();
-
-                for row in rows {
-                    if !row.status().is_enabled() {
-                        continue;
-                    }
-                    let Some(manifest) = row.manifest() else {
-                        continue;
-                    };
-                    if manifest.routing_facts_mode != "cached"
-                        || manifest.provides.routing_facts.is_empty()
-                    {
-                        continue;
-                    }
-
-                    active.insert(row.id.clone());
-                    let cadence = Duration::from_millis(manifest.routing_facts_refresh_ms);
-                    let Some(deadline) = next_due.get(&row.id).copied() else {
-                        next_due.insert(
-                            row.id.clone(),
-                            now + st.provider_work.scheduler_jitter(Duration::from_secs(30)),
-                        );
-                        continue;
-                    };
-                    if deadline > now {
-                        continue;
-                    }
-                    let Some(identity) = st
-                        .provider_work
-                        .auxiliary_identity(&format!("plugin:{}", row.id))
-                    else {
-                        continue;
-                    };
-
-                    next_due.insert(
-                        row.id.clone(),
-                        now + cadence
-                            + st.provider_work
-                                .scheduler_jitter(cadence.min(Duration::from_secs(30))),
-                    );
-                    due.push((row.id, identity));
-                }
-
-                next_due.retain(|plugin_id, _| active.contains(plugin_id));
-
-                let mut jobs = tokio::task::JoinSet::new();
-                for (plugin_id, identity) in due {
-                    let manager = manager.clone();
-                    let state = st.clone();
-                    jobs.spawn(async move {
-                        let refresh_plugin_id = plugin_id.clone();
-                        let result = state
-                            .provider_work
-                            .run(
-                                identity,
-                                crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
-                                Some("cached_snapshot".into()),
-                                move || async move {
-                                    manager
-                                        .refresh_cached_routing_facts(&refresh_plugin_id)
-                                        .await
-                                },
-                                |error| {
-                                    crate::provider_work::plugin_backoff_evidence_for_scope(
-                                        error,
-                                        crate::provider_work::RateLimitScope::Provider,
-                                    )
-                                },
-                            )
-                            .await;
-                        (plugin_id, result)
-                    });
-                }
-
-                while let Some(joined) = jobs.join_next().await {
-                    match joined {
-                        Ok((plugin_id, Ok(count))) => {
-                            tracing::debug!(
-                                plugin = %plugin_id,
-                                facts = *count,
-                                "refreshed cached plugin routing facts"
-                            );
-                        }
-                        Ok((plugin_id, Err(error))) => match error.as_ref() {
-                            crate::provider_work::ProviderWorkError::BackedOff(wait) => {
-                                tracing::debug!(plugin = %plugin_id, retry_after_secs = wait.as_secs(), "cached routing-fact refresh backed off");
-                            }
-                            crate::provider_work::ProviderWorkError::Operation(error) => {
-                                tracing::debug!(plugin = %plugin_id, error = %error.message(), "cached plugin routing fact refresh failed");
-                            }
-                            crate::provider_work::ProviderWorkError::Aborted => {
-                                tracing::debug!(plugin = %plugin_id, "cached routing-fact refresh task aborted");
-                            }
-                        },
-                        Err(error) => {
-                            tracing::debug!(
-                                error = %error,
-                                "cached plugin routing fact refresh task failed"
-                            );
-                        }
-                    }
-                }
+            while st.lifecycle.next_tick(&mut tick).await {
+                refresh_demanded_routing_facts(&st, &manager, &mut next_due).await;
             }
         });
     }
 
     // Per-plugin health probes (§6.5). Run on a background schedule owned by
     // core, never lazily on the routing path, so a cold account never pays a
-    // probe's wall time inside a client request (NFR-1.1/1.2).
+    // probe's wall time inside a client request (NFR-1.1/1.2). Only Providers
+    // a request used within the demand window are probed.
     if let Some(manager) = state.plugin_manager().cloned() {
         let st = state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(st.provider_work.scheduler_jitter(Duration::from_secs(15))).await;
+        lifecycle.spawn_background(async move {
+            if !st
+                .lifecycle
+                .sleep(st.provider_work.scheduler_jitter(Duration::from_secs(15)))
+                .await
+            {
+                return;
+            }
             let mut tick = tokio::time::interval(Duration::from_secs(15));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
+            while st.lifecycle.next_tick(&mut tick).await {
                 run_plugin_health_probes(&st, &manager).await;
             }
         });
@@ -596,46 +613,179 @@ pub fn spawn_background_tasks(state: AppState) {
     {
         let st = state.clone();
         let alerts = std::sync::Arc::new(alerts::AlertState::new());
-        tokio::spawn(async move {
+        lifecycle.spawn_background(async move {
             alerts::run(st, alerts).await;
         });
     }
 
     // Purge expired body logs (FR-6.5 retention) and old route traces.
-    let st = state.clone();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(3600));
-        loop {
-            tick.tick().await;
-            if let Ok(n) = db::purge_expired_body_logs(&st.pool).await {
-                if n > 0 {
-                    tracing::info!(purged = n, "purged expired body logs");
+    {
+        let st = state.clone();
+        lifecycle.spawn_background(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            while st.lifecycle.next_tick(&mut tick).await {
+                if let Ok(n) = db::purge_expired_body_logs(&st.pool).await {
+                    if n > 0 {
+                        tracing::info!(purged = n, "purged expired body logs");
+                    }
+                }
+                if let Ok(n) = db::purge_old_route_traces(&st.pool, 30).await {
+                    if n > 0 {
+                        tracing::info!(purged = n, "purged old route traces");
+                    }
                 }
             }
-            if let Ok(n) = db::purge_old_route_traces(&st.pool, 30).await {
-                if n > 0 {
-                    tracing::info!(purged = n, "purged old route traces");
-                }
-            }
-        }
-    });
+        });
+    }
 
     // Per-day usage/log export to disk (JSONL logs + CSV summaries) with
     // retention pruning. Runs hourly; failures never touch the data plane.
-    let st = state.clone();
-    tokio::spawn(async move {
-        let dir = st.config.paths.exports_dir();
-        let retention = st.config.export_retention_days as i64;
-        let mut tick = tokio::time::interval(Duration::from_secs(3600));
-        loop {
-            tick.tick().await;
-            match export::run_export(&st.pool, &dir, 40, retention).await {
-                Ok(n) if n > 0 => tracing::info!(files = n, "exported closed usage days"),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "usage export failed"),
+    {
+        let st = state.clone();
+        lifecycle.spawn_background(async move {
+            let dir = st.config.paths.exports_dir();
+            let retention = st.config.export_retention_days as i64;
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            while st.lifecycle.next_tick(&mut tick).await {
+                match export::run_export(&st.pool, &dir, 40, retention).await {
+                    Ok(n) if n > 0 => tracing::info!(files = n, "exported closed usage days"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "usage export failed"),
+                }
+            }
+        });
+    }
+}
+
+/// One pass of the cached routing-fact scheduler. Plugins nobody demanded
+/// within [`crate::integrations::DEMAND_WINDOW`] are skipped without listing
+/// plugins or instantiating anything. A newly demanded plugin without a
+/// schedule is refreshed immediately so its first facts land promptly.
+async fn refresh_demanded_routing_facts(
+    st: &AppState,
+    manager: &Arc<PluginManager>,
+    next_due: &mut std::collections::HashMap<String, tokio::time::Instant>,
+) {
+    use crate::integrations::{plugin_key, IntegrationWork, DEMAND_WINDOW};
+
+    let demanded: std::collections::HashSet<String> = st
+        .integrations
+        .demanded(DEMAND_WINDOW)
+        .into_iter()
+        .filter_map(|key| key.strip_prefix("plugin:").map(str::to_owned))
+        .collect();
+    if demanded.is_empty() {
+        next_due.clear();
+        return;
+    }
+    let rows = match manager.list().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::debug!(error = %error, "listing plugins for cached routing fact refresh failed");
+            return;
+        }
+    };
+
+    let now = tokio::time::Instant::now();
+    let mut active = std::collections::HashSet::new();
+    let mut due = Vec::new();
+
+    for row in rows {
+        if !demanded.contains(&row.id) || !row.status().is_enabled() {
+            continue;
+        }
+        let Some(manifest) = row.manifest() else {
+            continue;
+        };
+        if manifest.routing_facts_mode != "cached" || manifest.provides.routing_facts.is_empty() {
+            continue;
+        }
+
+        let integration = plugin_key(&row.id);
+        st.integrations.record(&integration, IntegrationWork::Poll);
+        active.insert(row.id.clone());
+        let cadence = Duration::from_millis(manifest.routing_facts_refresh_ms);
+        if next_due
+            .get(&row.id)
+            .is_some_and(|deadline| *deadline > now)
+        {
+            continue;
+        }
+        let Some(identity) = st.provider_work.auxiliary_identity(&integration) else {
+            continue;
+        };
+
+        next_due.insert(
+            row.id.clone(),
+            now + cadence
+                + st.provider_work
+                    .scheduler_jitter(cadence.min(Duration::from_secs(30))),
+        );
+        st.integrations.record(&integration, IntegrationWork::Wake);
+        due.push((row.id, identity));
+    }
+
+    next_due.retain(|plugin_id, _| active.contains(plugin_id));
+
+    let mut jobs = tokio::task::JoinSet::new();
+    for (plugin_id, identity) in due {
+        let manager = manager.clone();
+        let state = st.clone();
+        jobs.spawn(async move {
+            let refresh_plugin_id = plugin_id.clone();
+            let result = state
+                .provider_work
+                .run(
+                    identity,
+                    crate::provider_work::ProviderWorkClass::RoutingFactsRefresh,
+                    Some("cached_snapshot".into()),
+                    move || async move {
+                        manager
+                            .refresh_cached_routing_facts(&refresh_plugin_id)
+                            .await
+                    },
+                    |error| {
+                        crate::provider_work::plugin_backoff_evidence_for_scope(
+                            error,
+                            crate::provider_work::RateLimitScope::Provider,
+                        )
+                    },
+                )
+                .await;
+            (plugin_id, result)
+        });
+    }
+
+    while let Some(joined) = jobs.join_next().await {
+        match joined {
+            Ok((plugin_id, Ok(count))) => {
+                tracing::debug!(
+                    plugin = %plugin_id,
+                    facts = *count,
+                    "refreshed cached plugin routing facts"
+                );
+            }
+            Ok((plugin_id, Err(error))) => match error.as_ref() {
+                crate::provider_work::ProviderWorkError::BackedOff(wait) => {
+                    tracing::debug!(plugin = %plugin_id, retry_after_secs = wait.as_secs(), "cached routing-fact refresh backed off");
+                }
+                crate::provider_work::ProviderWorkError::Operation(error) => {
+                    tracing::debug!(plugin = %plugin_id, error = %error.message(), "cached plugin routing fact refresh failed");
+                }
+                crate::provider_work::ProviderWorkError::Aborted => {
+                    tracing::debug!(plugin = %plugin_id, "cached routing-fact refresh task aborted");
+                }
+            },
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    "cached plugin routing fact refresh task failed"
+                );
             }
         }
-    });
+    }
 }
 
 /// Probe every account of a plugin-bound provider off the request path (§6.5)
@@ -720,9 +870,26 @@ async fn apply_plugin_health_status(
     }
 }
 
-async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>) {
+pub(crate) async fn run_plugin_health_probes(state: &AppState, manager: &Arc<PluginManager>) {
+    use crate::integrations::{provider_key, DEMAND_WINDOW};
+
+    if !state
+        .integrations
+        .demanded(DEMAND_WINDOW)
+        .iter()
+        .any(|key| key.starts_with("provider:"))
+    {
+        return;
+    }
     let providers = match db::list_providers(&state.pool).await {
-        Ok(p) => p,
+        Ok(p) => p
+            .into_iter()
+            .filter(|provider| {
+                state
+                    .integrations
+                    .demanded_within(&provider_key(&provider.id), DEMAND_WINDOW)
+            })
+            .collect::<Vec<_>>(),
         Err(_) => return,
     };
     let task_errors = crate::provider_work::run_bounded_provider_jobs(providers, {
@@ -747,6 +914,10 @@ async fn run_plugin_health_probes_for_provider(
     manager: &Arc<PluginManager>,
     provider: db::ProviderRow,
 ) {
+    state.integrations.record(
+        &crate::integrations::provider_key(&provider.id),
+        crate::integrations::IntegrationWork::Poll,
+    );
     if !state
         .registry
         .snapshot()
@@ -784,6 +955,10 @@ async fn run_plugin_health_probes_for_provider(
         let Some(identity) = state.provider_work_identity(&provider.id, Some(&account.id)) else {
             continue;
         };
+        state.integrations.record(
+            &crate::integrations::provider_key(&provider.id),
+            crate::integrations::IntegrationWork::Probe,
+        );
         let probe_plugin = pref.plugin_id.clone();
         let probe_provider = provider.id.clone();
         let probe_account = account.id.clone();
@@ -1174,6 +1349,150 @@ mod tests {
         (Arc::new(OpaqueStateStore::new(pool, crypto)), root)
     }
 
+    impl ShutdownResources {
+        fn for_opaque_state(opaque_state: Arc<OpaqueStateStore>) -> Self {
+            Self {
+                lifecycle: crate::process::ProcessLifecycle::new(),
+                opaque_state,
+                log_queue: None,
+                target_telemetry: None,
+                pool: None,
+            }
+        }
+    }
+
+    /// The grace deadline fires the abort token, which disconnect-aware
+    /// handlers observe as a client disconnect: they cancel their upstream
+    /// work instead of holding the process for the unwind window.
+    #[tokio::test]
+    async fn shutdown_deadline_cancels_disconnect_aware_requests() {
+        use axum::extract::ConnectInfo;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_started_tx, request_started_rx) = oneshot::channel::<()>();
+        let request_started_tx = Arc::new(Mutex::new(Some(request_started_tx)));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let app = Router::new().route(
+            "/upstream",
+            get({
+                let request_started_tx = request_started_tx.clone();
+                let cancelled = cancelled.clone();
+                move |ConnectInfo(info): ConnectInfo<ClientConnectionInfo>| {
+                    let request_started_tx = request_started_tx.clone();
+                    let cancelled = cancelled.clone();
+                    async move {
+                        if let Some(tx) = request_started_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        info.disconnect.cancelled().await;
+                        cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                        "cancelled"
+                    }
+                }
+            }),
+        );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let grace = Duration::from_millis(50);
+        let (store, root) = test_store().await;
+        let server_task = tokio::spawn(serve_with_shutdown(
+            listener,
+            app,
+            grace,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            ShutdownResources::for_opaque_state(store),
+        ));
+        let request_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .get(format!("http://{addr}/upstream"))
+                .send()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), request_started_rx)
+            .await
+            .expect("request never reached the handler")
+            .expect("request-start signal sender dropped");
+
+        let started = tokio::time::Instant::now();
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), server_task)
+            .await
+            .expect("abort should unwind a disconnect-aware request well before ABORT_UNWIND")
+            .expect("server task panicked")
+            .expect("server returned an error");
+        assert!(started.elapsed() >= grace);
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+
+        request_task.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Shutdown stops background scheduling, lets the running iteration finish
+    /// (no half-written state), refuses new work, flushes, and closes the pool.
+    #[tokio::test]
+    async fn shutdown_drains_background_work_then_closes_database() {
+        let (store, root) = test_store().await;
+        let pool = crate::db::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            root.join("bg.db").display()
+        ))
+        .await
+        .unwrap();
+        let mut resources = ShutdownResources::for_opaque_state(store);
+        resources.pool = Some(pool.clone());
+        let lifecycle = resources.lifecycle.clone();
+
+        let iterations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let in_iteration = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let lifecycle_loop = lifecycle.clone();
+            let iterations = iterations.clone();
+            let in_iteration = in_iteration.clone();
+            assert!(lifecycle.spawn_background(async move {
+                let mut tick = tokio::time::interval(Duration::from_millis(10));
+                while lifecycle_loop.next_tick(&mut tick).await {
+                    in_iteration.store(true, std::sync::atomic::Ordering::SeqCst);
+                    iterations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    in_iteration.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_task = tokio::spawn(serve_with_shutdown(
+            listener,
+            Router::new(),
+            Duration::from_secs(1),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            resources,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_millis(900), server_task)
+            .await
+            .expect("server did not return after shutdown")
+            .expect("server task panicked")
+            .expect("server returned an error");
+
+        assert!(!in_iteration.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(lifecycle.tracked_len(), 0);
+        let after = iterations.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(iterations.load(std::sync::atomic::Ordering::SeqCst), after);
+        assert!(!lifecycle.spawn_background(async {}));
+        assert!(!lifecycle.spawn_flight(async {}));
+        assert!(pool.is_closed());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn shutdown_deadline_bounds_stuck_in_flight_request() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1209,7 +1528,7 @@ mod tests {
             async move {
                 let _ = shutdown_rx.await;
             },
-            store,
+            ShutdownResources::for_opaque_state(store),
         ));
 
         let request_task = tokio::spawn(async move {
@@ -1227,15 +1546,18 @@ mod tests {
         let started = tokio::time::Instant::now();
         shutdown_tx.send(()).unwrap();
 
-        tokio::time::timeout(Duration::from_millis(500), server_task)
+        // A handler that ignores cancellation is given ABORT_UNWIND after the
+        // grace deadline, then dropped.
+        let bound = grace + crate::process::ABORT_UNWIND + Duration::from_millis(500);
+        tokio::time::timeout(bound, server_task)
             .await
             .expect("server exceeded the shutdown deadline tolerance")
             .expect("server task panicked")
             .expect("server returned an error");
 
         assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "shutdown should return shortly after the grace deadline"
+            started.elapsed() < bound,
+            "shutdown should return shortly after the grace deadline plus abort unwind"
         );
 
         request_task.abort();
@@ -1256,7 +1578,7 @@ mod tests {
             async move {
                 let _ = shutdown_rx.await;
             },
-            store,
+            ShutdownResources::for_opaque_state(store),
         ));
 
         shutdown_tx.send(()).unwrap();
@@ -1300,7 +1622,7 @@ mod tests {
             async move {
                 let _ = shutdown_rx.await;
             },
-            store.clone(),
+            ShutdownResources::for_opaque_state(store.clone()),
         ));
         shutdown_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_millis(500), server_task)

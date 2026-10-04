@@ -1158,6 +1158,15 @@ impl ProviderRow {
     }
 }
 
+/// Control-plane revision bumped by triggers on every registry-table write.
+pub async fn registry_revision(pool: &Pool) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT revision FROM registry_revision WHERE id = 1")
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
 pub async fn list_providers(pool: &Pool) -> Result<Vec<ProviderRow>> {
     Ok(
         sqlx::query_as::<_, ProviderRow>("SELECT * FROM providers ORDER BY created_at")
@@ -5725,10 +5734,11 @@ mod pending_marker_publication_tests {
 }
 
 #[cfg(test)]
-mod usage_request_log_tests {
+pub(crate) mod usage_request_log_tests {
     use super::*;
 
-    fn request_row(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn request_row(
         id: &str,
         ts: &str,
         status: &str,

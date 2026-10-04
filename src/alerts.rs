@@ -120,7 +120,7 @@ impl AlertState {
     }
 }
 
-/// Run the alert evaluation loop until the process exits.
+/// Run the alert evaluation loop until shutdown begins.
 pub async fn run(state: AppState, alerts: Arc<AlertState>) {
     let Some(url) = state.config.alert_webhook_url.clone() else {
         tracing::info!("alert webhook not configured; alerting disabled");
@@ -129,8 +129,8 @@ pub async fn run(state: AppState, alerts: Arc<AlertState>) {
     let interval = state.config.alert_interval_secs.max(5);
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        ticker.tick().await;
+    let lifecycle = state.lifecycle.clone();
+    while lifecycle.next_tick(&mut ticker).await {
         if let Err(e) = evaluate(&state, &alerts, &url).await {
             tracing::warn!(error = %e, "alert evaluation failed");
         }

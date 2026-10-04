@@ -76,6 +76,9 @@ impl RotationGate {
 pub struct RefreshCoordinator {
     schedules: Arc<DashMap<CredentialKey, LeaseSchedule>>,
     gates: Arc<DashMap<CredentialKey, Arc<RotationGate>>>,
+    /// Signalled when a schedule may have moved earlier, so the next-due
+    /// timer re-arms instead of polling.
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl RefreshCoordinator {
@@ -283,6 +286,7 @@ impl RefreshCoordinator {
         }
 
         self.schedules.insert(key, schedule);
+        self.changed.notify_one();
     }
 
     fn apply_minimum_retry_floor(
@@ -316,6 +320,25 @@ impl RefreshCoordinator {
         self.gates.retain(|key, _| key.provider_id != provider_id);
         self.schedules
             .retain(|key, _| key.provider_id != provider_id);
+    }
+
+    /// Earliest instant a schedule can become claimable: its refresh deadline,
+    /// or the end of an active claim. `None` when nothing is scheduled.
+    pub fn next_due(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.schedules
+            .iter()
+            .map(|entry| match entry.claim_until {
+                Some(claim_until) if claim_until > now => claim_until.max(entry.next_attempt_at),
+                _ => entry.next_attempt_at,
+            })
+            .min()
+    }
+
+    /// Wait until a schedule may have moved earlier. A notification sent while
+    /// nobody waits is retained, so a change between [`Self::next_due`] and
+    /// this call is never lost.
+    pub async fn schedule_changed(&self) {
+        self.changed.notified().await
     }
 
     /// Atomically claim every lease whose refresh deadline has arrived.
@@ -588,6 +611,8 @@ impl RefreshCoordinator {
             .unwrap_or_else(|| exponential_backoff_secs(schedule.failures));
         schedule.next_attempt_at = now + ChronoDuration::seconds(retry.min(MAX_RETRY_SECS) as i64);
         schedule.claim_until = None;
+        drop(schedule);
+        self.changed.notify_one();
     }
 
     fn remove_schedule_for_gate(&self, key: &CredentialKey, gate: &Arc<RotationGate>) {
