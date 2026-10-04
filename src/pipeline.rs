@@ -1446,14 +1446,23 @@ pub(crate) async fn run_with_disconnect(
         // A translated frontend may replay a signed thinking block from this
         // plugin/Gemini target. The transport name cannot establish its origin;
         // a matching scoped, producer/model-compatible stored signature can.
-        let inline_opaque = request_has_nonportable_inline_state(
-            &target_req,
-            preserves_anthropic_thinking,
-            cross_provider || cross_format,
-            adapter
-                .opaque_state_target(&target.model)
-                .map(|_| &opaque_report),
-        );
+        //
+        // OpenAI Chat `reasoning_content`/`reasoning_signature` replayed to a
+        // same-provider OpenAI Chat passthrough target is forwarded verbatim:
+        // the upstream that produced it owns its replay semantics (#207).
+        let chat_reasoning_passthrough = format == FrontendFormat::OpenAi
+            && !cross_format
+            && !cross_provider
+            && target_req.raw_body.is_some();
+        let inline_opaque = !chat_reasoning_passthrough
+            && request_has_nonportable_inline_state(
+                &target_req,
+                preserves_anthropic_thinking,
+                cross_provider || cross_format,
+                adapter
+                    .opaque_state_target(&target.model)
+                    .map(|_| &opaque_report),
+            );
 
         // `opaque_report.nonportable()` must independently enter portability
         // handling: stored state can be incompatible with a target even when
@@ -1515,7 +1524,7 @@ pub(crate) async fn run_with_disconnect(
                         &meta,
                         &mut trace,
                         Some(target.account.label.clone()),
-                        "non-portable provider continuation state cannot be sent to a direct cross-format target",
+                        "non-portable provider continuation state cannot be sent to this direct target",
                         started,
                     )
                     .await,

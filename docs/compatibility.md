@@ -362,8 +362,15 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   stored a signature is later routed to an OpenAI target). Compatible stored
   state is restored only after the portability decision, so a
   `strip_with_warning` boundary never deletes state that the chosen target can
-  use, and a direct cross-format target with no Route refuses known non-portable
-  state instead of silently dropping it.
+  use, and a direct target with no Route refuses known non-portable state
+  instead of silently dropping it.
+- **OpenAI Chat reasoning replay.** An OpenAI Chat assistant message carrying
+  `reasoning_content` / `reasoning_signature` sent to a same-provider OpenAI
+  Chat target on the same-format passthrough path is forwarded verbatim. The
+  upstream that produced the reasoning owns its replay semantics (some
+  OpenAI-compatible providers require it during tool loops, others reject it),
+  so Kinetix neither strips nor refuses it. Cross-format or cross-provider
+  replay still follows the Route portability policy above.
 - **Cross-model continuation.** Exact-model scoping stops a real signature from
   being replayed onto a model that did not produce it, but leaving the
   historical `functionCall` unsigned would still fail the next `generateContent`

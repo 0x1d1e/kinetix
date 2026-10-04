@@ -724,6 +724,20 @@ def run_http_case(case_id):
         return
 
 
+    if case_id == "chat.native.openai.reasoning_replay":
+        payload = {
+            "model": "syn-openai",
+            "stream": False,
+            "messages": [
+                {"role": "assistant", "content": "prior", "reasoning_content": "earlier thought", "reasoning_signature": "sig-own"},
+                {"role": "user", "content": "fixture:chat-reasoning-replay"},
+            ],
+        }
+        status, headers, body = request("/v1/chat/completions", payload)
+        need(status == 200, body)
+        need(not headers.get("x-kinetix-warning"), "same-format reasoning replay must not warn")
+        return
+
     if case_id == "messages.translate.gemini.opaque_reasoning":
         payload = {
             "model": "syn-fallback",

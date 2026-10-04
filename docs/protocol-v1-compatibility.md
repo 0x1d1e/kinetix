@@ -29,7 +29,7 @@ not a claim that every field of every upstream vendor API is implemented.
 | max_tokens / max_completion_tokens | passthrough | translated | Both map to canonical max output tokens. | `chat.native.openai.sync`<br>`chat.translate.gemini.sync`<br>`chat.translate.anthropic.sync` |
 | stop / seed / presence_penalty / frequency_penalty | passthrough | translated where the selected adapter has a canonical wire mapping | The positive fixture sends all four; Gemini proves stop/seed while same-format OpenAI preserves penalties. | `chat.native.openai.sync`<br>`chat.translate.gemini.sync` |
 | reasoning_effort | passthrough | translated only with model thinking_map | No reasoning control is invented when no mapping exists. | `chat.native.openai.sync`<br>`chat.translate.gemini.sync`<br>`chat.translate.anthropic.sync` |
-| assistant reasoning history/signature | passthrough | portable only on compatible path; otherwise route portability policy applies | Opaque state is stripped-with-warning or rejected at the first cross-format/provider boundary. | `chat.fallback.opaque_reasoning` |
+| assistant reasoning history/signature | passthrough (forwarded verbatim to same-provider OpenAI Chat target) | portable only on compatible path; otherwise route portability policy applies | Same-format, same-provider replay is forwarded unchanged; the upstream owns replay semantics. Opaque state is stripped-with-warning or rejected at the first cross-format/provider boundary. | `chat.native.openai.reasoning_replay`<br>`chat.fallback.opaque_reasoning` |
 | stream | passthrough | translated | Streaming is normalized through canonical events on translation. | `chat.native.openai.sync`<br>`chat.native.openai.stream`<br>`chat.translate.gemini.sync`<br>`chat.translate.gemini.stream`<br>`chat.translate.anthropic.sync`<br>`chat.translate.anthropic.stream` |
 | stream_options.include_usage | passthrough | client preference preserved on translation | Internal accounting may request upstream usage even when client did not. | `chat.native.openai.stream`<br>`chat.translate.gemini.stream`<br>`chat.translate.anthropic.stream` |
 | n > 1 | passthrough | rejected (400) | Multiple completions cannot be represented faithfully on translated paths. | `chat.native.openai.provider_extensions`<br>`chat.translate.gemini.unsupported_fields.reject` |
@@ -151,6 +151,7 @@ not a claim that every field of every upstream vendor API is implemented.
 | `chat.fallback.tool_continuation` | http | Chat tool-result identity survives route fallback |
 | `messages.translate.openai.tool_continuation` | http | Messages tool-result identity survives OpenAI translation |
 | `chat.fallback.opaque_reasoning` | http | Opaque reasoning state is stripped with warning at first portability boundary |
+| `chat.native.openai.reasoning_replay` | http | Chat reasoning_content/reasoning_signature replay to a same-provider OpenAI Chat passthrough target is forwarded verbatim |
 | `messages.translate.multimodal_tool_result.reject` | http | Unsupported multimodal tool results, documents, and server-tool semantics fail explicitly |
 | `chat.native.openai.provider_extensions` | http | Chat same-format OpenAI preserves n and provider-specific fields |
 | `messages.native.anthropic.provider_extensions` | http | Messages same-format Anthropic preserves provider-specific fields |
