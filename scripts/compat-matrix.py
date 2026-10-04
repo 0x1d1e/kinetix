@@ -750,9 +750,8 @@ def test_pi_parallel_tools(upstream_model):
 
 def test_pi_vision(upstream_model):
     t0 = time.time()
-    payload = {
+    events, _ = _pi_stream({
         "model": upstream_model,
-        "stream": False,
         "messages": [{
             "role": "user",
             "content": [
@@ -760,35 +759,146 @@ def test_pi_vision(upstream_model):
                 {"type": "image_url", "image_url": {"url": _ONE_PIXEL_PNG}},
             ],
         }],
-    }
-    req = urllib.request.Request(
-        f"{BASE_URL}/v1/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json", "User-Agent": "pi (linux; x86_64)"},
-    )
-    with urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode())
-    passed = bool(data.get("choices"))
+    })
+    passed = bool(_pi_stream_text(events))
     record_result("Pi (OpenAI Chat)", upstream_model, "vision", passed, "data-url image", int((time.time()-t0)*1000))
 
 
 def test_pi_thinking(upstream_model):
     t0 = time.time()
-    payload = {
+    events, _ = _pi_stream({
         "model": upstream_model,
-        "stream": False,
         "reasoning_effort": "high",
         "messages": [{"role": "user", "content": "fixture:thinking solve carefully"}],
+    })
+    passed = bool(_pi_stream_text(events))
+    record_result("Pi (OpenAI Chat)", upstream_model, "reasoning_control", passed, "reasoning_effort=high", int((time.time()-t0)*1000))
+
+
+def _pi_stream(payload, session_id=None):
+    """Send a request shaped like Pi's OpenAI-compatible client: streaming, Pi
+    user agent, and `x-session-id` when `compat.sendSessionAffinityHeaders` is
+    set (docs/pi-compatibility.md)."""
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "pi (linux; x86_64)",
     }
+    if session_id:
+        headers["x-session-id"] = session_id
     req = urllib.request.Request(
         f"{BASE_URL}/v1/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json", "User-Agent": "pi (linux; x86_64)"},
+        data=json.dumps({**payload, "stream": True}).encode(),
+        headers=headers,
     )
     with urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode())
-    passed = bool(data.get("choices"))
-    record_result("Pi (OpenAI Chat)", upstream_model, "reasoning_control", passed, "reasoning_effort=high", int((time.time()-t0)*1000))
+        return read_sse_events(resp), resp.headers
+
+
+def _pi_stream_tool_calls(events):
+    calls = {}
+    for _, ev in events:
+        if not isinstance(ev, dict) or not ev.get("choices"):
+            continue
+        for call in ev["choices"][0].get("delta", {}).get("tool_calls", []) or []:
+            slot = calls.setdefault(call.get("index", 0), {"id": None, "name": None, "arguments": ""})
+            slot["id"] = call.get("id") or slot["id"]
+            fn = call.get("function", {})
+            slot["name"] = fn.get("name") or slot["name"]
+            slot["arguments"] += fn.get("arguments") or ""
+    return [calls[i] for i in sorted(calls)]
+
+
+def _pi_stream_text(events):
+    return "".join(
+        ev["choices"][0].get("delta", {}).get("content") or ""
+        for _, ev in events
+        if isinstance(ev, dict) and ev.get("choices")
+    )
+
+
+_PI_WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    },
+}
+
+
+def test_pi_tool_loop(upstream_model):
+    """A real two-turn Pi tool loop: turn 2 answers the exact tool-call id
+    Kinetix returned in turn 1. The strict upstream rejects turn 2 unless the
+    tool result reaches it as a native tool result."""
+    t0 = time.time()
+    session_id = f"pi_loop_{upstream_model}_{int(time.time())}"
+    user = {"role": "user", "content": "What is the weather in Paris?"}
+    events, _ = _pi_stream({"model": upstream_model, "messages": [user], "tools": [_PI_WEATHER_TOOL]}, session_id)
+    calls = _pi_stream_tool_calls(events)
+    passed = len(calls) == 1 and bool(calls[0]["id"]) and calls[0]["name"] == "get_weather"
+    detail = f"turn 1 calls={[(c['id'], c['name']) for c in calls]}"
+    if passed:
+        call = calls[0]
+        events, _ = _pi_stream({
+            "model": upstream_model,
+            "tools": [_PI_WEATHER_TOOL],
+            "messages": [
+                user,
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {"name": call["name"], "arguments": call["arguments"] or "{}"},
+                }]},
+                {"role": "tool", "tool_call_id": call["id"], "content": "fixture:tool-continuation 18C"},
+            ],
+        }, session_id)
+        # The strict upstream returned 200, so the result reached it natively.
+        passed = any(isinstance(e[1], dict) and e[1].get("choices") for e in events) and any(
+            e[1] == "[DONE]" for e in events
+        )
+        detail = f"id {call['id']} answered"
+    record_result("Pi (OpenAI Chat)", upstream_model, "tool_loop", passed, detail, int((time.time()-t0)*1000))
+
+
+def test_pi_signature_continuation():
+    """Pi never sends Gemini thought signatures back. Kinetix must restore the
+    stored signature for the tool call Pi answers, or the strict upstream
+    rejects the continuation like real Gemini 3 does."""
+    t0 = time.time()
+    session_id = f"pi_sig_{int(time.time())}"
+    user = {"role": "user", "content": "fixture:gemini-signature-continuation weather?"}
+    tool = _PI_WEATHER_TOOL
+    events, _ = _pi_stream({"model": "syn-gemini-3", "messages": [user], "tools": [tool]}, session_id)
+    calls = _pi_stream_tool_calls(events)
+    passed = len(calls) == 1 and bool(calls[0]["id"])
+    detail = f"turn 1 calls={len(calls)}"
+    if passed:
+        call = calls[0]
+        events, _ = _pi_stream({
+            "model": "syn-gemini-3",
+            "tools": [tool],
+            "messages": [
+                user,
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": call["arguments"] or "{}"},
+                }]},
+                {"role": "tool", "tool_call_id": call["id"], "content": "18C"},
+            ],
+        }, session_id)
+        passed = any(e[1] == "[DONE]" for e in events)
+        detail = "signature restored for Pi continuation"
+    record_result("Pi (OpenAI Chat)", "syn-gemini-3", "signature_contin", passed, detail, int((time.time()-t0)*1000))
+
+
+def test_pi_fallback_stream():
+    t0 = time.time()
+    events, headers = _pi_stream({"model": "syn-fallback", "messages": [{"role": "user", "content": "fallback"}]})
+    fallback = headers.get("x-kinetix-fallback")
+    passed = bool(_pi_stream_text(events)) and fallback == "1"
+    record_result("Pi (OpenAI Chat)", "syn-fallback", "fallback_stream", passed, f"header={fallback}", int((time.time()-t0)*1000))
 
 
 def test_unknown_client_field_is_dropped(upstream_model):
@@ -1052,6 +1162,15 @@ def run_matrix():
     test_pi_thinking("syn-gemini-3")
     test_unknown_client_field_is_dropped("syn-gemini-3")
     test_route_fallback()
+
+    # Pi acceptance profile (#201 tier 1): the request shapes Pi really sends,
+    # each checked by a strict synthetic upstream.
+    test_pi_tool_loop("syn-openai")
+    test_pi_tool_loop("syn-gemini-3")
+    test_pi_vision("syn-openai")
+    test_pi_thinking("syn-openai")
+    test_pi_signature_continuation()
+    test_pi_fallback_stream()
 
     # 2. Next-Gen Coding Agent / Codex (OpenAI Responses API)
     print("\n==> Testing Next-Gen Coding Agent (OpenAI Responses API)")
