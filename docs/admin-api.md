@@ -94,7 +94,8 @@ lookups can reuse the hint without treating it as verified metadata.
 Pricing sync updates price observations and catalog provenance only. Refresh
 model discovery and review/accept observed changes to update existing model
 limits and capabilities. Unknown prices do not mean free usage; direct API rates
-are not automatically used for subscription integrations.
+are not automatically used for subscription integrations. A refresh never
+changes runtime semantics on its own; see [model-state.md](model-state.md).
 
 ## Bounds and secrets
 

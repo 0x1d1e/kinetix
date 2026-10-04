@@ -4288,6 +4288,7 @@ pub async fn update_model_reconciliation(
             let mut prices = row.prices();
             let mut accepted_prices = false;
             let mut accepted_transport: Option<String> = None;
+            let mut accepted_limits: Vec<(&str, String)> = Vec::new();
             let mut accepted_discovery = serde_json::Map::new();
 
             for field in &selected {
@@ -4301,6 +4302,8 @@ pub async fn update_model_reconciliation(
                         if let Some(value) = observed.get("context_window").and_then(Value::as_i64)
                         {
                             context_window = Some(value);
+                            accepted_limits
+                                .push(("context_window", observed_limit_source(&observed, field)));
                         }
                     }
                     "max_output_tokens" => {
@@ -4308,6 +4311,10 @@ pub async fn update_model_reconciliation(
                             observed.get("max_output_tokens").and_then(Value::as_i64)
                         {
                             max_output_tokens = Some(value);
+                            accepted_limits.push((
+                                "max_output_tokens",
+                                observed_limit_source(&observed, field),
+                            ));
                         }
                     }
                     "thinking_map" => {
@@ -4419,6 +4426,18 @@ pub async fn update_model_reconciliation(
             object.remove("ignored_diff");
             object.insert("decision_at".into(), json!(db::now_iso()));
             accepted_discovery.insert("reconciliation".into(), reconciliation.clone());
+            let accepted_limits: Vec<(&str, &str)> = accepted_limits
+                .iter()
+                .map(|(field, source)| (*field, source.as_str()))
+                .collect();
+            if let Some(provenance) =
+                crate::model_state::accepted_provenance_patch(&discovery, &accepted_limits)
+            {
+                accepted_discovery.insert(
+                    crate::model_state::ACCEPTED_PROVENANCE_KEY.into(),
+                    provenance,
+                );
+            }
 
             let price_provenance = accepted_prices.then(|| {
                 accept_price_fields(&discovery, &row.prices(), &prices, &observed, &selected)
@@ -4477,6 +4496,16 @@ pub async fn update_model_reconciliation(
     .await
     .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Source of an observed limit being accepted. Discovery always records one;
+/// a missing source means the provider's model list reported it.
+fn observed_limit_source(observed: &Value, field: &str) -> String {
+    observed
+        .pointer(&format!("/capability_sources/{field}"))
+        .and_then(Value::as_str)
+        .unwrap_or("upstream_discovery")
+        .to_string()
 }
 
 fn models_dev_pricing_patch(
@@ -8152,6 +8181,35 @@ pub async fn create_model(
     if let Some(observation) = initial_latest_observation.as_ref() {
         discovery_patch.insert("latest_observation".into(), observation.clone());
     }
+    let created_limits: Vec<(&str, &str)> = [
+        ("context_window", body.context_window),
+        ("max_output_tokens", body.max_output_tokens),
+    ]
+    .into_iter()
+    .filter_map(|(field, value)| {
+        let value = value?;
+        let imported_source = imported_from_discovery
+            .then(|| body.discovery.get(field).and_then(Value::as_i64) == Some(value))
+            .filter(|matches| *matches)
+            .and_then(|_| {
+                body.discovery
+                    .pointer(&format!("/capability_sources/{field}"))
+            })
+            .and_then(Value::as_str);
+        Some((
+            field,
+            imported_source.unwrap_or(crate::model_state::OPERATOR_SOURCE),
+        ))
+    })
+    .collect();
+    if let Some(provenance) =
+        crate::model_state::accepted_provenance_patch(&json!({}), &created_limits)
+    {
+        discovery_patch.insert(
+            crate::model_state::ACCEPTED_PROVENANCE_KEY.into(),
+            provenance,
+        );
+    }
     if !effective_prices.is_configured() {
         discovery_patch.insert("effective_pricing".into(), Value::Null);
     }
@@ -8313,6 +8371,28 @@ pub async fn update_model(
                 &existing_discovery,
                 &thinking_map,
             )),
+        );
+    }
+    let edited_limits: Vec<(&str, &str)> = [
+        (
+            "context_window",
+            model.context_window != body.context_window,
+        ),
+        (
+            "max_output_tokens",
+            model.max_output_tokens != body.max_output_tokens,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, edited)| *edited)
+    .map(|(field, _)| (field, crate::model_state::OPERATOR_SOURCE))
+    .collect();
+    if let Some(provenance) =
+        crate::model_state::accepted_provenance_patch(&existing_discovery, &edited_limits)
+    {
+        discovery_patch.insert(
+            crate::model_state::ACCEPTED_PROVENANCE_KEY.into(),
+            provenance,
         );
     }
     let display_name = body.display_name.as_deref().unwrap_or(&body.upstream_id);

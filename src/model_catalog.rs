@@ -451,6 +451,35 @@ fn models_dev_cache() -> &'static tokio::sync::RwLock<Option<ModelsDevCacheEntry
     CACHE.get_or_init(|| tokio::sync::RwLock::new(None))
 }
 
+/// Unit tests never reach the live catalog: they observe only the fixture
+/// registered for the provider base URL under test, or no catalog.
+#[cfg(test)]
+fn test_catalogs() -> &'static std::sync::Mutex<std::collections::HashMap<String, ModelsDevCatalog>>
+{
+    static CATALOGS: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ModelsDevCatalog>>,
+    > = OnceLock::new();
+    CATALOGS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn test_fixture(base_url: &str) -> Option<Option<ModelsDevFetch>> {
+    let catalog = test_catalogs()
+        .lock()
+        .expect("test catalog lock")
+        .get(base_url)
+        .cloned();
+    Some(catalog.map(|catalog| ModelsDevFetch {
+        catalog,
+        outcome: ModelsDevRefreshOutcome::Fresh,
+    }))
+}
+
+#[cfg(not(test))]
+fn test_fixture(_base_url: &str) -> Option<Option<ModelsDevFetch>> {
+    None
+}
+
 fn models_dev_stale_fallback(cached: Option<ModelsDevCacheEntry>) -> Option<ModelsDevFetch> {
     cached
         .filter(|entry| entry.fetched_at.elapsed() <= MODELS_DEV_STALE_IF_ERROR_TTL)
@@ -519,8 +548,24 @@ impl ModelsDevCatalog {
 
     pub async fn fetch_with_outcome(
         client: &reqwest::Client,
-        _base_url: &str,
+        base_url: &str,
     ) -> Option<ModelsDevFetch> {
+        if let Some(fixture) = test_fixture(base_url) {
+            return fixture;
+        }
+        Self::fetch_live(client).await
+    }
+
+    /// Register the catalog unit tests observe for `base_url`.
+    #[cfg(test)]
+    pub(crate) fn register_for_test(base_url: &str, catalog: ModelsDevCatalog) {
+        test_catalogs()
+            .lock()
+            .expect("test catalog lock")
+            .insert(base_url.to_string(), catalog);
+    }
+
+    async fn fetch_live(client: &reqwest::Client) -> Option<ModelsDevFetch> {
         // The catalog destination is fixed and never derived from provider input.
         // Apply the existing SSRF/private-network guard to the actual outbound
         // destination rather than suppressing enrichment for private gateways.

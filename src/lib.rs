@@ -48,6 +48,7 @@ pub mod live;
 pub mod logqueue;
 pub mod model_capabilities;
 pub mod model_catalog;
+pub mod model_state;
 pub mod net;
 pub mod opaque_state;
 pub mod outbound;
