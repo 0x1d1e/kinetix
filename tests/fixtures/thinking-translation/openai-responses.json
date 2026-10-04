@@ -1,0 +1,674 @@
+{
+ "transport": "openai-responses",
+ "models": {
+  "discovered-level-disable": {
+   "discovery": {
+    "reasoning_capability": {
+     "supported": true,
+     "mode": "level",
+     "levels": [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh"
+     ],
+     "can_disable": true,
+     "upstream_format": "responses_effort"
+    }
+   }
+  },
+  "configured-level-no-disable": {
+   "thinking_map": {
+    "mode": "level",
+    "levels": {
+     "minimal": "minimal",
+     "low": "low",
+     "medium": "medium",
+     "high": "high",
+     "xhigh": "xhigh",
+     "max": "max"
+    },
+    "level_field": "reasoning.effort"
+   }
+  },
+  "configured-flat-field": {
+   "thinking_map": {
+    "mode": "level",
+    "levels": {
+     "high": "high"
+    },
+    "level_field": "reasoning_effort"
+   }
+  },
+  "no-thinking-capability": {}
+ },
+ "cases": [
+  {
+   "name": "absent/discovered-level-disable",
+   "model": "discovered-level-disable",
+   "frontend": "openai-chat",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false
+    }
+   }
+  },
+  {
+   "name": "absent/configured-level-no-disable",
+   "model": "configured-level-no-disable",
+   "frontend": "openai-chat",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false
+    }
+   }
+  },
+  {
+   "name": "absent/no-thinking-capability",
+   "model": "no-thinking-capability",
+   "frontend": "openai-chat",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false
+    }
+   }
+  },
+  {
+   "name": "off/discovered-level-disable",
+   "model": "discovered-level-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "none"
+     }
+    }
+   }
+  },
+  {
+   "name": "off/configured-level-no-disable",
+   "model": "configured-level-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "off/no-thinking-capability",
+   "model": "no-thinking-capability",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/minimal/discovered-level-disable",
+   "model": "discovered-level-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "minimal"
+   },
+   "canonical": "minimal",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "minimal"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/minimal/configured-level-no-disable",
+   "model": "configured-level-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "minimal"
+   },
+   "canonical": "minimal",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "minimal"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/low/discovered-level-disable",
+   "model": "discovered-level-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "low"
+   },
+   "canonical": "low",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "low"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/low/configured-level-no-disable",
+   "model": "configured-level-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "low"
+   },
+   "canonical": "low",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "low"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/medium/discovered-level-disable",
+   "model": "discovered-level-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "medium"
+   },
+   "canonical": "medium",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "medium"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/medium/configured-level-no-disable",
+   "model": "configured-level-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "medium"
+   },
+   "canonical": "medium",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "medium"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/high/discovered-level-disable",
+   "model": "discovered-level-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "high"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/high/configured-level-no-disable",
+   "model": "configured-level-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "high"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/xhigh/discovered-level-disable",
+   "model": "discovered-level-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "xhigh"
+   },
+   "canonical": "xhigh",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "xhigh"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/xhigh/configured-level-no-disable",
+   "model": "configured-level-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "xhigh"
+   },
+   "canonical": "xhigh",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "xhigh"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/max/discovered-level-disable",
+   "model": "discovered-level-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "max"
+   },
+   "canonical": "max",
+   "expect": {
+    "rejected": "thinking level 'max' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/max/configured-level-no-disable",
+   "model": "configured-level-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "max"
+   },
+   "canonical": "max",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "max"
+     }
+    }
+   }
+  },
+  {
+   "name": "default/anthropic-adaptive/configured-level-no-disable",
+   "model": "configured-level-no-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "default",
+   "expect": {
+    "rejected": "thinking level 'default' has no executable mapping"
+   }
+  },
+  {
+   "name": "effort/anthropic-adaptive-max/configured-level-no-disable",
+   "model": "configured-level-no-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "max"
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "max",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "max_output_tokens": 64000,
+     "reasoning": {
+      "effort": "max"
+     }
+    }
+   }
+  },
+  {
+   "name": "budget/anthropic-8192-is-medium/configured-level-no-disable",
+   "model": "configured-level-no-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "enabled",
+     "budget_tokens": 8192
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "medium",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "max_output_tokens": 64000,
+     "reasoning": {
+      "effort": "medium"
+     }
+    }
+   }
+  },
+  {
+   "name": "flat-field/high",
+   "model": "configured-flat-field",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "input_text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "stream": true,
+     "store": false,
+     "reasoning_effort": "high"
+    }
+   }
+  },
+  {
+   "name": "passthrough/native-nested-effort-preserved/configured-level-no-disable",
+   "model": "configured-level-no-disable",
+   "frontend": "openai-responses",
+   "intent": {
+    "reasoning": {
+     "effort": "max"
+    }
+   },
+   "canonical": "max",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": "hi",
+     "stream": true,
+     "store": false,
+     "reasoning": {
+      "effort": "max"
+     }
+    }
+   }
+  },
+  {
+   "name": "passthrough/legacy-flat-effort-stripped/no-thinking-capability",
+   "model": "no-thinking-capability",
+   "frontend": "openai-responses",
+   "intent": {
+    "reasoning_effort": "low"
+   },
+   "canonical": "low",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "input": "hi",
+     "stream": true,
+     "store": false
+    }
+   }
+  }
+ ]
+}

@@ -1619,9 +1619,12 @@ pub(crate) async fn run_with_disconnect(
                 )
                 .await);
             }
-            if let Err(error) =
-                check_resolved_thinking_translation(adapter.as_ref(), target, &profile, &target_req)
-            {
+            if let Err(error) = check_resolved_thinking_translation(
+                adapter.as_ref(),
+                &target.model.display_name,
+                &profile,
+                &target_req,
+            ) {
                 return Err(finish_policy_rejection(
                     state,
                     &meta,
@@ -5006,9 +5009,12 @@ fn check_thinking_translation_for_adapter(
     check_thinking_translation(target, req)
 }
 
-fn check_resolved_thinking_translation(
+/// Fail closed when a translated request carries a canonical thinking level the
+/// resolved execution profile cannot execute. Same-format passthrough does not
+/// reach this gate.
+pub fn check_resolved_thinking_translation(
     adapter: &dyn Adapter,
-    target: &ResolvedTarget,
+    model_name: &str,
     profile: &crate::adapters::ResolvedExecutionProfile,
     req: &InternalRequest,
 ) -> Result<(), ProxyError> {
@@ -5033,8 +5039,7 @@ fn check_resolved_thinking_translation(
         return Ok(());
     }
     Err(ProxyError::unsupported(format!(
-        "thinking level '{key}' has no executable mapping for model '{}' on transport '{}'",
-        target.model.display_name,
+        "thinking level '{key}' has no executable mapping for model '{model_name}' on transport '{}'",
         profile.transport.as_str()
     )))
 }

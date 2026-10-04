@@ -1,0 +1,327 @@
+[
+ {
+  "name": "openai-chat/absent",
+  "frontend": "openai-chat",
+  "intent": {},
+  "canonical": null
+ },
+ {
+  "name": "openai-chat/reasoning_effort=none",
+  "frontend": "openai-chat",
+  "intent": {
+   "reasoning_effort": "none"
+  },
+  "canonical": "off"
+ },
+ {
+  "name": "openai-chat/reasoning_effort=minimal",
+  "frontend": "openai-chat",
+  "intent": {
+   "reasoning_effort": "minimal"
+  },
+  "canonical": "minimal"
+ },
+ {
+  "name": "openai-chat/reasoning_effort=low",
+  "frontend": "openai-chat",
+  "intent": {
+   "reasoning_effort": "low"
+  },
+  "canonical": "low"
+ },
+ {
+  "name": "openai-chat/reasoning_effort=medium",
+  "frontend": "openai-chat",
+  "intent": {
+   "reasoning_effort": "medium"
+  },
+  "canonical": "medium"
+ },
+ {
+  "name": "openai-chat/reasoning_effort=high",
+  "frontend": "openai-chat",
+  "intent": {
+   "reasoning_effort": "high"
+  },
+  "canonical": "high"
+ },
+ {
+  "name": "openai-chat/reasoning_effort=xhigh",
+  "frontend": "openai-chat",
+  "intent": {
+   "reasoning_effort": "xhigh"
+  },
+  "canonical": "xhigh"
+ },
+ {
+  "name": "openai-chat/reasoning_effort=max",
+  "frontend": "openai-chat",
+  "intent": {
+   "reasoning_effort": "max"
+  },
+  "canonical": "max"
+ },
+ {
+  "name": "openai-responses/absent",
+  "frontend": "openai-responses",
+  "intent": {},
+  "canonical": null
+ },
+ {
+  "name": "openai-responses/reasoning.effort=none",
+  "frontend": "openai-responses",
+  "intent": {
+   "reasoning": {
+    "effort": "none"
+   }
+  },
+  "canonical": "off"
+ },
+ {
+  "name": "openai-responses/reasoning.effort=minimal",
+  "frontend": "openai-responses",
+  "intent": {
+   "reasoning": {
+    "effort": "minimal"
+   }
+  },
+  "canonical": "minimal"
+ },
+ {
+  "name": "openai-responses/reasoning.effort=low",
+  "frontend": "openai-responses",
+  "intent": {
+   "reasoning": {
+    "effort": "low"
+   }
+  },
+  "canonical": "low"
+ },
+ {
+  "name": "openai-responses/reasoning.effort=medium",
+  "frontend": "openai-responses",
+  "intent": {
+   "reasoning": {
+    "effort": "medium"
+   }
+  },
+  "canonical": "medium"
+ },
+ {
+  "name": "openai-responses/reasoning.effort=high",
+  "frontend": "openai-responses",
+  "intent": {
+   "reasoning": {
+    "effort": "high"
+   }
+  },
+  "canonical": "high"
+ },
+ {
+  "name": "openai-responses/reasoning.effort=xhigh",
+  "frontend": "openai-responses",
+  "intent": {
+   "reasoning": {
+    "effort": "xhigh"
+   }
+  },
+  "canonical": "xhigh"
+ },
+ {
+  "name": "openai-responses/reasoning.effort=max",
+  "frontend": "openai-responses",
+  "intent": {
+   "reasoning": {
+    "effort": "max"
+   }
+  },
+  "canonical": "max"
+ },
+ {
+  "name": "openai-responses/legacy-reasoning_effort-alias",
+  "frontend": "openai-responses",
+  "intent": {
+   "reasoning_effort": "high"
+  },
+  "canonical": "high"
+ },
+ {
+  "name": "openai-responses/nested-wins-over-legacy-alias",
+  "frontend": "openai-responses",
+  "intent": {
+   "reasoning": {
+    "effort": "low"
+   },
+   "reasoning_effort": "high"
+  },
+  "canonical": "low"
+ },
+ {
+  "name": "anthropic/absent",
+  "frontend": "anthropic-messages",
+  "intent": {},
+  "canonical": null
+ },
+ {
+  "name": "anthropic/thinking-disabled",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "disabled"
+   }
+  },
+  "canonical": "off"
+ },
+ {
+  "name": "anthropic/thinking-adaptive-without-effort",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "adaptive"
+   }
+  },
+  "canonical": "default"
+ },
+ {
+  "name": "anthropic/thinking-adaptive-effort=low",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "adaptive"
+   },
+   "output_config": {
+    "effort": "low"
+   }
+  },
+  "canonical": "low"
+ },
+ {
+  "name": "anthropic/thinking-adaptive-effort=medium",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "adaptive"
+   },
+   "output_config": {
+    "effort": "medium"
+   }
+  },
+  "canonical": "medium"
+ },
+ {
+  "name": "anthropic/thinking-adaptive-effort=high",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "adaptive"
+   },
+   "output_config": {
+    "effort": "high"
+   }
+  },
+  "canonical": "high"
+ },
+ {
+  "name": "anthropic/thinking-adaptive-effort=xhigh",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "adaptive"
+   },
+   "output_config": {
+    "effort": "xhigh"
+   }
+  },
+  "canonical": "xhigh"
+ },
+ {
+  "name": "anthropic/thinking-adaptive-effort=max",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "adaptive"
+   },
+   "output_config": {
+    "effort": "max"
+   }
+  },
+  "canonical": "max"
+ },
+ {
+  "name": "anthropic/thinking-enabled-budget=0",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "enabled",
+    "budget_tokens": 0
+   }
+  },
+  "canonical": "off"
+ },
+ {
+  "name": "anthropic/thinking-enabled-budget=1024",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "enabled",
+    "budget_tokens": 1024
+   }
+  },
+  "canonical": "low"
+ },
+ {
+  "name": "anthropic/thinking-enabled-budget=2048",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "enabled",
+    "budget_tokens": 2048
+   }
+  },
+  "canonical": "low"
+ },
+ {
+  "name": "anthropic/thinking-enabled-budget=2049",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "enabled",
+    "budget_tokens": 2049
+   }
+  },
+  "canonical": "medium"
+ },
+ {
+  "name": "anthropic/thinking-enabled-budget=8192",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "enabled",
+    "budget_tokens": 8192
+   }
+  },
+  "canonical": "medium"
+ },
+ {
+  "name": "anthropic/thinking-enabled-budget=8193",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "enabled",
+    "budget_tokens": 8193
+   }
+  },
+  "canonical": "high"
+ },
+ {
+  "name": "anthropic/thinking-enabled-budget=32000",
+  "frontend": "anthropic-messages",
+  "intent": {
+   "thinking": {
+    "type": "enabled",
+    "budget_tokens": 32000
+   }
+  },
+  "canonical": "high"
+ }
+]
