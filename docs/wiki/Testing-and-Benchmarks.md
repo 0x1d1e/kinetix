@@ -59,7 +59,7 @@ field-level positive/rejection semantics, parallel tools, vision variants, neste
 schemas, fallback portability, token counting, and model discovery.
 
 The source of truth is `tests/fixtures/protocol-v1-compatibility.json`. Generate
-`docs/protocol-v1-compatibility.md` with
+`docs/protocol-v1-compatibility.md` and `docs/generated/compatibility-matrix.md` with
 `python3 scripts/render-protocol-v1-compat.py`; `--check` fails if generated
 documentation or evidence references drift. Positive field fixtures are validated
 at the synthetic upstream boundary so dropped translated fields fail the matrix.

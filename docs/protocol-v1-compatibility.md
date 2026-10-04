@@ -21,7 +21,7 @@ not a claim that every field of every upstream vendor API is implemented.
 | model | required / route resolved | required / route resolved | Required client model selector. | `chat.native.openai.sync`<br>`chat.translate.gemini.sync`<br>`chat.translate.anthropic.sync` |
 | messages: text | passthrough | translated | System/developer text is hoisted; user/assistant text is canonicalized. | `chat.native.openai.sync`<br>`chat.translate.gemini.sync`<br>`chat.translate.anthropic.sync` |
 | messages: image_url / data URL | passthrough | translated | URL and data-URL images map to canonical image parts. | `chat.image.variants`<br>`chat.native.openai.stream`<br>`chat.translate.gemini.stream`<br>`chat.translate.anthropic.stream` |
-| assistant tool_calls + tool results | passthrough | translated | Tool ids are retained; result names are resolved from prior calls when needed. | `chat.fallback.tool_continuation` |
+| assistant tool_calls + tool results | passthrough | translated | Tool ids are retained; result names are resolved from prior calls when needed. | `chat.native.openai.tool_continuation`<br>`chat.fallback.tool_continuation`<br>`chat.translate.anthropic.tool_continuation` |
 | function tools | passthrough | translated | Function name, description and JSON schema are canonicalized. | `chat.native.openai.sync`<br>`chat.translate.gemini.nested_schema` |
 | parallel tool calls | passthrough | translated | Stable call identity is required across translated streams. | `chat.translate.gemini.parallel_tools` |
 | tool_choice | passthrough | translated | auto/none/required/specific function map to canonical tool choice. | `chat.tool_choice.variants`<br>`chat.translate.anthropic.sync` |
@@ -34,7 +34,7 @@ not a claim that every field of every upstream vendor API is implemented.
 | stream_options.include_usage | passthrough | client preference preserved on translation | Internal accounting may request upstream usage even when client did not. | `chat.native.openai.stream`<br>`chat.translate.gemini.stream`<br>`chat.translate.anthropic.stream` |
 | n > 1 | passthrough | rejected (400) | Multiple completions cannot be represented faithfully on translated paths. | `chat.native.openai.provider_extensions`<br>`chat.translate.gemini.unsupported_fields.reject` |
 | logprobs / top_logprobs | passthrough | rejected (400) | No canonical cross-format representation. | `chat.translate.gemini.unsupported_fields.reject` |
-| response_format.json_schema | passthrough | rejected (400) | Structured schema enforcement cannot be guaranteed cross-format. | `chat.translate.gemini.unsupported_fields.reject` |
+| response_format.json_schema | passthrough | rejected (400) | Structured schema enforcement cannot be guaranteed cross-format. | `chat.translate.gemini.unsupported_fields.reject`<br>`chat.translate.anthropic.unsupported_fields.reject`<br>`field_contract.dispositions` |
 | modalities / audio output | passthrough | rejected (400) | Audio output is not in the v1 canonical model. | `chat.translate.gemini.unsupported_fields.reject` |
 | prediction | passthrough | rejected (400) | Prediction semantics are not portable. | `chat.translate.gemini.unsupported_fields.reject` |
 | unsupported nested content (file/audio/refusal/reasoning_details) | passthrough | rejected (400) | Behaviorally significant nested content is never silently dropped. | `chat.translate.gemini.nested_content.reject` |
@@ -48,7 +48,7 @@ not a claim that every field of every upstream vendor API is implemented.
 | system text blocks | passthrough | translated | String and text-block system prompts map to canonical system entries. | `messages.system.variants` |
 | text content | passthrough | translated | Text blocks are canonicalized. | `messages.native.anthropic.sync`<br>`messages.translate.gemini.sync`<br>`messages.translate.openai.sync` |
 | image source (base64/URL) | passthrough | translated | Images map through the canonical image representation. | `messages.image.variants`<br>`messages.native.anthropic.stream` |
-| tool_use / tool_result | passthrough | translated | Tool-use ids and result identity are retained. | `messages.translate.openai.tool_continuation` |
+| tool_use / tool_result | passthrough | translated | Tool-use ids and result identity are retained. | `messages.native.anthropic.tool_continuation`<br>`messages.translate.gemini.tool_continuation`<br>`messages.translate.openai.tool_continuation` |
 | function tools + input_schema | passthrough | translated | Nested schemas are preserved where target schema permits. | `messages.native.anthropic.sync`<br>`messages.translate.gemini.sync`<br>`messages.translate.openai.sync` |
 | parallel tool_use blocks | passthrough | translated | Distinct ids/indexes must survive translation. | `messages.translate.gemini.parallel_tools` |
 | tool_choice | passthrough | translated | auto/any/none/specific tool are normalized. | `messages.tool_choice.variants`<br>`messages.translate.openai.sync` |
@@ -76,7 +76,7 @@ not a claim that every field of every upstream vendor API is implemented.
 | input string / message items | Responses-native encoding | translated | Same-format Responses requests preserve validated input items; cross-format requests map through canonical messages and the selected target dialect. | `responses.input.variants`<br>`responses.native.openai.sync`<br>`responses.native.openai.passthrough` |
 | input_image URL/data URL | Responses-native encoding | translated | Supported image input maps through canonical vision parts. | `responses.image.variants`<br>`responses.native.openai.sync` |
 | instructions | Responses-native instructions | translated | Text instructions map through canonical system prompts. | `responses.native.openai.sync`<br>`responses.translate.openai.sync`<br>`responses.translate.gemini.sync`<br>`responses.translate.anthropic.sync` |
-| function tools / function_call / function_call_output | Responses-native function items | translated | Custom function tools and supported tool history/results use Responses function-call items. | `responses.native.openai.sync`<br>`responses.translate.openai.sync`<br>`responses.translate.openai.tool_continuation` |
+| function tools / function_call / function_call_output | Responses-native function items | translated | Custom function tools and supported tool history/results use Responses function-call items. | `responses.native.openai.sync`<br>`responses.translate.openai.sync`<br>`responses.translate.openai.tool_continuation`<br>`responses.translate.gemini.tool_continuation`<br>`responses.translate.anthropic.tool_continuation` |
 | Response object / output_text event required fields | parallel_tool_calls, tool_choice, tools; logprobs on output_text delta/done; usage details always present | synthesized Responses objects use request tool metadata and required fields | Schema regressions deserialize created, in-progress, completed, incomplete, and failed Responses plus text events; absent usage breakdown counts default to zero. | `responses.synthetic.wire_schema`<br>`responses.translate.stream_failure` |
 | tool_choice auto/none/required/named function | n/a | translated | Other tool-choice semantics are rejected. | `responses.tool_choice.variants` |
 | parallel tool calls from upstream | n/a | translated | Distinct tool ids are retained; request field parallel_tool_calls is not enforceable and is rejected. | `responses.translate.anthropic.parallel_tools` |
@@ -150,13 +150,18 @@ not a claim that every field of every upstream vendor API is implemented.
 | `responses.translate.anthropic.parallel_tools` | http | Parallel Responses tool identities survive Responses-to-Anthropic translation |
 | `chat.translate.gemini.nested_schema` | http | Nested Chat tool schema survives Gemini translation |
 | `chat.fallback.tool_continuation` | http | Chat tool-result identity survives route fallback |
+| `chat.native.openai.tool_continuation` | http | Chat tool-result identity survives same-format OpenAI passthrough |
+| `chat.translate.anthropic.tool_continuation` | http | Chat tool-result identity survives Anthropic translation |
 | `messages.translate.openai.tool_continuation` | http | Messages tool-result identity survives OpenAI translation |
+| `messages.native.anthropic.tool_continuation` | http | Messages tool-result identity survives same-format Anthropic passthrough |
+| `messages.translate.gemini.tool_continuation` | http | Messages tool-result identity survives Gemini translation |
 | `chat.fallback.opaque_reasoning` | http | Opaque reasoning state is stripped with warning at first portability boundary |
 | `chat.native.openai.reasoning_replay` | http | Chat reasoning_content/reasoning_signature replay to a same-provider OpenAI Chat passthrough target is forwarded verbatim |
 | `messages.translate.multimodal_tool_result.reject` | http | Unsupported multimodal tool results, documents, and server-tool semantics fail explicitly |
 | `chat.native.openai.provider_extensions` | http | Chat same-format OpenAI preserves n and provider-specific fields |
 | `messages.native.anthropic.provider_extensions` | http | Messages same-format Anthropic preserves provider-specific fields |
-| `chat.translate.gemini.unsupported_fields.reject` | http | Every documented non-portable Chat semantic field is explicitly rejected on translation |
+| `chat.translate.gemini.unsupported_fields.reject` | http | Chat n/logprobs/json_schema/audio/prediction pass through same-format OpenAI and are rejected on Gemini translation |
+| `chat.translate.anthropic.unsupported_fields.reject` | http | Chat n/logprobs/json_schema/audio/prediction pass through same-format OpenAI and are rejected on Anthropic translation |
 | `responses.unsupported_fields.reject` | http | Every documented unsupported Responses semantic is explicitly rejected |
 | `messages.count_tokens.native_exact` | http | Native Anthropic token count accepts system/messages/tools and is exact |
 | `messages.count_tokens.translated_estimated` | http | Translated token count accepts system/messages/tools and is explicitly estimated |
@@ -175,6 +180,8 @@ not a claim that every field of every upstream vendor API is implemented.
 | `responses.image.variants` | http | Responses URL and data-URL image variants translate explicitly |
 | `responses.tool_choice.variants` | http | Responses auto/none/required/named function tool choices translate explicitly |
 | `responses.translate.openai.tool_continuation` | http | Responses function_call/function_call_output identity survives translation |
+| `responses.translate.gemini.tool_continuation` | http | Responses function_call/function_call_output identity survives Gemini translation |
+| `responses.translate.anthropic.tool_continuation` | http | Responses function_call/function_call_output identity survives Anthropic translation |
 | `responses.supported_options` | http | Responses accepted false/empty/text/disabled option forms remain accepted |
 | `messages.count_tokens.openai_estimated` | http | OpenAI-compatible token count uses the documented local estimate |
 | `messages.count_tokens.heterogeneous_estimated` | http | Heterogeneous route token count stays local and does not consume route-balancing state |
@@ -182,6 +189,7 @@ not a claim that every field of every upstream vendor API is implemented.
 | `chat.translate.gemini.cross_model_placeholder` | http | A Gemini signature captured on one model is translated with the provider's documented placeholder, not replayed or stripped, when the continuation moves to another model |
 | `chat.translate.gemini.cross_model_placeholder_direct` | http | A direct same-family Gemini model switch with no Route policy is translated with the provider's documented placeholder instead of being refused |
 | `chat.translate.gemini.legacy_model_strip_without_placeholder` | http | A continuation onto a pre-Gemini-3 model strips the non-portable signature instead of injecting the Gemini 3 validator-bypass placeholder |
+| `field_contract.dispositions` | cargo | tests/field_contract.rs: every decoded frontend field has an executed preserved/translated/consumed/rejected disposition per outbound transport |
 
 The `http` cases run through `scripts/protocol-v1-matrix.py` inside the existing synthetic compatibility harness. The `cargo` cases run as normal Rust integration tests. Entries marked `manual` are executable release acceptance and are intentionally excluded from normal PR/local CI. Real Pi, Claude Code, Responses-client, and external `.kxp` sessions remain release-only.
 

@@ -189,8 +189,14 @@ OpenAI-format `GET /v1/models` items keep the standard `id`, `object`,
 ## Field-level v1 contract
 
 The generated field matrix lives at
-[`docs/protocol-v1-compatibility.md`](protocol-v1-compatibility.md). Its source of
-truth is `tests/fixtures/protocol-v1-compatibility.json`.
+[`docs/protocol-v1-compatibility.md`](protocol-v1-compatibility.md). The
+path-by-feature summary (tools, images, structured output, thinking, streaming,
+continuation, reasoning replay) lives at
+[`docs/generated/compatibility-matrix.md`](generated/compatibility-matrix.md); each
+cell is `native`, `translated`, `supported`, `rejected`, or `conditional` and cites
+evidence case IDs. Both are generated from
+`tests/fixtures/protocol-v1-compatibility.json` (the `matrix` section feeds the
+summary).
 
 Each semantic row cites one or more concrete evidence cases. Rows that describe both
 same-format and translated behavior cite the relevant paths independently instead of
@@ -410,7 +416,9 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   upstream that produced the reasoning owns its replay semantics (some
   OpenAI-compatible providers require it during tool loops, others reject it),
   so Kinetix neither strips nor refuses it. Cross-format or cross-provider
-  replay still follows the Route portability policy above.
+  replay still follows the Route portability policy above. This is the
+  reasoning replay column of the
+  [compatibility matrix](generated/compatibility-matrix.md).
 - **Cross-model continuation.** Exact-model scoping stops a real signature from
   being replayed onto a model that did not produce it, but leaving the
   historical `functionCall` unsigned would still fail the next `generateContent`

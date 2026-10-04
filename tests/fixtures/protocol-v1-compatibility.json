@@ -164,9 +164,29 @@
       "summary": "Chat tool-result identity survives route fallback"
     },
     {
+      "id": "chat.native.openai.tool_continuation",
+      "runner": "http",
+      "summary": "Chat tool-result identity survives same-format OpenAI passthrough"
+    },
+    {
+      "id": "chat.translate.anthropic.tool_continuation",
+      "runner": "http",
+      "summary": "Chat tool-result identity survives Anthropic translation"
+    },
+    {
       "id": "messages.translate.openai.tool_continuation",
       "runner": "http",
       "summary": "Messages tool-result identity survives OpenAI translation"
+    },
+    {
+      "id": "messages.native.anthropic.tool_continuation",
+      "runner": "http",
+      "summary": "Messages tool-result identity survives same-format Anthropic passthrough"
+    },
+    {
+      "id": "messages.translate.gemini.tool_continuation",
+      "runner": "http",
+      "summary": "Messages tool-result identity survives Gemini translation"
     },
     {
       "id": "chat.fallback.opaque_reasoning",
@@ -196,7 +216,12 @@
     {
       "id": "chat.translate.gemini.unsupported_fields.reject",
       "runner": "http",
-      "summary": "Every documented non-portable Chat semantic field is explicitly rejected on translation"
+      "summary": "Chat n/logprobs/json_schema/audio/prediction pass through same-format OpenAI and are rejected on Gemini translation"
+    },
+    {
+      "id": "chat.translate.anthropic.unsupported_fields.reject",
+      "runner": "http",
+      "summary": "Chat n/logprobs/json_schema/audio/prediction pass through same-format OpenAI and are rejected on Anthropic translation"
     },
     {
       "id": "responses.unsupported_fields.reject",
@@ -289,6 +314,16 @@
       "summary": "Responses function_call/function_call_output identity survives translation"
     },
     {
+      "id": "responses.translate.gemini.tool_continuation",
+      "runner": "http",
+      "summary": "Responses function_call/function_call_output identity survives Gemini translation"
+    },
+    {
+      "id": "responses.translate.anthropic.tool_continuation",
+      "runner": "http",
+      "summary": "Responses function_call/function_call_output identity survives Anthropic translation"
+    },
+    {
       "id": "responses.supported_options",
       "runner": "http",
       "summary": "Responses accepted false/empty/text/disabled option forms remain accepted"
@@ -322,6 +357,11 @@
       "id": "chat.translate.gemini.legacy_model_strip_without_placeholder",
       "runner": "http",
       "summary": "A continuation onto a pre-Gemini-3 model strips the non-portable signature instead of injecting the Gemini 3 validator-bypass placeholder"
+    },
+    {
+      "id": "field_contract.dispositions",
+      "runner": "cargo",
+      "summary": "tests/field_contract.rs: every decoded frontend field has an executed preserved/translated/consumed/rejected disposition per outbound transport"
     }
   ],
   "apis": [
@@ -368,7 +408,9 @@
           "translated",
           "Tool ids are retained; result names are resolved from prior calls when needed.",
           [
-            "chat.fallback.tool_continuation"
+            "chat.native.openai.tool_continuation",
+            "chat.fallback.tool_continuation",
+            "chat.translate.anthropic.tool_continuation"
           ]
         ],
         [
@@ -503,7 +545,9 @@
           "rejected (400)",
           "Structured schema enforcement cannot be guaranteed cross-format.",
           [
-            "chat.translate.gemini.unsupported_fields.reject"
+            "chat.translate.gemini.unsupported_fields.reject",
+            "chat.translate.anthropic.unsupported_fields.reject",
+            "field_contract.dispositions"
           ]
         ],
         [
@@ -594,6 +638,8 @@
           "translated",
           "Tool-use ids and result identity are retained.",
           [
+            "messages.native.anthropic.tool_continuation",
+            "messages.translate.gemini.tool_continuation",
             "messages.translate.openai.tool_continuation"
           ]
         ],
@@ -798,7 +844,9 @@
           [
             "responses.native.openai.sync",
             "responses.translate.openai.sync",
-            "responses.translate.openai.tool_continuation"
+            "responses.translate.openai.tool_continuation",
+            "responses.translate.gemini.tool_continuation",
+            "responses.translate.anthropic.tool_continuation"
           ]
         ],
         [
@@ -1077,5 +1125,618 @@
         ]
       ]
     }
-  ]
+  ],
+  "matrix": {
+    "generated_doc": "docs/generated/compatibility-matrix.md",
+    "statuses": {
+      "native": "Same-format passthrough; the client body reaches the upstream unchanged except for documented model policy.",
+      "translated": "Rebuilt from the canonical representation in the target dialect.",
+      "supported": "Multi-turn state survives on this path.",
+      "rejected": "Refused before any upstream call; never silently dropped.",
+      "conditional": "Preserved, replaced, or stripped depending on the producing model and the Route portability policy (see note)."
+    },
+    "features": [
+      {
+        "id": "tools",
+        "label": "tools",
+        "definition": "Function tools, tool_choice, and tool-call identity in responses."
+      },
+      {
+        "id": "images",
+        "label": "images",
+        "definition": "Image input parts."
+      },
+      {
+        "id": "structured",
+        "label": "structured",
+        "definition": "Schema-constrained output (response_format.json_schema, text.format)."
+      },
+      {
+        "id": "thinking",
+        "label": "thinking",
+        "definition": "Reasoning / thinking controls."
+      },
+      {
+        "id": "streaming",
+        "label": "streaming",
+        "definition": "SSE lifecycle, terminal events, usage, and tool identity while streaming."
+      },
+      {
+        "id": "continuation",
+        "label": "continuation",
+        "definition": "Tool-call / tool-result identity across turns."
+      },
+      {
+        "id": "reasoning_replay",
+        "label": "reasoning replay",
+        "definition": "Prior-turn reasoning content and signatures replayed by the client."
+      }
+    ],
+    "paths": [
+      {
+        "id": "chat->openai",
+        "label": "Chat -> OpenAI Chat"
+      },
+      {
+        "id": "chat->gemini",
+        "label": "Chat -> Gemini"
+      },
+      {
+        "id": "chat->anthropic",
+        "label": "Chat -> Anthropic"
+      },
+      {
+        "id": "messages->anthropic",
+        "label": "Messages -> Anthropic"
+      },
+      {
+        "id": "messages->gemini",
+        "label": "Messages -> Gemini"
+      },
+      {
+        "id": "messages->openai",
+        "label": "Messages -> OpenAI Chat"
+      },
+      {
+        "id": "responses->openai-responses",
+        "label": "Responses -> OpenAI Responses"
+      },
+      {
+        "id": "responses->openai",
+        "label": "Responses -> OpenAI Chat"
+      },
+      {
+        "id": "responses->gemini",
+        "label": "Responses -> Gemini"
+      },
+      {
+        "id": "responses->anthropic",
+        "label": "Responses -> Anthropic"
+      }
+    ],
+    "cells": [
+      {
+        "path": "chat->openai",
+        "feature": "tools",
+        "status": "native",
+        "evidence": [
+          "chat.native.openai.sync",
+          "chat.native.openai.stream"
+        ]
+      },
+      {
+        "path": "chat->openai",
+        "feature": "images",
+        "status": "native",
+        "evidence": [
+          "chat.native.openai.sync"
+        ]
+      },
+      {
+        "path": "chat->openai",
+        "feature": "structured",
+        "status": "native",
+        "evidence": [
+          "chat.translate.gemini.unsupported_fields.reject",
+          "field_contract.dispositions"
+        ],
+        "note": "response_format is forwarded verbatim."
+      },
+      {
+        "path": "chat->openai",
+        "feature": "thinking",
+        "status": "native",
+        "evidence": [
+          "chat.native.openai.sync"
+        ]
+      },
+      {
+        "path": "chat->openai",
+        "feature": "streaming",
+        "status": "native",
+        "evidence": [
+          "chat.native.openai.stream"
+        ]
+      },
+      {
+        "path": "chat->openai",
+        "feature": "continuation",
+        "status": "supported",
+        "evidence": [
+          "chat.native.openai.tool_continuation"
+        ]
+      },
+      {
+        "path": "chat->openai",
+        "feature": "reasoning_replay",
+        "status": "supported",
+        "evidence": [
+          "chat.native.openai.reasoning_replay"
+        ],
+        "note": "Policy (#207): reasoning_content/reasoning_signature are forwarded verbatim to a same-provider target; the upstream owns replay semantics. Cross-provider replay follows the Route portability policy; a direct target with no Route refuses it (400) rather than dropping it."
+      },
+      {
+        "path": "chat->gemini",
+        "feature": "tools",
+        "status": "translated",
+        "evidence": [
+          "chat.translate.gemini.sync",
+          "chat.translate.gemini.stream",
+          "chat.translate.gemini.parallel_tools",
+          "chat.translate.gemini.nested_schema",
+          "chat.tool_choice.variants"
+        ]
+      },
+      {
+        "path": "chat->gemini",
+        "feature": "images",
+        "status": "translated",
+        "evidence": [
+          "chat.translate.gemini.sync",
+          "chat.image.variants"
+        ]
+      },
+      {
+        "path": "chat->gemini",
+        "feature": "structured",
+        "status": "rejected",
+        "evidence": [
+          "chat.translate.gemini.unsupported_fields.reject",
+          "field_contract.dispositions"
+        ],
+        "note": "response_format.json_schema returns 400; a json_object hint is dropped (field-contract gap)."
+      },
+      {
+        "path": "chat->gemini",
+        "feature": "thinking",
+        "status": "translated",
+        "evidence": [
+          "chat.translate.gemini.sync"
+        ],
+        "note": "Requires a model thinking_map; no reasoning control is invented without one."
+      },
+      {
+        "path": "chat->gemini",
+        "feature": "streaming",
+        "status": "translated",
+        "evidence": [
+          "chat.translate.gemini.stream"
+        ]
+      },
+      {
+        "path": "chat->gemini",
+        "feature": "continuation",
+        "status": "supported",
+        "evidence": [
+          "chat.fallback.tool_continuation"
+        ]
+      },
+      {
+        "path": "chat->gemini",
+        "feature": "reasoning_replay",
+        "status": "conditional",
+        "evidence": [
+          "chat.translate.gemini.tool_signature_continuation",
+          "chat.translate.gemini.cross_model_placeholder",
+          "chat.translate.gemini.legacy_model_strip_without_placeholder",
+          "chat.fallback.opaque_reasoning"
+        ],
+        "note": "Gemini thought signatures are restored host-side for the producing model, replaced by the documented placeholder on another Gemini 3 model, and stripped before Gemini 3. Foreign reasoning state follows the Route portability policy."
+      },
+      {
+        "path": "chat->anthropic",
+        "feature": "tools",
+        "status": "translated",
+        "evidence": [
+          "chat.translate.anthropic.sync",
+          "chat.translate.anthropic.stream"
+        ]
+      },
+      {
+        "path": "chat->anthropic",
+        "feature": "images",
+        "status": "translated",
+        "evidence": [
+          "chat.translate.anthropic.sync"
+        ]
+      },
+      {
+        "path": "chat->anthropic",
+        "feature": "structured",
+        "status": "rejected",
+        "evidence": [
+          "chat.translate.anthropic.unsupported_fields.reject",
+          "field_contract.dispositions"
+        ],
+        "note": "response_format.json_schema returns 400; a json_object hint is dropped (field-contract gap)."
+      },
+      {
+        "path": "chat->anthropic",
+        "feature": "thinking",
+        "status": "translated",
+        "evidence": [
+          "chat.translate.anthropic.sync"
+        ],
+        "note": "Requires a model thinking_map; no reasoning control is invented without one."
+      },
+      {
+        "path": "chat->anthropic",
+        "feature": "streaming",
+        "status": "translated",
+        "evidence": [
+          "chat.translate.anthropic.stream"
+        ]
+      },
+      {
+        "path": "chat->anthropic",
+        "feature": "continuation",
+        "status": "supported",
+        "evidence": [
+          "chat.translate.anthropic.tool_continuation"
+        ]
+      },
+      {
+        "path": "messages->anthropic",
+        "feature": "tools",
+        "status": "native",
+        "evidence": [
+          "messages.native.anthropic.sync",
+          "messages.native.anthropic.stream"
+        ]
+      },
+      {
+        "path": "messages->anthropic",
+        "feature": "images",
+        "status": "native",
+        "evidence": [
+          "messages.native.anthropic.sync"
+        ]
+      },
+      {
+        "path": "messages->anthropic",
+        "feature": "thinking",
+        "status": "native",
+        "evidence": [
+          "messages.native.anthropic.sync"
+        ]
+      },
+      {
+        "path": "messages->anthropic",
+        "feature": "streaming",
+        "status": "native",
+        "evidence": [
+          "messages.native.anthropic.stream"
+        ]
+      },
+      {
+        "path": "messages->anthropic",
+        "feature": "continuation",
+        "status": "supported",
+        "evidence": [
+          "messages.native.anthropic.tool_continuation"
+        ]
+      },
+      {
+        "path": "messages->gemini",
+        "feature": "tools",
+        "status": "translated",
+        "evidence": [
+          "messages.translate.gemini.sync",
+          "messages.translate.gemini.stream",
+          "messages.translate.gemini.parallel_tools",
+          "messages.tool_choice.variants"
+        ]
+      },
+      {
+        "path": "messages->gemini",
+        "feature": "images",
+        "status": "translated",
+        "evidence": [
+          "messages.translate.gemini.sync",
+          "messages.image.variants"
+        ]
+      },
+      {
+        "path": "messages->gemini",
+        "feature": "thinking",
+        "status": "translated",
+        "evidence": [
+          "messages.translate.gemini.sync"
+        ],
+        "note": "Requires a model thinking_map; no reasoning control is invented without one."
+      },
+      {
+        "path": "messages->gemini",
+        "feature": "streaming",
+        "status": "translated",
+        "evidence": [
+          "messages.translate.gemini.stream"
+        ]
+      },
+      {
+        "path": "messages->gemini",
+        "feature": "continuation",
+        "status": "supported",
+        "evidence": [
+          "messages.translate.gemini.tool_continuation"
+        ]
+      },
+      {
+        "path": "messages->gemini",
+        "feature": "reasoning_replay",
+        "status": "conditional",
+        "evidence": [
+          "messages.translate.gemini.opaque_reasoning"
+        ],
+        "note": "A thinking signature from another provider is stripped with a warning or rejected per the Route portability policy."
+      },
+      {
+        "path": "messages->openai",
+        "feature": "tools",
+        "status": "translated",
+        "evidence": [
+          "messages.translate.openai.sync",
+          "messages.translate.openai.stream"
+        ]
+      },
+      {
+        "path": "messages->openai",
+        "feature": "images",
+        "status": "translated",
+        "evidence": [
+          "messages.translate.openai.sync"
+        ]
+      },
+      {
+        "path": "messages->openai",
+        "feature": "thinking",
+        "status": "translated",
+        "evidence": [
+          "messages.translate.openai.sync"
+        ],
+        "note": "Requires a model thinking_map; no reasoning control is invented without one."
+      },
+      {
+        "path": "messages->openai",
+        "feature": "streaming",
+        "status": "translated",
+        "evidence": [
+          "messages.translate.openai.stream"
+        ]
+      },
+      {
+        "path": "messages->openai",
+        "feature": "continuation",
+        "status": "supported",
+        "evidence": [
+          "messages.translate.openai.tool_continuation"
+        ]
+      },
+      {
+        "path": "responses->openai-responses",
+        "feature": "tools",
+        "status": "native",
+        "evidence": [
+          "responses.native.openai.sync"
+        ]
+      },
+      {
+        "path": "responses->openai-responses",
+        "feature": "images",
+        "status": "native",
+        "evidence": [
+          "responses.native.openai.sync"
+        ]
+      },
+      {
+        "path": "responses->openai-responses",
+        "feature": "structured",
+        "status": "rejected",
+        "evidence": [
+          "responses.unsupported_fields.reject",
+          "field_contract.dispositions"
+        ],
+        "note": "Structured text.format is rejected at decode for every target; only {type:\"text\"} is accepted."
+      },
+      {
+        "path": "responses->openai-responses",
+        "feature": "thinking",
+        "status": "native",
+        "evidence": [
+          "responses.native.openai.passthrough"
+        ],
+        "note": "reasoning.effort is normalized through the model thinking_map; an unmapped level is rejected."
+      },
+      {
+        "path": "responses->openai-responses",
+        "feature": "streaming",
+        "status": "native",
+        "evidence": [
+          "responses.native.openai.stream",
+          "responses.native.openai.incomplete"
+        ]
+      },
+      {
+        "path": "responses->openai",
+        "feature": "tools",
+        "status": "translated",
+        "evidence": [
+          "responses.translate.openai.sync",
+          "responses.translate.openai.stream"
+        ]
+      },
+      {
+        "path": "responses->openai",
+        "feature": "images",
+        "status": "translated",
+        "evidence": [
+          "responses.translate.openai.sync"
+        ]
+      },
+      {
+        "path": "responses->openai",
+        "feature": "structured",
+        "status": "rejected",
+        "evidence": [
+          "responses.unsupported_fields.reject",
+          "field_contract.dispositions"
+        ],
+        "note": "Structured text.format is rejected at decode for every target; only {type:\"text\"} is accepted."
+      },
+      {
+        "path": "responses->openai",
+        "feature": "thinking",
+        "status": "translated",
+        "evidence": [
+          "responses.translate.openai.sync"
+        ],
+        "note": "Requires a model thinking_map; no reasoning control is invented without one."
+      },
+      {
+        "path": "responses->openai",
+        "feature": "streaming",
+        "status": "translated",
+        "evidence": [
+          "responses.translate.openai.stream",
+          "responses.translate.stream_failure"
+        ]
+      },
+      {
+        "path": "responses->openai",
+        "feature": "continuation",
+        "status": "supported",
+        "evidence": [
+          "responses.translate.openai.tool_continuation"
+        ]
+      },
+      {
+        "path": "responses->gemini",
+        "feature": "tools",
+        "status": "translated",
+        "evidence": [
+          "responses.translate.gemini.sync",
+          "responses.translate.gemini.stream",
+          "responses.tool_choice.variants"
+        ]
+      },
+      {
+        "path": "responses->gemini",
+        "feature": "images",
+        "status": "translated",
+        "evidence": [
+          "responses.translate.gemini.sync",
+          "responses.image.variants"
+        ]
+      },
+      {
+        "path": "responses->gemini",
+        "feature": "structured",
+        "status": "rejected",
+        "evidence": [
+          "responses.unsupported_fields.reject",
+          "field_contract.dispositions"
+        ],
+        "note": "Structured text.format is rejected at decode for every target; only {type:\"text\"} is accepted."
+      },
+      {
+        "path": "responses->gemini",
+        "feature": "thinking",
+        "status": "translated",
+        "evidence": [
+          "responses.translate.gemini.sync"
+        ],
+        "note": "Requires a model thinking_map; no reasoning control is invented without one."
+      },
+      {
+        "path": "responses->gemini",
+        "feature": "streaming",
+        "status": "translated",
+        "evidence": [
+          "responses.translate.gemini.stream"
+        ]
+      },
+      {
+        "path": "responses->gemini",
+        "feature": "continuation",
+        "status": "supported",
+        "evidence": [
+          "responses.translate.gemini.tool_continuation"
+        ]
+      },
+      {
+        "path": "responses->anthropic",
+        "feature": "tools",
+        "status": "translated",
+        "evidence": [
+          "responses.translate.anthropic.sync",
+          "responses.translate.anthropic.stream",
+          "responses.translate.anthropic.parallel_tools"
+        ]
+      },
+      {
+        "path": "responses->anthropic",
+        "feature": "images",
+        "status": "translated",
+        "evidence": [
+          "responses.translate.anthropic.sync"
+        ]
+      },
+      {
+        "path": "responses->anthropic",
+        "feature": "structured",
+        "status": "rejected",
+        "evidence": [
+          "responses.unsupported_fields.reject",
+          "field_contract.dispositions"
+        ],
+        "note": "Structured text.format is rejected at decode for every target; only {type:\"text\"} is accepted."
+      },
+      {
+        "path": "responses->anthropic",
+        "feature": "thinking",
+        "status": "translated",
+        "evidence": [
+          "responses.translate.anthropic.sync"
+        ],
+        "note": "Requires a model thinking_map; no reasoning control is invented without one."
+      },
+      {
+        "path": "responses->anthropic",
+        "feature": "streaming",
+        "status": "translated",
+        "evidence": [
+          "responses.translate.anthropic.stream",
+          "responses.translate.provider_terminal_semantics"
+        ]
+      },
+      {
+        "path": "responses->anthropic",
+        "feature": "continuation",
+        "status": "supported",
+        "evidence": [
+          "responses.translate.anthropic.tool_continuation"
+        ]
+      }
+    ]
+  }
 }

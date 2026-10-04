@@ -260,6 +260,55 @@ def expect_rejected(path, base_payload, variants, expected_status=422):
         need(status == expected_status, f"{label}: expected {expected_status}, got {status}: {body}")
 
 
+TOOL_CONTINUATION_CASES = {
+    "chat.native.openai.tool_continuation": ("chat", "syn-openai"),
+    "chat.fallback.tool_continuation": ("chat", "syn-fallback"),
+    "chat.translate.anthropic.tool_continuation": ("chat", "syn-anthropic"),
+    "messages.native.anthropic.tool_continuation": ("messages", "syn-anthropic"),
+    "messages.translate.gemini.tool_continuation": ("messages", "syn-gemini-3"),
+    "messages.translate.openai.tool_continuation": ("messages", "syn-openai"),
+    "responses.translate.openai.tool_continuation": ("responses", "syn-openai"),
+    "responses.translate.gemini.tool_continuation": ("responses", "syn-gemini-3"),
+    "responses.translate.anthropic.tool_continuation": ("responses", "syn-anthropic"),
+}
+
+
+def expect_tool_continuation(profile, model):
+    """Replay a tool call and its result; the strict upstream rejects the turn
+    unless the result still references the call in the target dialect."""
+    result = "fixture:tool-continuation 18C"
+    if profile == "chat":
+        path = "/v1/chat/completions"
+        payload = {"messages": [
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_keep_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call_keep_1", "content": result},
+        ]}
+    elif profile == "messages":
+        path = "/v1/messages"
+        payload = {"max_tokens": 64, "messages": [
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "toolu_keep_1", "name": "get_weather",
+                "input": {"city": "Paris"},
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "toolu_keep_1", "content": result,
+            }]},
+        ]}
+    else:
+        path = "/v1/responses"
+        payload = {"input": [
+            {"type": "function_call", "call_id": "call_keep_resp", "name": "get_weather",
+             "arguments": "{\"city\":\"Paris\"}"},
+            {"type": "function_call_output", "call_id": "call_keep_resp", "output": result},
+        ]}
+    payload.update({"model": model, "stream": False})
+    status, _, body = request(path, payload)
+    need(status == 200, f"{path} -> {model} returned {status}: {body}")
+
+
 def run_http_case(case_id):
     path_cases = {
         "chat.native.openai.sync": ("chat", "syn-openai", False),
@@ -285,6 +334,8 @@ def run_http_case(case_id):
         profile, model, stream = path_cases[case_id]
         builder = {"chat": chat_payload, "messages": messages_payload, "responses": responses_payload}[profile]
         return expect_mixed(profile, model, builder(model, stream=stream))
+    if case_id in TOOL_CONTINUATION_CASES:
+        return expect_tool_continuation(*TOOL_CONTINUATION_CASES[case_id])
 
 
     if case_id == "chat.image.variants":
@@ -397,21 +448,6 @@ def run_http_case(case_id):
             payload["tool_choice"] = choice
             status, _, body = request("/v1/responses", payload)
             need(status == 200, f"{label}: {body}")
-        return
-
-    if case_id == "responses.translate.openai.tool_continuation":
-        payload = {
-            "model": "syn-openai",
-            "stream": False,
-            "input": [
-                {"type": "function_call", "call_id": "call_keep_resp", "name": "get_weather",
-                 "arguments": "{\"city\":\"Paris\"}"},
-                {"type": "function_call_output", "call_id": "call_keep_resp",
-                 "output": "fixture:tool-continuation 18C"},
-            ],
-        }
-        status, _, body = request("/v1/responses", payload)
-        need(status == 200, body)
         return
 
     if case_id == "responses.supported_options":
@@ -673,42 +709,6 @@ def run_http_case(case_id):
         )
         return
 
-    if case_id == "chat.fallback.tool_continuation":
-        payload = {
-            "model": "syn-fallback",
-            "stream": False,
-            "messages": [
-                {"role": "assistant", "content": None, "tool_calls": [{
-                    "id": "call_keep_1", "type": "function",
-                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
-                }]},
-                {"role": "tool", "tool_call_id": "call_keep_1", "content": "fixture:tool-continuation 18C"},
-            ],
-        }
-        status, _, body = request("/v1/chat/completions", payload)
-        need(status == 200, body)
-        return
-
-    if case_id == "messages.translate.openai.tool_continuation":
-        payload = {
-            "model": "syn-openai",
-            "stream": False,
-            "max_tokens": 64,
-            "messages": [
-                {"role": "assistant", "content": [{
-                    "type": "tool_use", "id": "toolu_keep_1", "name": "get_weather",
-                    "input": {"city": "Paris"},
-                }]},
-                {"role": "user", "content": [{
-                    "type": "tool_result", "tool_use_id": "toolu_keep_1",
-                    "content": "fixture:tool-continuation 18C",
-                }]},
-            ],
-        }
-        status, _, body = request("/v1/messages", payload)
-        need(status == 200, body)
-        return
-
     if case_id == "chat.fallback.opaque_reasoning":
         payload = {
             "model": "syn-fallback",
@@ -817,7 +817,11 @@ def run_http_case(case_id):
         need(status == 200, body)
         return
 
-    if case_id == "chat.translate.gemini.unsupported_fields.reject":
+    if case_id in (
+        "chat.translate.gemini.unsupported_fields.reject",
+        "chat.translate.anthropic.unsupported_fields.reject",
+    ):
+        translated_model = "syn-anthropic" if ".anthropic." in case_id else "syn-gemini-3"
         variants = [
             ("n", {"n": 2}),
             ("logprobs", {"logprobs": True, "top_logprobs": 2}),
@@ -843,7 +847,7 @@ def run_http_case(case_id):
             native.update(patch)
             status, _, body = request("/v1/chat/completions", native)
             need(status == 200, f"{label}: same-format passthrough failed: {status}: {body}")
-        translated = {"model": "syn-gemini-3", "messages": [{"role": "user", "content": "translated"}]}
+        translated = {"model": translated_model, "messages": [{"role": "user", "content": "translated"}]}
         expect_rejected("/v1/chat/completions", translated, variants, expected_status=400)
         return
 
