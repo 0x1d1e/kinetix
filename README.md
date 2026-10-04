@@ -353,6 +353,8 @@ Additional documentation:
 - [Glossary](docs/GLOSSARY.md)
 - [Protocol compatibility](docs/compatibility.md)
 - [Pi compatibility](docs/pi-compatibility.md)
+- [Operational guarantees](docs/guarantees.md)
+- [Model state lifecycle](docs/model-state.md)
 - [Benchmarks](docs/benchmarks.md)
 - [Deployment](deploy/README.md)
 - [Contributing](CONTRIBUTING.md)
