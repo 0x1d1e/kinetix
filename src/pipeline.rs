@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::adapters::{Adapter, UpstreamContext};
 use crate::app::AppState;
+use crate::attempt_budget::{AttemptBudget, Exhausted};
 use crate::cost;
 use crate::db::{self, UsageLogRow};
 use crate::frontends::{self, Encoder, EncoderCtx, FrontendFormat};
@@ -37,17 +38,12 @@ use crate::types::{
 };
 
 const STICKY_TTL: Duration = Duration::from_secs(30 * 60);
-const MAX_PRE_COMMIT_DEADLINE: Duration = Duration::from_secs(30);
 const CIRCUIT_THRESHOLD: i64 = 4;
 /// SSE keepalive cadence. Cloudflare drops proxied connections that are idle
 /// for ~100s (HTTP 524), so a silent thinking phase must be kept alive well
 /// within that window (NFR-1 / FR-9.4). Exposed for tests.
 pub const KEEPALIVE_INTERVAL_SECS: u64 = 15;
 const CIRCUIT_OPEN_SECS: i64 = 30;
-/// Bounded exponential backoff between pre-commit retry attempts (FR-4.4):
-/// 100ms, 200ms, 400ms, capped at 1s, so a failing pool cannot be hot-looped.
-const BACKOFF_BASE_MS: u64 = 100;
-const BACKOFF_CAP_MS: u64 = 1000;
 
 fn provider_phase_timeout(provider: &db::ProviderRow) -> Duration {
     Duration::from_millis(provider.timeout_ms.max(1) as u64)
@@ -61,16 +57,6 @@ fn timeout_failure(message: &'static str) -> UpstreamFailure {
         message: message.into(),
         quota_reset_at: None,
     }
-}
-
-fn phase_budget(deadline: Instant, provider_timeout: Duration) -> Option<(Instant, Duration)> {
-    let now = Instant::now();
-    let remaining = deadline.saturating_duration_since(now);
-    if remaining.is_zero() {
-        return None;
-    }
-    let budget = remaining.min(provider_timeout);
-    Some((now + budget, budget))
 }
 
 fn cache_status_from_usage(usage: &TokenUsage) -> &'static str {
@@ -1169,7 +1155,7 @@ pub(crate) async fn run_with_disconnect(
     let mut attempts_done = 0usize;
     let mut previous_origin: Option<ContinuationOrigin> = None;
     let mut skip_logical_target: Option<String> = None;
-    let deadline = started + MAX_PRE_COMMIT_DEADLINE;
+    let attempt_budget = AttemptBudget::pre_commit(max_attempts);
     let mut auth_retried_accounts = std::collections::HashSet::new();
     let mut last_precommit_failure: Option<LastPrecommitFailure> = None;
 
@@ -1188,8 +1174,8 @@ pub(crate) async fn run_with_disconnect(
                 continue;
             }
         }
-        if attempts_done >= max_attempts || Instant::now() >= deadline {
-            if Instant::now() >= deadline {
+        if let Err(exhausted) = attempt_budget.admit(started.elapsed(), attempts_done) {
+            if exhausted == Exhausted::Deadline {
                 trace.step("skip", None, "pre-commit deadline exceeded");
             }
             break;
@@ -1638,10 +1624,14 @@ pub(crate) async fn run_with_disconnect(
         }
 
         // Bounded exponential backoff between attempts (FR-4.4). Never applied
-        // before the first attempt, and capped so a healthy pool is not slowed.
-        if attempts_done > 0 {
-            let exp = BACKOFF_BASE_MS.saturating_mul(1u64 << (attempts_done - 1).min(4));
-            tokio::time::sleep(Duration::from_millis(exp.min(BACKOFF_CAP_MS))).await;
+        // before the first attempt, and never slept past the request deadline.
+        match attempt_budget.backoff(started.elapsed(), attempts_done) {
+            Ok(delay) if delay.is_zero() => {}
+            Ok(delay) => tokio::time::sleep(delay).await,
+            Err(_) => {
+                trace.step("skip", None, "pre-commit deadline exceeded");
+                break;
+            }
         }
 
         // Adaptive upstream concurrency is opt-in with the adaptive route
@@ -1695,10 +1685,11 @@ pub(crate) async fn run_with_disconnect(
         crate::alerts::record_added_latency(started.elapsed().as_millis() as u64);
 
         let provider_timeout = provider_phase_timeout(&target.provider);
-        let Some((phase_deadline, send_budget)) = phase_budget(deadline, provider_timeout) else {
+        let Some(send_budget) = attempt_budget.phase(started.elapsed(), provider_timeout) else {
             trace.step("skip", None, "pre-commit deadline exceeded");
             break;
         };
+        let phase_deadline = Instant::now() + send_budget;
 
         // Reserve HALF_OPEN exclusively only after all local validation,
         // credential resolution, adaptive admission, and deadline checks pass.

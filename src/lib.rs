@@ -27,6 +27,7 @@ pub mod alloc;
 pub mod api;
 pub mod app;
 pub mod assets;
+pub(crate) mod attempt_budget;
 pub mod auth;
 pub mod bootstrap;
 pub mod cli;
