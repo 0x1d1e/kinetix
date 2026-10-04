@@ -207,11 +207,6 @@ class Handler(BaseHTTPRequestHandler):
             ):
                 self._json(400, {"error": {"message": "opaque reasoning state crossed portability boundary"}})
                 return
-            if _fixture(req, "chat-reasoning-replay") and not (
-                _contains_key(req, {"reasoning_content"}) and _contains_key(req, {"reasoning_signature"})
-            ):
-                self._json(400, {"error": {"message": "same-format reasoning replay was not forwarded verbatim"}})
-                return
             if _fixture(req, "gemini-cross-model-placeholder") and _contains_key(req, {"functionResponse"}):
                 # Cross-model continuation: the trace originated on `syn-gemini-3`
                 # (real signature OPAQUE_SIG_FLASH) but is being continued on
@@ -333,6 +328,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if _fixture(req, "tool-continuation") and not _contains_key(req, {"tool_call_id"}):
             self._json(400, {"error": {"message": "tool result identity was not preserved"}})
+            return
+        if _fixture(req, "chat-reasoning-replay") and not (
+            _contains_key(req, {"reasoning_content"}) and _contains_key(req, {"reasoning_signature"})
+        ):
+            self._json(400, {"error": {"message": "same-format reasoning replay was not forwarded verbatim"}})
             return
 
         if model == "syn-truncated-openai":
