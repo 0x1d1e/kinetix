@@ -298,6 +298,21 @@ run_pi() {
   KINETIX_ADMIN_TOKEN="$ADMIN_TOKEN" \
   KINETIX_KEY="$KEY" \
     python3 "$ROOT/scripts/release-client-profile.py" pi "$model" "$PROXY_BASE" "$agent"
+  # Non-secret profile facts for pi-acceptance.json (no API key or base URL).
+  python3 - "$agent/models.json" "$model" "$ARTIFACTS/$CASE_ID.pi-profile.json" <<'PY'
+import json
+import pathlib
+import sys
+
+provider = json.loads(pathlib.Path(sys.argv[1]).read_text())["providers"]["kinetix"]
+entry = next((m for m in provider.get("models", []) if m.get("id") == sys.argv[2]), {})
+pathlib.Path(sys.argv[3]).write_text(json.dumps({
+    "api": provider.get("api"),
+    "model": sys.argv[2],
+    "reasoning": entry.get("reasoning"),
+    "input": entry.get("input", []),
+}, indent=2) + "\n")
+PY
   (
     cd "$project"
     PI_CODING_AGENT_DIR="$agent" \
@@ -492,6 +507,25 @@ if [ "$CLIENT" = all ] || [ "$CLIENT" = pi ]; then
   run_client_case pi translated "$PI_TRANSLATED_MODEL" "$version" 0 0 run_pi || failures=$((failures + 1))
   run_client_case pi fallback "$PI_FALLBACK_MODEL" "$version" 1 0 run_pi || failures=$((failures + 1))
   run_client_case pi affinity "$PI_AFFINITY_MODEL" "$version" 0 1 run_pi || failures=$((failures + 1))
+  # Version of the deployment under test, not of a local binary.
+  kinetix_version="$(python3 - "$BASE" "$ADMIN_TOKEN" <<'PY' || true
+import json
+import sys
+import urllib.request
+
+request = urllib.request.Request(
+    sys.argv[1] + "/admin/api/reference",
+    headers={"x-kinetix-admin-token": sys.argv[2]},
+)
+with urllib.request.urlopen(request, timeout=15) as response:
+    print(json.loads(response.read())["version"])
+PY
+)"
+  pi_report_args=(--artifacts "$ARTIFACTS" --pi-version "$version" --kinetix-version "${kinetix_version:-unknown}")
+  if [ -n "${KINETIX_ACCEPT_PI_BASELINE:-}" ]; then
+    pi_report_args+=(--baseline "$KINETIX_ACCEPT_PI_BASELINE")
+  fi
+  python3 "$ROOT/scripts/pi-acceptance-report.py" "${pi_report_args[@]}" || failures=$((failures + 1))
 fi
 
 if [ "$CLIENT" = all ] || [ "$CLIENT" = claude ]; then

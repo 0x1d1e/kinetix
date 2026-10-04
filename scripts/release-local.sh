@@ -4,9 +4,13 @@
 # package tarballs, compute SHA256SUMS, and optionally publish directly to GitHub Releases.
 #
 # Usage:
-#   scripts/release-local.sh <tag> [--publish] [--draft]
+#   scripts/release-local.sh <tag> [--publish] [--draft] [--pi-acceptance <file>]
 # Example:
-#   scripts/release-local.sh v0.1.0 --publish
+#   scripts/release-local.sh v0.1.0 --publish --pi-acceptance acceptance-artifacts/<stamp>/pi-acceptance.json
+#
+# Publishing requires a passing real-Pi acceptance artifact for this release
+# candidate (see docs/pi-compatibility.md). It is verified and attached to the
+# release. --skip-pi-acceptance publishes without it and says so loudly.
 
 set -euo pipefail
 
@@ -22,6 +26,8 @@ if [ $# -lt 1 ]; then
   echo "  <tag>        Release tag, e.g. v0.1.0"
   echo "  --publish    Upload artifacts directly to GitHub Release using gh CLI"
   echo "  --draft      Create release as draft when publishing"
+  echo "  --pi-acceptance <file>  Passing pi-acceptance.json for this release candidate"
+  echo "  --skip-pi-acceptance    Publish without the real-Pi acceptance artifact"
   exit 1
 fi
 
@@ -30,16 +36,46 @@ shift
 
 PUBLISH=0
 DRAFT_FLAG=""
+PI_ACCEPTANCE=""
+SKIP_PI_ACCEPTANCE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --publish) PUBLISH=1; shift ;;
     --draft) DRAFT_FLAG="--draft"; shift ;;
+    --pi-acceptance)
+      [ $# -ge 2 ] || err "--pi-acceptance needs a file"
+      PI_ACCEPTANCE="$2"; shift 2 ;;
+    --skip-pi-acceptance) SKIP_PI_ACCEPTANCE=1; shift ;;
     *) err "Unknown option: $1" ;;
   esac
 done
 
 if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
   err "Tag must match vX.Y.Z exactly (got '$TAG')"
+fi
+
+# Release-candidate Pi acceptance gate, checked before the build. The artifact
+# comes from a scripts/release-client-acceptance.sh pi run against this build.
+if [ -n "$PI_ACCEPTANCE" ]; then
+  [ -f "$PI_ACCEPTANCE" ] || err "pi acceptance artifact not found: $PI_ACCEPTANCE"
+  python3 - "$PI_ACCEPTANCE" "${TAG#v}" <<'PY' || err "pi acceptance artifact does not pass for $TAG"
+import json
+import sys
+
+report = json.load(open(sys.argv[1]))
+version = sys.argv[2]
+if report.get("schema") != "kinetix.pi-acceptance.v1":
+    raise SystemExit(f"unexpected schema: {report.get('schema')}")
+if report.get("result") != "pass":
+    raise SystemExit("pi acceptance result is not pass")
+if version not in str(report.get("kinetix_version", "")).split():
+    raise SystemExit(f"artifact Kinetix version {report.get('kinetix_version')!r} is not {version}")
+print(f"pi acceptance ok: Pi {report.get('pi_version')}, {len(report.get('cases', []))} case(s)")
+PY
+  PI_ACCEPTANCE="$(cd "$(dirname "$PI_ACCEPTANCE")" && pwd)/$(basename "$PI_ACCEPTANCE")"
+elif [ "$PUBLISH" -eq 1 ]; then
+  [ "$SKIP_PI_ACCEPTANCE" -eq 1 ] || err "publishing needs --pi-acceptance <file> (or --skip-pi-acceptance)"
+  printf '\033[1;33m==>\033[0m %s\n' "publishing $TAG WITHOUT real-Pi acceptance evidence" >&2
 fi
 
 cd "$ROOT_DIR"
@@ -166,7 +202,13 @@ log "Generating canonical SHA256SUMS..."
 log "Release artifacts prepared in $DIST_DIR from source $SOURCE_SHA:"
 ls -lh "$DIST_DIR"
 
-# 4. Optional publish via gh. Create a new tag only after every artifact succeeds.
+# 4. Attach the release-candidate Pi acceptance evidence verified above.
+rm -f "$DIST_DIR/pi-acceptance.json"
+if [ -n "$PI_ACCEPTANCE" ]; then
+  cp "$PI_ACCEPTANCE" "$DIST_DIR/pi-acceptance.json"
+fi
+
+# 5. Optional publish via gh. Create a new tag only after every artifact succeeds.
 if [ "$PUBLISH" -eq 1 ]; then
   log "Publishing release $TAG to GitHub..."
 
@@ -195,6 +237,9 @@ if [ "$PUBLISH" -eq 1 ]; then
     "$DIST_DIR"/kinetix-"$TAG"-*.sha256
     "$DIST_DIR"/SHA256SUMS
   )
+  if [ -f "$DIST_DIR/pi-acceptance.json" ]; then
+    RELEASE_ASSETS+=("$DIST_DIR/pi-acceptance.json")
+  fi
   gh release upload "$TAG" "${RELEASE_ASSETS[@]}" --clobber
 
   log "Release $TAG published successfully!"

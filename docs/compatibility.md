@@ -261,6 +261,9 @@ eligible targets. Responses has no native Responses upstream passthrough in v1, 
 real-client matrix covers each built-in translation adapter instead of inventing a
 same-format path.
 
+The Pi section also writes and gates on `pi-acceptance.json`; release candidates
+attach it to the release. See [Pi compatibility](pi-compatibility.md#tier-2-real-pi-release-gate).
+
 The runner starts `scripts/release-client-proxy.py` locally for each case. It forwards
 the real client's bytes unchanged while recording client-visible evidence: request
 `stream`, response `Content-Type`, session headers, Kinetix request/opaque route IDs,
