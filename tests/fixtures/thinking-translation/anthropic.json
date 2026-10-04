@@ -1,0 +1,1116 @@
+{
+ "transport": "anthropic",
+ "models": {
+  "manual-budget": {
+   "thinking_map": {
+    "levels": {
+     "off": {
+      "type": "disabled"
+     },
+     "minimal": 1024,
+     "low": 2048,
+     "medium": 8192,
+     "high": 16384,
+     "xhigh": 24576,
+     "max": 32000
+    },
+    "budget_field": "thinking.budget_tokens"
+   }
+  },
+  "manual-budget-no-disable": {
+   "thinking_map": {
+    "levels": {
+     "low": 2048,
+     "medium": 8192,
+     "high": 16384
+    },
+    "budget_field": "thinking.budget_tokens"
+   }
+  },
+  "adaptive-effort": {
+   "thinking_map": {
+    "mode": "adaptive",
+    "levels": {
+     "off": {
+      "thinking.type": "disabled"
+     },
+     "low": "low",
+     "medium": "medium",
+     "high": "high",
+     "xhigh": "xhigh",
+     "max": "max"
+    },
+    "level_field": "output_config.effort"
+   }
+  },
+  "adaptive-no-disable": {
+   "thinking_map": {
+    "mode": "adaptive",
+    "levels": {
+     "low": "low",
+     "high": "high"
+    },
+    "level_field": "output_config.effort"
+   }
+  },
+  "discovered-adaptive-descriptive": {
+   "discovery": {
+    "reasoning_capability": {
+     "supported": true,
+     "mode": "adaptive",
+     "levels": [
+      "low",
+      "high"
+     ],
+     "upstream_format": "provider_declared"
+    }
+   }
+  },
+  "no-thinking-capability": {},
+  "discovered-manual-budget-descriptive": {
+   "discovery": {
+    "reasoning_capability": {
+     "supported": true,
+     "mode": "manual_budget",
+     "levels": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "can_disable": true,
+     "upstream_format": "anthropic_budget_tokens"
+    }
+   }
+  }
+ },
+ "cases": [
+  {
+   "name": "absent/manual-budget",
+   "model": "manual-budget",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000
+   },
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000
+    }
+   }
+  },
+  {
+   "name": "absent/manual-budget-no-disable",
+   "model": "manual-budget-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000
+   },
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000
+    }
+   }
+  },
+  {
+   "name": "absent/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000
+   },
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000
+    }
+   }
+  },
+  {
+   "name": "absent/adaptive-no-disable",
+   "model": "adaptive-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000
+   },
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000
+    }
+   }
+  },
+  {
+   "name": "absent/discovered-adaptive-descriptive",
+   "model": "discovered-adaptive-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000
+   },
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000
+    }
+   }
+  },
+  {
+   "name": "absent/no-thinking-capability",
+   "model": "no-thinking-capability",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000
+   },
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000
+    }
+   }
+  },
+  {
+   "name": "off/manual-budget",
+   "model": "manual-budget",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "thinking": {
+      "type": "disabled"
+     }
+    }
+   }
+  },
+  {
+   "name": "off/manual-budget-no-disable",
+   "model": "manual-budget-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "off/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "thinking": {
+      "type": "disabled"
+     }
+    }
+   }
+  },
+  {
+   "name": "off/adaptive-no-disable",
+   "model": "adaptive-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "off/no-thinking-capability",
+   "model": "no-thinking-capability",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/minimal/manual-budget",
+   "model": "manual-budget",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "minimal"
+   },
+   "canonical": "minimal",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "thinking": {
+      "budget_tokens": 1024,
+      "type": "enabled"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/minimal/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "minimal"
+   },
+   "canonical": "minimal",
+   "expect": {
+    "rejected": "thinking level 'minimal' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/low/manual-budget",
+   "model": "manual-budget",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "low"
+   },
+   "canonical": "low",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "thinking": {
+      "budget_tokens": 2048,
+      "type": "enabled"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/low/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "low"
+   },
+   "canonical": "low",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "output_config": {
+      "effort": "low"
+     },
+     "thinking": {
+      "type": "adaptive"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/medium/manual-budget",
+   "model": "manual-budget",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "medium"
+   },
+   "canonical": "medium",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "thinking": {
+      "budget_tokens": 8192,
+      "type": "enabled"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/medium/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "medium"
+   },
+   "canonical": "medium",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "output_config": {
+      "effort": "medium"
+     },
+     "thinking": {
+      "type": "adaptive"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/high/manual-budget",
+   "model": "manual-budget",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "thinking": {
+      "budget_tokens": 16384,
+      "type": "enabled"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/high/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "output_config": {
+      "effort": "high"
+     },
+     "thinking": {
+      "type": "adaptive"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/xhigh/manual-budget",
+   "model": "manual-budget",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "xhigh"
+   },
+   "canonical": "xhigh",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "thinking": {
+      "budget_tokens": 24576,
+      "type": "enabled"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/xhigh/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "xhigh"
+   },
+   "canonical": "xhigh",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "output_config": {
+      "effort": "xhigh"
+     },
+     "thinking": {
+      "type": "adaptive"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/max/manual-budget",
+   "model": "manual-budget",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "max"
+   },
+   "canonical": "max",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "thinking": {
+      "budget_tokens": 32000,
+      "type": "enabled"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/max/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "max"
+   },
+   "canonical": "max",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "output_config": {
+      "effort": "max"
+     },
+     "thinking": {
+      "type": "adaptive"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/low/manual-budget-no-disable",
+   "model": "manual-budget-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "low"
+   },
+   "canonical": "low",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "thinking": {
+      "budget_tokens": 2048,
+      "type": "enabled"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/high/adaptive-no-disable",
+   "model": "adaptive-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "output_config": {
+      "effort": "high"
+     },
+     "thinking": {
+      "type": "adaptive"
+     }
+    }
+   }
+  },
+  {
+   "name": "level/medium/adaptive-no-disable",
+   "model": "adaptive-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "medium"
+   },
+   "canonical": "medium",
+   "expect": {
+    "rejected": "thinking level 'medium' has no executable mapping"
+   }
+  },
+  {
+   "name": "budget/openai-responses-effort-high/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "openai-responses",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning": {
+     "effort": "high"
+    }
+   },
+   "canonical": "high",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000,
+     "output_config": {
+      "effort": "high"
+     },
+     "thinking": {
+      "type": "adaptive"
+     }
+    }
+   }
+  },
+  {
+   "name": "descriptive-adaptive/high",
+   "model": "discovered-adaptive-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "rejected": "thinking level 'high' has no executable mapping"
+   }
+  },
+  {
+   "name": "passthrough/manual-budget-8192-preserved/manual-budget",
+   "model": "manual-budget",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "max_tokens": 64000,
+    "thinking": {
+     "type": "enabled",
+     "budget_tokens": 8192
+    }
+   },
+   "canonical": "medium",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "thinking": {
+      "type": "enabled",
+      "budget_tokens": 8192
+     },
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "max_tokens": 64000
+    }
+   }
+  },
+  {
+   "name": "passthrough/disabled-preserved/manual-budget",
+   "model": "manual-budget",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "max_tokens": 64000,
+    "thinking": {
+     "type": "disabled"
+    }
+   },
+   "canonical": "off",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "thinking": {
+      "type": "disabled"
+     },
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "max_tokens": 64000
+    }
+   }
+  },
+  {
+   "name": "passthrough/adaptive-effort-preserved/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "max_tokens": 64000,
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "max"
+    }
+   },
+   "canonical": "max",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "output_config": {
+      "effort": "max"
+     },
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "thinking": {
+      "type": "adaptive"
+     },
+     "max_tokens": 64000
+    }
+   }
+  },
+  {
+   "name": "passthrough/adaptive-default-preserved/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "max_tokens": 64000,
+    "thinking": {
+     "type": "adaptive"
+    }
+   },
+   "canonical": "default",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "thinking": {
+      "type": "adaptive"
+     },
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "max_tokens": 64000
+    }
+   }
+  },
+  {
+   "name": "passthrough/legacy-budget-normalized-to-adaptive/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "max_tokens": 64000,
+    "thinking": {
+     "type": "enabled",
+     "budget_tokens": 8192
+    }
+   },
+   "canonical": "medium",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "thinking": {
+      "type": "adaptive"
+     },
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "max_tokens": 64000,
+     "output_config": {
+      "effort": "medium"
+     }
+    }
+   }
+  },
+  {
+   "name": "passthrough/disabled-preserved/adaptive-effort",
+   "model": "adaptive-effort",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "max_tokens": 64000,
+    "thinking": {
+     "type": "disabled"
+    }
+   },
+   "canonical": "off",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "thinking": {
+      "type": "disabled"
+     },
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "max_tokens": 64000
+    }
+   }
+  },
+  {
+   "name": "passthrough/disabled-rejected-without-mapping/adaptive-no-disable",
+   "model": "adaptive-no-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "max_tokens": 64000,
+    "thinking": {
+     "type": "disabled"
+    }
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "absent/discovered-manual-budget-descriptive",
+   "model": "discovered-manual-budget-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000
+   },
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "stream": true,
+     "messages": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "max_tokens": 64000
+    }
+   }
+  },
+  {
+   "name": "off/discovered-manual-budget-descriptive",
+   "model": "discovered-manual-budget-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/high/discovered-manual-budget-descriptive",
+   "model": "discovered-manual-budget-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "max_tokens": 64000,
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "rejected": "thinking level 'high' has no executable mapping"
+   }
+  },
+  {
+   "name": "cross-format/reasoning-summary-rejected/no-thinking-capability",
+   "model": "no-thinking-capability",
+   "frontend": "openai-responses",
+   "intent": {
+    "reasoning": {
+     "summary": "auto"
+    }
+   },
+   "canonical": null,
+   "expect": {
+    "rejected": "reasoning.summary"
+   }
+  }
+ ]
+}

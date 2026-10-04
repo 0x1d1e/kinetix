@@ -20,6 +20,8 @@ pub enum FrontendFormat {
 }
 
 const TRANSLATION_ISSUES_KEY: &str = "__kinetix_translation_issues";
+/// `extra` marker for a client `reasoning.summary` (Responses only).
+pub const REASONING_SUMMARY_KEY: &str = "__kinetix_reasoning_summary";
 
 pub(crate) fn attach_translation_issues(
     extra: &mut serde_json::Map<String, Value>,
@@ -518,6 +520,11 @@ pub fn translation_unsupported(
     }
     if extra.contains_key("prediction") {
         return Some("'prediction' is not supported on a translating path".into());
+    }
+    if extra.contains_key(REASONING_SUMMARY_KEY) {
+        return Some(
+            "'reasoning.summary' is only supported on a same-format Responses path".into(),
+        );
     }
     None
 }

@@ -851,11 +851,16 @@ def run_http_case(case_id):
             ("hosted tool", {"tools": [{
                 "type": "web_search_preview"
             }]}),
-            ("reasoning summary", {"reasoning": {
-                "effort": "high", "summary": "auto"
-            }}),
         ]
         expect_rejected("/v1/responses", base, variants)
+        # reasoning.summary is a same-format control: accepted at decode, then
+        # refused by the translation gate (400) on a translating target.
+        expect_rejected(
+            "/v1/responses",
+            base,
+            [("reasoning summary", {"reasoning": {"effort": "high", "summary": "auto"}})],
+            expected_status=400,
+        )
         return
 
     if case_id.startswith("messages.count_tokens."):

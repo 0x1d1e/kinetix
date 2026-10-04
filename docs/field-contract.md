@@ -9,7 +9,7 @@ Every semantic field a frontend accepts has an explicit disposition per outbound
 | `consumed` | Client value is consumed internally and not forwarded. An adapter-owned replacement may be emitted when declared via `upstream` + `expect`. |
 | `rejected` | Request fails before any upstream call; nothing is sent. No `upstream`/`expect`. |
 
-Source of truth: `tests/fixtures/field-contract/{openai-chat,anthropic-messages,openai-responses}.json`. Harness: `tests/field_contract.rs`. It decodes a sample request, runs the real translation gate and `pipeline::build_upstream_body` per transport (`openai`, `openai-responses`, `anthropic`, `gemini`), and compares the result to the fixture.
+Source of truth: `tests/fixtures/field-contract/{openai-chat,anthropic-messages,openai-responses}.json`. Harness: `tests/field_contract.rs`. It decodes a sample request, runs the real translation gate and `pipeline::build_upstream_body` per transport (`openai`, `openai-responses`, `anthropic`, `gemini`), and compares the result to the fixture. Thinking levels are pinned end to end in [thinking-contract.md](thinking-contract.md).
 
 CI fails when:
 

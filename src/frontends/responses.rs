@@ -134,6 +134,14 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
     if let Some(prompt_cache_key) = obj.get("prompt_cache_key") {
         extra.insert("prompt_cache_key".to_string(), prompt_cache_key.clone());
     }
+    // Same-format passthrough forwards `reasoning.summary`; no other wire
+    // format can deliver reasoning summaries, so translation refuses it.
+    if let Some(summary) = body.pointer("/reasoning/summary") {
+        extra.insert(
+            crate::frontends::REASONING_SUMMARY_KEY.to_string(),
+            summary.clone(),
+        );
+    }
     let identity_issues = crate::frontends::resolve_tool_result_names(&mut out_messages);
     if let Some(issue) = identity_issues.first() {
         return Err(ProxyError::unsupported(format!(
@@ -303,11 +311,16 @@ fn validate_supported_subset(obj: &serde_json::Map<String, Value>) -> Result<(),
             ProxyError::bad_request("Responses API 'reasoning' must be an object")
         })?;
         for key in reasoning.keys() {
-            if key != "effort" {
+            if key != "effort" && key != "summary" {
                 return Err(ProxyError::unsupported(format!(
-                    "Responses API reasoning.{key} is unsupported; only reasoning.effort is translated"
+                    "Responses API reasoning.{key} is unsupported; only reasoning.effort and reasoning.summary are accepted"
                 )));
             }
+        }
+        if reasoning.get("summary").is_some_and(|v| !v.is_string()) {
+            return Err(ProxyError::bad_request(
+                "Responses API reasoning.summary must be a string",
+            ));
         }
         if let Some(effort) = reasoning.get("effort") {
             let effort = effort.as_str().ok_or_else(|| {

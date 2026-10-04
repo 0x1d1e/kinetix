@@ -15,6 +15,29 @@ use crate::types::{
 
 pub struct OpenAiResponsesAdapter;
 
+/// Remove a dotted path, pruning parent objects the removal leaves empty.
+fn remove_dotted(obj: &mut Map<String, Value>, path: &str) {
+    fn rec(obj: &mut Map<String, Value>, parts: &[&str]) {
+        match parts {
+            [] => {}
+            [last] => {
+                obj.remove(*last);
+            }
+            [head, rest @ ..] => {
+                let Some(child) = obj.get_mut(*head).and_then(Value::as_object_mut) else {
+                    return;
+                };
+                rec(child, rest);
+                if child.is_empty() {
+                    obj.remove(*head);
+                }
+            }
+        }
+    }
+    let parts: Vec<&str> = path.split('.').collect();
+    rec(obj, &parts);
+}
+
 impl OpenAiResponsesAdapter {
     pub fn new() -> Self {
         Self
@@ -327,18 +350,40 @@ impl OpenAiResponsesAdapter {
             body.insert("max_output_tokens".into(), json!(max_tokens));
         }
 
+        // The legacy flat alias is never valid on the Responses API; with a
+        // thinking intent it is translated below.
         body.remove("reasoning_effort");
-        body.remove("reasoning");
+        // `reasoning` is preserved verbatim unless the client expressed a
+        // thinking intent, and then only the thinking fields are replaced so
+        // siblings such as `summary` survive.
         if let Some(level) = req.thinking {
             let thinking = ctx.model.thinking();
-            if let Some(value) = thinking.levels.get(level.as_key()) {
-                if let Some(fields) = value.as_object() {
-                    for (path, field_value) in fields {
-                        crate::adapters::openai::insert_dotted(body, path, field_value.clone());
-                    }
-                } else if let Some(field) = thinking.scalar_field() {
-                    crate::adapters::openai::insert_dotted(body, field, value.clone());
+            let key = level.as_key();
+            if level == crate::types::ThinkingLevel::Default && thinking.is_adaptive() {
+                return Ok(());
+            }
+            // Same-format passthrough skips the translation gate, so an
+            // unmapped level must fail here instead of dropping the intent.
+            if !thinking.level_is_executable(key) {
+                return Err(Self::bad_request(format!(
+                    "thinking level '{key}' has no executable mapping for model '{}'",
+                    ctx.model.display_name
+                )));
+            }
+            remove_dotted(body, "reasoning.effort");
+            for owned in thinking.levels.values().flat_map(|value| match value {
+                Value::Object(fields) => fields.keys().map(String::as_str).collect::<Vec<_>>(),
+                _ => thinking.scalar_field().into_iter().collect(),
+            }) {
+                remove_dotted(body, owned);
+            }
+            let value = &thinking.levels[key];
+            if let Some(fields) = value.as_object() {
+                for (path, field_value) in fields {
+                    crate::adapters::openai::insert_dotted(body, path, field_value.clone());
                 }
+            } else if let Some(field) = thinking.scalar_field() {
+                crate::adapters::openai::insert_dotted(body, field, value.clone());
             }
         }
         Ok(())
@@ -868,6 +913,70 @@ mod tests {
         let body = OpenAiResponsesAdapter.build_body(&ctx, &req).unwrap();
         assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("none")));
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn responses_passthrough_preserves_reasoning_siblings() {
+        let provider = provider();
+        let mut model = model();
+        model.thinking_map = json!({
+            "levels": {"low": "low"},
+            "mode": "level",
+            "level_field": "reasoning.effort"
+        })
+        .to_string();
+        let ctx = UpstreamContext {
+            provider: &provider,
+            model: &model,
+            account_id: None,
+            session_context: None,
+            credential_metadata: None,
+            credential: "secret".into(),
+        };
+        let adapter = OpenAiResponsesAdapter;
+
+        // No thinking intent: reasoning is preserved exactly.
+        let mut body = json!({"reasoning": {"summary": "auto"}});
+        adapter
+            .normalize_passthrough_body(&ctx, &request(), &mut body)
+            .unwrap();
+        assert_eq!(body["reasoning"], json!({"summary": "auto"}));
+
+        // Mapped intent: only effort is replaced; legacy alias is translated.
+        let mut req = request();
+        req.thinking = Some(ThinkingLevel::Low);
+        let mut body =
+            json!({"reasoning_effort": "low", "reasoning": {"effort": "high", "summary": "auto"}});
+        adapter
+            .normalize_passthrough_body(&ctx, &req, &mut body)
+            .unwrap();
+        assert_eq!(
+            body["reasoning"],
+            json!({"effort": "low", "summary": "auto"})
+        );
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn responses_passthrough_rejects_unmapped_thinking_level() {
+        let provider = provider();
+        let model = model();
+        let ctx = UpstreamContext {
+            provider: &provider,
+            model: &model,
+            account_id: None,
+            session_context: None,
+            credential_metadata: None,
+            credential: "secret".into(),
+        };
+        let mut req = request();
+        req.thinking = Some(ThinkingLevel::Low);
+        let mut body = json!({"reasoning_effort": "low", "input": "hi"});
+        let error = OpenAiResponsesAdapter
+            .normalize_passthrough_body(&ctx, &req, &mut body)
+            .unwrap_err();
+        assert_eq!(error.kind, FailureKind::BadRequest);
+        assert!(error.message.contains("no executable mapping"));
     }
 
     #[test]

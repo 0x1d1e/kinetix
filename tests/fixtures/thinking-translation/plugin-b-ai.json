@@ -1,0 +1,551 @@
+{
+ "transport": "openai",
+ "models": {
+  "b-ai-level-low-high-max-with-disable": {
+   "plugin_capabilities": {
+    "schema_version": 1,
+    "transport": {
+     "format": "openai"
+    },
+    "reasoning": {
+     "supported": true,
+     "mode": "level",
+     "levels": [
+      "low",
+      "high",
+      "max"
+     ],
+     "default": "high",
+     "can_disable": true
+    }
+   }
+  },
+  "b-ai-supported-without-control-metadata": {
+   "plugin_capabilities": {
+    "schema_version": 1,
+    "transport": {
+     "format": "openai"
+    },
+    "reasoning": {
+     "supported": true
+    }
+   }
+  },
+  "b-ai-uncataloged-unknown": {
+   "plugin_capabilities": {
+    "schema_version": 1,
+    "transport": {
+     "format": "openai"
+    }
+   }
+  }
+ },
+ "cases": [
+  {
+   "name": "absent/b-ai-level-low-high-max-with-disable",
+   "model": "b-ai-level-low-high-max-with-disable",
+   "frontend": "anthropic-messages",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "stream_options": {
+      "include_usage": true
+     },
+     "max_tokens": 1024
+    }
+   }
+  },
+  {
+   "name": "minimal/b-ai-level-low-high-max-with-disable",
+   "model": "b-ai-level-low-high-max-with-disable",
+   "frontend": "openai-responses",
+   "intent": {
+    "reasoning": {
+     "effort": "minimal"
+    }
+   },
+   "canonical": "minimal",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "off/b-ai-level-low-high-max-with-disable",
+   "model": "b-ai-level-low-high-max-with-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "disabled"
+    }
+   },
+   "canonical": "off",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "stream_options": {
+      "include_usage": true
+     },
+     "max_tokens": 1024,
+     "reasoning_effort": "none"
+    }
+   }
+  },
+  {
+   "name": "default/b-ai-level-low-high-max-with-disable",
+   "model": "b-ai-level-low-high-max-with-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    }
+   },
+   "canonical": "default",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "low/b-ai-level-low-high-max-with-disable",
+   "model": "b-ai-level-low-high-max-with-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "low"
+    }
+   },
+   "canonical": "low",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "stream_options": {
+      "include_usage": true
+     },
+     "max_tokens": 1024,
+     "reasoning_effort": "low"
+    }
+   }
+  },
+  {
+   "name": "medium/b-ai-level-low-high-max-with-disable",
+   "model": "b-ai-level-low-high-max-with-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "medium"
+    }
+   },
+   "canonical": "medium",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "high/b-ai-level-low-high-max-with-disable",
+   "model": "b-ai-level-low-high-max-with-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "high"
+    }
+   },
+   "canonical": "high",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "stream_options": {
+      "include_usage": true
+     },
+     "max_tokens": 1024,
+     "reasoning_effort": "high"
+    }
+   }
+  },
+  {
+   "name": "xhigh/b-ai-level-low-high-max-with-disable",
+   "model": "b-ai-level-low-high-max-with-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "xhigh"
+    }
+   },
+   "canonical": "xhigh",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "max/b-ai-level-low-high-max-with-disable",
+   "model": "b-ai-level-low-high-max-with-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "max"
+    }
+   },
+   "canonical": "max",
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "stream_options": {
+      "include_usage": true
+     },
+     "max_tokens": 1024,
+     "reasoning_effort": "max"
+    }
+   }
+  },
+  {
+   "name": "absent/b-ai-supported-without-control-metadata",
+   "model": "b-ai-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "stream_options": {
+      "include_usage": true
+     },
+     "max_tokens": 1024
+    }
+   }
+  },
+  {
+   "name": "minimal/b-ai-supported-without-control-metadata",
+   "model": "b-ai-supported-without-control-metadata",
+   "frontend": "openai-responses",
+   "intent": {
+    "reasoning": {
+     "effort": "minimal"
+    }
+   },
+   "canonical": "minimal",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "off/b-ai-supported-without-control-metadata",
+   "model": "b-ai-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "disabled"
+    }
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "default/b-ai-supported-without-control-metadata",
+   "model": "b-ai-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    }
+   },
+   "canonical": "default",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "low/b-ai-supported-without-control-metadata",
+   "model": "b-ai-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "low"
+    }
+   },
+   "canonical": "low",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "medium/b-ai-supported-without-control-metadata",
+   "model": "b-ai-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "medium"
+    }
+   },
+   "canonical": "medium",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "high/b-ai-supported-without-control-metadata",
+   "model": "b-ai-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "high"
+    }
+   },
+   "canonical": "high",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "xhigh/b-ai-supported-without-control-metadata",
+   "model": "b-ai-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "xhigh"
+    }
+   },
+   "canonical": "xhigh",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "max/b-ai-supported-without-control-metadata",
+   "model": "b-ai-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "max"
+    }
+   },
+   "canonical": "max",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "absent/b-ai-uncataloged-unknown",
+   "model": "b-ai-uncataloged-unknown",
+   "frontend": "anthropic-messages",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "model": "m-upstream",
+     "messages": [
+      {
+       "role": "user",
+       "content": "hi"
+      }
+     ],
+     "stream": true,
+     "stream_options": {
+      "include_usage": true
+     },
+     "max_tokens": 1024
+    }
+   }
+  },
+  {
+   "name": "minimal/b-ai-uncataloged-unknown",
+   "model": "b-ai-uncataloged-unknown",
+   "frontend": "openai-responses",
+   "intent": {
+    "reasoning": {
+     "effort": "minimal"
+    }
+   },
+   "canonical": "minimal",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "off/b-ai-uncataloged-unknown",
+   "model": "b-ai-uncataloged-unknown",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "disabled"
+    }
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "default/b-ai-uncataloged-unknown",
+   "model": "b-ai-uncataloged-unknown",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    }
+   },
+   "canonical": "default",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "low/b-ai-uncataloged-unknown",
+   "model": "b-ai-uncataloged-unknown",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "low"
+    }
+   },
+   "canonical": "low",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "medium/b-ai-uncataloged-unknown",
+   "model": "b-ai-uncataloged-unknown",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "medium"
+    }
+   },
+   "canonical": "medium",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "high/b-ai-uncataloged-unknown",
+   "model": "b-ai-uncataloged-unknown",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "high"
+    }
+   },
+   "canonical": "high",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "xhigh/b-ai-uncataloged-unknown",
+   "model": "b-ai-uncataloged-unknown",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "xhigh"
+    }
+   },
+   "canonical": "xhigh",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "max/b-ai-uncataloged-unknown",
+   "model": "b-ai-uncataloged-unknown",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "max"
+    }
+   },
+   "canonical": "max",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  }
+ ]
+}

@@ -1,0 +1,784 @@
+{
+ "transport": "gemini",
+ "models": {
+  "level-3-no-disable": {
+   "discovery": {
+    "reasoning_capability": {
+     "supported": true,
+     "mode": "level",
+     "levels": [
+      "minimal",
+      "low",
+      "medium",
+      "high"
+     ],
+     "can_disable": false,
+     "upstream_format": "gemini_thinking_level"
+    }
+   }
+  },
+  "manual-budget-disable": {
+   "thinking_map": {
+    "mode": "manual_budget",
+    "levels": {
+     "off": 0,
+     "minimal": 512,
+     "low": 1024,
+     "medium": 8192,
+     "high": 24576
+    },
+    "budget_field": "thinkingConfig.thinkingBudget"
+   }
+  },
+  "no-thinking-capability": {},
+  "discovered-adaptive-descriptive": {
+   "discovery": {
+    "reasoning_capability": {
+     "supported": true,
+     "mode": "adaptive",
+     "levels": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "can_disable": true,
+     "upstream_format": "gemini_adaptive"
+    }
+   }
+  },
+  "discovered-manual-budget-descriptive": {
+   "discovery": {
+    "reasoning_capability": {
+     "supported": true,
+     "mode": "manual_budget",
+     "levels": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "can_disable": true,
+     "upstream_format": "gemini_thinking_budget"
+    }
+   }
+  }
+ },
+ "cases": [
+  {
+   "name": "absent/level-3-no-disable",
+   "model": "level-3-no-disable",
+   "frontend": "openai-chat",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "absent/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "openai-chat",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "absent/no-thinking-capability",
+   "model": "no-thinking-capability",
+   "frontend": "openai-chat",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "off/level-3-no-disable",
+   "model": "level-3-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "off/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "thinkingConfig": {
+       "thinkingBudget": 0
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "off/no-thinking-capability",
+   "model": "no-thinking-capability",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/minimal/level-3-no-disable",
+   "model": "level-3-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "minimal"
+   },
+   "canonical": "minimal",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "thinkingConfig": {
+       "thinkingLevel": "minimal"
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "level/minimal/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "minimal"
+   },
+   "canonical": "minimal",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "thinkingConfig": {
+       "thinkingBudget": 512
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "level/low/level-3-no-disable",
+   "model": "level-3-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "low"
+   },
+   "canonical": "low",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "thinkingConfig": {
+       "thinkingLevel": "low"
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "level/low/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "low"
+   },
+   "canonical": "low",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "thinkingConfig": {
+       "thinkingBudget": 1024
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "level/medium/level-3-no-disable",
+   "model": "level-3-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "medium"
+   },
+   "canonical": "medium",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "thinkingConfig": {
+       "thinkingLevel": "medium"
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "level/medium/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "medium"
+   },
+   "canonical": "medium",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "thinkingConfig": {
+       "thinkingBudget": 8192
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "level/high/level-3-no-disable",
+   "model": "level-3-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "thinkingConfig": {
+       "thinkingLevel": "high"
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "level/high/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "thinkingConfig": {
+       "thinkingBudget": 24576
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "level/xhigh/level-3-no-disable",
+   "model": "level-3-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "xhigh"
+   },
+   "canonical": "xhigh",
+   "expect": {
+    "rejected": "thinking level 'xhigh' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/xhigh/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "xhigh"
+   },
+   "canonical": "xhigh",
+   "expect": {
+    "rejected": "thinking level 'xhigh' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/max/level-3-no-disable",
+   "model": "level-3-no-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "max"
+   },
+   "canonical": "max",
+   "expect": {
+    "rejected": "thinking level 'max' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/max/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "max"
+   },
+   "canonical": "max",
+   "expect": {
+    "rejected": "thinking level 'max' has no executable mapping"
+   }
+  },
+  {
+   "name": "default/anthropic-adaptive/level-3-no-disable",
+   "model": "level-3-no-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "default",
+   "expect": {
+    "rejected": "thinking level 'default' has no executable mapping"
+   }
+  },
+  {
+   "name": "effort/anthropic-adaptive-high/level-3-no-disable",
+   "model": "level-3-no-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "high"
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "high",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "maxOutputTokens": 64000,
+      "thinkingConfig": {
+       "thinkingLevel": "high"
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "budget/anthropic-8192-is-medium/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "enabled",
+     "budget_tokens": 8192
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "medium",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "maxOutputTokens": 64000,
+      "thinkingConfig": {
+       "thinkingBudget": 8192
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "budget/anthropic-1024-is-low/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "enabled",
+     "budget_tokens": 1024
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "low",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "maxOutputTokens": 64000,
+      "thinkingConfig": {
+       "thinkingBudget": 1024
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "budget/anthropic-16000-is-high/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "enabled",
+     "budget_tokens": 16000
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "high",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "maxOutputTokens": 64000,
+      "thinkingConfig": {
+       "thinkingBudget": 24576
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "off/anthropic-disabled/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "disabled"
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "off",
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "maxOutputTokens": 64000,
+      "thinkingConfig": {
+       "thinkingBudget": 0
+      }
+     }
+    }
+   }
+  },
+  {
+   "name": "default/anthropic-adaptive/manual-budget-disable",
+   "model": "manual-budget-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "default",
+   "expect": {
+    "rejected": "thinking level 'default' has no executable mapping"
+   }
+  },
+  {
+   "name": "absent/discovered-adaptive-descriptive",
+   "model": "discovered-adaptive-descriptive",
+   "frontend": "openai-chat",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "off/discovered-adaptive-descriptive",
+   "model": "discovered-adaptive-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/high/discovered-adaptive-descriptive",
+   "model": "discovered-adaptive-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "rejected": "thinking level 'high' has no executable mapping"
+   }
+  },
+  {
+   "name": "default/anthropic-adaptive/discovered-adaptive-descriptive",
+   "model": "discovered-adaptive-descriptive",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "default",
+   "expect": {
+    "rejected": "thinking level 'default' has no executable mapping"
+   }
+  },
+  {
+   "name": "absent/discovered-manual-budget-descriptive",
+   "model": "discovered-manual-budget-descriptive",
+   "frontend": "openai-chat",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "off/discovered-manual-budget-descriptive",
+   "model": "discovered-manual-budget-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/high/discovered-manual-budget-descriptive",
+   "model": "discovered-manual-budget-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "rejected": "thinking level 'high' has no executable mapping"
+   }
+  },
+  {
+   "name": "default/anthropic-adaptive/discovered-manual-budget-descriptive",
+   "model": "discovered-manual-budget-descriptive",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "default",
+   "expect": {
+    "rejected": "thinking level 'default' has no executable mapping"
+   }
+  },
+  {
+   "name": "cross-format/reasoning-summary-rejected/no-thinking-capability",
+   "model": "no-thinking-capability",
+   "frontend": "openai-responses",
+   "intent": {
+    "reasoning": {
+     "summary": "auto"
+    }
+   },
+   "canonical": null,
+   "expect": {
+    "rejected": "reasoning.summary"
+   }
+  }
+ ]
+}
