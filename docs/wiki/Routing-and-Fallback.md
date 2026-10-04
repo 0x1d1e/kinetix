@@ -138,6 +138,10 @@ Plugins implementing the `RoutingFactProvider` capability can export typed facts
   Anthropic: a single terminal `error` event). Nothing is silently spliced.
 - The attempt loop is bounded by `max_attempts` (default 5, capped) and a 30-second
   pre-commit deadline, with bounded backoff between attempts (100 ms → 1 s).
+  The deadline is request-scoped: routing time, backoff, and every attempt
+  count against it. Each attempt's connect/first-event phase gets its
+  provider timeout clipped to the time left, and a backoff that would use up
+  the remainder is skipped rather than slept.
 The host, native adapters, and plugins use the same failure kinds:
 `rate_limit`, `quota_exhausted`, `auth_error`, `target_error`, `server_error`,
 `connection_error`, `timeout`, `bad_request`, `malformed_upstream`,
