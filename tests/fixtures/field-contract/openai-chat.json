@@ -123,10 +123,8 @@
       "sample": true,
       "outbound": {
         "openai": {
-          "disposition": "consumed",
-          "note": "Kinetix forces include_usage=true upstream for accounting; response path filters it from client output",
-          "upstream": "/stream_options/include_usage",
-          "expect": true
+          "disposition": "preserved",
+          "note": "equals the forced value; the include_usage=false case proves the override"
         },
         "openai-responses": {
           "disposition": "consumed",

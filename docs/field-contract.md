@@ -4,10 +4,10 @@ Every semantic field a frontend accepts has an explicit disposition per outbound
 
 | Disposition | Meaning |
 |---|---|
-| `preserved` | Sent upstream unchanged (same value, same location). |
+| `preserved` | Sent upstream unchanged (same value, same location). No `upstream`/`expect` allowed; the sample is the expected value. |
 | `translated` | Sent upstream in the target protocol's shape. Fixture declares `upstream` (JSON pointer) and `expect`. |
-| `consumed` | Used by Kinetix or has no upstream equivalent; must not appear upstream. |
-| `rejected` | Request fails before any upstream call; nothing is sent. |
+| `consumed` | Client value is consumed internally and not forwarded. An adapter-owned replacement may be emitted when declared via `upstream` + `expect`. |
+| `rejected` | Request fails before any upstream call; nothing is sent. No `upstream`/`expect`. |
 
 Source of truth: `tests/fixtures/field-contract/{openai-chat,anthropic-messages,openai-responses}.json`. Harness: `tests/field_contract.rs`. It decodes a sample request, runs the real translation gate and `pipeline::build_upstream_body` per transport (`openai`, `openai-responses`, `anthropic`, `gemini`), and compares the result to the fixture.
 
@@ -23,7 +23,7 @@ CI fails when:
 ## Fixture features
 
 - `path`: JSON pointer inside `field` (e.g. `/stream_options/include_usage`); `sample` is the value at that path. Use it so subfields get their own disposition.
-- `consumed` + `upstream` + `expect`: the adapter overrides that location with its own value (e.g. `store` forced `false`, `include_usage` forced `true`). The sample must differ from `expect`. Declare one case per client value where normalization exists.
+- `consumed` + `upstream` + `expect`: the adapter overrides that location with its own value (e.g. `store` forced `false`, `include_usage` forced `true`). This is enforced: the sample must differ from `expect`, otherwise use `preserved` (or `rejected` if the other value is refused). Declare one case per client value where normalization exists.
 - Plain `consumed` fails if the sample is found at its wire path upstream (works for booleans) or any unique scalar leaf appears anywhere upstream.
 - `companions`: extra top-level request fields the sample needs (e.g. `thinking` for `output_config.effort`).
 

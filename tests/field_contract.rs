@@ -535,34 +535,45 @@ fn carried_dispositions_declare_their_wire_shape() {
                     TRANSPORTS.contains(&transport.as_str()),
                     "{file}: {transport}"
                 );
-                let (upstream, expect) = match declared {
-                    Declared::Full {
-                        upstream, expect, ..
-                    } => (upstream.is_some(), expect.is_some()),
-                    Declared::Short(_) => (false, false),
-                };
-                match declared.disposition() {
-                    FieldDisposition::Translated => assert!(
-                        upstream && expect,
-                        "{file}: {}->{transport}: translated needs `upstream` and `expect`",
-                        entry.label()
-                    ),
-                    // `upstream` + `expect` on a consumed field means the
-                    // adapter overrides that location with its own value.
-                    FieldDisposition::Consumed => assert!(
-                        upstream == expect,
-                        "{file}: {}->{transport}: consumed override needs both `upstream` and `expect`",
-                        entry.label()
-                    ),
-                    FieldDisposition::Rejected => assert!(
-                        !upstream && !expect,
-                        "{file}: {}->{transport}: rejected fields have no wire shape",
-                        entry.label()
-                    ),
-                    FieldDisposition::Preserved => {}
+                if let Some(error) =
+                    wire_shape_errors(declared.disposition(), declared, &entry.sample)
+                {
+                    panic!("{file}: {}->{transport}: {error}", entry.label());
                 }
             }
         }
+    }
+}
+
+/// Schema rules that keep each disposition meaning what it says.
+fn wire_shape_errors(
+    disposition: FieldDisposition,
+    declared: &Declared,
+    sample: &Value,
+) -> Option<&'static str> {
+    let (upstream, expect) = match declared {
+        Declared::Full {
+            upstream, expect, ..
+        } => (upstream.as_ref(), expect.as_ref()),
+        Declared::Short(_) => (None, None),
+    };
+    match disposition {
+        FieldDisposition::Preserved if upstream.is_some() || expect.is_some() => {
+            Some("preserved keeps its path and value; `upstream`/`expect` are not allowed")
+        }
+        FieldDisposition::Rejected if upstream.is_some() || expect.is_some() => {
+            Some("rejected fields have no wire shape")
+        }
+        FieldDisposition::Translated if upstream.is_none() || expect.is_none() => {
+            Some("translated needs `upstream` and `expect`")
+        }
+        FieldDisposition::Consumed if upstream.is_some() != expect.is_some() => {
+            Some("consumed override needs both `upstream` and `expect`")
+        }
+        FieldDisposition::Consumed if expect == Some(sample) => {
+            Some("override must differ from the sample; use `preserved` or `rejected`")
+        }
+        _ => None,
     }
 }
 
@@ -680,7 +691,7 @@ fn harness_detects_boolean_leak_of_consumed_field() {
 
 #[test]
 fn harness_detects_value_rewritten_under_preserved() {
-    // Kinetix forces include_usage=true; declaring `false` as preserved must fail.
+    // Kinetix forces include_usage=true; `false` declared as preserved must fail.
     let mut contract = load("openai-chat.json");
     let index = contract
         .fields
@@ -693,6 +704,16 @@ fn harness_detects_value_rewritten_under_preserved() {
     );
     let problems = check_entry(&contract, &contract.fields[index], "openai");
     assert!(!problems.is_empty(), "{problems:?}");
+}
+
+#[test]
+fn preserved_declaration_cannot_carry_an_expected_value() {
+    // A preserved field with `expect` would let a rewrite pass as preserved.
+    let declared: Declared = serde_json::from_value(
+        json!({"disposition": "preserved", "upstream": "/temperature", "expect": 0.9}),
+    )
+    .unwrap();
+    assert!(wire_shape_errors(FieldDisposition::Preserved, &declared, &json!(0.3)).is_some());
 }
 
 #[test]
@@ -756,4 +777,14 @@ fn decoders_only_read_registered_fields() {
             }
         }
     }
+}
+
+#[test]
+fn consumed_override_must_differ_from_sample() {
+    let declared: Declared = serde_json::from_value(
+        json!({"disposition": "consumed", "upstream": "/store", "expect": false}),
+    )
+    .unwrap();
+    assert!(wire_shape_errors(FieldDisposition::Consumed, &declared, &json!(false)).is_some());
+    assert!(wire_shape_errors(FieldDisposition::Consumed, &declared, &json!(true)).is_none());
 }

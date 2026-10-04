@@ -375,10 +375,8 @@
       "sample": false,
       "outbound": {
         "openai-responses": {
-          "disposition": "consumed",
-          "note": "Kinetix forces store=false upstream",
-          "upstream": "/store",
-          "expect": false
+          "disposition": "preserved",
+          "note": "false is the only accepted value (true is rejected), so Kinetix's forced store=false is indistinguishable from preserving it"
         },
         "openai": {
           "disposition": "consumed",

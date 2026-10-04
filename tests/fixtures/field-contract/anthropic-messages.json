@@ -224,13 +224,7 @@
           "expect": "high",
           "note": "adaptive thinking effort maps to the target's reasoning effort"
         },
-        "anthropic": {
-          "disposition": "preserved",
-          "upstream": "/output_config",
-          "expect": {
-            "effort": "high"
-          }
-        },
+        "anthropic": "preserved",
         "gemini": {
           "disposition": "translated",
           "upstream": "/generationConfig/thinkingConfig/thinkingLevel",
