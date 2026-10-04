@@ -9,6 +9,26 @@ use crate::types::{
     ThinkingLevel, ToolChoice, ToolDef,
 };
 
+/// Top-level Messages fields this decoder models into the canonical request.
+/// Every entry needs a disposition in
+/// `tests/fixtures/field-contract/anthropic-messages.json`; anything else lands
+/// in `InternalRequest::extra`.
+pub const DECODED_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "stream",
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_tokens",
+    "stop_sequences",
+    "output_config",
+    "tools",
+    "tool_choice",
+    "thinking",
+];
+
 pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
     let obj = body
         .as_object()
@@ -115,20 +135,8 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
     let stream = obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
 
     let mut extra = serde_json::Map::new();
-    const KNOWN: [&str; 10] = [
-        "model",
-        "messages",
-        "system",
-        "stream",
-        "temperature",
-        "top_p",
-        "top_k",
-        "max_tokens",
-        "stop_sequences",
-        "output_config",
-    ];
     for (k, v) in obj {
-        if !KNOWN.contains(&k.as_str()) && k != "tools" && k != "tool_choice" && k != "thinking" {
+        if !DECODED_FIELDS.contains(&k.as_str()) {
             extra.insert(k.clone(), v.clone());
         }
     }

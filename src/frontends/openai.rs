@@ -9,6 +9,29 @@ use crate::types::{
     ThinkingLevel, ToolChoice, ToolDef,
 };
 
+/// Top-level Chat Completions fields this decoder models into the canonical
+/// request. Every entry needs a disposition in
+/// `tests/fixtures/field-contract/openai-chat.json`; anything else lands in
+/// `InternalRequest::extra`.
+pub const DECODED_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "stream",
+    "stream_options",
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_tokens",
+    "max_completion_tokens",
+    "stop",
+    "seed",
+    "presence_penalty",
+    "frequency_penalty",
+    "tools",
+    "tool_choice",
+    "reasoning_effort",
+];
+
 pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
     let obj = body
         .as_object()
@@ -160,26 +183,8 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
 
     // Fields we don't model: keep only genuinely unknown ones for optional forwarding.
     let mut extra = serde_json::Map::new();
-    const KNOWN: [&str; 16] = [
-        "model",
-        "messages",
-        "stream",
-        "stream_options",
-        "temperature",
-        "top_p",
-        "top_k",
-        "max_tokens",
-        "max_completion_tokens",
-        "stop",
-        "seed",
-        "presence_penalty",
-        "frequency_penalty",
-        "tools",
-        "tool_choice",
-        "reasoning_effort",
-    ];
     for (k, v) in obj {
-        if !KNOWN.contains(&k.as_str()) {
+        if !DECODED_FIELDS.contains(&k.as_str()) {
             extra.insert(k.clone(), v.clone());
         }
     }

@@ -1,0 +1,500 @@
+{
+  "frontend": "anthropic-messages",
+  "base": {
+    "model": "m-client",
+    "max_tokens": 1000,
+    "messages": [
+      {
+        "role": "user",
+        "content": "hello-marker"
+      }
+    ]
+  },
+  "fields": [
+    {
+      "field": "model",
+      "sample": "m-client",
+      "outbound": {
+        "openai": {
+          "disposition": "translated",
+          "upstream": "/model",
+          "expect": "m-upstream"
+        },
+        "openai-responses": {
+          "disposition": "translated",
+          "upstream": "/model",
+          "expect": "m-upstream"
+        },
+        "anthropic": {
+          "disposition": "translated",
+          "upstream": "/model",
+          "expect": "m-upstream"
+        },
+        "gemini": {
+          "disposition": "consumed",
+          "note": "selects the upstream model through the request URL, not the body"
+        }
+      }
+    },
+    {
+      "field": "messages",
+      "sample": [
+        {
+          "role": "user",
+          "content": "hello-marker"
+        }
+      ],
+      "outbound": {
+        "openai": {
+          "disposition": "translated",
+          "upstream": "/messages/0/content",
+          "expect": "hello-marker"
+        },
+        "openai-responses": {
+          "disposition": "translated",
+          "upstream": "/input/0/content/0/text",
+          "expect": "hello-marker"
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/contents/0/parts/0/text",
+          "expect": "hello-marker"
+        }
+      }
+    },
+    {
+      "field": "system",
+      "sample": "sysmarker",
+      "outbound": {
+        "openai": {
+          "disposition": "translated",
+          "upstream": "/messages/0/content",
+          "expect": "sysmarker"
+        },
+        "openai-responses": {
+          "disposition": "translated",
+          "upstream": "/instructions",
+          "expect": "sysmarker"
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/systemInstruction/parts/0/text",
+          "expect": "sysmarker"
+        }
+      }
+    },
+    {
+      "field": "stream",
+      "sample": false,
+      "outbound": {
+        "openai": {
+          "disposition": "consumed",
+          "note": "Kinetix always streams upstream; the client flag only selects response framing"
+        },
+        "openai-responses": {
+          "disposition": "consumed",
+          "note": "Kinetix always streams upstream; the client flag only selects response framing"
+        },
+        "anthropic": {
+          "disposition": "consumed",
+          "note": "Kinetix always streams upstream; the client flag only selects response framing"
+        },
+        "gemini": {
+          "disposition": "consumed",
+          "note": "Kinetix always streams upstream; the client flag only selects response framing"
+        }
+      }
+    },
+    {
+      "field": "temperature",
+      "sample": 0.3711,
+      "outbound": {
+        "openai": "preserved",
+        "openai-responses": "preserved",
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/generationConfig/temperature",
+          "expect": 0.3711
+        }
+      }
+    },
+    {
+      "field": "top_p",
+      "sample": 0.8123,
+      "outbound": {
+        "openai": "preserved",
+        "openai-responses": "preserved",
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/generationConfig/topP",
+          "expect": 0.8123
+        }
+      }
+    },
+    {
+      "field": "top_k",
+      "sample": 41.5,
+      "outbound": {
+        "openai": "preserved",
+        "openai-responses": "rejected",
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/generationConfig/topK",
+          "expect": 41.5
+        }
+      }
+    },
+    {
+      "field": "max_tokens",
+      "sample": 1234,
+      "outbound": {
+        "openai": "preserved",
+        "openai-responses": {
+          "disposition": "translated",
+          "upstream": "/max_output_tokens",
+          "expect": 1234
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/generationConfig/maxOutputTokens",
+          "expect": 1234
+        }
+      }
+    },
+    {
+      "field": "stop_sequences",
+      "sample": [
+        "stopmarker-1"
+      ],
+      "outbound": {
+        "openai": {
+          "disposition": "translated",
+          "upstream": "/stop/0",
+          "expect": "stopmarker-1"
+        },
+        "openai-responses": "rejected",
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/generationConfig/stopSequences/0",
+          "expect": "stopmarker-1"
+        }
+      }
+    },
+    {
+      "field": "output_config",
+      "sample": {
+        "effort": "high"
+      },
+      "outbound": {
+        "openai": "rejected",
+        "openai-responses": "rejected",
+        "anthropic": "preserved",
+        "gemini": "rejected"
+      },
+      "case": "effort without thinking"
+    },
+    {
+      "field": "output_config",
+      "case": "effort with adaptive thinking",
+      "sample": {
+        "effort": "high"
+      },
+      "companions": {
+        "thinking": {
+          "type": "adaptive"
+        }
+      },
+      "outbound": {
+        "openai": {
+          "disposition": "translated",
+          "upstream": "/reasoning_effort",
+          "expect": "high",
+          "note": "adaptive thinking effort maps to the target's reasoning effort"
+        },
+        "openai-responses": {
+          "disposition": "translated",
+          "upstream": "/reasoning/effort",
+          "expect": "high",
+          "note": "adaptive thinking effort maps to the target's reasoning effort"
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/generationConfig/thinkingConfig/thinkingLevel",
+          "expect": "high",
+          "note": "adaptive thinking effort maps to the target's reasoning effort"
+        }
+      }
+    },
+    {
+      "field": "tools",
+      "sample": [
+        {
+          "name": "lookup_zq",
+          "description": "zq desc",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "q": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ],
+      "outbound": {
+        "openai": {
+          "disposition": "translated",
+          "upstream": "/tools/0/function/name",
+          "expect": "lookup_zq"
+        },
+        "openai-responses": {
+          "disposition": "translated",
+          "upstream": "/tools/0/name",
+          "expect": "lookup_zq"
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/tools/0/functionDeclarations/0/name",
+          "expect": "lookup_zq"
+        }
+      }
+    },
+    {
+      "field": "tool_choice",
+      "case": "any",
+      "sample": {
+        "type": "any"
+      },
+      "outbound": {
+        "openai": {
+          "disposition": "translated",
+          "upstream": "/tool_choice",
+          "expect": "required"
+        },
+        "openai-responses": {
+          "disposition": "translated",
+          "upstream": "/tool_choice",
+          "expect": "required"
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/toolConfig/functionCallingConfig/mode",
+          "expect": "ANY"
+        }
+      }
+    },
+    {
+      "field": "tool_choice",
+      "case": "specific",
+      "sample": {
+        "type": "tool",
+        "name": "lookup_zq"
+      },
+      "outbound": {
+        "openai": {
+          "disposition": "translated",
+          "upstream": "/tool_choice/function/name",
+          "expect": "lookup_zq"
+        },
+        "openai-responses": {
+          "disposition": "translated",
+          "upstream": "/tool_choice/name",
+          "expect": "lookup_zq"
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/toolConfig/functionCallingConfig/allowedFunctionNames/0",
+          "expect": "lookup_zq"
+        }
+      }
+    },
+    {
+      "field": "thinking",
+      "sample": {
+        "type": "enabled",
+        "budget_tokens": 16000
+      },
+      "outbound": {
+        "openai": {
+          "disposition": "translated",
+          "upstream": "/reasoning_effort",
+          "expect": "high"
+        },
+        "openai-responses": {
+          "disposition": "translated",
+          "upstream": "/reasoning/effort",
+          "expect": "high"
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/generationConfig/thinkingConfig/thinkingLevel",
+          "expect": "high"
+        }
+      }
+    },
+    {
+      "field": "metadata",
+      "sample": {
+        "user_id": "usermarker"
+      },
+      "outbound": {
+        "openai": {
+          "disposition": "consumed",
+          "note": "identity/telemetry hint with no upstream equivalent; dropped by the default compatibility policy"
+        },
+        "openai-responses": {
+          "disposition": "consumed",
+          "note": "identity/telemetry hint with no upstream equivalent; dropped by the default compatibility policy"
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "consumed",
+          "note": "identity/telemetry hint with no upstream equivalent; dropped by the default compatibility policy"
+        }
+      }
+    },
+    {
+      "field": "service_tier",
+      "sample": "auto",
+      "outbound": {
+        "openai": {
+          "disposition": "consumed",
+          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+        },
+        "openai-responses": {
+          "disposition": "consumed",
+          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "consumed",
+          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+        }
+      }
+    },
+    {
+      "field": "mcp_servers",
+      "sample": [
+        {
+          "type": "url",
+          "url": "https://mcp.example/markermcp",
+          "name": "markermcp"
+        }
+      ],
+      "outbound": {
+        "openai": {
+          "disposition": "consumed",
+          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+        },
+        "openai-responses": {
+          "disposition": "consumed",
+          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "consumed",
+          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+        }
+      }
+    },
+    {
+      "field": "container",
+      "sample": "containermarker",
+      "outbound": {
+        "openai": {
+          "disposition": "consumed",
+          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+        },
+        "openai-responses": {
+          "disposition": "consumed",
+          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "consumed",
+          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+        }
+      }
+    },
+    {
+      "field": "context_management",
+      "sample": {
+        "edits": [
+          {
+            "type": "clear_tool_uses_20250919",
+            "trigger": {
+              "type": "input_tokens",
+              "value": 98765
+            }
+          }
+        ]
+      },
+      "outbound": {
+        "openai": {
+          "disposition": "consumed",
+          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+        },
+        "openai-responses": {
+          "disposition": "consumed",
+          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+        },
+        "anthropic": "preserved",
+        "gemini": {
+          "disposition": "consumed",
+          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+        }
+      }
+    }
+  ],
+  "unknown_field": {
+    "field": "x_vendor_marker",
+    "sample": {
+      "nested": "vendormarker"
+    },
+    "outbound": {
+      "openai": {
+        "disposition": "consumed",
+        "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+      },
+      "openai-responses": {
+        "disposition": "consumed",
+        "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+      },
+      "anthropic": "preserved",
+      "gemini": {
+        "disposition": "consumed",
+        "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+      }
+    }
+  },
+  "adapter_owned": {
+    "openai": [
+      "model",
+      "stream",
+      "stream_options"
+    ],
+    "openai-responses": [
+      "model",
+      "stream",
+      "store"
+    ],
+    "anthropic": [
+      "model",
+      "stream",
+      "max_tokens"
+    ],
+    "gemini": []
+  }
+}

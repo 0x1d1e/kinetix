@@ -37,6 +37,8 @@ Keep changes scoped to the requested work. Avoid unrelated refactors, renames, f
 
 Bug fixes require a regression test when reasonably testable.
 
+Frontend field changes require a disposition in `tests/fixtures/field-contract/` (see `docs/field-contract.md`).
+
 Protocol/translation changes must cover the relevant compatibility fixtures/matrix, including streaming where applicable.
 
 Dashboard changes must typecheck and build.
