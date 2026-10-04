@@ -3248,7 +3248,7 @@ fn default_quota_window(account: &db::AccountRow) -> i64 {
     }
 }
 
-fn build_upstream_body(
+pub fn build_upstream_body(
     adapter: &dyn Adapter,
     ctx: &UpstreamContext<'_>,
     req: &InternalRequest,

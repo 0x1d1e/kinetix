@@ -18,6 +18,36 @@ use crate::types::{
 // Request decoding
 // ---------------------------------------------------------------------------
 
+/// Top-level Responses fields Kinetix accepts. Every entry needs a disposition
+/// in `tests/fixtures/field-contract/openai-responses.json`; any other field is
+/// rejected during validation.
+pub const DECODED_FIELDS: &[&str] = &[
+    "model",
+    "input",
+    "instructions",
+    "tools",
+    "tool_choice",
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_output_tokens",
+    "max_tokens",
+    "presence_penalty",
+    "frequency_penalty",
+    "stream",
+    "reasoning",
+    "reasoning_effort",
+    "prompt_cache_key",
+    "store",
+    "background",
+    "text",
+    "stream_options",
+    "truncation",
+    "parallel_tool_calls",
+    "metadata",
+    "include",
+];
+
 pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
     let obj = body
         .as_object()
@@ -128,35 +158,8 @@ pub fn decode_request(body: Value) -> Result<InternalRequest, ProxyError> {
 }
 
 fn validate_supported_subset(obj: &serde_json::Map<String, Value>) -> Result<(), ProxyError> {
-    const SUPPORTED: [&str; 24] = [
-        "model",
-        "input",
-        "instructions",
-        "tools",
-        "tool_choice",
-        "temperature",
-        "top_p",
-        "top_k",
-        "max_output_tokens",
-        "max_tokens",
-        "presence_penalty",
-        "frequency_penalty",
-        "stream",
-        "reasoning",
-        "reasoning_effort",
-        "prompt_cache_key",
-        "store",
-        "background",
-        "text",
-        "stream_options",
-        "truncation",
-        "parallel_tool_calls",
-        "metadata",
-        "include",
-    ];
-
     for key in obj.keys() {
-        if !SUPPORTED.contains(&key.as_str()) {
+        if !DECODED_FIELDS.contains(&key.as_str()) {
             return Err(ProxyError::unsupported(format!(
                 "Responses API field '{key}' is not supported by Kinetix's translated subset"
             )));
