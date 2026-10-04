@@ -287,6 +287,14 @@ fn run(
     let use_passthrough =
         req.raw_body.is_some() && passthrough::is_transport_passthrough(format, &transport);
     if !use_passthrough {
+        if let Some(message) = frontends::translation_unsupported(&req.extra) {
+            return (
+                canonical,
+                Outcome::Rejected(format!(
+                    "request uses a feature that cannot be translated: {message}"
+                )),
+            );
+        }
         if let Err(error) = check_resolved_thinking_translation(
             adapter.as_ref(),
             &model.display_name,

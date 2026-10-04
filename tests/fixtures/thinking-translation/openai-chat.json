@@ -816,6 +816,20 @@
      }
     }
    }
+  },
+  {
+   "name": "cross-format/reasoning-summary-rejected/no-thinking-capability",
+   "model": "no-thinking-capability",
+   "frontend": "openai-responses",
+   "intent": {
+    "reasoning": {
+     "summary": "auto"
+    }
+   },
+   "canonical": null,
+   "expect": {
+    "rejected": "reasoning.summary"
+   }
   }
  ]
 }

@@ -432,7 +432,12 @@ fn responses_rejects_stateful_hosted_and_untranslated_semantics() {
         serde_json::json!({
             "model":"m",
             "input":"hi",
-            "reasoning":{"effort":"high","summary":"auto"}
+            "reasoning":{"effort":"high","summary":5}
+        }),
+        serde_json::json!({
+            "model":"m",
+            "input":"hi",
+            "reasoning":{"generate_summary":"auto"}
         }),
         serde_json::json!({
             "model":"m",
@@ -453,6 +458,18 @@ fn responses_rejects_stateful_hosted_and_untranslated_semantics() {
             "unsupported Responses semantic was accepted"
         );
     }
+}
+
+#[test]
+fn responses_reasoning_summary_is_same_format_only() {
+    let req =
+        responses(r#"{"model":"m","input":"hi","reasoning":{"effort":"high","summary":"auto"}}"#);
+    assert_eq!(req.thinking, Some(kinetix::types::ThinkingLevel::High));
+    let message = frontends::translation_unsupported(&req.extra).expect("translation refuses it");
+    assert!(message.contains("reasoning.summary"), "{message}");
+
+    let plain = responses(r#"{"model":"m","input":"hi","reasoning":{"effort":"high"}}"#);
+    assert!(frontends::translation_unsupported(&plain.extra).is_none());
 }
 
 #[test]

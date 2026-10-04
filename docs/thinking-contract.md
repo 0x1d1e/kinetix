@@ -26,7 +26,8 @@ For every transport and model capability:
 | Explicit budget | client `budget_tokens` 8192 buckets to medium, then the map value lands at `thinking.budget_tokens` / `generationConfig.thinkingConfig.thinkingBudget` |
 | Categorical | each of minimal, low, medium, high, xhigh, max, mapped or rejected |
 | Absent | no thinking field emitted |
-| Passthrough | same-format client bytes preserved, except Anthropic adaptive normalization and Responses, which rebuilds reasoning from the model map (legacy flat `reasoning_effort` becomes `reasoning.effort`, or is rejected when the level has no executable mapping) |
+| Passthrough | same-format client bytes preserved, except Anthropic adaptive normalization and Responses, which preserves `reasoning` (including `reasoning.summary`) verbatim without a thinking intent, and with one replaces only the mapped thinking fields (legacy flat `reasoning_effort` becomes `reasoning.effort`; an unmapped level is rejected) |
+| Responses `reasoning.summary` | accepted and preserved on same-format Responses; rejected on every translating path (no other wire format can deliver summaries) |
 
 Only a Level-mode map is executable. Discovered `adaptive` / `manual_budget` metadata (Anthropic, Gemini, OpenAI Chat fixtures) is descriptive: any requested level, including `off` and `default`, is rejected instead of being guessed into a provider body. Operator-configured maps are executable in every mode.
 

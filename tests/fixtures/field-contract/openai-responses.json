@@ -321,6 +321,23 @@
       }
     },
     {
+      "field": "reasoning",
+      "case": "summary",
+      "path": "/reasoning/summary",
+      "sample": "auto",
+      "companions": {
+        "reasoning": {
+          "effort": "high"
+        }
+      },
+      "outbound": {
+        "openai": "rejected",
+        "openai-responses": "preserved",
+        "anthropic": "rejected",
+        "gemini": "rejected"
+      }
+    },
+    {
       "field": "reasoning_effort",
       "sample": "high",
       "outbound": {

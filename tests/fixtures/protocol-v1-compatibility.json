@@ -849,7 +849,7 @@
           "reasoning.effort / reasoning_effort",
           "normalized through executable model thinking_map",
           "translated only with model thinking_map",
-          "The legacy reasoning_effort alias is removed and emitted in the configured Responses reasoning shape; reasoning summary/output semantics are not implemented.",
+          "The legacy reasoning_effort alias is removed and emitted in the configured Responses reasoning shape, and an unmapped level is rejected on passthrough. reasoning.summary is preserved on same-format Responses and rejected on translating paths; reasoning output items are not implemented.",
           [
             "responses.native.openai.sync",
             "responses.native.openai.passthrough",
