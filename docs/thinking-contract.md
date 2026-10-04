@@ -26,9 +26,11 @@ For every transport and model capability:
 | Explicit budget | client `budget_tokens` 8192 buckets to medium, then the map value lands at `thinking.budget_tokens` / `generationConfig.thinkingConfig.thinkingBudget` |
 | Categorical | each of minimal, low, medium, high, xhigh, max, mapped or rejected |
 | Absent | no thinking field emitted |
-| Passthrough | same-format client bytes preserved, except Anthropic adaptive normalization and Responses legacy flat `reasoning_effort` removal |
+| Passthrough | same-format client bytes preserved, except Anthropic adaptive normalization and Responses, which rebuilds reasoning from the model map (legacy flat `reasoning_effort` becomes `reasoning.effort`, or is rejected when the level has no executable mapping) |
 
-Only a Level-mode map is executable. Discovered `adaptive` / `manual_budget` metadata is descriptive, so requests with a level are rejected rather than guessed.
+Only a Level-mode map is executable. Discovered `adaptive` / `manual_budget` metadata (Anthropic, Gemini, OpenAI Chat fixtures) is descriptive: any requested level, including `off` and `default`, is rejected instead of being guessed into a provider body. Operator-configured maps are executable in every mode.
+
+The matrix pins support or explicit rejection per transport. It does not force every provider into every class (Gemini has no adaptive envelope, so Gemini adaptive is unsupported).
 
 ## Changing a golden
 

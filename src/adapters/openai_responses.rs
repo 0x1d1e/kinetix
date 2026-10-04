@@ -330,15 +330,26 @@ impl OpenAiResponsesAdapter {
         body.remove("reasoning_effort");
         body.remove("reasoning");
         if let Some(level) = req.thinking {
+            // Same-format passthrough skips the translation gate, so an
+            // unmapped level must fail here instead of dropping the intent.
             let thinking = ctx.model.thinking();
-            if let Some(value) = thinking.levels.get(level.as_key()) {
-                if let Some(fields) = value.as_object() {
-                    for (path, field_value) in fields {
-                        crate::adapters::openai::insert_dotted(body, path, field_value.clone());
-                    }
-                } else if let Some(field) = thinking.scalar_field() {
-                    crate::adapters::openai::insert_dotted(body, field, value.clone());
+            let key = level.as_key();
+            if level == crate::types::ThinkingLevel::Default && thinking.is_adaptive() {
+                return Ok(());
+            }
+            if !thinking.level_is_executable(key) {
+                return Err(Self::bad_request(format!(
+                    "thinking level '{key}' has no executable mapping for model '{}'",
+                    ctx.model.display_name
+                )));
+            }
+            let value = &thinking.levels[key];
+            if let Some(fields) = value.as_object() {
+                for (path, field_value) in fields {
+                    crate::adapters::openai::insert_dotted(body, path, field_value.clone());
                 }
+            } else if let Some(field) = thinking.scalar_field() {
+                crate::adapters::openai::insert_dotted(body, field, value.clone());
             }
         }
         Ok(())
@@ -868,6 +879,28 @@ mod tests {
         let body = OpenAiResponsesAdapter.build_body(&ctx, &req).unwrap();
         assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("none")));
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn responses_passthrough_rejects_unmapped_thinking_level() {
+        let provider = provider();
+        let model = model();
+        let ctx = UpstreamContext {
+            provider: &provider,
+            model: &model,
+            account_id: None,
+            session_context: None,
+            credential_metadata: None,
+            credential: "secret".into(),
+        };
+        let mut req = request();
+        req.thinking = Some(ThinkingLevel::Low);
+        let mut body = json!({"reasoning_effort": "low", "input": "hi"});
+        let error = OpenAiResponsesAdapter
+            .normalize_passthrough_body(&ctx, &req, &mut body)
+            .unwrap_err();
+        assert_eq!(error.kind, FailureKind::BadRequest);
+        assert!(error.message.contains("no executable mapping"));
     }
 
     #[test]

@@ -654,8 +654,20 @@
    }
   },
   {
-   "name": "passthrough/legacy-flat-effort-stripped/no-thinking-capability",
+   "name": "passthrough/legacy-flat-effort-rejected-without-mapping/no-thinking-capability",
    "model": "no-thinking-capability",
+   "frontend": "openai-responses",
+   "intent": {
+    "reasoning_effort": "low"
+   },
+   "canonical": "low",
+   "expect": {
+    "rejected": "thinking level 'low' has no executable mapping"
+   }
+  },
+  {
+   "name": "passthrough/legacy-flat-effort-translated/configured-level-no-disable",
+   "model": "configured-level-no-disable",
    "frontend": "openai-responses",
    "intent": {
     "reasoning_effort": "low"
@@ -666,7 +678,10 @@
      "model": "m-upstream",
      "input": "hi",
      "stream": true,
-     "store": false
+     "store": false,
+     "reasoning": {
+      "effort": "low"
+     }
     }
    }
   }

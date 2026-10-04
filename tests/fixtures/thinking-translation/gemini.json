@@ -30,7 +30,37 @@
     "budget_field": "thinkingConfig.thinkingBudget"
    }
   },
-  "no-thinking-capability": {}
+  "no-thinking-capability": {},
+  "discovered-adaptive-descriptive": {
+   "discovery": {
+    "reasoning_capability": {
+     "supported": true,
+     "mode": "adaptive",
+     "levels": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "can_disable": true,
+     "upstream_format": "gemini_adaptive"
+    }
+   }
+  },
+  "discovered-manual-budget-descriptive": {
+   "discovery": {
+    "reasoning_capability": {
+     "supported": true,
+     "mode": "manual_budget",
+     "levels": [
+      "low",
+      "medium",
+      "high"
+     ],
+     "can_disable": true,
+     "upstream_format": "gemini_thinking_budget"
+    }
+   }
+  }
  },
  "cases": [
   {
@@ -604,6 +634,126 @@
   {
    "name": "default/anthropic-adaptive/manual-budget-disable",
    "model": "manual-budget-disable",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "default",
+   "expect": {
+    "rejected": "thinking level 'default' has no executable mapping"
+   }
+  },
+  {
+   "name": "absent/discovered-adaptive-descriptive",
+   "model": "discovered-adaptive-descriptive",
+   "frontend": "openai-chat",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "off/discovered-adaptive-descriptive",
+   "model": "discovered-adaptive-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/high/discovered-adaptive-descriptive",
+   "model": "discovered-adaptive-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "rejected": "thinking level 'high' has no executable mapping"
+   }
+  },
+  {
+   "name": "default/anthropic-adaptive/discovered-adaptive-descriptive",
+   "model": "discovered-adaptive-descriptive",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "max_tokens": 64000
+   },
+   "canonical": "default",
+   "expect": {
+    "rejected": "thinking level 'default' has no executable mapping"
+   }
+  },
+  {
+   "name": "absent/discovered-manual-budget-descriptive",
+   "model": "discovered-manual-budget-descriptive",
+   "frontend": "openai-chat",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "off/discovered-manual-budget-descriptive",
+   "model": "discovered-manual-budget-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "none"
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "thinking level 'off' has no executable mapping"
+   }
+  },
+  {
+   "name": "level/high/discovered-manual-budget-descriptive",
+   "model": "discovered-manual-budget-descriptive",
+   "frontend": "openai-chat",
+   "intent": {
+    "reasoning_effort": "high"
+   },
+   "canonical": "high",
+   "expect": {
+    "rejected": "thinking level 'high' has no executable mapping"
+   }
+  },
+  {
+   "name": "default/anthropic-adaptive/discovered-manual-budget-descriptive",
+   "model": "discovered-manual-budget-descriptive",
    "frontend": "anthropic-messages",
    "intent": {
     "thinking": {
