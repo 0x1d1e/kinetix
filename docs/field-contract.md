@@ -20,6 +20,15 @@ CI fails when:
 - a consumed field is serialized upstream;
 - an unknown field (`x_vendor_marker`) is not handled as declared.
 
+## Fixture features
+
+- `path`: JSON pointer inside `field` (e.g. `/stream_options/include_usage`); `sample` is the value at that path. Use it so subfields get their own disposition.
+- `consumed` + `upstream` + `expect`: the adapter overrides that location with its own value (e.g. `store` forced `false`, `include_usage` forced `true`). The sample must differ from `expect`. Declare one case per client value where normalization exists.
+- Plain `consumed` fails if the sample is found at its wire path upstream (works for booleans) or any unique scalar leaf appears anywhere upstream.
+- `companions`: extra top-level request fields the sample needs (e.g. `thinking` for `output_config.effort`).
+
+`DECODED_FIELDS` is hand-maintained, but `decoders_only_read_registered_fields` scans decoder sources for `obj.get("x")`/`contains_key`/`remove` and fails if `x` is neither registered nor in the fixture. Deriving both from one declaration remains a follow-up.
+
 ## Adding a field
 
 1. Add it to the frontend's `DECODED_FIELDS` (or leave it in `extra`, it still needs an entry).

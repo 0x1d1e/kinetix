@@ -67,7 +67,16 @@ struct Entry {
     field: String,
     #[serde(default)]
     case: Option<String>,
+    /// Nested location inside `field` (JSON pointer, e.g.
+    /// `/stream_options/include_usage`). When set, `sample` is the value at
+    /// that location, so subfields get their own disposition.
+    #[serde(default)]
+    path: Option<String>,
     sample: Value,
+    /// Extra top-level request fields the sample needs to be meaningful
+    /// (for example `thinking` for `output_config.effort`).
+    #[serde(default)]
+    companions: Option<serde_json::Map<String, Value>>,
     /// The sample has no scalar leaf that identifies it on the wire (for
     /// example a bare `"text"` type tag); skip leaf-based leak detection.
     #[serde(default)]
@@ -76,6 +85,13 @@ struct Entry {
 }
 
 impl Entry {
+    /// Where this entry lives in the client request and, when preserved, upstream.
+    fn pointer(&self) -> String {
+        self.path
+            .clone()
+            .unwrap_or_else(|| format!("/{}", self.field))
+    }
+
     fn label(&self) -> String {
         match &self.case {
             Some(case) => format!("{}[{case}]", self.field),
@@ -249,11 +265,28 @@ fn run(format: FrontendFormat, transport_name: &str, client_body: &Value) -> Out
 }
 
 fn request_for(contract: &Contract, entry: &Entry) -> Value {
-    let mut body = contract.base.as_object().cloned().unwrap_or_default();
-    body.insert(entry.field.clone(), entry.sample.clone());
-    // `max_completion_tokens` and friends are alternates for a base field;
-    // keep the sample isolated from its sibling.
-    Value::Object(body)
+    let mut body = contract.base.clone();
+    for (key, value) in entry.companions.iter().flatten() {
+        body[key] = value.clone();
+    }
+    set_pointer(&mut body, &entry.pointer(), entry.sample.clone());
+    body
+}
+
+fn set_pointer(root: &mut Value, pointer: &str, value: Value) {
+    let mut node = root;
+    let mut parts = pointer.trim_start_matches('/').split('/').peekable();
+    while let Some(part) = parts.next() {
+        let map = node.as_object_mut().expect("object on path");
+        if parts.peek().is_none() {
+            map.insert(part.into(), value);
+            return;
+        }
+        node = map.entry(part).or_insert_with(|| json!({}));
+        if !node.is_object() {
+            *node = json!({});
+        }
+    }
 }
 
 /// Distinctive scalar leaves of a sample (strings and numbers; booleans and
@@ -310,7 +343,7 @@ fn upstream_top_level_keys(contract: &Contract, transport: &str) -> BTreeSet<Str
                 Declared::Full { upstream, .. } => upstream.clone(),
                 Declared::Short(_) => None,
             };
-            let pointer = upstream.unwrap_or_else(|| format!("/{}", entry.field));
+            let pointer = upstream.unwrap_or_else(|| entry.pointer());
             keys.insert(
                 pointer
                     .trim_start_matches('/')
@@ -347,6 +380,32 @@ fn check_entry(contract: &Contract, entry: &Entry, transport: &str) -> Vec<Strin
             ));
         }
         (FieldDisposition::Consumed, Outcome::Sent(body)) => {
+            let (upstream, expect) = match declared {
+                Declared::Full {
+                    upstream, expect, ..
+                } => (upstream.clone(), expect.clone()),
+                Declared::Short(_) => (None, None),
+            };
+            match (upstream, expect) {
+                // Overridden: the adapter owns this location and must write
+                // its own value regardless of what the client sent.
+                (Some(pointer), Some(expect)) => match body.pointer(&pointer) {
+                    Some(actual) if *actual == expect => {}
+                    actual => problems.push(format!(
+                        "{label}: expected adapter override {expect} at {pointer}, found {actual:?} in {body}"
+                    )),
+                },
+                _ => {
+                    // Exact wire location catches booleans and nulls that
+                    // carry no unique marker.
+                    if body.pointer(&entry.pointer()) == Some(&entry.sample) {
+                        problems.push(format!(
+                            "{label}: consumed field forwarded at {}: {body}",
+                            entry.pointer()
+                        ));
+                    }
+                }
+            }
             for leaf in &markers {
                 if contains_leaf(body, leaf) {
                     problems.push(format!(
@@ -365,7 +424,7 @@ fn check_entry(contract: &Contract, entry: &Entry, transport: &str) -> Vec<Strin
                 } => (upstream.clone(), expect.clone()),
                 Declared::Short(_) => (None, None),
             };
-            let pointer = upstream.unwrap_or_else(|| format!("/{}", entry.field));
+            let pointer = upstream.unwrap_or_else(|| entry.pointer());
             let expected = match (disposition, expect) {
                 (_, Some(expect)) => expect,
                 (FieldDisposition::Preserved, None) => entry.sample.clone(),
@@ -374,8 +433,7 @@ fn check_entry(contract: &Contract, entry: &Entry, transport: &str) -> Vec<Strin
                     return problems;
                 }
             };
-            if disposition == FieldDisposition::Preserved && pointer != format!("/{}", entry.field)
-            {
+            if disposition == FieldDisposition::Preserved && pointer != entry.pointer() {
                 problems.push(format!(
                     "{label}: preserved must keep its path, got {pointer}"
                 ));
@@ -489,9 +547,16 @@ fn carried_dispositions_declare_their_wire_shape() {
                         "{file}: {}->{transport}: translated needs `upstream` and `expect`",
                         entry.label()
                     ),
-                    FieldDisposition::Consumed | FieldDisposition::Rejected => assert!(
+                    // `upstream` + `expect` on a consumed field means the
+                    // adapter overrides that location with its own value.
+                    FieldDisposition::Consumed => assert!(
+                        upstream == expect,
+                        "{file}: {}->{transport}: consumed override needs both `upstream` and `expect`",
+                        entry.label()
+                    ),
+                    FieldDisposition::Rejected => assert!(
                         !upstream && !expect,
-                        "{file}: {}->{transport}: only carried fields have a wire shape",
+                        "{file}: {}->{transport}: rejected fields have no wire shape",
                         entry.label()
                     ),
                     FieldDisposition::Preserved => {}
@@ -582,4 +647,113 @@ fn harness_detects_adapter_field_without_fixture_coverage() {
             .any(|p| p.contains("undeclared top-level field")),
         "{problems:?}"
     );
+}
+
+#[test]
+fn harness_detects_boolean_leak_of_consumed_field() {
+    // `parallel_tool_calls: false` has no unique marker; the wire-path check
+    // must still see it when a transport forwards it.
+    let contract = load("openai-chat.json");
+    let entry = contract
+        .fields
+        .iter()
+        .find(|e| e.field == "parallel_tool_calls")
+        .unwrap();
+    let problems = check_entry(&contract, entry, "openai");
+    assert!(problems.is_empty(), "preserved on openai: {problems:?}");
+    let mut contract = contract;
+    let index = contract
+        .fields
+        .iter()
+        .position(|e| e.field == "parallel_tool_calls")
+        .unwrap();
+    contract.fields[index].outbound.insert(
+        "openai".into(),
+        serde_json::from_value(json!("consumed")).unwrap(),
+    );
+    let problems = check_entry(&contract, &contract.fields[index], "openai");
+    assert!(
+        problems.iter().any(|p| p.contains("forwarded")),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn harness_detects_value_rewritten_under_preserved() {
+    // Kinetix forces include_usage=true; declaring `false` as preserved must fail.
+    let mut contract = load("openai-chat.json");
+    let index = contract
+        .fields
+        .iter()
+        .position(|e| e.case.as_deref() == Some("include_usage=false"))
+        .unwrap();
+    contract.fields[index].outbound.insert(
+        "openai".into(),
+        serde_json::from_value(json!("preserved")).unwrap(),
+    );
+    let problems = check_entry(&contract, &contract.fields[index], "openai");
+    assert!(!problems.is_empty(), "{problems:?}");
+}
+
+#[test]
+fn harness_detects_wrong_adapter_override() {
+    let mut contract = load("openai-responses.json");
+    let index = contract
+        .fields
+        .iter()
+        .position(|e| e.field == "store" && e.case.as_deref() == Some("false"))
+        .unwrap();
+    contract.fields[index].outbound.insert(
+        "openai-responses".into(),
+        serde_json::from_value(json!({
+            "disposition": "consumed", "upstream": "/store", "expect": true
+        }))
+        .unwrap(),
+    );
+    let problems = check_entry(&contract, &contract.fields[index], "openai-responses");
+    assert!(
+        problems.iter().any(|p| p.contains("adapter override")),
+        "{problems:?}"
+    );
+}
+
+/// Every top-level field a decoder reads (`obj.get("x")`) must be registered
+/// in `DECODED_FIELDS` or carry a fixture disposition, so a newly read field
+/// cannot slip past the contract.
+#[test]
+fn decoders_only_read_registered_fields() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/frontends");
+    for (source, file, format) in [
+        ("openai.rs", "openai-chat.json", FrontendFormat::OpenAi),
+        (
+            "anthropic.rs",
+            "anthropic-messages.json",
+            FrontendFormat::Anthropic,
+        ),
+        (
+            "responses.rs",
+            "openai-responses.json",
+            FrontendFormat::OpenAiResponses,
+        ),
+    ] {
+        let text: String = std::fs::read_to_string(root.join(source))
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        let contract = load(file);
+        let known: BTreeSet<&str> = decoded_fields(format)
+            .iter()
+            .copied()
+            .chain(contract.fields.iter().map(|e| e.field.as_str()))
+            .collect();
+        for needle in ["obj.get(\"", "obj.contains_key(\"", "obj.remove(\""] {
+            for part in text.split(needle).skip(1) {
+                let name = part.split('"').next().unwrap();
+                assert!(
+                    known.contains(name),
+                    "{source} reads top-level field '{name}' with no DECODED_FIELDS entry or fixture disposition"
+                );
+            }
+        }
+    }
 }

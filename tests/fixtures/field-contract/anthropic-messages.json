@@ -197,6 +197,46 @@
         "openai-responses": "rejected",
         "anthropic": "preserved",
         "gemini": "rejected"
+      },
+      "case": "effort without thinking"
+    },
+    {
+      "field": "output_config",
+      "case": "effort with adaptive thinking",
+      "sample": {
+        "effort": "high"
+      },
+      "companions": {
+        "thinking": {
+          "type": "adaptive"
+        }
+      },
+      "outbound": {
+        "openai": {
+          "disposition": "translated",
+          "upstream": "/reasoning_effort",
+          "expect": "high",
+          "note": "adaptive thinking effort maps to the target's reasoning effort"
+        },
+        "openai-responses": {
+          "disposition": "translated",
+          "upstream": "/reasoning/effort",
+          "expect": "high",
+          "note": "adaptive thinking effort maps to the target's reasoning effort"
+        },
+        "anthropic": {
+          "disposition": "preserved",
+          "upstream": "/output_config",
+          "expect": {
+            "effort": "high"
+          }
+        },
+        "gemini": {
+          "disposition": "translated",
+          "upstream": "/generationConfig/thinkingConfig/thinkingLevel",
+          "expect": "high",
+          "note": "adaptive thinking effort maps to the target's reasoning effort"
+        }
       }
     },
     {

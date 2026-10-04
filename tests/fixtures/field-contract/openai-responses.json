@@ -274,15 +274,21 @@
       "outbound": {
         "openai": {
           "disposition": "consumed",
-          "note": "Kinetix always streams upstream; the client flag only selects response framing"
+          "note": "Kinetix always streams upstream; the client flag only selects response framing",
+          "upstream": "/stream",
+          "expect": true
         },
         "openai-responses": {
           "disposition": "consumed",
-          "note": "Kinetix always streams upstream; the client flag only selects response framing"
+          "note": "Kinetix always streams upstream; the client flag only selects response framing",
+          "upstream": "/stream",
+          "expect": true
         },
         "anthropic": {
           "disposition": "consumed",
-          "note": "Kinetix always streams upstream; the client flag only selects response framing"
+          "note": "Kinetix always streams upstream; the client flag only selects response framing",
+          "upstream": "/stream",
+          "expect": true
         },
         "gemini": {
           "disposition": "consumed",
@@ -354,13 +360,30 @@
     },
     {
       "field": "store",
+      "case": "true",
+      "sample": true,
+      "outbound": {
+        "openai": "rejected",
+        "openai-responses": "rejected",
+        "anthropic": "rejected",
+        "gemini": "rejected"
+      }
+    },
+    {
+      "field": "store",
+      "case": "false",
       "sample": false,
       "outbound": {
+        "openai-responses": {
+          "disposition": "consumed",
+          "note": "Kinetix forces store=false upstream",
+          "upstream": "/store",
+          "expect": false
+        },
         "openai": {
           "disposition": "consumed",
           "note": "Kinetix never persists provider-side response objects"
         },
-        "openai-responses": "preserved",
         "anthropic": {
           "disposition": "consumed",
           "note": "Kinetix never persists provider-side response objects"
@@ -388,7 +411,19 @@
           "disposition": "consumed",
           "note": "background mode is never used upstream"
         }
-      }
+      },
+      "case": "false"
+    },
+    {
+      "field": "background",
+      "sample": true,
+      "outbound": {
+        "openai": "rejected",
+        "openai-responses": "rejected",
+        "anthropic": "rejected",
+        "gemini": "rejected"
+      },
+      "case": "true"
     },
     {
       "field": "text",
@@ -432,9 +467,7 @@
     },
     {
       "field": "stream_options",
-      "sample": {
-        "include_obfuscation": false
-      },
+      "sample": false,
       "outbound": {
         "openai": {
           "disposition": "consumed",
@@ -449,7 +482,21 @@
           "disposition": "consumed",
           "note": "client usage preference is honored by the frontend encoder; upstream usage is requested by Kinetix for accounting"
         }
-      }
+      },
+      "path": "/stream_options/include_obfuscation",
+      "case": "false"
+    },
+    {
+      "field": "stream_options",
+      "sample": true,
+      "outbound": {
+        "openai": "rejected",
+        "openai-responses": "rejected",
+        "anthropic": "rejected",
+        "gemini": "rejected"
+      },
+      "path": "/stream_options/include_obfuscation",
+      "case": "true"
     },
     {
       "field": "truncation",

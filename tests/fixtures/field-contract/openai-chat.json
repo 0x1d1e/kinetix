@@ -68,15 +68,21 @@
       "outbound": {
         "openai": {
           "disposition": "consumed",
-          "note": "Kinetix always streams upstream; the client flag only selects response framing"
+          "note": "Kinetix always streams upstream; the client flag only selects response framing",
+          "upstream": "/stream",
+          "expect": true
         },
         "openai-responses": {
           "disposition": "consumed",
-          "note": "Kinetix always streams upstream; the client flag only selects response framing"
+          "note": "Kinetix always streams upstream; the client flag only selects response framing",
+          "upstream": "/stream",
+          "expect": true
         },
         "anthropic": {
           "disposition": "consumed",
-          "note": "Kinetix always streams upstream; the client flag only selects response framing"
+          "note": "Kinetix always streams upstream; the client flag only selects response framing",
+          "upstream": "/stream",
+          "expect": true
         },
         "gemini": {
           "disposition": "consumed",
@@ -86,9 +92,61 @@
     },
     {
       "field": "stream_options",
-      "sample": {
-        "include_usage": true
-      },
+      "case": "include_usage=false",
+      "path": "/stream_options/include_usage",
+      "sample": false,
+      "outbound": {
+        "openai": {
+          "disposition": "consumed",
+          "note": "Kinetix forces include_usage=true upstream for accounting; response path filters it from client output",
+          "upstream": "/stream_options/include_usage",
+          "expect": true
+        },
+        "openai-responses": {
+          "disposition": "consumed",
+          "note": "client usage preference is honored by the frontend encoder; upstream usage is requested by Kinetix for accounting"
+        },
+        "anthropic": {
+          "disposition": "consumed",
+          "note": "client usage preference is honored by the frontend encoder; upstream usage is requested by Kinetix for accounting"
+        },
+        "gemini": {
+          "disposition": "consumed",
+          "note": "client usage preference is honored by the frontend encoder; upstream usage is requested by Kinetix for accounting"
+        }
+      }
+    },
+    {
+      "field": "stream_options",
+      "case": "include_usage=true",
+      "path": "/stream_options/include_usage",
+      "sample": true,
+      "outbound": {
+        "openai": {
+          "disposition": "consumed",
+          "note": "Kinetix forces include_usage=true upstream for accounting; response path filters it from client output",
+          "upstream": "/stream_options/include_usage",
+          "expect": true
+        },
+        "openai-responses": {
+          "disposition": "consumed",
+          "note": "client usage preference is honored by the frontend encoder; upstream usage is requested by Kinetix for accounting"
+        },
+        "anthropic": {
+          "disposition": "consumed",
+          "note": "client usage preference is honored by the frontend encoder; upstream usage is requested by Kinetix for accounting"
+        },
+        "gemini": {
+          "disposition": "consumed",
+          "note": "client usage preference is honored by the frontend encoder; upstream usage is requested by Kinetix for accounting"
+        }
+      }
+    },
+    {
+      "field": "stream_options",
+      "case": "include_obfuscation",
+      "path": "/stream_options/include_obfuscation",
+      "sample": true,
       "outbound": {
         "openai": "preserved",
         "openai-responses": {
