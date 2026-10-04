@@ -14,6 +14,7 @@ Harness: `tests/thinking_translation_contract.rs`. Fixtures: `tests/fixtures/thi
 
 - `client-intents.json`: client wire value to canonical `ThinkingLevel` per frontend (OpenAI Chat `reasoning_effort`, Responses `reasoning.effort`, Anthropic `thinking` / `output_config.effort` / `budget_tokens`). Pins Anthropic budget bucketing: `0` is off, `<=2048` low, `<=8192` medium, otherwise high.
 - `{openai-chat,openai-responses,anthropic,gemini}.json`: per transport, named model capability profiles (`thinking_map` or `discovery`) plus cases `{name, model, frontend, intent, canonical, expect}`. `expect` is `{"body": <full JSON>}` or `{"rejected": "<message substring>"}`.
+- `plugin-<id>.json` (`plugin-b-ai`, `plugin-ai-studio`): same case shape, but a model profile carries `plugin_capabilities`, the `capabilities_json` a model-source plugin emits (pinned by that plugin's own `thinking-contract.json` in `kinetix-plugins`). The harness normalizes it with `normalize_plugin_reasoning_capability` as discovery does, so the plugin contract and the host body goldens meet at the same capability JSON.
 
 ## Matrix
 

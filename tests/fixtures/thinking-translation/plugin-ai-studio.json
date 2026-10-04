@@ -1,0 +1,331 @@
+{
+ "transport": "gemini",
+ "models": {
+  "ai-studio-supported-without-control-metadata": {
+   "plugin_capabilities": {
+    "schema_version": 1,
+    "transport": {
+     "format": "gemini"
+    },
+    "reasoning": {
+     "supported": true
+    }
+   }
+  },
+  "ai-studio-unsupported": {
+   "plugin_capabilities": {
+    "schema_version": 1,
+    "transport": {
+     "format": "gemini"
+    },
+    "reasoning": {
+     "supported": false
+    }
+   }
+  }
+ },
+ "cases": [
+  {
+   "name": "absent/ai-studio-supported-without-control-metadata",
+   "model": "ai-studio-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "maxOutputTokens": 1024
+     }
+    }
+   }
+  },
+  {
+   "name": "minimal/ai-studio-supported-without-control-metadata",
+   "model": "ai-studio-supported-without-control-metadata",
+   "frontend": "openai-responses",
+   "intent": {
+    "reasoning": {
+     "effort": "minimal"
+    }
+   },
+   "canonical": "minimal",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "off/ai-studio-supported-without-control-metadata",
+   "model": "ai-studio-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "disabled"
+    }
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "default/ai-studio-supported-without-control-metadata",
+   "model": "ai-studio-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    }
+   },
+   "canonical": "default",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "low/ai-studio-supported-without-control-metadata",
+   "model": "ai-studio-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "low"
+    }
+   },
+   "canonical": "low",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "medium/ai-studio-supported-without-control-metadata",
+   "model": "ai-studio-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "medium"
+    }
+   },
+   "canonical": "medium",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "high/ai-studio-supported-without-control-metadata",
+   "model": "ai-studio-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "high"
+    }
+   },
+   "canonical": "high",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "xhigh/ai-studio-supported-without-control-metadata",
+   "model": "ai-studio-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "xhigh"
+    }
+   },
+   "canonical": "xhigh",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "max/ai-studio-supported-without-control-metadata",
+   "model": "ai-studio-supported-without-control-metadata",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "max"
+    }
+   },
+   "canonical": "max",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "absent/ai-studio-unsupported",
+   "model": "ai-studio-unsupported",
+   "frontend": "anthropic-messages",
+   "intent": {},
+   "canonical": null,
+   "expect": {
+    "body": {
+     "contents": [
+      {
+       "role": "user",
+       "parts": [
+        {
+         "text": "hi"
+        }
+       ]
+      }
+     ],
+     "generationConfig": {
+      "maxOutputTokens": 1024
+     }
+    }
+   }
+  },
+  {
+   "name": "minimal/ai-studio-unsupported",
+   "model": "ai-studio-unsupported",
+   "frontend": "openai-responses",
+   "intent": {
+    "reasoning": {
+     "effort": "minimal"
+    }
+   },
+   "canonical": "minimal",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "off/ai-studio-unsupported",
+   "model": "ai-studio-unsupported",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "disabled"
+    }
+   },
+   "canonical": "off",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "default/ai-studio-unsupported",
+   "model": "ai-studio-unsupported",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    }
+   },
+   "canonical": "default",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "low/ai-studio-unsupported",
+   "model": "ai-studio-unsupported",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "low"
+    }
+   },
+   "canonical": "low",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "medium/ai-studio-unsupported",
+   "model": "ai-studio-unsupported",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "medium"
+    }
+   },
+   "canonical": "medium",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "high/ai-studio-unsupported",
+   "model": "ai-studio-unsupported",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "high"
+    }
+   },
+   "canonical": "high",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "xhigh/ai-studio-unsupported",
+   "model": "ai-studio-unsupported",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "xhigh"
+    }
+   },
+   "canonical": "xhigh",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  },
+  {
+   "name": "max/ai-studio-unsupported",
+   "model": "ai-studio-unsupported",
+   "frontend": "anthropic-messages",
+   "intent": {
+    "thinking": {
+     "type": "adaptive"
+    },
+    "output_config": {
+     "effort": "max"
+    }
+   },
+   "canonical": "max",
+   "expect": {
+    "rejected": "has no executable mapping"
+   }
+  }
+ ]
+}

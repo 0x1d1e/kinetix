@@ -150,14 +150,17 @@ struct Contract {
     cases: Vec<Case>,
 }
 
-/// One model capability: an operator `thinking_map`, or discovery metadata the
-/// execution profile derives a map from.
+/// One model capability: an operator `thinking_map`, discovery metadata the
+/// execution profile derives a map from, or the `capabilities_json` a model
+/// source plugin emitted (normalized by the host exactly as at discovery).
 #[derive(Debug, Deserialize)]
 struct ModelProfile {
     #[serde(default)]
     thinking_map: Option<Value>,
     #[serde(default)]
     discovery: Option<Value>,
+    #[serde(default)]
+    plugin_capabilities: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,6 +217,14 @@ fn provider(wire: &str) -> ProviderRow {
 
 fn model(transport: &str, profile: &ModelProfile) -> ModelRow {
     let mut discovery = profile.discovery.clone().unwrap_or_else(|| json!({}));
+    if let Some(capabilities) = &profile.plugin_capabilities {
+        if let Some(reasoning) =
+            kinetix::model_capabilities::normalize_plugin_reasoning_capability(capabilities)
+        {
+            discovery["reasoning_capability"] =
+                serde_json::to_value(reasoning).expect("reasoning capability serializes");
+        }
+    }
     discovery["configured_transport"] = json!(transport);
     ModelRow {
         id: "m".into(),
@@ -382,4 +393,14 @@ fn anthropic_thinking_bodies_are_pinned() {
 #[test]
 fn gemini_thinking_bodies_are_pinned() {
     check_contract("gemini.json");
+}
+
+#[test]
+fn b_ai_discovered_capabilities_translate_to_pinned_bodies() {
+    check_contract("plugin-b-ai.json");
+}
+
+#[test]
+fn ai_studio_discovered_capabilities_translate_to_pinned_bodies() {
+    check_contract("plugin-ai-studio.json");
 }
