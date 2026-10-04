@@ -86,6 +86,7 @@ struct LastPrecommitFailure {
 
 struct ActivePrecommitAttempt {
     target: ResolvedTarget,
+    adapter: Arc<dyn Adapter>,
     attempt_number: usize,
     opaque_route_id: String,
     upstream_request_id: Option<String>,
@@ -210,6 +211,7 @@ impl RequestMeta {
                 termination,
                 Some("client disconnected before response commit"),
                 &active.opaque_route_id,
+                active.adapter.plugin_package_sha256(),
             );
             row.key_id = self.key_id.clone();
             row.key_name = self.key_name.clone();
@@ -256,6 +258,7 @@ impl RequestMeta {
             serving_account_id: last_attempt.row.serving_account_id.clone(),
             serving_account: last_attempt.row.serving_account.clone(),
             serving_provider: last_attempt.row.serving_provider.clone(),
+            plugin_package_sha256: last_attempt.row.plugin_package_sha256.clone(),
             upstream_request_id: last_attempt.row.upstream_request_id.clone(),
             flagged: 0,
             error_message: Some("client disconnected before response commit".into()),
@@ -599,6 +602,8 @@ struct Attempt {
     /// validation. This is a per-gap timer, never a total stream lifetime.
     idle_timeout: Duration,
     adapter: Arc<dyn Adapter>,
+    /// Package digest of the plugin adapter that served this attempt (#206).
+    plugin_package_sha256: Option<String>,
     is_sse: bool,
     /// Same-format passthrough is only possible when the upstream is actually
     /// SSE. A JSON response is normalized through parse_full_response().
@@ -1787,6 +1792,7 @@ pub(crate) async fn run_with_disconnect(
 
         meta.active_precommit_attempt = Some(ActivePrecommitAttempt {
             target: target.clone(),
+            adapter: adapter.clone(),
             attempt_number: meta.partial_attempts.len() + 1,
             opaque_route_id: trace.opaque_route_id.clone(),
             upstream_request_id: None,
@@ -1930,6 +1936,7 @@ pub(crate) async fn run_with_disconnect(
                                 precommit_usage,
                                 &failure,
                                 termination,
+                                adapter.plugin_package_sha256(),
                             )
                             .await;
                             if let Some(permit) = traffic_permit.as_ref() {
@@ -2072,6 +2079,7 @@ pub(crate) async fn run_with_disconnect(
                         precommit_usage: prepared.precommit_usage,
                         idle_timeout: provider_timeout,
                         adapter: adapter.clone(),
+                        plugin_package_sha256: adapter.plugin_package_sha256(),
                         is_sse: prepared.is_sse,
                         passthrough: use_passthrough && prepared.is_sse,
                         traffic_permit,
@@ -2162,6 +2170,7 @@ pub(crate) async fn run_with_disconnect(
                     TokenUsage::default(),
                     &failure,
                     termination,
+                    adapter.plugin_package_sha256(),
                 )
                 .await;
                 last_precommit_failure = Some(LastPrecommitFailure {
@@ -2441,6 +2450,7 @@ pub(crate) async fn run_with_disconnect(
                     TokenUsage::default(),
                     &failure,
                     termination,
+                    adapter.plugin_package_sha256(),
                 )
                 .await;
                 last_precommit_failure = Some(LastPrecommitFailure {
@@ -2686,6 +2696,7 @@ fn enqueue_precommit_failure_at(
             serving_account_id: None,
             serving_account: None,
             serving_provider: None,
+            plugin_package_sha256: None,
             upstream_request_id: None,
             flagged: 0,
             error_message: None,
@@ -6826,6 +6837,7 @@ async fn record_precommit_attempt_usage(
     usage: TokenUsage,
     failure: &UpstreamFailure,
     termination: StreamTermination,
+    plugin_package_sha256: Option<String>,
 ) {
     let computed_cost = (usage.input.is_some() && usage.output.is_some())
         .then(|| cost::compute_cost(&target.model.prices(), &usage))
@@ -6843,6 +6855,7 @@ async fn record_precommit_attempt_usage(
         termination,
         Some(&failure.message),
         &trace.opaque_route_id,
+        plugin_package_sha256,
     );
     let staged_attempt_index = meta.partial_attempts.len();
     meta.partial_attempts.push(PartialAttemptUsage {
@@ -6894,6 +6907,7 @@ fn usage_attempt_row(
     termination: StreamTermination,
     error_message: Option<&str>,
     opaque_route_id: &str,
+    plugin_package_sha256: Option<String>,
 ) -> db::UsageAttemptRow {
     db::UsageAttemptRow {
         id: format!("usage_attempt_{}", uuid::Uuid::new_v4().simple()),
@@ -6927,6 +6941,7 @@ fn usage_attempt_row(
         commit_state: termination.commit_state.as_usage_str().to_string(),
         error_message: error_message.map(str::to_owned),
         opaque_route_id: Some(opaque_route_id.to_string()),
+        plugin_package_sha256,
     }
 }
 
@@ -7010,6 +7025,10 @@ fn record_precommit_request_log(
         serving_account_id: Some(target.account.id.clone()),
         serving_account: Some(target.account.label.clone()),
         serving_provider: Some(target.provider.name.clone()),
+        plugin_package_sha256: meta
+            .partial_attempts
+            .last()
+            .and_then(|attempt| attempt.row.plugin_package_sha256.clone()),
         upstream_request_id: upstream_request_id.map(str::to_owned),
         flagged: 0,
         error_message: Some(failure.message.clone()),
@@ -7200,6 +7219,7 @@ async fn finalize_log(
         termination,
         error_message.as_deref(),
         &trace.opaque_route_id,
+        attempt.plugin_package_sha256.clone(),
     );
     let (request_usage, request_cost) = aggregate_request_accounting(meta, Some(&usage), cost);
 
@@ -7316,6 +7336,7 @@ async fn finalize_log(
         route_trace_id: Some(trace.opaque_route_id.clone()),
         opaque_route_id: Some(trace.opaque_route_id.clone()),
         admission_cost_usd,
+        plugin_package_sha256: attempt.plugin_package_sha256.clone(),
     };
     let mut attempt_rows = meta
         .partial_attempts

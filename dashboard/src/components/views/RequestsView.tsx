@@ -331,6 +331,11 @@ export const RequestsView: React.FC<RequestsViewProps> = ({ requests, liveReques
                   <div>
                     <code>Usage: {selectedRequest.usageConfidence} | commit: {selectedRequest.commitState || 'n/a'} | retries: {selectedRequest.retryCount}</code>
                   </div>
+                  {selectedRequest.pluginPackageSha256 && (
+                    <div className="break-all">
+                      <code>Plugin package: sha256:{selectedRequest.pluginPackageSha256}</code>
+                    </div>
+                  )}
                 </div>
 
                 {/* Fallback Path Trace */}

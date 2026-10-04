@@ -9319,6 +9319,7 @@ fn usage_json(u: &db::UsageLogRow) -> Value {
         "commit_state": u.commit_state,
         "retry_count": u.retry_count,
         "opaque_route_id": u.opaque_route_id,
+        "plugin_package_sha256": u.plugin_package_sha256,
     })
 }
 

@@ -322,6 +322,10 @@ impl Adapter for PluginAdapter {
         self.wire_format
     }
 
+    fn plugin_package_sha256(&self) -> Option<String> {
+        self.manager.active_package_sha256(&self.plugin_id)
+    }
+
     fn handles_thinking_translation(&self) -> bool {
         self.thinking_translation
     }

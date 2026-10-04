@@ -111,6 +111,7 @@ fn write_day(dir: &Path, day: &str, rows: &[UsageLogRow]) -> Result<(PathBuf, Pa
             "serving_account",
             "serving_provider",
             "error_message",
+            "plugin_package_sha256",
         ])?;
         for r in rows {
             w.write_record([
@@ -140,6 +141,7 @@ fn write_day(dir: &Path, day: &str, rows: &[UsageLogRow]) -> Result<(PathBuf, Pa
                 r.serving_account.clone().unwrap_or_default(),
                 r.serving_provider.clone().unwrap_or_default(),
                 r.error_message.clone().unwrap_or_default(),
+                r.plugin_package_sha256.clone().unwrap_or_default(),
             ])?;
         }
         w.flush()?;

@@ -163,6 +163,9 @@ async fn anthropic_plugin_upstream(
     }))
 }
 
+const TRANSLATION_PLUGIN_PACKAGE_SHA256: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
+
 struct AnthropicTranslationPluginAdapter;
 
 impl Adapter for AnthropicTranslationPluginAdapter {
@@ -187,6 +190,10 @@ impl Adapter for AnthropicTranslationPluginAdapter {
 
     fn wire_format(&self) -> &'static str {
         "anthropic-translation-plugin-fixture"
+    }
+
+    fn plugin_package_sha256(&self) -> Option<String> {
+        Some(TRANSLATION_PLUGIN_PACKAGE_SHA256.into())
     }
 
     fn handles_thinking_translation(&self) -> bool {
@@ -488,6 +495,23 @@ async fn anthropic_messages_frontend_passes_thinking_and_tool_continuation_to_pl
     assert_eq!(
         response_json["content"],
         json!([{"type": "text", "text": "plugin accepted the continuation"}])
+    );
+
+    // The package that served the request is recorded with its usage (#206).
+    state.log_queue.flush().await;
+    let digests: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT r.plugin_package_sha256, a.plugin_package_sha256 \
+         FROM usage_request_logs r JOIN usage_attempts a ON a.request_id = r.request_id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        digests,
+        vec![(
+            Some(TRANSLATION_PLUGIN_PACKAGE_SHA256.into()),
+            Some(TRANSLATION_PLUGIN_PACKAGE_SHA256.into())
+        )]
     );
 
     let mut nonportable_continuation = request.clone();
@@ -1854,7 +1878,15 @@ async fn reinstalling_a_retained_package_resyncs_runtime_capabilities() {
         "{}",
         enabled.text().await.unwrap()
     );
-    assert!(state.adapters.for_transport(&adapter_ref).is_ok());
+    assert_eq!(
+        state
+            .adapters
+            .for_transport(&adapter_ref)
+            .unwrap()
+            .plugin_package_sha256(),
+        Some(first_sha.clone()),
+        "usage logs record the package the adapter runs (#206)"
+    );
 
     // A non-expanding update keeps the approval and enabled state but stops
     // declaring the adapter, so the adapter is unregistered.
@@ -1890,6 +1922,9 @@ async fn reinstalling_a_retained_package_resyncs_runtime_capabilities() {
         row.enabled != 0,
         "runtime adapter registry must match the active package"
     );
+    if let Ok(adapter) = state.adapters.for_transport(&adapter_ref) {
+        assert_eq!(adapter.plugin_package_sha256(), Some(first_sha.clone()));
+    }
     assert!(
         !state.plugin_credentials.contains_key(PLUGIN_ID),
         "the reinstalled package declares no credential strategy"

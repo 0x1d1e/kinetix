@@ -604,6 +604,13 @@ pub trait Adapter: Send + Sync {
         false
     }
 
+    /// SHA-256 of the plugin package serving this adapter, recorded in usage
+    /// logs so a request is tied to exact package provenance. Built-in
+    /// adapters have none.
+    fn plugin_package_sha256(&self) -> Option<String> {
+        None
+    }
+
     /// Whether this adapter provides an exact upstream token-count API.
     fn supports_count_tokens(&self) -> bool {
         false
