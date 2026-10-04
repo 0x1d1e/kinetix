@@ -932,6 +932,29 @@ def run_http_case(case_id):
             f"restricted key exposed disallowed provider model: {sorted(restricted_ids)}",
         )
 
+        # Listings expose accepted capabilities and Kinetix metadata only.
+        by_id = {item.get("id"): item for item in data["data"]}
+        direct = by_id["syn-openai"]
+        need(
+            direct.get("capabilities", {}).get("tools") is True
+            and direct["capabilities"].get("images") is True
+            and direct["capabilities"].get("streaming") is True,
+            f"accepted capabilities missing from model listing: {direct}",
+        )
+        need(
+            direct.get("kinetix", {}).get("state") == "accepted"
+            and direct["kinetix"].get("transport") == "openai",
+            f"Kinetix model metadata missing: {direct}",
+        )
+        public_sources = {"operator", "models.dev", "plugin", "probe", "provider"}
+        for item in data["data"]:
+            kinetix = item.get("kinetix", {})
+            need(
+                set(kinetix) <= {"state", "transport", "provenance"}
+                and set(kinetix.get("provenance", {}).values()) <= public_sources,
+                f"model listing exposes non-public metadata: {item}",
+            )
+
         unauth_status, _, _ = request("/v1/models", None, "GET", key=None)
         need(unauth_status in (401, 403), f"models endpoint accepted unauthenticated request: {unauth_status}")
         return

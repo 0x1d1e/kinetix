@@ -146,6 +146,46 @@ frontend decoding.
 The matrix is hermetic, has no paid/public provider dependency, and remains in the
 normal `scripts/run-ci.sh` gate. Real installed clients are deliberately separate.
 
+## Model listing capabilities
+
+OpenAI-format `GET /v1/models` items keep the standard `id`, `object`,
+`created`, and `owned_by` fields and add accepted model metadata:
+
+```json
+{
+  "id": "claude-sonnet-5",
+  "object": "model",
+  "owned_by": "kinetix",
+  "context_window": 200000,
+  "capabilities": {
+    "tools": true,
+    "images": true,
+    "streaming": true,
+    "structured_output": false,
+    "thinking": {"modes": ["off", "adaptive"], "levels": ["low", "medium", "high"]}
+  },
+  "kinetix": {
+    "state": "accepted",
+    "transport": "anthropic",
+    "provenance": {"context_window": "models.dev", "thinking": "operator", "transport": "provider"}
+  }
+}
+```
+
+- Values come from accepted, effective model state only. Raw discovery
+  observations stay on the admin API ([model-state.md](model-state.md)).
+- Unknown values are omitted, never guessed. `streaming` is always `true`:
+  Kinetix serves streaming requests for every listed model.
+- `thinking.modes` uses `off`, `on`, `level`, `budget`, and `adaptive`.
+- A Route reports the intersection of the targets the key can reach: a
+  capability is `true` only when every target supports it and `false` when any
+  target lacks it. Context and output limits are the smallest target limit.
+  `transport` and provenance entries appear only when all targets agree.
+- `transport` is `openai`, `openai-responses`, `anthropic`, `gemini`, or
+  `plugin`. Provenance is `operator`, `models.dev`, `provider`, `plugin`, or
+  `probe`.
+- Anthropic-format listings keep the native shape without these fields.
+
 ## Field-level v1 contract
 
 The generated field matrix lives at

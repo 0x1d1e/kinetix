@@ -18428,7 +18428,12 @@ mod reasoning_discovery_control_plane_tests {
             .unwrap();
         assert!(listed.get("context_window").is_none());
         assert!(listed.get("max_output_tokens").is_none());
-        assert_eq!(listed["capabilities"], json!({"structured_output": true}));
+        // Unknown tools/images/thinking stay omitted; streaming is a gateway
+        // guarantee.
+        assert_eq!(
+            listed["capabilities"],
+            json!({"structured_output": true, "streaming": true})
+        );
 
         let raw_capabilities = serde_json::from_str::<Value>(&row.capabilities).unwrap();
         let caps = row.caps();

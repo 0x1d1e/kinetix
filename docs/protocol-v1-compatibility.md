@@ -102,6 +102,7 @@ not a claim that every field of every upstream vendor API is implemented.
 | authentication | virtual key required | same | Visibility is filtered by the caller's virtual key. | `models.visible` |
 | model ids | provider models + aliases + routes | same | Returns client-visible selectors, not serving account identities. | `models.visible` |
 | object shape | OpenAI-compatible list | same | Used by compatible clients for discovery. | `models.visible` |
+| capabilities / kinetix metadata | accepted state only; Routes report the target intersection | Anthropic format: not listed | OpenAI-format items add `capabilities` (`tools`, `images`, `streaming`, `structured_output`, `thinking`) and `kinetix` (`state`, `transport`, `provenance`). Unknown values are omitted; raw observations stay admin-only. | `models.visible` |
 
 ## Plugin adapter contract
 

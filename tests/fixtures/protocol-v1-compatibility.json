@@ -1015,6 +1015,15 @@
           [
             "models.visible"
           ]
+        ],
+        [
+          "capabilities / kinetix metadata",
+          "accepted state only; Routes report the target intersection",
+          "Anthropic format: not listed",
+          "OpenAI-format items add `capabilities` (`tools`, `images`, `streaming`, `structured_output`, `thinking`) and `kinetix` (`state`, `transport`, `provenance`). Unknown values are omitted; raw observations stay admin-only.",
+          [
+            "models.visible"
+          ]
         ]
       ]
     },
