@@ -402,6 +402,10 @@ fn shared_thinking(targets: &[RuntimeModel]) -> Option<ThinkingSupport> {
         shared.modes.retain(|mode| other.modes.contains(mode));
         shared.levels.retain(|level| other.levels.contains(level));
     }
+    // A levelled mode with no common level has no value every target accepts.
+    if shared.levels.is_empty() {
+        shared.modes.retain(|mode| mode != "level");
+    }
     // Effort levels only apply to a shared levelled mode.
     if shared
         .modes
@@ -970,6 +974,43 @@ mod tests {
             })
         );
         assert_eq!(listed(&body, "tools-model")["capabilities"]["tools"], true);
+    }
+
+    #[tokio::test]
+    async fn route_listing_drops_level_mode_without_a_shared_level() {
+        let level_model = |levels: Value| {
+            json!({
+                "context_window": 100_000,
+                "reasoning_capability": {"mode": "level", "levels": levels},
+                "operator_capability_overrides": {}
+            })
+        };
+        let (registry, _, _) = listing_registry(&[
+            (
+                "low-model",
+                json!({"text": true, "reasoning": true}),
+                level_model(json!(["low"])),
+            ),
+            (
+                "high-model",
+                json!({"text": true, "reasoning": true}),
+                level_model(json!(["high"])),
+            ),
+        ])
+        .await;
+        let body = models_body(FrontendFormat::OpenAi, &registry, &["*".into()], &[]);
+        assert_eq!(
+            listed(&body, "low-model")["capabilities"]["thinking"],
+            json!({"modes": ["level"], "levels": ["low"]})
+        );
+        // Both targets are levelled but share no level: no thinking value is
+        // executable on every target, so the Route advertises none.
+        let route = listed(&body, "listing-route");
+        assert!(
+            route["capabilities"].get("thinking").is_none(),
+            "{}",
+            route["capabilities"]
+        );
     }
 
     #[tokio::test]
