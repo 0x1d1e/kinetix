@@ -78,8 +78,8 @@ Applies to SIGTERM / Ctrl-C (`src/server.rs`, `src/process.rs`). Grace period:
 1. Stop accepting connections. Background loops stop at their next tick; an
    iteration already running finishes. New plugin hook jobs are refused.
 2. Drain in-flight requests, committed streams, background iterations, and
-   tracked flights (hook jobs, coalesced provider work) until the grace
-   period ends.
+   tracked flights (hook jobs, coalesced provider work), including flights
+   requests start while draining, until the grace period ends.
 3. At the deadline, cancel what remains. Uncommitted requests cancel their
    upstream calls and record cancellation accounting. Committed streams end
    with an explicit error. Remaining tracked work is dropped, with 2s to

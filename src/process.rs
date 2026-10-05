@@ -15,9 +15,15 @@
 //! fires the abort token, which drops every remaining tracked future (and
 //! with it any plugin invocation or upstream call it owns) and also cancels
 //! client requests still in flight.
+//!
+//! Requests may start owned and tracked flights while they drain, so the
+//! flight set is sealed only by [`ProcessLifecycle::drain_flights`], after
+//! request handlers are quiescent. Closing a `TaskTracker` does not stop
+//! spawns, and its `wait` resolves whenever a closed tracker is momentarily
+//! empty; sealing earlier would let a late flight escape the drain.
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::time::{Instant, Interval};
@@ -38,6 +44,9 @@ struct Inner {
     aborting: CancellationToken,
     background: TaskTracker,
     flights: TaskTracker,
+    /// Set by [`ProcessLifecycle::drain_flights`]. Spawns hold the read lock
+    /// across the check and the spawn so none can slip past the seal.
+    flights_sealed: RwLock<bool>,
 }
 
 /// How the tracked work ended during [`ProcessLifecycle::drain`].
@@ -107,12 +116,13 @@ impl ProcessLifecycle {
     /// Spawn a flight a caller is already awaiting (for example coalesced
     /// provider work an in-flight request depends on). It is accepted during
     /// the drain so draining requests can finish, and aborted at the deadline.
+    /// Once the flight set is sealed the task is dropped unrun.
     pub fn spawn_owned<F>(&self, task: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let aborting = self.inner.aborting.clone();
-        self.inner.flights.spawn(async move {
+        self.spawn_unsealed(async move {
             tokio::select! {
                 biased;
                 _ = aborting.cancelled() => {}
@@ -123,11 +133,28 @@ impl ProcessLifecycle {
 
     /// Spawn a flight that must observe [`Self::abort_token`] itself so it can
     /// finish cleanly (for example finalize accounting) when aborted. It is
-    /// tracked by the drain but not dropped at the deadline.
+    /// tracked by the drain but not dropped at the deadline. Once the flight
+    /// set is sealed the task is dropped unrun.
     pub fn spawn_tracked<F>(&self, task: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.spawn_unsealed(task);
+    }
+
+    fn spawn_unsealed<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let sealed = self
+            .inner
+            .flights_sealed
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *sealed {
+            tracing::warn!("flight spawned after shutdown sealed flights; dropping it");
+            return;
+        }
         self.inner.flights.spawn(task);
     }
 
@@ -162,11 +189,11 @@ impl ProcessLifecycle {
     }
 
     /// Stop scheduling: background loops exit at their next tick and new hook
-    /// flights are refused.
+    /// flights are refused. Owned and tracked flights stay accepted until
+    /// [`Self::drain_flights`] seals them.
     pub fn begin_shutdown(&self) {
         self.inner.stopping.cancel();
         self.inner.background.close();
-        self.inner.flights.close();
     }
 
     /// Fire the abort token immediately, cancelling in-flight client requests
@@ -180,25 +207,56 @@ impl ProcessLifecycle {
         self.inner.background.len() + self.inner.flights.len()
     }
 
-    /// Wait for tracked work until `deadline`, then abort the rest and give it
-    /// [`ABORT_UNWIND`] to unwind. Call after [`Self::begin_shutdown`].
+    /// Drain background loops, then seal and drain flights. Only for callers
+    /// with no request handlers left that could spawn flights; a server
+    /// drains requests alongside [`Self::drain_background`] and calls
+    /// [`Self::drain_flights`] afterwards.
     pub async fn drain(&self, deadline: Instant) -> DrainOutcome {
-        let wait = async {
-            self.inner.background.wait().await;
-            self.inner.flights.wait().await;
-        };
-        if tokio::time::timeout_at(deadline, wait).await.is_ok() {
+        let background = self.drain_background(deadline).await;
+        let flights = self.drain_flights(deadline).await;
+        if background == DrainOutcome::Aborted || flights == DrainOutcome::Aborted {
+            DrainOutcome::Aborted
+        } else {
+            DrainOutcome::Drained
+        }
+    }
+
+    /// Wait for background loops until `deadline`, then abort. Call after
+    /// [`Self::begin_shutdown`].
+    pub async fn drain_background(&self, deadline: Instant) -> DrainOutcome {
+        self.wait_or_abort(&self.inner.background, deadline).await
+    }
+
+    /// Seal the flight set, then wait for it until `deadline` and abort the
+    /// rest. Call once nothing can start owned or tracked flights anymore,
+    /// i.e. after request handlers finished.
+    pub async fn drain_flights(&self, deadline: Instant) -> DrainOutcome {
+        *self
+            .inner
+            .flights_sealed
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.inner.flights.close();
+        self.wait_or_abort(&self.inner.flights, deadline).await
+    }
+
+    /// Wait for `tracker` until `deadline`, then abort the rest and give it
+    /// [`ABORT_UNWIND`] to unwind. `tracker` must already be closed.
+    async fn wait_or_abort(&self, tracker: &TaskTracker, deadline: Instant) -> DrainOutcome {
+        if tokio::time::timeout_at(deadline, tracker.wait())
+            .await
+            .is_ok()
+        {
             return DrainOutcome::Drained;
         }
         self.abort();
-        let wait = async {
-            self.inner.background.wait().await;
-            self.inner.flights.wait().await;
-        };
-        if tokio::time::timeout(ABORT_UNWIND, wait).await.is_err() {
+        if tokio::time::timeout(ABORT_UNWIND, tracker.wait())
+            .await
+            .is_err()
+        {
             tracing::warn!(
-                remaining = self.tracked_len(),
-                "tracked background work did not unwind after abort"
+                remaining = tracker.len(),
+                "tracked work did not unwind after abort"
             );
         }
         DrainOutcome::Aborted
@@ -292,5 +350,40 @@ mod tests {
             DrainOutcome::Drained
         );
         assert!(ran.load(Ordering::SeqCst));
+    }
+
+    /// A request still draining may start an owned flight after background
+    /// work already drained. The flight drain must still wait for it, and a
+    /// flight spawned after the seal must not run untracked.
+    #[tokio::test(start_paused = true)]
+    async fn owned_flight_spawned_after_empty_drain_is_still_tracked() {
+        let lifecycle = ProcessLifecycle::new();
+        lifecycle.begin_shutdown();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            lifecycle.drain_background(deadline).await,
+            DrainOutcome::Drained
+        );
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_flag = finished.clone();
+        lifecycle.spawn_owned(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            finished_flag.store(true, Ordering::SeqCst);
+        });
+        assert_eq!(
+            lifecycle.drain_flights(deadline).await,
+            DrainOutcome::Drained
+        );
+        assert!(finished.load(Ordering::SeqCst));
+
+        let late = Arc::new(AtomicBool::new(false));
+        let late_flag = late.clone();
+        lifecycle.spawn_owned(async move {
+            late_flag.store(true, Ordering::SeqCst);
+        });
+        tokio::task::yield_now().await;
+        assert!(!late.load(Ordering::SeqCst));
+        assert_eq!(lifecycle.tracked_len(), 0);
     }
 }

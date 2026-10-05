@@ -362,8 +362,8 @@ impl ShutdownResources {
 /// (`docs/guarantees.md`):
 ///
 /// 1. stop accepting connections and stop scheduling background work;
-/// 2. drain in-flight requests, committed streams, background iterations, and
-///    tracked flights until `grace` elapses;
+/// 2. drain in-flight requests, committed streams, and background iterations,
+///    then the tracked flights they started, until `grace` elapses;
 /// 3. at the deadline fire the abort token: uncommitted requests are cancelled
 ///    (cancelling their upstream calls and recording cancellation accounting),
 ///    committed streams end with an explicit error, and remaining tracked
@@ -445,8 +445,14 @@ where
             }
         }
     };
-    let (server_result, background) = tokio::join!(server_drain, lifecycle.drain(deadline));
-    if background == crate::process::DrainOutcome::Aborted {
+    let (server_result, background) =
+        tokio::join!(server_drain, lifecycle.drain_background(deadline));
+    // Requests may start flights until they finish, so flights are sealed and
+    // drained only once the server stopped serving.
+    let flights = lifecycle.drain_flights(deadline).await;
+    if background == crate::process::DrainOutcome::Aborted
+        || flights == crate::process::DrainOutcome::Aborted
+    {
         tracing::warn!("background work aborted at the shutdown deadline");
     }
 
@@ -1428,6 +1434,83 @@ mod tests {
         assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
 
         request_task.abort();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A request finishing during the drain may leave an owned flight running
+    /// (coalesced provider work its caller stopped waiting for). Shutdown must
+    /// wait for that flight before flushing and closing, even though nothing
+    /// was tracked when the drain began.
+    #[tokio::test]
+    async fn shutdown_waits_for_flights_started_by_draining_requests() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (store, root) = test_store().await;
+        let resources = ShutdownResources::for_opaque_state(store);
+        let lifecycle = resources.lifecycle.clone();
+        let (request_started_tx, request_started_rx) = oneshot::channel::<()>();
+        let request_started_tx = Arc::new(Mutex::new(Some(request_started_tx)));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let app = Router::new().route(
+            "/work",
+            get({
+                let lifecycle = lifecycle.clone();
+                let finished = finished.clone();
+                move || {
+                    let lifecycle = lifecycle.clone();
+                    let finished = finished.clone();
+                    let request_started_tx = request_started_tx.clone();
+                    async move {
+                        if let Some(tx) = request_started_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        // Start the flight only once shutdown is under way.
+                        lifecycle.stopping().await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        lifecycle.spawn_owned(async move {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                        });
+                        "done"
+                    }
+                }
+            }),
+        );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server_task = tokio::spawn(serve_with_shutdown(
+            listener,
+            app,
+            Duration::from_secs(5),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            resources,
+        ));
+        let request_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .get(format!("http://{addr}/work"))
+                .send()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), request_started_rx)
+            .await
+            .expect("request never reached the handler")
+            .expect("request-start signal sender dropped");
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("shutdown should finish within the grace period")
+            .expect("server task panicked")
+            .expect("server returned an error");
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "shutdown returned before a flight started during the drain finished"
+        );
+
+        let _ = request_task.await;
         let _ = std::fs::remove_dir_all(&root);
     }
 
