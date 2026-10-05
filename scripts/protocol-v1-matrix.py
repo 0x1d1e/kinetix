@@ -124,6 +124,15 @@ def chat_payload(model, marker="fixture:chat-fields fixture:vision fixture:think
     }
     if stream:
         payload["stream_options"] = {"include_usage": True}
+    return without_unhonored_anthropic_params(payload)
+
+
+def without_unhonored_anthropic_params(payload):
+    # Anthropic has no seed or sampling penalties; sending them is a 400
+    # (translate.target_fields.policy), so all-fields payloads omit them.
+    if "anthropic" in payload["model"]:
+        for key in ("seed", "presence_penalty", "frequency_penalty"):
+            payload.pop(key, None)
     return payload
 
 
@@ -154,7 +163,7 @@ def messages_payload(model, marker="fixture:messages-fields fixture:vision fixtu
 
 
 def responses_payload(model, marker="fixture:responses-fields fixture:vision fixture:thinking", stream=True):
-    return {
+    return without_unhonored_anthropic_params({
         "model": model,
         "stream": stream,
         "instructions": "fixture:responses-instructions",
@@ -179,7 +188,7 @@ def responses_payload(model, marker="fixture:responses-fields fixture:vision fix
             {"type": "function", "name": "read_file", "description": "read", "parameters": {"type": "object"}},
         ],
         "tool_choice": "required",
-    }
+    })
 
 def chat_tool_identity(events):
     names = set()
@@ -851,6 +860,44 @@ def run_http_case(case_id):
             need(status == 200, f"{label}: same-format passthrough failed: {status}: {body}")
         translated = {"model": translated_model, "messages": [{"role": "user", "content": "translated"}]}
         expect_rejected("/v1/chat/completions", translated, variants, expected_status=400)
+        return
+
+    if case_id == "translate.target_fields.policy":
+        # Fields outside the canonical request must be honored by the target or
+        # refused (400); never silently dropped on a translating path.
+        chat = {"model": "syn-anthropic", "stream": False, "messages": [{"role": "user", "content": "translated"}]}
+        expect_rejected("/v1/chat/completions", chat, [
+            ("seed", {"seed": 7}),
+            ("presence_penalty", {"presence_penalty": 0.5}),
+            ("service_tier", {"service_tier": "flex"}),
+            ("logit_bias", {"logit_bias": {"50256": -100}}),
+            ("verbosity", {"verbosity": "low"}),
+            ("web_search_options", {"web_search_options": {}}),
+            ("store", {"store": True}),
+            ("unknown field", {"future_semantics": {"enabled": True}}),
+        ], expected_status=400)
+        gemini_chat = dict(chat, model="syn-gemini-3")
+        expect_rejected("/v1/chat/completions", gemini_chat, [
+            ("user", {"user": "end-user-1"}),
+            ("parallel_tool_calls", {"parallel_tool_calls": False}),
+        ], expected_status=400)
+        messages = {"model": "syn-openai", "stream": False, "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "translated"}]}
+        expect_rejected("/v1/messages", messages, [
+            ("service_tier", {"service_tier": "auto"}),
+            ("container", {"container": "container_1"}),
+            ("unknown field", {"future_semantics": {"enabled": True}}),
+        ], expected_status=400)
+        expect_rejected("/v1/messages", dict(messages, model="syn-gemini-3"), [
+            ("metadata.user_id", {"metadata": {"user_id": "end-user-1"}}),
+        ], expected_status=400)
+        for path, payload in [
+            ("/v1/chat/completions", dict(chat, user="end-user-1", parallel_tool_calls=True, prompt_cache_key="pck-1")),
+            ("/v1/chat/completions", dict(chat, model="syn-gemini-3", presence_penalty=0.5, frequency_penalty=0.5)),
+            ("/v1/messages", dict(messages, metadata={"user_id": "end-user-1"})),
+        ]:
+            status, _, body = request(path, payload)
+            need(status == 200, f"{path} {payload['model']}: honored fields refused: {status}: {body}")
         return
 
     if case_id == "responses.unsupported_fields.reject":

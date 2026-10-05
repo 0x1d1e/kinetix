@@ -35,11 +35,8 @@ CI fails when:
 2. Add a `fields[]` entry with a `sample` and an `outbound` disposition for every transport.
 3. Run `cargo test --test field_contract`.
 
-## Known gaps
+## Per-target field policy
 
-Entries whose note starts with `gap:` are `consumed` only because the default compatibility policy silently drops them today. They record current behavior, not endorsement. Each should become `translated` or `rejected` (or get a documented policy) in follow-ups, notably:
+The harness runs `apply_target_field_policy` (`src/frontends/mod.rs`) on every translating path, so fixtures assert runtime behavior: a field the target cannot honor is `rejected` (400), including unknown fields. No field is silently consumed unless it is a target default (e.g. `parallel_tool_calls: true`), internal-only (e.g. `prompt_cache_key` as Route cache-affinity key), or neutralized by another rule (e.g. `metadata` with `store` never true).
 
-- `seed`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `parallel_tool_calls`, `verbosity`, `service_tier`, `prompt_cache_key`, `web_search_options` when going to transports without an equivalent;
-- Anthropic `mcp_servers`, `container`, `context_management`, `service_tier` to other transports.
-
-Changing a gap's runtime behavior means flipping its fixture entry in the same PR.
+Operators can opt into removal per model with a parameter policy `{"<field>": {"supported": false, "policy": "drop"}}`. Dropped fields are logged and recorded in the Route trace. `operator_drop_policy_strips_unhonored_fields_instead_of_rejecting` covers this.

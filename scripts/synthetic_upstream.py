@@ -153,7 +153,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if "/gemini/" in self.path:
             if _fixture(req, "chat-fields"):
-                required = {"temperature", "topP", "topK", "maxOutputTokens", "stopSequences", "seed", "toolConfig", "thinkingConfig"}
+                required = {"temperature", "topP", "topK", "maxOutputTokens", "stopSequences", "seed", "presencePenalty", "frequencyPenalty", "toolConfig", "thinkingConfig"}
                 missing = sorted(key for key in required if not _contains_key(req, {key}))
                 if missing:
                     self._json(400, {"error": {"message": f"chat field semantics missing: {missing}"}})
@@ -165,7 +165,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(400, {"error": {"message": f"messages field semantics missing: {missing}"}})
                     return
             if _fixture(req, "responses-fields"):
-                required = {"systemInstruction", "temperature", "topP", "topK", "maxOutputTokens", "toolConfig", "thinkingConfig"}
+                required = {"systemInstruction", "temperature", "topP", "topK", "maxOutputTokens", "presencePenalty", "frequencyPenalty", "toolConfig", "thinkingConfig"}
                 missing = sorted(key for key in required if not _contains_key(req, {key}))
                 if missing:
                     self._json(400, {"error": {"message": f"responses field semantics missing: {missing}"}})

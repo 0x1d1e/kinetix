@@ -261,6 +261,38 @@ def test_pi_session_affinity(_upstream_model):
     )
 
 
+def test_prompt_cache_key_affinity(_upstream_model):
+    # prompt_cache_key alone (no session headers) is the cache-affinity key on
+    # a translated path; round-robin would otherwise alternate targets.
+    t0 = time.time()
+    cache_key = f"pck_{time.time_ns()}"
+    candidates = ("syn-anthropic-a", "syn-anthropic-b")
+    targets = []
+    for _ in range(4):
+        payload = {
+            "model": "syn-sticky-anthropic",
+            "stream": False,
+            "messages": [{"role": "user", "content": "cache affinity"}],
+            "prompt_cache_key": cache_key,
+        }
+        req = urllib.request.Request(
+            f"{BASE_URL}/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+        )
+        with urlopen(req, timeout=15) as resp:
+            targets.append(_target_marker(json.loads(resp.read().decode()), candidates))
+    passed = targets[0] is not None and len(set(targets)) == 1
+    record_result(
+        "Pi (OpenAI Chat)",
+        "syn-sticky-anthropic",
+        "prompt_cache_key_affinity",
+        passed,
+        " -> ".join(str(t) for t in targets),
+        int((time.time() - t0) * 1000),
+    )
+
+
 def test_pi_sync_aggregation(upstream_model):
     t0 = time.time()
     url = f"{BASE_URL}/v1/chat/completions"
@@ -901,7 +933,8 @@ def test_pi_fallback_stream():
     record_result("Pi (OpenAI Chat)", "syn-fallback", "fallback_stream", passed, f"header={fallback}", int((time.time()-t0)*1000))
 
 
-def test_unknown_client_field_is_dropped(upstream_model):
+def test_unknown_client_field_is_rejected(upstream_model):
+    # A translating path never silently drops a field it cannot honor.
     t0 = time.time()
     payload = {
         "model": upstream_model,
@@ -914,10 +947,13 @@ def test_unknown_client_field_is_dropped(upstream_model):
         data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json", "User-Agent": "pi (linux; x86_64)"},
     )
-    with urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode())
-    passed = bool(data.get("choices"))
-    record_result("Pi (OpenAI Chat)", upstream_model, "unknown_fields", passed, "not leaked to Gemini", int((time.time()-t0)*1000))
+    try:
+        urllib.request.urlopen(req, timeout=15)
+        status, body = 200, ""
+    except urllib.error.HTTPError as error:
+        status, body = error.code, error.read().decode()
+    passed = status == 400 and "client_only_unknown" in body
+    record_result("Pi (OpenAI Chat)", upstream_model, "unknown_fields", passed, f"HTTP {status}", int((time.time()-t0)*1000))
 
 
 def test_route_fallback():
@@ -1150,6 +1186,7 @@ def run_matrix():
     test_pi_tool_use("syn-openai")
     test_pi_multi_turn("syn-openai")
     test_pi_session_affinity("syn-openai")
+    test_prompt_cache_key_affinity("syn-openai")
     test_pi_openrouter_affinity("syn-openai")
     test_pi_sync_aggregation("syn-openai")
     test_openai_truncated_passthrough_identity()
@@ -1160,7 +1197,7 @@ def run_matrix():
     test_pi_parallel_tools("syn-gemini-3")
     test_pi_vision("syn-gemini-3")
     test_pi_thinking("syn-gemini-3")
-    test_unknown_client_field_is_dropped("syn-gemini-3")
+    test_unknown_client_field_is_rejected("syn-gemini-3")
     test_route_fallback()
 
     # Pi acceptance profile (#201 tier 1): the request shapes Pi really sends,

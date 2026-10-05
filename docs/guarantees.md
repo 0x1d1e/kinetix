@@ -97,12 +97,13 @@ one that behaves differently from its declaration, fails CI. See
 [field-contract.md](field-contract.md) and the generated
 [compatibility matrix](generated/compatibility-matrix.md).
 
-Fields that change the output contract (for example structured
-`response_format`, `n`, `logprobs`) are rejected when a translating path
-cannot honor them. Advisory fields with no target equivalent (sampling
-penalties, `seed`, `service_tier`, ...) are consumed under a documented
-compatibility policy: each is marked `gap:` in the field-contract fixtures and
-listed in [Known gaps](field-contract.md#known-gaps).
+On translating paths, a field the selected target cannot honor (no
+equivalent wire field, or a value it cannot express) is rejected with 400
+before any upstream call, and the request is never retried on another target.
+Unknown client fields are rejected the same way. An operator may opt a field
+into silent removal by setting its model parameter policy to `drop` (any field
+name, including non-canonical ones); each drop is logged and recorded in the
+Route trace. Same-format passthrough forwards the client body unchanged.
 
 ## Demand-driven work
 

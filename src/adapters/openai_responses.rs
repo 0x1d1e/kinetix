@@ -605,9 +605,26 @@ impl Adapter for OpenAiResponsesAdapter {
         if let Some(key) = req.extra.get("prompt_cache_key").and_then(Value::as_str) {
             body.insert("prompt_cache_key".into(), json!(key));
         }
+        // Non-canonical Chat fields admitted by the target field policy
+        // (`frontends::apply_target_field_policy`).
+        for key in ["user", "service_tier"] {
+            if let Some(value) = req.extra.get(key).filter(|v| !v.is_null()) {
+                body.insert(key.into(), value.clone());
+            }
+        }
+        if let Some(verbosity) = req.extra.get("verbosity").filter(|v| !v.is_null()) {
+            body.insert("text".into(), json!({ "verbosity": verbosity }));
+        }
 
         if let Some(tools) = Self::build_tools(req) {
             body.insert("tools".into(), tools);
+            if let Some(value) = req
+                .extra
+                .get("parallel_tool_calls")
+                .filter(|v| v.is_boolean())
+            {
+                body.insert("parallel_tool_calls".into(), value.clone());
+            }
         }
         if let Some(choice) = Self::build_tool_choice(req)? {
             body.insert("tool_choice".into(), choice);

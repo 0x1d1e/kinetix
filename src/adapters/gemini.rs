@@ -160,6 +160,18 @@ impl GeminiAdapter {
         );
         put_number("top_p", "topP", req.params.top_p, &mut cfg);
         put_number("top_k", "topK", req.params.top_k, &mut cfg);
+        put_number(
+            "presence_penalty",
+            "presencePenalty",
+            req.params.presence_penalty,
+            &mut cfg,
+        );
+        put_number(
+            "frequency_penalty",
+            "frequencyPenalty",
+            req.params.frequency_penalty,
+            &mut cfg,
+        );
 
         // max output tokens: clamp to model max if configured.
         if let Some(mt) = req.params.max_tokens {

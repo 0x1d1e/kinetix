@@ -61,7 +61,10 @@ response-object/storage semantics continue to fail closed.
 - **Parameters** (`temperature`, `top_p`, `top_k`, …) each carry a policy
   (`forward` / `clamp` / `reject` / `drop`) and optional min/max/default. A
   configured default is applied when the client omits the field; a client value
-  always wins.
+  always wins. On translating paths, a client field the target cannot honor
+  (including unknown fields) is rejected with 400 unless the model sets its
+  policy to `drop`, which works for any field name; drops are logged and shown
+  in the Route trace.
 - **Prices** are per-1M-token input/output/cached/thinking. Missing prices mean
   cost is **unknown**, never zero.
 

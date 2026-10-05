@@ -224,6 +224,11 @@
       "summary": "Chat n/logprobs/json_schema/audio/prediction pass through same-format OpenAI and are rejected on Anthropic translation"
     },
     {
+      "id": "translate.target_fields.policy",
+      "runner": "http",
+      "summary": "Non-canonical fields the translated target cannot honor (seed, penalties, service_tier, identity hints, unknown) are rejected; honored ones are translated"
+    },
+    {
       "id": "responses.unsupported_fields.reject",
       "runner": "http",
       "summary": "Every documented unsupported Responses semantic is explicitly rejected"
@@ -467,11 +472,12 @@
         [
           "stop / seed / presence_penalty / frequency_penalty",
           "passthrough",
-          "translated where the selected adapter has a canonical wire mapping",
-          "The positive fixture sends all four; Gemini proves stop/seed while same-format OpenAI preserves penalties.",
+          "translated where the target has a mapping; otherwise rejected (400) unless the model's parameter policy is drop",
+          "Gemini proves stop/seed/penalties; Anthropic has no seed or penalties and refuses them; same-format OpenAI preserves all four.",
           [
             "chat.native.openai.sync",
-            "chat.translate.gemini.sync"
+            "chat.translate.gemini.sync",
+            "translate.target_fields.policy"
           ]
         ],
         [
@@ -578,12 +584,23 @@
           ]
         ],
         [
+          "user / parallel_tool_calls / service_tier / verbosity / logit_bias / web_search_options / store / prompt_cache_key",
+          "passthrough",
+          "translated where the target has an official equivalent; otherwise rejected (400) unless the model's parameter policy is drop",
+          "user -> Responses user / Anthropic metadata.user_id; parallel_tool_calls:false -> Anthropic disable_parallel_tool_use; verbosity -> Responses text.verbosity; store:true is refused; prompt_cache_key also drives Route cache affinity.",
+          [
+            "translate.target_fields.policy",
+            "field_contract.dispositions"
+          ]
+        ],
+        [
           "unknown/provider-specific top-level fields",
           "passthrough verbatim",
-          "not guaranteed; cosmetic unknowns may be ignored",
+          "rejected (400) unless the model's parameter policy for that name is drop",
           "Use a same-format provider when vendor extensions are required.",
           [
-            "chat.native.openai.provider_extensions"
+            "chat.native.openai.provider_extensions",
+            "translate.target_fields.policy"
           ]
         ]
       ]
@@ -728,12 +745,13 @@
           ]
         ],
         [
-          "unknown/provider-specific fields",
+          "unknown/provider-specific fields (service_tier, mcp_servers, container, context_management, ...)",
           "passthrough verbatim",
-          "not guaranteed",
+          "rejected (400) unless the model's parameter policy for that name is drop; metadata.user_id -> OpenAI user",
           "Same-format passthrough is the extension-preserving path.",
           [
-            "messages.native.anthropic.provider_extensions"
+            "messages.native.anthropic.provider_extensions",
+            "translate.target_fields.policy"
           ]
         ]
       ]
@@ -915,8 +933,8 @@
         [
           "prompt_cache_key",
           "preserved",
-          "portable hint where target supports it",
-          "Preserved as a canonical extension.",
+          "forwarded to OpenAI targets; Route cache-affinity key everywhere",
+          "Namespaced per virtual key; used only for Route affinity, never for continuation provenance.",
           [
             "responses.native.openai.sync",
             "responses.translate.openai.sync"

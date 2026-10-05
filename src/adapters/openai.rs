@@ -340,6 +340,29 @@ impl Adapter for OpenAiAdapter {
             body.entry("prompt_cache_key".to_string())
                 .or_insert_with(|| json!(key));
         }
+        // Non-canonical Chat fields admitted by the target field policy
+        // (`frontends::apply_target_field_policy`) map 1:1 onto this wire.
+        for key in [
+            "user",
+            "service_tier",
+            "verbosity",
+            "logit_bias",
+            "web_search_options",
+        ] {
+            if let Some(value) = req.extra.get(key).filter(|v| !v.is_null()) {
+                body.insert(key.to_string(), value.clone());
+            }
+        }
+        // OpenAI only accepts `parallel_tool_calls` alongside `tools`.
+        if !req.tools.is_empty() {
+            if let Some(value) = req
+                .extra
+                .get("parallel_tool_calls")
+                .filter(|v| v.is_boolean())
+            {
+                body.insert("parallel_tool_calls".to_string(), value.clone());
+            }
+        }
         if let Some(tools) = Self::build_tools(req) {
             body.insert("tools".to_string(), tools);
         }

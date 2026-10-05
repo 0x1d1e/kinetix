@@ -109,6 +109,9 @@ pub struct RequestMeta {
     pub cache_status: &'static str,
     pub commit_state: &'static str,
     pub session: Option<String>,
+    /// Routing-only affinity key derived from the client's `prompt_cache_key`
+    /// (namespaced per virtual key). Never used for opaque-state provenance.
+    pub cache_affinity_key: Option<String>,
     /// Atomic RPM/TPM/budget reservation owned by this request. A dispatched
     /// failure or disconnect reconciles it as incomplete instead of canceling it.
     pub admission: Option<crate::admission::AdmissionReservation>,
@@ -154,6 +157,7 @@ impl RequestMeta {
             cache_status: "bypass",
             commit_state: "",
             session: None,
+            cache_affinity_key: None,
             admission: None,
             concurrency: None,
             partial_attempts: Vec::new(),
@@ -710,6 +714,7 @@ pub(crate) async fn run_with_disconnect(
         allow_fallback,
     );
     meta.session = session.clone();
+    meta.cache_affinity_key = cache_affinity_key(key.as_ref(), &req);
     meta.client_disconnect = client_disconnect;
     meta.log_queue = Some(state.log_queue.clone());
     meta.admission = admission;
@@ -1023,7 +1028,13 @@ pub(crate) async fn run_with_disconnect(
     // The shared planner owns affinity promotion as well as the ordered
     // pre-dispatch frontier. Runtime supplies its realized strategy order and
     // executes the resulting candidate plan.
-    let affinity_candidate_id = match (route.as_ref(), session_origin_key.as_ref()) {
+    // Affinity prefers the explicit session, then the client's prompt-cache key.
+    let affinity_key = session_origin_key.clone().or_else(|| {
+        meta.cache_affinity_key
+            .as_deref()
+            .and_then(|key| state.sticky_lookup(key, STICKY_TTL))
+    });
+    let affinity_candidate_id = match (route.as_ref(), affinity_key.as_ref()) {
         (Some(route), Some(sticky_key))
             if route.cache_affinity != 0 || route.sticky_routing != 0 =>
         {
@@ -1625,6 +1636,39 @@ pub(crate) async fn run_with_disconnect(
                 )
                 .await);
             }
+            match crate::frontends::apply_target_field_policy(
+                format,
+                &profile.transport,
+                &mut target_req,
+                &profile.parameters,
+            ) {
+                Ok(dropped) if !dropped.is_empty() => {
+                    let dropped = dropped.join(", ");
+                    tracing::info!(
+                        request_id = %meta.request_id,
+                        model = %target.model.display_name,
+                        dropped = %dropped,
+                        "dropped client fields under operator 'drop' parameter policy"
+                    );
+                    trace.step(
+                        "candidate",
+                        Some(target.account.label.clone()),
+                        format!("dropped fields under operator 'drop' policy: {dropped}"),
+                    );
+                }
+                Ok(_) => {}
+                Err(msg) => {
+                    return Err(finish_policy_rejection(
+                        state,
+                        &meta,
+                        &mut trace,
+                        Some(target.account.label.clone()),
+                        msg,
+                        started,
+                    )
+                    .await);
+                }
+            }
             if let Err(error) = check_resolved_thinking_translation(
                 adapter.as_ref(),
                 &target.model.display_name,
@@ -1665,7 +1709,7 @@ pub(crate) async fn run_with_disconnect(
             let key = traffic_key(target);
             let affinity = route.as_ref().is_some_and(|route| {
                 (route.cache_affinity != 0 || route.sticky_routing != 0)
-                    && session_origin_key
+                    && affinity_key
                         .as_ref()
                         .is_some_and(|sticky| target_key(route, target) == *sticky)
             });
@@ -5374,6 +5418,19 @@ fn predicate_capabilities(
     (flags, Value::Object(raw))
 }
 
+/// Sticky-store key for a client `prompt_cache_key`. The control-character
+/// separators cannot occur in an HTTP session header, so the namespace never
+/// collides with explicit sessions; the virtual key keeps tenants apart.
+fn cache_affinity_key(key: Option<&db::VirtualKeyRow>, req: &InternalRequest) -> Option<String> {
+    const MAX_PROMPT_CACHE_KEY_LEN: usize = 256;
+    let value = req.extra.get("prompt_cache_key")?.as_str()?;
+    if value.is_empty() || value.len() > MAX_PROMPT_CACHE_KEY_LEN {
+        return None;
+    }
+    let tenant = key.map_or("", |key| key.id.as_str());
+    Some(format!("\u{1f}prompt_cache_key\u{1f}{tenant}\u{1f}{value}"))
+}
+
 fn check_param_policy(
     target: &ResolvedTarget,
     profile: &crate::adapters::ResolvedExecutionProfile,
@@ -7258,15 +7315,18 @@ async fn finalize_log(
     // Persist the successful session target for both affinity and opaque-state
     // provenance. Affinity only changes routing when its route switch is enabled;
     // provenance is read by FR-2.11 to identify first-attempt provider changes.
-    if let (Some(session), Some(route_id)) = (&meta.session, &meta.route_id) {
+    if let Some(route_id) = &meta.route_id {
         if snap.routes.contains_key(route_id) && status == "success" {
-            state.sticky_remember(
-                session,
-                format!(
-                    "{}|{}|{}",
-                    route_id, attempt.target.account.id, attempt.target.model.id
-                ),
+            let target_key = format!(
+                "{}|{}|{}",
+                route_id, attempt.target.account.id, attempt.target.model.id
             );
+            for key in [&meta.session, &meta.cache_affinity_key]
+                .into_iter()
+                .flatten()
+            {
+                state.sticky_remember(key, target_key.clone());
+            }
         }
     }
 

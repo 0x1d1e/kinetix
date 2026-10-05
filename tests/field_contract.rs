@@ -198,7 +198,7 @@ fn thinking_map(transport: &str) -> Value {
     }
 }
 
-fn model(transport: &str) -> ModelRow {
+fn model(transport: &str, parameters: &str) -> ModelRow {
     ModelRow {
         id: "m".into(),
         provider_id: "prov".into(),
@@ -209,7 +209,7 @@ fn model(transport: &str) -> ModelRow {
         max_output_tokens: None,
         capabilities: "{}".into(),
         prices: "{}".into(),
-        parameters: "{}".into(),
+        parameters: parameters.into(),
         thinking_map: thinking_map(transport).to_string(),
         extra_request: "{}".into(),
         discovery: "{}".into(),
@@ -228,6 +228,15 @@ enum Outcome {
 /// Mirror of the pipeline's per-target body construction: decode, translation
 /// gate, then the same `build_upstream_body` the dispatcher uses.
 fn run(format: FrontendFormat, transport_name: &str, client_body: &Value) -> Outcome {
+    run_with_parameters(format, transport_name, client_body, "{}")
+}
+
+fn run_with_parameters(
+    format: FrontendFormat,
+    transport_name: &str,
+    client_body: &Value,
+    parameters: &str,
+) -> Outcome {
     let transport = transport_of(transport_name);
     let mut req = match frontends::decode(format, client_body.clone()) {
         Ok(req) => req,
@@ -242,11 +251,19 @@ fn run(format: FrontendFormat, transport_name: &str, client_body: &Value) -> Out
             return Outcome::Rejected(message);
         }
     }
+    let model = model(transport_name, parameters);
+    if !use_passthrough {
+        if let Err(message) =
+            frontends::apply_target_field_policy(format, &transport, &mut req, &model.params())
+        {
+            return Outcome::Rejected(message);
+        }
+    }
     let wire = match &transport {
         TargetTransport::OpenAiChat | TargetTransport::OpenAiResponses => "openai",
         other => other.as_str(),
     };
-    let (provider, model) = (provider(wire), model(transport_name));
+    let provider = provider(wire);
     let ctx = UpstreamContext {
         provider: &provider,
         model: &model,
@@ -787,4 +804,47 @@ fn consumed_override_must_differ_from_sample() {
     .unwrap();
     assert!(wire_shape_errors(FieldDisposition::Consumed, &declared, &json!(false)).is_some());
     assert!(wire_shape_errors(FieldDisposition::Consumed, &declared, &json!(true)).is_none());
+}
+
+#[test]
+fn operator_drop_policy_strips_unhonored_fields_instead_of_rejecting() {
+    let base = load("openai-chat.json").base;
+    let mut body = base.clone();
+    body["seed"] = json!(424242);
+    body["service_tier"] = json!("tiermarker");
+    body["x_vendor_marker"] = json!("vendormarker");
+
+    // Default: refused, naming every unhonored field.
+    let Outcome::Rejected(message) = run(FrontendFormat::OpenAi, "anthropic", &body) else {
+        panic!("unhonored fields must be rejected by default");
+    };
+    for field in ["seed", "service_tier", "x_vendor_marker"] {
+        assert!(message.contains(field), "{message}");
+    }
+
+    // Operator opt-in `drop` for each name: dropped, never sent upstream.
+    let parameters = json!({
+        "seed": {"supported": false, "policy": "drop"},
+        "service_tier": {"supported": false, "policy": "drop"},
+        "x_vendor_marker": {"supported": false, "policy": "drop"},
+    })
+    .to_string();
+    let Outcome::Sent(sent) =
+        run_with_parameters(FrontendFormat::OpenAi, "anthropic", &body, &parameters)
+    else {
+        panic!("dropped fields must not reject the request");
+    };
+    for leaf in [json!(424242), json!("tiermarker"), json!("vendormarker")] {
+        assert!(!contains_leaf(&sent, &leaf), "{leaf} leaked: {sent}");
+    }
+
+    // A partial policy still refuses the remaining field.
+    let parameters = json!({"seed": {"supported": false, "policy": "drop"}}).to_string();
+    let Outcome::Rejected(message) =
+        run_with_parameters(FrontendFormat::OpenAi, "anthropic", &body, &parameters)
+    else {
+        panic!("fields without a drop policy must still be rejected");
+    };
+    assert!(!message.contains("'seed'"), "{message}");
+    assert!(message.contains("service_tier"), "{message}");
 }
