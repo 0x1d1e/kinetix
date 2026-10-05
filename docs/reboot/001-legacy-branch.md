@@ -1,6 +1,6 @@
 # 001: Cut legacy/v0.6 and announce the reboot
 
-Status: open
+Status: done
 Sequence step: 1 ([reboot.md](../reboot.md#sequence))
 Blocked by: none
 ADRs: [ADR-0001](../adr/0001-reboot-versioning.md)
@@ -21,5 +21,5 @@ Freeze the pre-reboot source so 0.6.x users have a reference and the reboot can 
 
 ## Acceptance
 
-- [ ] Both repos have `legacy/v0.6` pushed.
-- [ ] README notice merged in both repos.
+- [x] Both repos have `legacy/v0.6` pushed.
+- [x] README notice merged in both repos.
