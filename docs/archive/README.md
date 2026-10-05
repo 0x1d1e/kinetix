@@ -9,6 +9,6 @@ Do not update them to track current behavior.
 
 For the current architecture and terminology, use:
 - [docs/ARCHITECTURE.md](../ARCHITECTURE.md)
-- [docs/GLOSSARY.md](../GLOSSARY.md)
+- [CONTEXT.md](../../CONTEXT.md)
 - [AGENTS.md](../../AGENTS.md)
 - executable contracts, tests, and WIT

@@ -10,10 +10,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 REPO = "https://github.com/PrightCord/kinetix/blob/main/"
 PAGES = {
     "docs/ARCHITECTURE.md": "docs/wiki/Architecture.md",
-    "docs/GLOSSARY.md": "docs/wiki/Glossary.md",
+    "CONTEXT.md": "docs/wiki/Glossary.md",
 }
 LINKS = {
-    "GLOSSARY.md": "Glossary",
+    "../CONTEXT.md": "Glossary",
     "../AGENTS.md": REPO + "AGENTS.md",
     "../pi-warden.md": REPO + "pi-warden.md",
     "protocol-v1-compatibility.md": REPO + "docs/protocol-v1-compatibility.md",

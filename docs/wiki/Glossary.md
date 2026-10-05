@@ -1,4 +1,4 @@
-<!-- GENERATED from docs/GLOSSARY.md by scripts/render-doc-pages.py.
+<!-- GENERATED from CONTEXT.md by scripts/render-doc-pages.py.
      Edit the canonical docs file instead. -->
 
 # Kinetix glossary
@@ -95,7 +95,8 @@ LLM service. A Provider is not a wire format.
 ## Route
 
 A client-visible executable selector containing one or more Targets plus
-selection and fallback policy.
+selection and fallback policy. A Route selects Targets; it does not change wire
+semantics such as tool-schema mode, thinking mapping, or continuation behavior.
 
 ## Session Affinity
 
@@ -114,7 +115,9 @@ identity.
 ## Target
 
 One concrete candidate inside a Route. A Target identifies the configured
-model and Provider path that may be attempted.
+model and Provider path that may be attempted. Wire-semantic settings, such as
+tool-schema mode, are Target-owned: the Provider supplies the default and the
+Target may narrow or override it.
 
 ## Wire Format
 

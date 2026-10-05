@@ -74,7 +74,7 @@ Kinetix does not retry or fail over to another target.
 - **Plugin ABI:** `wit/`.
 - **Database history:** `migrations/`.
 - **Current executable behavior:** implementation and tests.
-- **Domain terminology:** [Glossary](GLOSSARY.md).
+- **Domain terminology:** [Glossary](../CONTEXT.md).
 - **Contributor invariants:** [`AGENTS.md`](../AGENTS.md).
 - **Agent enforcement:** [`pi-warden.md`](../pi-warden.md).
 

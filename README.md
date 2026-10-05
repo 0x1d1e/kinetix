@@ -11,6 +11,18 @@ Everything ships as a single Rust binary with an embedded admin dashboard.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Wiki](https://img.shields.io/badge/docs-wiki-blueviolet)](https://github.com/PrightCord/kinetix/wiki)
 
+> [!IMPORTANT]
+> **Kinetix is rebooting at 0.1.0.** Kinetix and kinetix-plugins will restart
+> together at 0.1.0 with breaking contract changes. When 0.1.0 ships, all
+> existing releases and tags (including 0.6.x) will be deleted. The pre-reboot
+> source will stay on the `legacy/v0.6` branch.
+>
+> - `kinetix update` on 0.6.x will not detect 0.1.0. Reinstall manually with
+>   `install.sh`.
+> - Plugin installs from 0.6.x will fail once the old release assets are gone.
+>
+> Plan: [docs/reboot.md](docs/reboot.md). Decision: [ADR-0001](docs/adr/0001-reboot-versioning.md).
+
 ## Why Kinetix?
 
 Coding agents and LLM clients usually expect one API endpoint. Real setups often involve multiple providers, accounts, subscriptions, models, quotas, and failure modes.
@@ -350,7 +362,7 @@ The [Kinetix Wiki](https://github.com/PrightCord/kinetix/wiki) contains the main
 Additional documentation:
 
 - [Architecture](docs/ARCHITECTURE.md)
-- [Glossary](docs/GLOSSARY.md)
+- [Glossary](CONTEXT.md)
 - [Protocol compatibility](docs/compatibility.md)
 - [Pi compatibility](docs/pi-compatibility.md)
 - [Operational guarantees](docs/guarantees.md)
