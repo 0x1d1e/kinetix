@@ -347,7 +347,7 @@ Integrations may declare `manual_credential` (a kind and named requirements) and
 
 Kinetix parses, validates, and retains these declarations; it does not apply their proposals. Enrollment, object persistence, permission approval, and traffic activation remain host-owned. Proposed routes target the provider account pool, not the initially proposed account. Runtime account selection remains unchanged.
 
-The proposed contract and planner live in [kinetix-plugins PR #78](https://github.com/PrightCord/kinetix-plugins/pull/78). The mirrored corpus at `wit/fixtures/plugin-manifest/v1/cases.json` is checked by both repositories; it covers native/anonymous providers, public parameters, legacy manifests, installation metadata, and invalid declarations. Keep the contract draft until both changes land.
+The proposed contract and planner live in [kinetix-plugins PR #78](https://github.com/0x1d1e/kinetix-plugins/pull/78). The mirrored corpus at `wit/fixtures/plugin-manifest/v1/cases.json` is checked by both repositories; it covers native/anonymous providers, public parameters, legacy manifests, installation metadata, and invalid declarations. Keep the contract draft until both changes land.
 
 ### Native dashboard actions
 
@@ -404,7 +404,7 @@ description = "Optional email address used as an OAuth login hint."
 
 ## Developing Plugins
 
-The official Rust SDK, first-party plugins, catalog source, and packaging tooling live in the separate [`PrightCord/kinetix-plugins`](https://github.com/PrightCord/kinetix-plugins) repository.
+The official Rust SDK, first-party plugins, catalog source, and packaging tooling live in the separate [`0x1d1e/kinetix-plugins`](https://github.com/0x1d1e/kinetix-plugins) repository.
 
 ### 1. Project Setup
 
@@ -444,7 +444,7 @@ export!(MyPlugin);
 
 ### 3. Build from `kinetix-plugins`
 
-From a checkout of `PrightCord/kinetix-plugins`, the build script compiles the crate for `wasm32-unknown-unknown`, converts it to a component using `wasm-tools`, validates WIT compliance, and packages the deterministic `.kxp` archive:
+From a checkout of `0x1d1e/kinetix-plugins`, the build script compiles the crate for `wasm32-unknown-unknown`, converts it to a component using `wasm-tools`, validates WIT compliance, and packages the deterministic `.kxp` archive:
 
 ```bash
 ./scripts/build-plugin.sh plugins/antigravity-oauth
@@ -471,7 +471,7 @@ operation. Plugins never receive filesystem access to this cache.
 
 ## Plugin Catalog
 
-The authoritative official catalog metadata lives in `PrightCord/kinetix-plugins/catalog.json`.
+The authoritative official catalog metadata lives in `0x1d1e/kinetix-plugins/catalog.json`.
 Kinetix vendors a default offline snapshot at `src/plugins/catalog.snapshot.json`, exposed through
 `GET /admin/api/plugins/catalog`. The catalog powers dashboard discovery, but it is deliberately
 **not** a trust root for package installation.
@@ -499,7 +499,7 @@ download URL or signing key.
 
 Generate the signing key offline and keep the private key out of the repository:
 
-Run publisher-key and package tooling from the `PrightCord/kinetix-plugins` checkout:
+Run publisher-key and package tooling from the `0x1d1e/kinetix-plugins` checkout:
 
 ```sh
 openssl genpkey -algorithm ED25519 -out kinetix-plugin-signing.pem

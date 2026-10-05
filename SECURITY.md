@@ -16,9 +16,9 @@ Only the latest release line receives active security updates and vulnerability 
 We take the security of Kinetix seriously. If you discover a vulnerability, please report it responsibly:
 
 1. **GitHub Security Advisory (Preferred)**:
-   Submit a private report via [GitHub Private Vulnerability Reporting](https://github.com/PrightCord/kinetix/security/advisories/new).
+   Submit a private report via [GitHub Private Vulnerability Reporting](https://github.com/0x1d1e/kinetix/security/advisories/new).
 2. **Alternative Disclosure**:
-   If GitHub Security Advisories are inaccessible, open a confidential issue or contact the maintainer directly through the contact details listed on [GitHub profile](https://github.com/PrightCord).
+   If GitHub Security Advisories are inaccessible, open a confidential issue or contact the maintainer directly through the contact details listed on [GitHub profile](https://github.com/0x1d1e).
 
 Please **do not** report suspected security vulnerabilities through public GitHub issues or discussions.
 

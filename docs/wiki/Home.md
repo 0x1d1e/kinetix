@@ -8,7 +8,7 @@ admin dashboard. It is built for developers and small technical teams running AI
 coding agents such as [Pi](https://pi.dev).
 
 This wiki is the detailed, task-oriented companion to the repo
-[`README.md`](https://github.com/PrightCord/kinetix/blob/main/README.md).
+[`README.md`](https://github.com/0x1d1e/kinetix/blob/main/README.md).
 
 ## Start here
 
@@ -44,7 +44,7 @@ This wiki is the detailed, task-oriented companion to the repo
 ## Editing this wiki
 
 The wiki pages are generated from the markdown files in
-[`docs/wiki/`](https://github.com/PrightCord/kinetix/tree/main/docs/wiki). Edit
+[`docs/wiki/`](https://github.com/0x1d1e/kinetix/tree/main/docs/wiki). Edit
 them there (so changes are reviewed and versioned with the code) and mirror them
 to the GitHub wiki with:
 

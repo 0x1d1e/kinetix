@@ -66,9 +66,9 @@ If a provider bound to a plugin (`wire_plugin` or `credential_plugin`) is skippe
 
 ## Plugin installation or validation fails
 
-- **"archive is invalid or tar traversal detected"**: The `.kxp` package format must be a clean archive containing `plugin.toml` and `plugin.wasm` at the root, with no absolute paths or symlinks. Build packages from the `PrightCord/kinetix-plugins` repository using `scripts/build-plugin.sh`.
+- **"archive is invalid or tar traversal detected"**: The `.kxp` package format must be a clean archive containing `plugin.toml` and `plugin.wasm` at the root, with no absolute paths or symlinks. Build packages from the `0x1d1e/kinetix-plugins` repository using `scripts/build-plugin.sh`.
 - **"untrusted signature"**: If the plugin contains `plugin.sig`, provide the publisher's Ed25519 public key via `--trusted-key <key>` (base64 or hex), or use `--allow-untrusted-signature` in development.
-- **"component linking failed"**: The component was compiled against an incompatible WIT version or missing required exports. Recompile the plugin against the SDK/WIT in `PrightCord/kinetix-plugins` (currently `wit-bindgen 0.62`).
+- **"component linking failed"**: The component was compiled against an incompatible WIT version or missing required exports. Recompile the plugin against the SDK/WIT in `0x1d1e/kinetix-plugins` (currently `wit-bindgen 0.62`).
 
 ## A client stays logged in after a restart
 

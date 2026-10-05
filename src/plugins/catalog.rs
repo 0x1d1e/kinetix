@@ -1,7 +1,7 @@
 //! Official plugin catalog and publisher trust metadata.
 //!
 //! Kinetix keeps a vendored snapshot for offline/default discovery. The source
-//! catalog and publisher metadata live in `PrightCord/kinetix-plugins`; these
+//! catalog and publisher metadata live in `0x1d1e/kinetix-plugins`; these
 //! snapshots are host assets, not plugin source. Publisher keys remain separate
 //! so changing a catalog entry cannot introduce a new trusted signing key.
 
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const DEFAULT_CATALOG_URL: &str =
-    "https://raw.githubusercontent.com/PrightCord/kinetix-plugins/main/catalog.json";
+    "https://raw.githubusercontent.com/0x1d1e/kinetix-plugins/main/catalog.json";
 pub const CATALOG_CACHE_FILE: &str = "catalog.cache.json";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

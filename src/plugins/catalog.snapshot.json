@@ -7,7 +7,7 @@
       "description": "Google OAuth credential strategy and v1internal provider adapter for Antigravity.",
       "publisher": "Kinetix",
       "official": true,
-      "homepage": "https://github.com/PrightCord/kinetix-plugins/tree/main/plugins/antigravity-oauth",
+      "homepage": "https://github.com/0x1d1e/kinetix-plugins/tree/main/plugins/antigravity-oauth",
       "latest_version": "0.1.2",
       "artifact_name": "dev.kinetix.antigravity-oauth-0.1.2.kxp",
       "capabilities": [
@@ -17,7 +17,7 @@
       ],
       "installable": true,
       "distribution": {
-        "url": "https://github.com/PrightCord/kinetix-plugins/releases/download/antigravity-oauth-v0.1.2/dev.kinetix.antigravity-oauth-0.1.2.kxp",
+        "url": "https://github.com/0x1d1e/kinetix-plugins/releases/download/antigravity-oauth-v0.1.2/dev.kinetix.antigravity-oauth-0.1.2.kxp",
         "sha256": "eb4321967ab860c244aea7c48f2433c897f1e99dfa58af3765d803e5f68444c4",
         "publisher_key_id": "kinetix-official-v1",
         "allowed_hosts": [
@@ -33,7 +33,7 @@
       "description": "Anthropic Claude Code OAuth credential strategy and auth flow.",
       "publisher": "Kinetix",
       "official": true,
-      "homepage": "https://github.com/PrightCord/kinetix-plugins/tree/main/plugins/claude-code-oauth",
+      "homepage": "https://github.com/0x1d1e/kinetix-plugins/tree/main/plugins/claude-code-oauth",
       "latest_version": "0.1.4",
       "artifact_name": "dev.kinetix.claude-code-oauth-0.1.4.kxp",
       "capabilities": [
@@ -42,7 +42,7 @@
       ],
       "installable": true,
       "distribution": {
-        "url": "https://github.com/PrightCord/kinetix-plugins/releases/download/claude-code-oauth-v0.1.4/dev.kinetix.claude-code-oauth-0.1.4.kxp",
+        "url": "https://github.com/0x1d1e/kinetix-plugins/releases/download/claude-code-oauth-v0.1.4/dev.kinetix.claude-code-oauth-0.1.4.kxp",
         "sha256": "2593cdb2468d6c07a23cf05b46a73e2d09bd3b19a4b2bd31f463b421d54f7d01",
         "publisher_key_id": "kinetix-official-v1",
         "allowed_hosts": [
@@ -58,7 +58,7 @@
       "description": "OpenCode Free no-auth provider adapter and dynamic model discovery.",
       "publisher": "Kinetix",
       "official": true,
-      "homepage": "https://github.com/PrightCord/kinetix-plugins/tree/main/plugins/opencode-free",
+      "homepage": "https://github.com/0x1d1e/kinetix-plugins/tree/main/plugins/opencode-free",
       "latest_version": "0.1.2",
       "artifact_name": "dev.kinetix.opencode-free-0.1.2.kxp",
       "capabilities": [
@@ -67,7 +67,7 @@
       ],
       "installable": true,
       "distribution": {
-        "url": "https://github.com/PrightCord/kinetix-plugins/releases/download/opencode-free-v0.1.2/dev.kinetix.opencode-free-0.1.2.kxp",
+        "url": "https://github.com/0x1d1e/kinetix-plugins/releases/download/opencode-free-v0.1.2/dev.kinetix.opencode-free-0.1.2.kxp",
         "sha256": "e00aff8a891db76952dd861d6d55986efd481138aa11cd1d093624ed31265bf4",
         "publisher_key_id": "kinetix-official-v1",
         "allowed_hosts": [

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Kinetix uninstaller (Linux) — the inverse of install.sh.
 #
-#   curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/uninstall.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/0x1d1e/kinetix/main/uninstall.sh | bash
 #
 # Removes the XDG config/data/state directories (the database, exports, backups,
 # master key, and admin password) and, optionally, the `kinetix` binary itself.

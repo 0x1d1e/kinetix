@@ -7,7 +7,7 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-REPO = "https://github.com/PrightCord/kinetix/blob/main/"
+REPO = "https://github.com/0x1d1e/kinetix/blob/main/"
 PAGES = {
     "docs/ARCHITECTURE.md": "docs/wiki/Architecture.md",
     "CONTEXT.md": "docs/wiki/Glossary.md",

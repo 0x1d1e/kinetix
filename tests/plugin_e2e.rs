@@ -2,7 +2,7 @@
 //!
 //! This exercises the full path that unit tests cannot: a genuine `.kxp`
 //! package containing a WebAssembly component built by the external
-//! `PrightCord/kinetix-plugins` repository, installed through the manager,
+//! `0x1d1e/kinetix-plugins` repository, installed through the manager,
 //! enabled (which instantiates it), and invoked through a capability. It proves
 //! the WIT host boundary works against a real guest.
 //!
@@ -722,7 +722,7 @@ async fn anthropic_messages_frontend_passes_thinking_and_tool_continuation_to_pl
 async fn installs_enables_and_instantiates_a_real_component() {
     let Some(path) = package_path() else {
         eprintln!(
-            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from 0x1d1e/kinetix-plugins"
         );
         return;
     };
@@ -786,7 +786,7 @@ async fn installs_enables_and_instantiates_a_real_component() {
 async fn invokes_a_real_guest_capability_through_the_host_boundary() {
     let Some(path) = package_path() else {
         eprintln!(
-            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from 0x1d1e/kinetix-plugins"
         );
         return;
     };
@@ -826,7 +826,7 @@ async fn invokes_a_real_guest_capability_through_the_host_boundary() {
 async fn invokes_real_guest_credential_rotation_through_host_boundary() {
     let Some(path) = package_path() else {
         eprintln!(
-            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from 0x1d1e/kinetix-plugins"
         );
         return;
     };
@@ -857,7 +857,7 @@ async fn invokes_real_guest_credential_rotation_through_host_boundary() {
 async fn a_real_guest_health_probe_is_declared_resolvable_and_invocable() {
     let Some(path) = package_path() else {
         eprintln!(
-            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from 0x1d1e/kinetix-plugins"
         );
         return;
     };
@@ -947,7 +947,7 @@ async fn a_real_guest_health_probe_is_declared_resolvable_and_invocable() {
 async fn adapter_world_translates_the_antigravity_wire_format() {
     let Some(path) = package_path() else {
         eprintln!(
-            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from 0x1d1e/kinetix-plugins"
         );
         return;
     };
@@ -1513,7 +1513,7 @@ async fn api_v1_and_api_v2_legacy_host_imports_coexist_with_opaque_session_conte
 async fn antigravity_lease_metadata_reaches_the_v3_adapter_without_parsing_the_secret() {
     let Some(path) = package_path() else {
         eprintln!(
-            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from 0x1d1e/kinetix-plugins"
         );
         return;
     };
@@ -1705,7 +1705,7 @@ async fn antigravity_lease_metadata_reaches_the_v3_adapter_without_parsing_the_s
 async fn adapter_classifies_quota_exhaustion() {
     let Some(path) = package_path() else {
         eprintln!(
-            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from PrightCord/kinetix-plugins"
+            "skipping: set KINETIX_PLUGIN_E2E_PACKAGE to a built .kxp from 0x1d1e/kinetix-plugins"
         );
         return;
     };

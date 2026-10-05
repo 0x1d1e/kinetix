@@ -59,7 +59,7 @@ custom provider wire adapters (`wire_plugin`), dynamic credential strategies
 (`credential_plugin`), routing facts (`plugin.<id>.<name>`), health probes, and
 model discovery. Native providers remain zero-overhead and completely unaffected
 by installed plugins. See [Plugins](Plugins) for operator documentation and
-[the current plugin contract](https://github.com/PrightCord/kinetix/blob/main/wit/kinetix-plugin.wit).
+[the current plugin contract](https://github.com/0x1d1e/kinetix/blob/main/wit/kinetix-plugin.wit).
 
 **Is it multi-tenant / highly available?**
 No. It's a single-machine, small-team gateway. Multi-tenant SaaS and HA are

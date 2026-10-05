@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 use crate::cli::UpdateArgs;
 
-const REPO: &str = "https://github.com/PrightCord/kinetix";
+const REPO: &str = "https://github.com/0x1d1e/kinetix";
 const MAX_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
 
 pub async fn run(args: UpdateArgs) -> Result<()> {

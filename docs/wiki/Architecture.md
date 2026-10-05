@@ -78,17 +78,17 @@ Kinetix does not retry or fail over to another target.
 - **Database history:** `migrations/`.
 - **Current executable behavior:** implementation and tests.
 - **Domain terminology:** [Glossary](Glossary).
-- **Contributor invariants:** [`AGENTS.md`](https://github.com/PrightCord/kinetix/blob/main/AGENTS.md).
-- **Agent enforcement:** [`pi-warden.md`](https://github.com/PrightCord/kinetix/blob/main/pi-warden.md).
+- **Contributor invariants:** [`AGENTS.md`](https://github.com/0x1d1e/kinetix/blob/main/AGENTS.md).
+- **Agent enforcement:** [`pi-warden.md`](https://github.com/0x1d1e/kinetix/blob/main/pi-warden.md).
 
 ## Further reading
 
-- [Protocol compatibility](https://github.com/PrightCord/kinetix/blob/main/docs/protocol-v1-compatibility.md)
-- [Pi compatibility](https://github.com/PrightCord/kinetix/blob/main/docs/pi-compatibility.md)
+- [Protocol compatibility](https://github.com/0x1d1e/kinetix/blob/main/docs/protocol-v1-compatibility.md)
+- [Pi compatibility](https://github.com/0x1d1e/kinetix/blob/main/docs/pi-compatibility.md)
 - [Plugins](Plugins)
 - [Routing and Fallback](Routing-and-Fallback)
-- [Security](https://github.com/PrightCord/kinetix/blob/main/SECURITY.md)
-- [Deployment](https://github.com/PrightCord/kinetix/blob/main/deploy/README.md)
+- [Security](https://github.com/0x1d1e/kinetix/blob/main/SECURITY.md)
+- [Deployment](https://github.com/0x1d1e/kinetix/blob/main/deploy/README.md)
 
-Historical designs are preserved in [the archive](https://github.com/PrightCord/kinetix/blob/main/docs/archive/README.md); they do
+Historical designs are preserved in [the archive](https://github.com/0x1d1e/kinetix/blob/main/docs/archive/README.md); they do
 not define current behavior.

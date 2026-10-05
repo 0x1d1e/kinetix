@@ -60,7 +60,7 @@ after the first run.
 | `KINETIX_ALERT_P95_LATENCY_MS` | `100` | p95 added-proxy-latency alert threshold (sustained 10 min). |
 
 A documented template is in
-[`.env.example`](https://github.com/PrightCord/kinetix/blob/main/.env.example).
+[`.env.example`](https://github.com/0x1d1e/kinetix/blob/main/.env.example).
 
 ## Bootstrap file (optional)
 
@@ -68,7 +68,7 @@ For a reproducible, file-driven first start you can seed an empty database from 
 TOML file (`KINETIX_BOOTSTRAP_FILE=config.toml`). It is used **only when the
 database has no providers**; afterwards the database is authoritative. A
 documented example is
-[`config.toml.example`](https://github.com/PrightCord/kinetix/blob/main/config.toml.example).
+[`config.toml.example`](https://github.com/0x1d1e/kinetix/blob/main/config.toml.example).
 
 Bootstrap accepts the same executable controls as the database: provider failure/security settings, account priority/weight/quota window, model parameter/thinking/extra-request policy, route fallback triggers and optional `max_concurrent_requests`, unpinned provider-pool targets, target predicates/overrides, and virtual-key provider/IP/logging restrictions including optional per-key `max_concurrent_requests`. Zero or omission leaves a key or Route uncapped. Legacy `continuity_policy = "error"` is accepted only for compatibility and maps to `portability_policy = "reject"`; new configuration should use `portability_policy` only.
 

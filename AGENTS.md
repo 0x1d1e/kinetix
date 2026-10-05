@@ -11,7 +11,7 @@ Kinetix is a self-hosted, streaming-first LLM gateway written in Rust with an em
 - `src/plugins/` + `wit/` — sandboxed WASM plugin host and public plugin contract.
 - `src/db.rs` + `migrations/` — SQLite control-plane persistence.
 - `dashboard/` — React/TypeScript admin UI embedded into the Rust binary.
-- `PrightCord/kinetix-plugins` — guest SDK, first-party plugins, catalog, and plugin packaging.
+- `0x1d1e/kinetix-plugins` — guest SDK, first-party plugins, catalog, and plugin packaging.
 
 Keep protocol frontends, canonical representation, routing, adapters, plugin execution, and persistence as separate boundaries.
 

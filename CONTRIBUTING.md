@@ -21,7 +21,7 @@ Thank you for your interest in contributing to Kinetix! Kinetix is a streaming-f
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/PrightCord/kinetix.git
+   git clone https://github.com/0x1d1e/kinetix.git
    cd kinetix
    ```
 

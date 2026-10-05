@@ -6,10 +6,10 @@ It exposes OpenAI- and Anthropic-compatible APIs in front of operator-configured
 
 Everything ships as a single Rust binary with an embedded admin dashboard.
 
-[![CI](https://github.com/PrightCord/kinetix/actions/workflows/ci.yml/badge.svg)](https://github.com/PrightCord/kinetix/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/PrightCord/kinetix)](https://github.com/PrightCord/kinetix/releases/latest)
+[![CI](https://github.com/0x1d1e/kinetix/actions/workflows/ci.yml/badge.svg)](https://github.com/0x1d1e/kinetix/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/0x1d1e/kinetix)](https://github.com/0x1d1e/kinetix/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Wiki](https://img.shields.io/badge/docs-wiki-blueviolet)](https://github.com/PrightCord/kinetix/wiki)
+[![Wiki](https://img.shields.io/badge/docs-wiki-blueviolet)](https://github.com/0x1d1e/kinetix/wiki)
 
 > [!IMPORTANT]
 > **Kinetix is rebooting at 0.1.0.** Kinetix and kinetix-plugins will restart
@@ -83,7 +83,7 @@ Fallback is only attempted before the response has been committed to the client.
 ### Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/0x1d1e/kinetix/main/install.sh | bash
 ```
 
 The installer places `kinetix` in `~/.local/bin` without creating local state. Initialize the installation when ready:
@@ -224,7 +224,7 @@ Routes can also provide fallback and explicit session-affinity behavior.
 
 Kinetix does not infer conversation identity when the client provides no supported session identifier.
 
-See the [Routing and Fallback](https://github.com/PrightCord/kinetix/wiki/Routing-and-Fallback) documentation for details.
+See the [Routing and Fallback](https://github.com/0x1d1e/kinetix/wiki/Routing-and-Fallback) documentation for details.
 
 ## Virtual keys
 
@@ -281,10 +281,10 @@ Plugins run without ambient authority and interact with Kinetix through the vers
 
 Plugin packages use the `.kxp` format.
 
-Operator documentation is available in [docs/wiki/Plugins.md](docs/wiki/Plugins.md) and the [GitHub Wiki Plugins page](https://github.com/PrightCord/kinetix/wiki/Plugins).
+Operator documentation is available in [docs/wiki/Plugins.md](docs/wiki/Plugins.md) and the [GitHub Wiki Plugins page](https://github.com/0x1d1e/kinetix/wiki/Plugins).
 
 Plugin developers can start with the public contract in [`wit/`](wit/) and the
-[plugin SDK, packages, and catalog](https://github.com/PrightCord/kinetix-plugins).
+[plugin SDK, packages, and catalog](https://github.com/0x1d1e/kinetix-plugins).
 
 ## Dashboard
 
@@ -353,11 +353,11 @@ kinetix key --help
 kinetix plugin --help
 ```
 
-See the [CLI Reference](https://github.com/PrightCord/kinetix/wiki/CLI-Reference) for the complete command surface.
+See the [CLI Reference](https://github.com/0x1d1e/kinetix/wiki/CLI-Reference) for the complete command surface.
 
 ## Documentation
 
-The [Kinetix Wiki](https://github.com/PrightCord/kinetix/wiki) contains the main user and operator documentation.
+The [Kinetix Wiki](https://github.com/0x1d1e/kinetix/wiki) contains the main user and operator documentation.
 
 Additional documentation:
 

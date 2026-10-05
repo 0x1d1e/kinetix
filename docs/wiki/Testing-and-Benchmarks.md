@@ -125,7 +125,7 @@ Cancellation latency: `scripts/cancel_bench.py` measures how long the upstream
 keeps being written after a client disconnect.
 
 Measured results, methodology, and caveats are documented in
-[`docs/benchmarks.md`](https://github.com/PrightCord/kinetix/blob/main/docs/benchmarks.md).
+[`docs/benchmarks.md`](https://github.com/0x1d1e/kinetix/blob/main/docs/benchmarks.md).
 Headline numbers: added TTFT/total overhead of **~0.1–2 ms**, throughput far above
 the 50 req/s target with zero errors, idle RSS ~13 MB, cold start ~75 ms.
 

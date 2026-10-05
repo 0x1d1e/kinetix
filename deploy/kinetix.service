@@ -1,6 +1,6 @@
 [Unit]
 Description=Kinetix — multi-protocol LLM proxy
-Documentation=https://github.com/PrightCord/kinetix
+Documentation=https://github.com/0x1d1e/kinetix
 After=network-online.target
 Wants=network-online.target
 

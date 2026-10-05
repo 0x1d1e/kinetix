@@ -4,9 +4,9 @@ version = "0.6.4"
 edition = "2021"
 description = "Multi-protocol LLM proxy: OpenAI/Anthropic in, configurable upstreams out, with virtual keys, account pools, Routes, and cost tracking"
 license = "MIT"
-repository = "https://github.com/PrightCord/kinetix"
+repository = "https://github.com/0x1d1e/kinetix"
 authors = ["PrightCord"]
-homepage = "https://github.com/PrightCord/kinetix"
+homepage = "https://github.com/0x1d1e/kinetix"
 default-run = "kinetix"
 
 [[bin]]

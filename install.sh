@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Kinetix installer (Linux x86_64 / aarch64).
 #
-#   curl -fsSL https://raw.githubusercontent.com/PrightCord/kinetix/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/0x1d1e/kinetix/main/install.sh | bash
 #
 # It installs the `kinetix` binary to ~/.local/bin. Run `kinetix init` when you
 # are ready to create local state and generate the dashboard admin password.
@@ -10,10 +10,10 @@
 # Environment overrides:
 #   KINETIX_VERSION   release tag or branch to install (default: latest release, fallback: main)
 #   KINETIX_PREFIX    install prefix (default: ~/.local)
-#   KINETIX_REPO      git / release repository URL (default: https://github.com/PrightCord/kinetix)
+#   KINETIX_REPO      git / release repository URL (default: https://github.com/0x1d1e/kinetix)
 set -euo pipefail
 
-REPO="${KINETIX_REPO:-https://github.com/PrightCord/kinetix}"
+REPO="${KINETIX_REPO:-https://github.com/0x1d1e/kinetix}"
 REPO="${REPO%/}"
 PREFIX="${KINETIX_PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
