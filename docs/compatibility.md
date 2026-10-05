@@ -75,8 +75,11 @@ Supported request semantics:
   same-format passthrough);
 - `reasoning.summary` as a same-format Responses control, forwarded unchanged
   alongside the mapped `reasoning.effort`; translating paths reject it;
-- `prompt_cache_key` as a portable OpenAI prompt-cache hint, also used as the
-  Route cache-affinity key (scoped per virtual key);
+- `prompt_cache_key` as an advisory OpenAI prompt-cache hint: forwarded to
+  OpenAI targets, used as the Route cache-affinity key (scoped per virtual key)
+  when the Route enables affinity or sticky routing, and otherwise accepted
+  and recorded in the Route trace as `prompt_cache_key ignored: affinity
+  disabled` (never a 400);
 - streaming and non-streaming output for text and custom function calls.
 
 Streaming emits the supported semantic lifecycle events:

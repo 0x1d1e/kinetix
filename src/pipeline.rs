@@ -1669,6 +1669,18 @@ pub(crate) async fn run_with_disconnect(
                     .await);
                 }
             }
+            if prompt_cache_key_ignored(&profile.transport, &target_req, route.as_ref()) {
+                tracing::info!(
+                    request_id = %meta.request_id,
+                    model = %target.model.display_name,
+                    "prompt_cache_key ignored: affinity disabled"
+                );
+                trace.step(
+                    "candidate",
+                    Some(target.account.label.clone()),
+                    "prompt_cache_key ignored: affinity disabled",
+                );
+            }
             if let Err(error) = check_resolved_thinking_translation(
                 adapter.as_ref(),
                 &target.model.display_name,
@@ -5421,6 +5433,23 @@ fn predicate_capabilities(
 /// Sticky-store key for a client `prompt_cache_key`. The control-character
 /// separators cannot occur in an HTTP session header, so the namespace never
 /// collides with explicit sessions; the virtual key keeps tenants apart.
+/// `prompt_cache_key` is an advisory hint: OpenAI transports forward it, and
+/// otherwise it is consumed as the Route cache-affinity key. When neither
+/// applies, Kinetix still accepts it but records that it was ignored.
+fn prompt_cache_key_ignored(
+    transport: &crate::adapters::TargetTransport,
+    req: &InternalRequest,
+    route: Option<&db::RouteRow>,
+) -> bool {
+    use crate::adapters::TargetTransport as T;
+    matches!(transport, T::Anthropic | T::Gemini)
+        && req
+            .extra
+            .get("prompt_cache_key")
+            .is_some_and(|value| !value.is_null())
+        && !route.is_some_and(|route| route.cache_affinity != 0 || route.sticky_routing != 0)
+}
+
 fn cache_affinity_key(key: Option<&db::VirtualKeyRow>, req: &InternalRequest) -> Option<String> {
     const MAX_PROMPT_CACHE_KEY_LEN: usize = 256;
     let value = req.extra.get("prompt_cache_key")?.as_str()?;
@@ -8218,6 +8247,33 @@ mod route_policy_tests {
             enabled: 1,
             created_at: "2026-01-01T00:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn prompt_cache_key_is_reported_ignored_only_without_affinity_or_forwarding() {
+        use crate::adapters::TargetTransport as T;
+        let mut req = request();
+        assert!(!prompt_cache_key_ignored(&T::Anthropic, &req, None));
+        req.extra
+            .insert("prompt_cache_key".into(), serde_json::json!("pck"));
+
+        let plain = route(serde_json::json!({}));
+        assert!(prompt_cache_key_ignored(&T::Anthropic, &req, None));
+        assert!(prompt_cache_key_ignored(&T::Gemini, &req, Some(&plain)));
+        // Forwarded upstream by OpenAI transports.
+        assert!(!prompt_cache_key_ignored(&T::OpenAiChat, &req, None));
+        assert!(!prompt_cache_key_ignored(&T::OpenAiResponses, &req, None));
+        // Consumed as the Route cache-affinity key.
+        let mut sticky = plain.clone();
+        sticky.sticky_routing = 1;
+        assert!(!prompt_cache_key_ignored(
+            &T::Anthropic,
+            &req,
+            Some(&sticky)
+        ));
+        let mut affine = plain;
+        affine.cache_affinity = 1;
+        assert!(!prompt_cache_key_ignored(&T::Gemini, &req, Some(&affine)));
     }
 
     fn provider(rules: Value) -> db::ProviderRow {

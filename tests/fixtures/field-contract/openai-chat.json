@@ -698,11 +698,11 @@
         "openai-responses": "preserved",
         "anthropic": {
           "disposition": "consumed",
-          "note": "Route cache-affinity key (namespaced per virtual key); this transport has no request-level prompt-cache key"
+          "note": "advisory hint with no request-level equivalent on this transport: consumed as the Route cache-affinity key (namespaced per virtual key) when the Route enables affinity or sticky routing, otherwise accepted and recorded in the Route trace as ignored"
         },
         "gemini": {
           "disposition": "consumed",
-          "note": "Route cache-affinity key (namespaced per virtual key); this transport has no request-level prompt-cache key"
+          "note": "advisory hint with no request-level equivalent on this transport: consumed as the Route cache-affinity key (namespaced per virtual key) when the Route enables affinity or sticky routing, otherwise accepted and recorded in the Route trace as ignored"
         }
       }
     },

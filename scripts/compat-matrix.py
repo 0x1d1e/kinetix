@@ -19,6 +19,7 @@ import urllib.request
 
 BASE_URL = os.environ.get("KINETIX_BASE", "http://127.0.0.1:8180")
 API_KEY = os.environ.get("KINETIX_KEY", "")
+ADMIN_TOKEN = os.environ.get("KINETIX_ADMIN_TOKEN", "")
 
 TEST_RESULTS = []
 
@@ -289,6 +290,61 @@ def test_prompt_cache_key_affinity(_upstream_model):
         "prompt_cache_key_affinity",
         passed,
         " -> ".join(str(t) for t in targets),
+        int((time.time() - t0) * 1000),
+    )
+
+
+def _route_trace_text(request_id):
+    # Admin session cookie from a password login, then the request's trace.
+    login = urllib.request.Request(
+        f"{BASE_URL}/admin/api/login",
+        data=json.dumps({"password": ADMIN_TOKEN}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urlopen(login, timeout=15) as resp:
+        cookie = "; ".join(
+            c.split(";", 1)[0] for c in resp.headers.get_all("Set-Cookie") or []
+        )
+    req = urllib.request.Request(
+        f"{BASE_URL}/admin/api/requests/{request_id}/route-trace",
+        headers={"Cookie": cookie},
+    )
+    with urlopen(req, timeout=15) as resp:
+        return resp.read().decode()
+
+
+def test_prompt_cache_key_ignored_is_traced():
+    # Without Route affinity, a target that cannot forward prompt_cache_key
+    # accepts it and records that it was ignored; a sticky Route consumes it.
+    t0 = time.time()
+    notes = {}
+    for model in ("syn-anthropic", "syn-sticky-anthropic"):
+        payload = {
+            "model": model,
+            "stream": False,
+            "messages": [{"role": "user", "content": "cache hint"}],
+            "prompt_cache_key": f"pck_{time.time_ns()}",
+        }
+        req = urllib.request.Request(
+            f"{BASE_URL}/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+        )
+        try:
+            with urlopen(req, timeout=15) as resp:
+                request_id = resp.headers.get("x-request-id")
+                status = resp.status
+            trace = _route_trace_text(request_id)
+            notes[model] = (status, "prompt_cache_key ignored: affinity disabled" in trace)
+        except Exception as e:
+            notes[model] = (str(e), None)
+    passed = notes == {"syn-anthropic": (200, True), "syn-sticky-anthropic": (200, False)}
+    record_result(
+        "Pi (OpenAI Chat)",
+        "syn-anthropic",
+        "prompt_cache_key_ignored_traced",
+        passed,
+        json.dumps(notes),
         int((time.time() - t0) * 1000),
     )
 
@@ -1187,6 +1243,7 @@ def run_matrix():
     test_pi_multi_turn("syn-openai")
     test_pi_session_affinity("syn-openai")
     test_prompt_cache_key_affinity("syn-openai")
+    test_prompt_cache_key_ignored_is_traced()
     test_pi_openrouter_affinity("syn-openai")
     test_pi_sync_aggregation("syn-openai")
     test_openai_truncated_passthrough_identity()

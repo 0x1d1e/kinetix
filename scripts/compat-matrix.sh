@@ -91,7 +91,7 @@ if [ "$KEY_READY" != true ]; then
 fi
 
 echo "==> Running compatibility matrix suite"
-KINETIX_BASE="http://$BIND" KINETIX_KEY="$KEY" python3 scripts/compat-matrix.py
+KINETIX_BASE="http://$BIND" KINETIX_KEY="$KEY" KINETIX_ADMIN_TOKEN="$ADMIN_TOKEN" python3 scripts/compat-matrix.py
 
 echo "==> Running protocol v1 native/translated matrix"
 KINETIX_BASE="http://$BIND" \

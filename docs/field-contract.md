@@ -37,6 +37,6 @@ CI fails when:
 
 ## Per-target field policy
 
-The harness runs `apply_target_field_policy` (`src/frontends/mod.rs`) on every translating path, so fixtures assert runtime behavior: a field the target cannot honor is `rejected` (400), including unknown fields. No field is silently consumed unless it is a target default (e.g. `parallel_tool_calls: true`), internal-only (e.g. `prompt_cache_key` as Route cache-affinity key), or neutralized by another rule (e.g. `metadata` with `store` never true).
+The harness runs `apply_target_field_policy` (`src/frontends/mod.rs`) on every translating path, so fixtures assert runtime behavior: a field the target cannot honor is `rejected` (400), including unknown fields. No field is silently consumed unless it is a target default (e.g. `parallel_tool_calls: true`), evaluated by Kinetix against Route policy (e.g. `prompt_cache_key`: affinity key, or traced as ignored when affinity is off), or neutralized by another rule (e.g. `metadata` with `store` never true).
 
 Operators can opt into removal per model with a parameter policy `{"<field>": {"supported": false, "policy": "drop"}}`. Dropped fields are logged and recorded in the Route trace. `operator_drop_policy_strips_unhonored_fields_instead_of_rejecting` covers this.

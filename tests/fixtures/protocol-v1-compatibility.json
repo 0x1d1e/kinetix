@@ -933,7 +933,7 @@
         [
           "prompt_cache_key",
           "preserved",
-          "forwarded to OpenAI targets; Route cache-affinity key everywhere",
+          "forwarded to OpenAI targets; Route cache-affinity key when the Route enables affinity or sticky routing; otherwise accepted and traced as ignored",
           "Namespaced per virtual key; used only for Route affinity, never for continuation provenance.",
           [
             "responses.native.openai.sync",
