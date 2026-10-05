@@ -19,7 +19,7 @@ from the deterministic protocol matrix or Rust tests; field-level detail lives i
 
 - **tools**: Function tools, tool_choice, and tool-call identity in responses.
 - **images**: Image input parts.
-- **structured**: Schema-constrained output (response_format.json_schema, text.format).
+- **structured**: Structured output (response_format json_object/json_schema, text.format).
 - **thinking**: Reasoning / thinking controls.
 - **streaming**: SSE lifecycle, terminal events, usage, and tool identity while streaming.
 - **continuation**: Tool-call / tool-result identity across turns.
@@ -55,14 +55,14 @@ from the deterministic protocol matrix or Rust tests; field-level detail lives i
 | Chat -> OpenAI Chat | reasoning replay | supported | `chat.native.openai.reasoning_replay` | Policy (#207): reasoning_content/reasoning_signature are forwarded verbatim to a same-provider target; the upstream owns replay semantics. Cross-provider replay follows the Route portability policy; a direct target with no Route refuses it (400) rather than dropping it. |
 | Chat -> Gemini | tools | translated | `chat.translate.gemini.sync`<br>`chat.translate.gemini.stream`<br>`chat.translate.gemini.parallel_tools`<br>`chat.translate.gemini.nested_schema`<br>`chat.tool_choice.variants` |  |
 | Chat -> Gemini | images | translated | `chat.translate.gemini.sync`<br>`chat.image.variants` |  |
-| Chat -> Gemini | structured | rejected | `chat.translate.gemini.unsupported_fields.reject`<br>`field_contract.dispositions` | response_format.json_schema returns 400; a json_object hint is dropped (field-contract gap). |
+| Chat -> Gemini | structured | rejected | `chat.translate.gemini.unsupported_fields.reject`<br>`field_contract.dispositions` | Structured response_format (json_object, json_schema) returns 400; plain text is consumed. |
 | Chat -> Gemini | thinking | translated | `chat.translate.gemini.sync` | Requires a model thinking_map; no reasoning control is invented without one. |
 | Chat -> Gemini | streaming | translated | `chat.translate.gemini.stream` |  |
 | Chat -> Gemini | continuation | supported | `chat.fallback.tool_continuation` |  |
 | Chat -> Gemini | reasoning replay | conditional | `chat.translate.gemini.tool_signature_continuation`<br>`chat.translate.gemini.cross_model_placeholder`<br>`chat.translate.gemini.legacy_model_strip_without_placeholder`<br>`chat.fallback.opaque_reasoning` | Gemini thought signatures are restored host-side for the producing model, replaced by the documented placeholder on another Gemini 3 model, and stripped before Gemini 3. Foreign reasoning state follows the Route portability policy. |
 | Chat -> Anthropic | tools | translated | `chat.translate.anthropic.sync`<br>`chat.translate.anthropic.stream` |  |
 | Chat -> Anthropic | images | translated | `chat.translate.anthropic.sync` |  |
-| Chat -> Anthropic | structured | rejected | `chat.translate.anthropic.unsupported_fields.reject`<br>`field_contract.dispositions` | response_format.json_schema returns 400; a json_object hint is dropped (field-contract gap). |
+| Chat -> Anthropic | structured | rejected | `chat.translate.anthropic.unsupported_fields.reject`<br>`field_contract.dispositions` | Structured response_format (json_object, json_schema) returns 400; plain text is consumed. |
 | Chat -> Anthropic | thinking | translated | `chat.translate.anthropic.sync` | Requires a model thinking_map; no reasoning control is invented without one. |
 | Chat -> Anthropic | streaming | translated | `chat.translate.anthropic.stream` |  |
 | Chat -> Anthropic | continuation | supported | `chat.translate.anthropic.tool_continuation` |  |

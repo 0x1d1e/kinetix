@@ -540,10 +540,10 @@
           ]
         ],
         [
-          "response_format.json_schema",
+          "response_format.json_object / json_schema",
           "passthrough",
           "rejected (400)",
-          "Structured schema enforcement cannot be guaranteed cross-format.",
+          "Structured output enforcement cannot be guaranteed cross-format.",
           [
             "chat.translate.gemini.unsupported_fields.reject",
             "chat.translate.anthropic.unsupported_fields.reject",
@@ -1149,7 +1149,7 @@
       {
         "id": "structured",
         "label": "structured",
-        "definition": "Schema-constrained output (response_format.json_schema, text.format)."
+        "definition": "Structured output (response_format json_object/json_schema, text.format)."
       },
       {
         "id": "thinking",
@@ -1304,7 +1304,7 @@
           "chat.translate.gemini.unsupported_fields.reject",
           "field_contract.dispositions"
         ],
-        "note": "response_format.json_schema returns 400; a json_object hint is dropped (field-contract gap)."
+        "note": "Structured response_format (json_object, json_schema) returns 400; plain text is consumed."
       },
       {
         "path": "chat->gemini",
@@ -1368,7 +1368,7 @@
           "chat.translate.anthropic.unsupported_fields.reject",
           "field_contract.dispositions"
         ],
-        "note": "response_format.json_schema returns 400; a json_object hint is dropped (field-contract gap)."
+        "note": "Structured response_format (json_object, json_schema) returns 400; plain text is consumed."
       },
       {
         "path": "chat->anthropic",

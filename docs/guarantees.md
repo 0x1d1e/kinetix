@@ -91,10 +91,18 @@ Applies to SIGTERM / Ctrl-C (`src/server.rs`, `src/process.rs`). Grace period:
 ## Translation
 
 Every represented semantic field is preserved, translated, consumed
-internally, or explicitly rejected. Nothing is dropped silently. Enforced per
-frontend and transport by `tests/field_contract.rs`; see
+internally, or explicitly rejected. Enforced per frontend and transport by
+`tests/field_contract.rs`: a decoded field without a declared disposition, or
+one that behaves differently from its declaration, fails CI. See
 [field-contract.md](field-contract.md) and the generated
 [compatibility matrix](generated/compatibility-matrix.md).
+
+Fields that change the output contract (for example structured
+`response_format`, `n`, `logprobs`) are rejected when a translating path
+cannot honor them. Advisory fields with no target equivalent (sampling
+penalties, `seed`, `service_tier`, ...) are consumed under a documented
+compatibility policy: each is marked `gap:` in the field-contract fixtures and
+listed in [Known gaps](field-contract.md#known-gaps).
 
 ## Demand-driven work
 

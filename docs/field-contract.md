@@ -40,7 +40,6 @@ CI fails when:
 Entries whose note starts with `gap:` are `consumed` only because the default compatibility policy silently drops them today. They record current behavior, not endorsement. Each should become `translated` or `rejected` (or get a documented policy) in follow-ups, notably:
 
 - `seed`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `parallel_tool_calls`, `verbosity`, `service_tier`, `prompt_cache_key`, `web_search_options` when going to transports without an equivalent;
-- `response_format: json_object` to non-OpenAI-chat transports;
 - Anthropic `mcp_servers`, `container`, `context_management`, `service_tier` to other transports.
 
 Changing a gap's runtime behavior means flipping its fixture entry in the same PR.

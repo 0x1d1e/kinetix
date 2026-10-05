@@ -829,6 +829,7 @@ def run_http_case(case_id):
                 "type": "json_schema",
                 "json_schema": {"name": "answer", "schema": {"type": "object"}},
             }}),
+            ("response_format.json_object", {"response_format": {"type": "json_object"}}),
             ("modalities/audio", {"modalities": ["text", "audio"], "audio": {"voice": "alloy", "format": "wav"}}),
             ("prediction", {"prediction": {"type": "content", "content": "expected"}}),
         ]
@@ -836,6 +837,7 @@ def run_http_case(case_id):
             "n": "passthrough-n",
             "logprobs": "passthrough-logprobs",
             "response_format.json_schema": "passthrough-response-format",
+            "response_format.json_object": "passthrough-response-format",
             "modalities/audio": "passthrough-modalities-audio",
             "prediction": "passthrough-prediction",
         }

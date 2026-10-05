@@ -504,15 +504,20 @@ pub fn translation_unsupported(
     if extra.contains_key("logprobs") || extra.contains_key("top_logprobs") {
         return Some("'logprobs'/'top_logprobs' are not supported on a translating path".into());
     }
-    if let Some(rf) = extra.get("response_format") {
-        // A plain text/json_object hint is safe to drop; a json_schema constraint
-        // is not enforceable through the other formats.
-        let has_schema = rf.get("json_schema").map(|v| !v.is_null()).unwrap_or(false)
-            || rf.get("type").and_then(|v| v.as_str()) == Some("json_schema");
-        if has_schema {
-            return Some(
-                "'response_format.json_schema' is not enforceable on a translating path".into(),
-            );
+    if let Some(rf) = extra.get("response_format").filter(|rf| !rf.is_null()) {
+        // Plain text is every upstream's default output, so it is consumed.
+        // Any structured format (json_object, json_schema) is not enforceable
+        // through the other formats and would otherwise be silently dropped.
+        let plain_text = rf.get("type").and_then(Value::as_str) == Some("text")
+            && rf.get("json_schema").map_or(true, Value::is_null);
+        if !plain_text {
+            let kind = rf
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("structured");
+            return Some(format!(
+                "'response_format.{kind}' is not enforceable on a translating path"
+            ));
         }
     }
     if extra.contains_key("modalities") || extra.contains_key("audio") {

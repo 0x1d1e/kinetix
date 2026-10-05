@@ -456,18 +456,9 @@
       },
       "outbound": {
         "openai": "preserved",
-        "openai-responses": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        },
-        "anthropic": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        },
-        "gemini": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        }
+        "openai-responses": "rejected",
+        "anthropic": "rejected",
+        "gemini": "rejected"
       }
     },
     {
