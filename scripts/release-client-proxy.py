@@ -55,6 +55,42 @@ def request_tool_results(raw):
     return count
 
 
+IMAGE_PART_TYPES = {"image_url", "image", "input_image"}
+REASONING_CONTROLS = {"reasoning_effort", "reasoning", "thinking"}
+REASONING_REPLAY_KEYS = {"reasoning_content", "reasoning", "reasoning_details", "thinking"}
+
+
+def request_evidence(raw):
+    """Client-visible request features: image parts, reasoning control, replayed
+    reasoning in history, and the tool-call ids that tool results answer."""
+    try:
+        value = json.loads(raw.decode() or "{}")
+    except Exception:
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    images = 0
+    result_ids = set()
+    replayed = 0
+    for item in walk(value):
+        if item.get("type") in IMAGE_PART_TYPES:
+            images += 1
+        if item.get("role") in {"tool", "function"} and item.get("tool_call_id"):
+            result_ids.add(str(item["tool_call_id"]))
+        if item.get("type") == "function_call_output" and item.get("call_id"):
+            result_ids.add(str(item["call_id"]))
+        if item.get("type") == "tool_result" and item.get("tool_use_id"):
+            result_ids.add(str(item["tool_use_id"]))
+        if item.get("role") == "assistant" and any(item.get(key) for key in REASONING_REPLAY_KEYS):
+            replayed += 1
+    return {
+        "request_images": images,
+        "request_reasoning_control": sorted(key for key in REASONING_CONTROLS if value.get(key)),
+        "request_reasoning_replay": replayed,
+        "request_tool_result_ids": sorted(result_ids),
+    }
+
+
 def response_tool_ids(raw):
     text = raw.decode(errors="replace")
     values = []
@@ -215,6 +251,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "fallback": response_headers.get("x-kinetix-fallback"),
                 "warning": response_headers.get("x-kinetix-warning"),
                 "tool_call_ids": response_tool_ids(bytes(response_bytes)),
+                **request_evidence(body),
                 "error": error,
                 "response_error": error_excerpt,
             }

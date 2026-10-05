@@ -861,7 +861,20 @@ async fn run_scheduled_model_lifecycle_for_provider(
     )
     .await;
 
+    let integration = crate::integrations::provider_key(&provider.id);
+    state
+        .integrations
+        .record(&integration, crate::integrations::IntegrationWork::Poll);
+    if reconcile_due || pricing_due {
+        state
+            .integrations
+            .record(&integration, crate::integrations::IntegrationWork::Wake);
+    }
     if reconcile_due {
+        state.integrations.record(
+            &integration,
+            crate::integrations::IntegrationWork::Discovery,
+        );
         if let Err(error) =
             run_model_lifecycle_lane(state, &provider.id, ModelLifecycleLane::Reconciliation).await
         {
@@ -4275,6 +4288,7 @@ pub async fn update_model_reconciliation(
             let mut prices = row.prices();
             let mut accepted_prices = false;
             let mut accepted_transport: Option<String> = None;
+            let mut accepted_limits: Vec<(&str, String)> = Vec::new();
             let mut accepted_discovery = serde_json::Map::new();
 
             for field in &selected {
@@ -4288,6 +4302,8 @@ pub async fn update_model_reconciliation(
                         if let Some(value) = observed.get("context_window").and_then(Value::as_i64)
                         {
                             context_window = Some(value);
+                            accepted_limits
+                                .push(("context_window", observed_limit_source(&observed, field)));
                         }
                     }
                     "max_output_tokens" => {
@@ -4295,6 +4311,10 @@ pub async fn update_model_reconciliation(
                             observed.get("max_output_tokens").and_then(Value::as_i64)
                         {
                             max_output_tokens = Some(value);
+                            accepted_limits.push((
+                                "max_output_tokens",
+                                observed_limit_source(&observed, field),
+                            ));
                         }
                     }
                     "thinking_map" => {
@@ -4406,6 +4426,18 @@ pub async fn update_model_reconciliation(
             object.remove("ignored_diff");
             object.insert("decision_at".into(), json!(db::now_iso()));
             accepted_discovery.insert("reconciliation".into(), reconciliation.clone());
+            let accepted_limits: Vec<(&str, &str)> = accepted_limits
+                .iter()
+                .map(|(field, source)| (*field, source.as_str()))
+                .collect();
+            if let Some(provenance) =
+                crate::model_state::accepted_provenance_patch(&discovery, &accepted_limits)
+            {
+                accepted_discovery.insert(
+                    crate::model_state::ACCEPTED_PROVENANCE_KEY.into(),
+                    provenance,
+                );
+            }
 
             let price_provenance = accepted_prices.then(|| {
                 accept_price_fields(&discovery, &row.prices(), &prices, &observed, &selected)
@@ -4464,6 +4496,16 @@ pub async fn update_model_reconciliation(
     .await
     .map_err(ApiError::internal)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Source of an observed limit being accepted. Discovery always records one;
+/// a missing source means the provider's model list reported it.
+fn observed_limit_source(observed: &Value, field: &str) -> String {
+    observed
+        .pointer(&format!("/capability_sources/{field}"))
+        .and_then(Value::as_str)
+        .unwrap_or("upstream_discovery")
+        .to_string()
 }
 
 fn models_dev_pricing_patch(
@@ -8139,6 +8181,35 @@ pub async fn create_model(
     if let Some(observation) = initial_latest_observation.as_ref() {
         discovery_patch.insert("latest_observation".into(), observation.clone());
     }
+    let created_limits: Vec<(&str, &str)> = [
+        ("context_window", body.context_window),
+        ("max_output_tokens", body.max_output_tokens),
+    ]
+    .into_iter()
+    .filter_map(|(field, value)| {
+        let value = value?;
+        let imported_source = imported_from_discovery
+            .then(|| body.discovery.get(field).and_then(Value::as_i64) == Some(value))
+            .filter(|matches| *matches)
+            .and_then(|_| {
+                body.discovery
+                    .pointer(&format!("/capability_sources/{field}"))
+            })
+            .and_then(Value::as_str);
+        Some((
+            field,
+            imported_source.unwrap_or(crate::model_state::OPERATOR_SOURCE),
+        ))
+    })
+    .collect();
+    if let Some(provenance) =
+        crate::model_state::accepted_provenance_patch(&json!({}), &created_limits)
+    {
+        discovery_patch.insert(
+            crate::model_state::ACCEPTED_PROVENANCE_KEY.into(),
+            provenance,
+        );
+    }
     if !effective_prices.is_configured() {
         discovery_patch.insert("effective_pricing".into(), Value::Null);
     }
@@ -8300,6 +8371,28 @@ pub async fn update_model(
                 &existing_discovery,
                 &thinking_map,
             )),
+        );
+    }
+    let edited_limits: Vec<(&str, &str)> = [
+        (
+            "context_window",
+            model.context_window != body.context_window,
+        ),
+        (
+            "max_output_tokens",
+            model.max_output_tokens != body.max_output_tokens,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, edited)| *edited)
+    .map(|(field, _)| (field, crate::model_state::OPERATOR_SOURCE))
+    .collect();
+    if let Some(provenance) =
+        crate::model_state::accepted_provenance_patch(&existing_discovery, &edited_limits)
+    {
+        discovery_patch.insert(
+            crate::model_state::ACCEPTED_PROVENANCE_KEY.into(),
+            provenance,
         );
     }
     let display_name = body.display_name.as_deref().unwrap_or(&body.upstream_id);
@@ -9306,6 +9399,7 @@ fn usage_json(u: &db::UsageLogRow) -> Value {
         "commit_state": u.commit_state,
         "retry_count": u.retry_count,
         "opaque_route_id": u.opaque_route_id,
+        "plugin_package_sha256": u.plugin_package_sha256,
     })
 }
 
@@ -10025,6 +10119,7 @@ pub async fn metrics(State(state): State<AppState>, _auth: AdminAuth) -> Respons
             ));
         }
     }
+    append_integration_metrics(&state, &mut body);
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -10033,6 +10128,62 @@ pub async fn metrics(State(state): State<AppState>, _auth: AdminAuth) -> Respons
         body,
     )
         .into_response()
+}
+
+/// Per-integration idle-contract counters (#199). Integrations are
+/// `provider:<id>` and `plugin:<id>`; WASM instantiations come from the plugin
+/// runtime and are reported under the plugin integration.
+fn append_integration_metrics(state: &AppState, body: &mut String) {
+    let mut rows: std::collections::BTreeMap<String, [u64; 6]> = state
+        .integrations
+        .snapshot()
+        .into_iter()
+        .map(|row| {
+            (
+                row.integration,
+                [
+                    row.poll_count,
+                    row.wake_count,
+                    row.discovery_runs,
+                    row.probe_runs,
+                    row.credential_refresh_runs,
+                    0,
+                ],
+            )
+        })
+        .collect();
+    if let Some(manager) = state.plugin_manager() {
+        for (plugin_id, count) in manager.wasm_instantiations() {
+            rows.entry(crate::integrations::plugin_key(&plugin_id))
+                .or_default()[5] = count;
+        }
+    }
+    let series = [
+        ("poll", "Scheduler evaluations of an integration"),
+        ("wake", "Scheduler wakeups that ran integration work"),
+        ("discovery_runs", "Model discovery / reconciliation runs"),
+        ("probe_runs", "Health probes run"),
+        (
+            "credential_refresh_runs",
+            "Scheduled credential refreshes run",
+        ),
+        ("wasm_instantiations", "WASM component instantiations"),
+    ];
+    for (index, (name, help)) in series.iter().enumerate() {
+        body.push_str(&format!(
+            "# HELP kinetix_integration_{name}_total {help}\n# TYPE kinetix_integration_{name}_total counter\n"
+        ));
+        for (integration, values) in &rows {
+            let integration = integration
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            body.push_str(&format!(
+                "kinetix_integration_{name}_total{{integration=\"{integration}\"}} {}\n",
+                values[index]
+            ));
+        }
+    }
 }
 
 // ===========================================================================
@@ -18277,7 +18428,12 @@ mod reasoning_discovery_control_plane_tests {
             .unwrap();
         assert!(listed.get("context_window").is_none());
         assert!(listed.get("max_output_tokens").is_none());
-        assert_eq!(listed["capabilities"], json!({"structured_output": true}));
+        // Unknown tools/images/thinking stay omitted; streaming is a gateway
+        // guarantee.
+        assert_eq!(
+            listed["capabilities"],
+            json!({"structured_output": true, "streaming": true})
+        );
 
         let raw_capabilities = serde_json::from_str::<Value>(&row.capabilities).unwrap();
         let caps = row.caps();
@@ -19355,6 +19511,120 @@ mod credential_enrollment_regression_tests {
         .execute(&state.pool)
         .await
         .unwrap();
+    }
+
+    /// #199 idle contract: 100 inactive plugin-bound integrations cost no
+    /// network calls, WASM instantiations, probes, or per-integration
+    /// scheduler work while fake time runs an hour of every background loop.
+    #[tokio::test]
+    async fn idle_integrations_do_no_integration_specific_work() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let connections = connections.clone();
+            tokio::spawn(async move {
+                while listener.accept().await.is_ok() {
+                    connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+
+        let (state, root) = test_state_with_plugins("idle-contract").await;
+        install_direct_api_test_plugin(&state, &base_url).await;
+        let mut provider_ids = Vec::new();
+        for index in 0..100 {
+            let name = format!("idle-{index}");
+            let provider_id = db::insert_provider(
+                &state.pool,
+                &db::NewProvider {
+                    name: &name,
+                    base_url: &base_url,
+                    wire_format: crate::types::WireFormat::Openai,
+                    auth_scheme: crate::types::AuthScheme::Bearer,
+                    custom_header_name: None,
+                    custom_param_name: None,
+                    extra_headers: json!({}),
+                    timeout_ms: 1_000,
+                    capability_mode: "permissive",
+                    models_path: None,
+                    rate_limit_rules: json!({}),
+                    follow_redirects: false,
+                    credential_hosts: "",
+                    allow_insecure_tls: true,
+                    wire_plugin: "",
+                    credential_plugin: "plugin:plugin.test/direct",
+                    model_source_plugin: "",
+                    credential_mode: "manual",
+                    source_plugin_id: None,
+                    source_integration_id: None,
+                },
+            )
+            .await
+            .unwrap();
+            let secret = state.crypto.encrypt("sk-idle").unwrap();
+            db::insert_account(
+                &state.pool,
+                &provider_id,
+                "idle",
+                &secret,
+                "sk-…idle",
+                1,
+                1,
+                None,
+                "none",
+            )
+            .await
+            .unwrap();
+            provider_ids.push(provider_id);
+        }
+        sqlx::query("UPDATE providers SET enabled = 0")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        state.registry.reload(&state.pool).await.unwrap();
+
+        // Fake time from here on; setup needs real time for SQLite connects.
+        tokio::time::pause();
+        crate::server::spawn_background_tasks(state.clone());
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+
+        let manager = state.plugin_manager().unwrap();
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(manager.wasm_instantiations().is_empty());
+        assert_eq!(
+            state.integrations.snapshot(),
+            Vec::new(),
+            "idle integrations must not be polled, woken, probed, or refreshed"
+        );
+
+        // Control: demand alone makes the same probe pass start working, so
+        // the zero counts above come from the idle gate rather than a dead
+        // scheduler. Real time again: pooled SQLite connections expired
+        // during the fake hour and must reconnect.
+        tokio::time::resume();
+        let demanded = crate::integrations::provider_key(&provider_ids[0]);
+        state.integrations.note_demand(&demanded);
+        crate::server::run_plugin_health_probes(&state, manager).await;
+        assert!(state.integrations.get(&demanded).poll_count > 0);
+        assert_eq!(
+            state
+                .integrations
+                .get(&crate::integrations::provider_key(&provider_ids[1])),
+            crate::integrations::IntegrationCounters {
+                integration: crate::integrations::provider_key(&provider_ids[1]),
+                ..Default::default()
+            }
+        );
+
+        state.lifecycle.begin_shutdown();
+        state
+            .lifecycle
+            .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn auth() -> AdminAuth {

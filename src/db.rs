@@ -1158,6 +1158,15 @@ impl ProviderRow {
     }
 }
 
+/// Control-plane revision bumped by triggers on every registry-table write.
+pub async fn registry_revision(pool: &Pool) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT revision FROM registry_revision WHERE id = 1")
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
 pub async fn list_providers(pool: &Pool) -> Result<Vec<ProviderRow>> {
     Ok(
         sqlx::query_as::<_, ProviderRow>("SELECT * FROM providers ORDER BY created_at")
@@ -3767,6 +3776,9 @@ pub struct UsageLogRow {
     /// This internal value is not part of serialized usage reports.
     #[serde(skip_serializing, default)]
     pub admission_cost_usd: Option<f64>,
+    /// SHA-256 of the plugin package that served the final attempt (#206).
+    #[serde(default)]
+    pub plugin_package_sha256: Option<String>,
 }
 
 pub async fn insert_usage_log(pool: &Pool, u: &UsageLogRow) -> Result<()> {
@@ -3781,8 +3793,9 @@ async fn insert_usage_log_on(conn: &mut sqlx::SqliteConnection, u: &UsageLogRow)
          route_name, fallback_hops, fallback_path, status, status_code, latency_ms, ttft_ms, input_tokens,
          output_tokens, cached_tokens, cache_write_tokens, thinking_tokens, cost_usd, cost_known, price_version_id, cache_status,
          serving_account_id, serving_account, serving_provider, upstream_request_id, flagged, error_message,
-         usage_confidence, commit_state, retry_count, route_trace_id, opaque_route_id, admission_cost_usd)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         usage_confidence, commit_state, retry_count, route_trace_id, opaque_route_id, admission_cost_usd,
+         plugin_package_sha256)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&u.id)
     .bind(&u.request_id)
@@ -3821,6 +3834,7 @@ async fn insert_usage_log_on(conn: &mut sqlx::SqliteConnection, u: &UsageLogRow)
     .bind(&u.route_trace_id)
     .bind(&u.opaque_route_id)
     .bind(u.admission_cost_usd)
+    .bind(&u.plugin_package_sha256)
     .execute(conn)
     .await?;
     Ok(())
@@ -3855,6 +3869,9 @@ pub struct UsageAttemptRow {
     pub commit_state: String,
     pub error_message: Option<String>,
     pub opaque_route_id: Option<String>,
+    /// SHA-256 of the plugin package whose adapter served this attempt (#206).
+    #[serde(default)]
+    pub plugin_package_sha256: Option<String>,
 }
 
 pub async fn insert_usage_attempt(pool: &Pool, attempt: &UsageAttemptRow) -> Result<()> {
@@ -3871,8 +3888,9 @@ async fn insert_usage_attempt_on(
          (id, request_id, attempt_number, ts, key_id, key_name, effective_model, route_id, route_name,
           serving_account_id, serving_account, serving_provider, upstream_request_id, status, status_code,
           input_tokens, output_tokens, cached_tokens, cache_write_tokens, thinking_tokens, cost_usd,
-          cost_known, price_version_id, usage_confidence, commit_state, error_message, opaque_route_id)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          cost_known, price_version_id, usage_confidence, commit_state, error_message, opaque_route_id,
+          plugin_package_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&attempt.id)
     .bind(&attempt.request_id)
@@ -3901,6 +3919,7 @@ async fn insert_usage_attempt_on(
     .bind(&attempt.commit_state)
     .bind(&attempt.error_message)
     .bind(&attempt.opaque_route_id)
+    .bind(&attempt.plugin_package_sha256)
     .execute(conn)
     .await?;
     Ok(())
@@ -5725,10 +5744,11 @@ mod pending_marker_publication_tests {
 }
 
 #[cfg(test)]
-mod usage_request_log_tests {
+pub(crate) mod usage_request_log_tests {
     use super::*;
 
-    fn request_row(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn request_row(
         id: &str,
         ts: &str,
         status: &str,
@@ -5777,6 +5797,7 @@ mod usage_request_log_tests {
             route_trace_id: None,
             opaque_route_id: None,
             admission_cost_usd: None,
+            plugin_package_sha256: None,
         }
     }
 
@@ -5928,6 +5949,11 @@ mod usage_request_log_tests {
         )
         .await
         .unwrap();
+        // A legacy database also predates the plugin package digest column.
+        sqlx::query("ALTER TABLE usage_logs DROP COLUMN plugin_package_sha256")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::raw_sql(include_str!(
             "../migrations/20260930130000_usage_attempt_accounting.sql"
         ))
@@ -5936,6 +5962,12 @@ mod usage_request_log_tests {
         .unwrap();
         sqlx::raw_sql(include_str!(
             "../migrations/20260930150000_usage_request_log_admission_cost.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/20261004110000_usage_plugin_package_digest.sql"
         ))
         .execute(&pool)
         .await

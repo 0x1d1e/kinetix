@@ -84,6 +84,7 @@ impl AttemptBudget {
 }
 
 /// Scripted behavior of one candidate attempt.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScriptedAttempt {
     pub provider_timeout: Duration,
@@ -92,6 +93,7 @@ pub(crate) struct ScriptedAttempt {
     pub succeeds: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttemptResult {
     Succeeded,
@@ -100,6 +102,7 @@ pub(crate) enum AttemptResult {
     TimedOut,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SimulatedAttempt {
     pub candidate: usize,
@@ -108,6 +111,7 @@ pub(crate) struct SimulatedAttempt {
     pub result: AttemptResult,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SimulationEnd {
     Succeeded,
@@ -116,6 +120,7 @@ pub(crate) enum SimulationEnd {
     CandidatesExhausted,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Simulation {
     pub attempts: Vec<SimulatedAttempt>,
@@ -125,6 +130,7 @@ pub(crate) struct Simulation {
 
 /// Replay the attempt loop over scripted candidates on a virtual clock that
 /// starts `initial_elapsed` after request start. Fully deterministic.
+#[cfg(test)]
 pub(crate) fn simulate(
     budget: AttemptBudget,
     initial_elapsed: Duration,

@@ -97,8 +97,10 @@ selection and fallback policy.
 ## Session Affinity
 
 An explicit continuity hint used to prefer a previously selected target or
-account for a client session. Kinetix does not infer affinity when no supported
-session identity is available.
+account for a client session. When cache affinity or sticky routing is enabled
+on the Route, a client `prompt_cache_key` (scoped per virtual key) also serves
+as an affinity key. Kinetix does not infer affinity when no supported identity
+is available.
 
 ## Source Integration
 

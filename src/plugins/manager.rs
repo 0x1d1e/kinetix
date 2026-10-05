@@ -355,6 +355,24 @@ impl PluginManager {
         }
     }
 
+    /// WASM component instantiations per plugin id (#199 idle contract).
+    pub fn wasm_instantiations(&self) -> Vec<(String, u64)> {
+        self.inner.runtime.instantiations()
+    }
+
+    pub fn wasm_instantiations_for(&self, id: &str) -> u64 {
+        self.inner.runtime.instantiations_for(id)
+    }
+
+    /// SHA-256 of the package whose compiled component this plugin's
+    /// invocations currently run (#206). `None` before the first compile.
+    pub fn active_package_sha256(&self, id: &str) -> Option<String> {
+        self.inner
+            .component_cache
+            .get(id)
+            .map(|cached| cached.package_sha256.clone())
+    }
+
     pub fn metrics_for_plugin(&self, id: &str) -> PluginMetricsSnapshot {
         use std::sync::atomic::Ordering::Relaxed;
 

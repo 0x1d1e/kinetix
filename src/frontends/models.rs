@@ -6,8 +6,12 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use serde_json::{json, Value};
 
-use crate::db::ModelRow;
+use std::collections::BTreeMap;
+
+use crate::adapters::TargetTransport;
 use crate::frontends::FrontendFormat;
+use crate::model_capabilities::ModelCapabilityFlags;
+use crate::model_state::{RuntimeModel, ThinkingSupport, OPERATOR_SOURCE};
 use crate::registry::Registry;
 use crate::types::{ErrorKind, ProxyError};
 
@@ -55,9 +59,6 @@ pub struct ClientProfileModel {
 #[derive(Clone)]
 struct ModelEntry {
     name: String,
-    context_window: Option<i64>,
-    max_output_tokens: Option<i64>,
-    capabilities: Option<Value>,
 }
 
 /// Return client-visible names that the key can actually resolve to at least
@@ -84,7 +85,8 @@ pub fn models_body(
     key_allowed: &[String],
     key_allowed_providers: &[String],
 ) -> Value {
-    let entries = model_entries(registry, key_allowed, key_allowed_providers);
+    let snapshot = registry.snapshot();
+    let entries = model_entries_in(&snapshot, key_allowed, key_allowed_providers);
     let created = chrono::Utc::now().timestamp();
 
     match format {
@@ -98,16 +100,9 @@ pub fn models_body(
                         "created": created,
                         "owned_by": "kinetix",
                     });
-                    if let Some(c) = entry.context_window {
-                        obj["context_window"] = json!(c);
-                    }
-                    if let Some(m) = entry.max_output_tokens {
-                        obj["max_output_tokens"] = json!(m);
-                    }
-                    // Only explicitly configured capabilities are exposed; unknown
-                    // metadata stays omitted, never assumed (FR-10.10).
-                    if let Some(c) = &entry.capabilities {
-                        obj["capabilities"] = c.clone();
+                    let targets = runtime_targets(&snapshot, &entry.name, key_allowed_providers);
+                    if let Some(listing) = Listing::intersect(&targets) {
+                        listing.write(&mut obj);
                     }
                     obj
                 })
@@ -138,15 +133,6 @@ pub fn models_body(
     }
 }
 
-fn model_entries(
-    registry: &Registry,
-    key_allowed: &[String],
-    key_allowed_providers: &[String],
-) -> Vec<ModelEntry> {
-    let snapshot = registry.snapshot();
-    model_entries_in(&snapshot, key_allowed, key_allowed_providers)
-}
-
 fn model_entries_in(
     snap: &crate::registry::Snapshot,
     key_allowed: &[String],
@@ -155,47 +141,21 @@ fn model_entries_in(
     // Client-facing names: aliases and Routes first, then upstream IDs. Add
     // provider-qualified IDs whenever the model grant permits the qualified name.
     let mut entries: Vec<ModelEntry> = Vec::new();
+    let mut push = |name: &str| {
+        if !entries.iter().any(|entry| entry.name == name) {
+            entries.push(ModelEntry {
+                name: name.to_string(),
+            });
+        }
+    };
     for alias in snap.aliases.values() {
-        let (context_window, max_output_tokens, capabilities) = match alias.target_type.as_str() {
-            "route" => (None, None, None),
-            _ => snap
-                .models
-                .get(&alias.target_id)
-                .map(|model| {
-                    (
-                        model.context_window,
-                        model.max_output_tokens,
-                        declared_caps(model),
-                    )
-                })
-                .unwrap_or((None, None, None)),
-        };
-        entries.push(ModelEntry {
-            name: alias.alias.clone(),
-            context_window,
-            max_output_tokens,
-            capabilities,
-        });
+        push(&alias.alias);
     }
-    for route in snap.routes.values() {
-        if route.enabled != 0 && !entries.iter().any(|entry| entry.name == route.name) {
-            entries.push(ModelEntry {
-                name: route.name.clone(),
-                context_window: None,
-                max_output_tokens: None,
-                capabilities: None,
-            });
-        }
+    for route in snap.routes.values().filter(|route| route.enabled != 0) {
+        push(&route.name);
     }
-    for model in snap.models.values() {
-        if model.enabled != 0 && !entries.iter().any(|entry| entry.name == model.upstream_id) {
-            entries.push(ModelEntry {
-                name: model.upstream_id.clone(),
-                context_window: model.context_window,
-                max_output_tokens: model.max_output_tokens,
-                capabilities: declared_caps(model),
-            });
-        }
+    for model in snap.models.values().filter(|model| model.enabled != 0) {
+        push(&model.upstream_id);
     }
     for model in snap.models.values().filter(|model| model.enabled != 0) {
         let Some(provider) = snap.providers.get(&model.provider_id) else {
@@ -205,17 +165,9 @@ fn model_entries_in(
         provider_names.sort_unstable();
         for provider_name in provider_names {
             let name = format!("{provider_name}/{}", model.upstream_id);
-            if !crate::db::VirtualKeyRow::model_is_allowed(key_allowed, &name)
-                || entries.iter().any(|entry| entry.name == name)
-            {
-                continue;
+            if crate::db::VirtualKeyRow::model_is_allowed(key_allowed, &name) {
+                push(&name);
             }
-            entries.push(ModelEntry {
-                name,
-                context_window: model.context_window,
-                max_output_tokens: model.max_output_tokens,
-                capabilities: declared_caps(model),
-            });
         }
     }
 
@@ -258,27 +210,32 @@ fn provider_ids_allowed<'a>(
         })
 }
 
-fn client_model_metadata(
+/// Effective runtime semantics of every eligible target `name` resolves to
+/// for a key: the resolved model, or each permitted, resolvable Route target.
+fn runtime_targets(
     snapshot: &crate::registry::Snapshot,
     name: &str,
     allowed_providers: &[String],
-) -> crate::client_profiles::ClientModelMetadata {
+) -> Vec<RuntimeModel> {
     use crate::registry::Resolved;
 
-    let Some(resolved) = Registry::resolve_in(snapshot, name) else {
-        return crate::client_profiles::ClientModelMetadata::default();
-    };
-    let models: Vec<ModelRow> = match resolved {
-        Resolved::Single { model_id, .. } => snapshot
-            .models
-            .get(&model_id)
-            .cloned()
-            .into_iter()
-            .collect(),
-        Resolved::Route { targets, .. } => {
+    match Registry::resolve_in(snapshot, name) {
+        Some(Resolved::Single {
+            provider_id,
+            model_id,
+        }) => {
+            let (Some(provider), Some(model)) = (
+                snapshot.providers.get(&provider_id),
+                snapshot.models.get(&model_id),
+            ) else {
+                return Vec::new();
+            };
+            RuntimeModel::resolve(provider, model).into_iter().collect()
+        }
+        Some(Resolved::Route { targets, .. }) => {
             let mut seen = std::collections::HashSet::new();
             targets
-                .into_iter()
+                .iter()
                 .filter(|target| {
                     provider_ids_allowed(
                         std::iter::once(target.provider.id.as_str()),
@@ -286,72 +243,203 @@ fn client_model_metadata(
                     )
                 })
                 .filter(|target| seen.insert(target.model.id.clone()))
-                .map(|target| target.model)
+                .filter_map(|target| RuntimeModel::resolve(&target.provider, &target.model).ok())
                 .collect()
         }
-    };
-    if models.is_empty() {
-        return crate::client_profiles::ClientModelMetadata::default();
+        None => Vec::new(),
     }
+}
 
-    let capabilities: Vec<_> = models.iter().map(declared_caps).collect();
-    let reasoning = capabilities
+fn client_model_metadata(
+    snapshot: &crate::registry::Snapshot,
+    name: &str,
+    allowed_providers: &[String],
+) -> crate::client_profiles::ClientModelMetadata {
+    let targets = runtime_targets(snapshot, name, allowed_providers);
+    let Some(listing) = Listing::intersect(&targets) else {
+        return crate::client_profiles::ClientModelMetadata::default();
+    };
+    // A reasoning flag is shared only when every target agrees.
+    let reasoning = targets
         .iter()
-        .map(|caps| caps.as_ref()?.get("reasoning")?.as_bool())
+        .map(|target| target.capabilities.reasoning)
         .collect::<Option<Vec<_>>>()
         .and_then(|values| {
             let first = *values.first()?;
             values.iter().all(|value| *value == first).then_some(first)
         });
     let mut input = Vec::new();
-    if capabilities.iter().all(|caps| {
-        caps.as_ref()
-            .and_then(|caps| caps.get("text"))
-            .and_then(Value::as_bool)
-            == Some(true)
-    }) {
+    if listing.capabilities.text == Some(true) {
         input.push("text".to_string());
     }
-    if capabilities.iter().all(|caps| {
-        caps.as_ref()
-            .and_then(|caps| caps.get("vision"))
-            .and_then(Value::as_bool)
-            == Some(true)
-    }) {
+    if listing.capabilities.vision == Some(true) {
         input.push("image".to_string());
     }
-
     crate::client_profiles::ClientModelMetadata {
         reasoning,
         input: (!input.is_empty()).then_some(input),
-        context_window: models
-            .iter()
-            .map(|model| model.context_window)
-            .collect::<Option<Vec<_>>>()
-            .and_then(|limits| limits.into_iter().min()),
-        max_output_tokens: models
-            .iter()
-            .map(|model| model.max_output_tokens)
-            .collect::<Option<Vec<_>>>()
-            .and_then(|limits| limits.into_iter().min()),
+        context_window: listing.context_window,
+        max_output_tokens: listing.max_output_tokens,
     }
 }
 
-/// The explicitly declared boolean capabilities of a model, or `None` when the
-/// model declares no capability metadata. Unknown metadata is never invented.
-fn declared_caps(m: &ModelRow) -> Option<Value> {
-    let v: Value = serde_json::from_str(&m.capabilities).ok()?;
-    let obj = v.as_object()?;
-    let mut out = serde_json::Map::new();
-    for (k, val) in obj {
-        if val.is_boolean() {
-            out.insert(k.clone(), val.clone());
-        }
+/// Client-visible accepted semantics of a listed name (#198). For a Route it
+/// is the conservative intersection of its eligible targets: a capability is
+/// `true` only when every target supports it, `false` when any target lacks
+/// it, and omitted while unknown. Raw observations are never listed.
+struct Listing {
+    context_window: Option<i64>,
+    max_output_tokens: Option<i64>,
+    capabilities: ModelCapabilityFlags,
+    thinking: Option<ThinkingSupport>,
+    transport: Option<&'static str>,
+    provenance: BTreeMap<&'static str, &'static str>,
+}
+
+impl Listing {
+    fn intersect(targets: &[RuntimeModel]) -> Option<Self> {
+        let (first, rest) = targets.split_first()?;
+        let limit = |field: fn(&RuntimeModel) -> Option<i64>| {
+            targets
+                .iter()
+                .map(field)
+                .collect::<Option<Vec<_>>>()
+                .and_then(|limits| limits.into_iter().min())
+        };
+        let flag = |field: fn(&ModelCapabilityFlags) -> Option<bool>| {
+            let values: Vec<_> = targets
+                .iter()
+                .map(|target| field(&target.capabilities))
+                .collect();
+            if values.contains(&Some(false)) {
+                Some(false)
+            } else if values.iter().all(|value| *value == Some(true)) {
+                Some(true)
+            } else {
+                None
+            }
+        };
+        let transport = public_transport(&first.transport);
+        let transport = rest
+            .iter()
+            .all(|target| public_transport(&target.transport) == transport)
+            .then_some(transport);
+        let provenance = first
+            .provenance
+            .iter()
+            .map(|(field, source)| (*field, public_source(source)))
+            .filter(|(field, source)| {
+                rest.iter().all(|target| {
+                    target
+                        .provenance
+                        .get(field)
+                        .map(|other| public_source(other))
+                        == Some(*source)
+                })
+            })
+            .collect();
+        Some(Self {
+            context_window: limit(|target| target.context_window),
+            max_output_tokens: limit(|target| target.max_output_tokens),
+            capabilities: ModelCapabilityFlags {
+                text: flag(|caps| caps.text),
+                reasoning: flag(|caps| caps.reasoning),
+                vision: flag(|caps| caps.vision),
+                tool_calling: flag(|caps| caps.tool_calling),
+                parallel_tools: flag(|caps| caps.parallel_tools),
+                structured_output: flag(|caps| caps.structured_output),
+            },
+            thinking: shared_thinking(targets),
+            transport,
+            provenance,
+        })
     }
-    if out.is_empty() {
-        None
+
+    /// Add the listing to an OpenAI model object. Unknown values are omitted.
+    fn write(&self, obj: &mut Value) {
+        if let Some(context_window) = self.context_window {
+            obj["context_window"] = json!(context_window);
+        }
+        if let Some(max_output_tokens) = self.max_output_tokens {
+            obj["max_output_tokens"] = json!(max_output_tokens);
+        }
+        // Every listed model streams: the gateway always serves streaming
+        // requests, synthesizing a stream for non-streaming upstreams.
+        let mut capabilities = serde_json::Map::from_iter([("streaming".into(), json!(true))]);
+        for (key, value) in [
+            ("tools", self.capabilities.tool_calling),
+            ("parallel_tools", self.capabilities.parallel_tools),
+            ("images", self.capabilities.vision),
+            ("structured_output", self.capabilities.structured_output),
+        ] {
+            if let Some(value) = value {
+                capabilities.insert(key.into(), json!(value));
+            }
+        }
+        if let Some(thinking) = &self.thinking {
+            capabilities.insert("thinking".into(), json!(thinking));
+        }
+        obj["capabilities"] = Value::Object(capabilities);
+
+        let mut kinetix = json!({ "state": "accepted" });
+        if let Some(transport) = self.transport {
+            kinetix["transport"] = json!(transport);
+        }
+        if !self.provenance.is_empty() {
+            kinetix["provenance"] = json!(self.provenance);
+        }
+        obj["kinetix"] = kinetix;
+    }
+}
+
+/// Thinking modes and levels every target supports; unknown when any target's
+/// support is unknown or no mode is shared.
+fn shared_thinking(targets: &[RuntimeModel]) -> Option<ThinkingSupport> {
+    let (first, rest) = targets.split_first()?;
+    let mut shared = first.thinking.clone()?;
+    for target in rest {
+        let other = target.thinking.as_ref()?;
+        shared.modes.retain(|mode| other.modes.contains(mode));
+        shared.levels.retain(|level| other.levels.contains(level));
+    }
+    // A levelled mode with no common level has no value every target accepts.
+    if shared.levels.is_empty() {
+        shared.modes.retain(|mode| mode != "level");
+    }
+    // Effort levels only apply to a shared levelled mode.
+    if shared
+        .modes
+        .iter()
+        .all(|mode| mode == "off" || mode == "on")
+    {
+        shared.levels.clear();
+    }
+    (!shared.modes.is_empty()).then_some(shared)
+}
+
+/// Public transport family. Plugin references stay private.
+fn public_transport(transport: &TargetTransport) -> &'static str {
+    match transport {
+        TargetTransport::OpenAiChat => "openai",
+        TargetTransport::OpenAiResponses => "openai-responses",
+        TargetTransport::Anthropic => "anthropic",
+        TargetTransport::Gemini => "gemini",
+        TargetTransport::Plugin(_) => "plugin",
+    }
+}
+
+/// Coarse public source category. Internal source details stay private.
+fn public_source(source: &str) -> &'static str {
+    if source == OPERATOR_SOURCE {
+        "operator"
+    } else if source.starts_with("models.dev") {
+        "models.dev"
+    } else if source.contains("plugin") {
+        "plugin"
+    } else if source.contains("probe") {
+        "probe"
     } else {
-        Some(Value::Object(out))
+        "provider"
     }
 }
 
@@ -715,6 +803,237 @@ mod tests {
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn listing_registry(models: &[(&str, Value, Value)]) -> (Registry, String, Vec<String>) {
+        let root = std::env::temp_dir().join(format!(
+            "kinetix-model-listing-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let database_url = format!("sqlite://{}", root.join("kinetix.db").display());
+        let pool = crate::db::connect(&database_url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let provider_id = insert_test_provider(&pool, "listing").await;
+        let account_id = crate::db::insert_account(
+            &pool,
+            &provider_id,
+            "listing-account",
+            "encrypted-test-secret",
+            "masked",
+            1,
+            1,
+            None,
+            "none",
+        )
+        .await
+        .unwrap();
+        let mut model_ids = Vec::new();
+        for (name, capabilities, discovery) in models {
+            model_ids.push(
+                crate::db::insert_model(
+                    &pool,
+                    &crate::db::NewModel {
+                        provider_id: &provider_id,
+                        upstream_id: name,
+                        display_name: name,
+                        enabled: true,
+                        context_window: discovery["context_window"].as_i64(),
+                        max_output_tokens: Some(8_192),
+                        capabilities: capabilities.clone(),
+                        prices: json!({}),
+                        parameters: json!({}),
+                        thinking_map: json!({}),
+                        extra_request: json!({}),
+                        discovery: discovery.clone(),
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let targets: Vec<(&str, &str)> = model_ids
+            .iter()
+            .map(|model_id| (account_id.as_str(), model_id.as_str()))
+            .collect();
+        insert_test_route(&pool, "listing-route", &targets).await;
+        let registry = Registry::new();
+        registry.reload(&pool).await.unwrap();
+        (registry, provider_id, model_ids)
+    }
+
+    fn listed<'a>(body: &'a Value, id: &str) -> &'a Value {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == id)
+            .unwrap()
+    }
+
+    fn adaptive_discovery(context_window: i64) -> Value {
+        json!({
+            "imported_from_discovery": true,
+            "context_window": context_window,
+            "reasoning_capability": {
+                "mode": "adaptive",
+                "levels": ["off", "low", "medium", "high"],
+                "can_disable": true
+            },
+            "capability_sources": {
+                "context_window": "models.dev:canonical",
+                "reasoning": "models.dev:canonical"
+            },
+            "operator_capability_overrides": {},
+            "latest_observation": {
+                "context_window": 1_000_000,
+                "capabilities": {"tool_calling": false, "vision": false}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn model_listing_exposes_accepted_capabilities_and_provenance() {
+        let (registry, _, _) = listing_registry(&[(
+            "adaptive-model",
+            json!({"text": true, "reasoning": true, "tool_calling": true, "vision": true, "structured_output": false}),
+            adaptive_discovery(200_000),
+        )])
+        .await;
+        let body = models_body(FrontendFormat::OpenAi, &registry, &["*".into()], &[]);
+        assert_eq!(body["object"], "list");
+        let model = listed(&body, "adaptive-model").clone();
+        assert_eq!(model["object"], "model");
+        assert_eq!(model["owned_by"], "kinetix");
+        assert_eq!(model["context_window"], 200_000);
+        assert_eq!(model["max_output_tokens"], 8_192);
+        // Accepted values only: the newer observation (tools=false, 1M) is
+        // not listed until accepted.
+        assert_eq!(
+            model["capabilities"],
+            json!({
+                "tools": true,
+                "images": true,
+                "streaming": true,
+                "structured_output": false,
+                "thinking": {"modes": ["off", "adaptive"], "levels": ["low", "medium", "high"]}
+            })
+        );
+        assert_eq!(
+            model["kinetix"],
+            json!({
+                "state": "accepted",
+                "transport": "openai",
+                "provenance": {
+                    "context_window": "models.dev",
+                    "thinking": "models.dev",
+                    "transport": "provider"
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn route_listing_reports_the_conservative_target_intersection() {
+        let (registry, _, _) = listing_registry(&[
+            (
+                "tools-model",
+                json!({"text": true, "reasoning": true, "tool_calling": true, "vision": true}),
+                adaptive_discovery(200_000),
+            ),
+            (
+                "no-tools-model",
+                json!({"text": true, "reasoning": true, "tool_calling": false}),
+                json!({
+                    "context_window": 100_000,
+                    "reasoning_capability": {"mode": "level", "levels": ["low", "high"], "can_disable": true},
+                    "operator_capability_overrides": {}
+                }),
+            ),
+        ])
+        .await;
+        let body = models_body(FrontendFormat::OpenAi, &registry, &["*".into()], &[]);
+        let route = listed(&body, "listing-route");
+        assert_eq!(route["context_window"], 100_000);
+        // Only some targets support tools: never `tools: true`. Vision is
+        // unknown on one target, so it is omitted.
+        assert_eq!(
+            route["capabilities"],
+            json!({
+                "tools": false,
+                "streaming": true,
+                "thinking": {"modes": ["off"]}
+            })
+        );
+        assert_eq!(
+            route["kinetix"],
+            json!({
+                "state": "accepted",
+                "transport": "openai",
+                "provenance": {"transport": "provider"}
+            })
+        );
+        assert_eq!(listed(&body, "tools-model")["capabilities"]["tools"], true);
+    }
+
+    #[tokio::test]
+    async fn route_listing_drops_level_mode_without_a_shared_level() {
+        let level_model = |levels: Value| {
+            json!({
+                "context_window": 100_000,
+                "reasoning_capability": {"mode": "level", "levels": levels},
+                "operator_capability_overrides": {}
+            })
+        };
+        let (registry, _, _) = listing_registry(&[
+            (
+                "low-model",
+                json!({"text": true, "reasoning": true}),
+                level_model(json!(["low"])),
+            ),
+            (
+                "high-model",
+                json!({"text": true, "reasoning": true}),
+                level_model(json!(["high"])),
+            ),
+        ])
+        .await;
+        let body = models_body(FrontendFormat::OpenAi, &registry, &["*".into()], &[]);
+        assert_eq!(
+            listed(&body, "low-model")["capabilities"]["thinking"],
+            json!({"modes": ["level"], "levels": ["low"]})
+        );
+        // Both targets are levelled but share no level: no thinking value is
+        // executable on every target, so the Route advertises none.
+        let route = listed(&body, "listing-route");
+        assert!(
+            route["capabilities"].get("thinking").is_none(),
+            "{}",
+            route["capabilities"]
+        );
+    }
+
+    #[tokio::test]
+    async fn route_listing_only_intersects_targets_the_key_can_reach() {
+        let (registry, provider_id, _) = listing_registry(&[(
+            "tools-model",
+            json!({"tool_calling": true}),
+            json!({"context_window": 64_000}),
+        )])
+        .await;
+        let body = models_body(
+            FrontendFormat::OpenAi,
+            &registry,
+            &["*".into()],
+            std::slice::from_ref(&provider_id),
+        );
+        assert_eq!(
+            listed(&body, "listing-route")["capabilities"]["tools"],
+            true
+        );
+        let anthropic = models_body(FrontendFormat::Anthropic, &registry, &["*".into()], &[]);
+        let model = &anthropic["data"][0];
+        assert!(model.get("capabilities").is_none() && model.get("kinetix").is_none());
     }
 
     #[test]

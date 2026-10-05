@@ -91,6 +91,10 @@ pub struct AppState {
     /// run off the request path; if the queue is full a hook is dropped rather
     /// than delaying a client request.
     hook_tx: tokio::sync::mpsc::Sender<HookJob>,
+    /// Process-owned background loops and flights; drained on shutdown.
+    pub lifecycle: crate::process::ProcessLifecycle,
+    /// Per-integration idle-contract counters and request demand.
+    pub integrations: crate::integrations::IntegrationActivity,
 }
 
 enum RefreshLookup<T, E> {
@@ -141,19 +145,44 @@ type HookJob =
 const HOOK_QUEUE_CAPACITY: usize = 1024;
 const MAX_CONCURRENT_HOOK_JOBS: usize = 32;
 
-fn spawn_hook_worker(mut hook_rx: tokio::sync::mpsc::Receiver<HookJob>) {
+/// Dispatch queued hooks as process-owned flights (#205). Once shutdown
+/// begins the dispatcher stops; still-queued hooks are dropped (hooks are
+/// best-effort) and running ones get the shutdown grace before being aborted.
+fn spawn_hook_worker(
+    lifecycle: &crate::process::ProcessLifecycle,
+    mut hook_rx: tokio::sync::mpsc::Receiver<HookJob>,
+) {
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HOOK_JOBS));
-    tokio::spawn(async move {
-        while let Some(job) = hook_rx.recv().await {
-            let permit = slots
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("hook dispatcher semaphore is never closed");
-            tokio::spawn(async move {
+    let flights = lifecycle.clone();
+    lifecycle.spawn_background(async move {
+        loop {
+            let job = tokio::select! {
+                biased;
+                _ = flights.stopping() => break,
+                job = hook_rx.recv() => match job {
+                    Some(job) => job,
+                    None => return,
+                },
+            };
+            let permit = tokio::select! {
+                biased;
+                _ = flights.stopping() => break,
+                permit = slots.clone().acquire_owned() => {
+                    permit.expect("hook dispatcher semaphore is never closed")
+                }
+            };
+            flights.spawn_flight(async move {
                 let _permit = permit;
                 job().await;
             });
+        }
+        hook_rx.close();
+        let mut dropped = 0usize;
+        while hook_rx.try_recv().is_ok() {
+            dropped += 1;
+        }
+        if dropped > 0 {
+            tracing::info!(dropped, "shutdown dropped queued plugin hooks");
         }
     });
 }
@@ -175,11 +204,13 @@ impl AppState {
         let sessions = Arc::new(crate::auth::Sessions::new(config.session_ttl_minutes));
         let plugin_auth_sessions = Arc::new(crate::auth::PluginAuthSessions::new());
         let target_telemetry = crate::target_telemetry::TargetTelemetry::new(pool.clone());
+        let lifecycle = crate::process::ProcessLifecycle::new();
         let provider_work = crate::provider_work::ProviderWorkCoordinator::with_lifecycle_lock(
             registry.lifecycle_lock(),
-        );
+        )
+        .with_process(lifecycle.clone());
         let (hook_tx, hook_rx) = tokio::sync::mpsc::channel::<HookJob>(HOOK_QUEUE_CAPACITY);
-        spawn_hook_worker(hook_rx);
+        spawn_hook_worker(&lifecycle, hook_rx);
         AppState {
             config,
             pool,
@@ -218,6 +249,8 @@ impl AppState {
             plugin_auth_sessions,
             plugins: None,
             hook_tx,
+            lifecycle,
+            integrations: Default::default(),
         }
     }
 
@@ -235,6 +268,10 @@ impl AppState {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
+        if self.lifecycle.is_stopping() {
+            tracing::debug!("shutdown in progress; dropping plugin hook");
+            return;
+        }
         let job: HookJob = Box::new(move || Box::pin(make()));
         if self.hook_tx.try_send(job).is_err() {
             tracing::debug!("plugin hook queue saturated; dropping hook");
@@ -654,6 +691,10 @@ impl AppState {
             return;
         };
 
+        self.integrations.record(
+            &crate::integrations::provider_key(&provider.id),
+            crate::integrations::IntegrationWork::CredentialRefresh,
+        );
         let refresh = self.credential_refresh.clone();
         let provider_id = provider.id.clone();
         let account_for_refresh = account.clone();
@@ -801,7 +842,7 @@ mod hook_dispatch_tests {
     #[tokio::test]
     async fn blocked_hook_job_does_not_block_next_job() {
         let (tx, rx) = tokio::sync::mpsc::channel::<HookJob>(HOOK_QUEUE_CAPACITY);
-        spawn_hook_worker(rx);
+        spawn_hook_worker(&crate::process::ProcessLifecycle::new(), rx);
 
         let gate = Arc::new(tokio::sync::Notify::new());
         let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
@@ -832,5 +873,72 @@ mod hook_dispatch_tests {
             .unwrap();
 
         gate.notify_waiters();
+    }
+
+    /// #205: hook jobs are process-owned flights. Shutdown drains a running
+    /// hook within the grace period, aborts one that outlives it, and never
+    /// starts a hook queued or submitted after shutdown begins.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drains_then_aborts_hook_flights_and_refuses_new_ones() {
+        use std::sync::atomic::AtomicBool;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let lifecycle = crate::process::ProcessLifecycle::new();
+        let (tx, rx) = tokio::sync::mpsc::channel::<HookJob>(HOOK_QUEUE_CAPACITY);
+        spawn_hook_worker(&lifecycle, rx);
+
+        let quick_done = Arc::new(AtomicBool::new(false));
+        let stuck_dropped = Arc::new(AtomicBool::new(false));
+        let late_ran = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        {
+            let quick_done = quick_done.clone();
+            tx.send(Box::new(move || {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    quick_done.store(true, Ordering::SeqCst);
+                })
+            }))
+            .await
+            .unwrap();
+        }
+        {
+            let flag = DropFlag(stuck_dropped.clone());
+            tx.send(Box::new(move || {
+                Box::pin(async move {
+                    let _flag = flag;
+                    let _ = started_tx.send(());
+                    std::future::pending::<()>().await;
+                })
+            }))
+            .await
+            .unwrap();
+        }
+        started_rx.await.unwrap();
+
+        lifecycle.begin_shutdown();
+        {
+            let late_ran = late_ran.clone();
+            let _ = tx.try_send(Box::new(move || {
+                Box::pin(async move {
+                    late_ran.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+        let outcome = lifecycle
+            .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await;
+
+        assert_eq!(outcome, crate::process::DrainOutcome::Aborted);
+        assert!(quick_done.load(Ordering::SeqCst), "running hook drained");
+        assert!(stuck_dropped.load(Ordering::SeqCst), "stuck hook aborted");
+        assert!(!late_ran.load(Ordering::SeqCst), "no hook after shutdown");
+        assert_eq!(lifecycle.tracked_len(), 0);
     }
 }

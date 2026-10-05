@@ -124,6 +124,15 @@ def chat_payload(model, marker="fixture:chat-fields fixture:vision fixture:think
     }
     if stream:
         payload["stream_options"] = {"include_usage": True}
+    return without_unhonored_anthropic_params(payload)
+
+
+def without_unhonored_anthropic_params(payload):
+    # Anthropic has no seed or sampling penalties; sending them is a 400
+    # (translate.target_fields.policy), so all-fields payloads omit them.
+    if "anthropic" in payload["model"]:
+        for key in ("seed", "presence_penalty", "frequency_penalty"):
+            payload.pop(key, None)
     return payload
 
 
@@ -154,7 +163,7 @@ def messages_payload(model, marker="fixture:messages-fields fixture:vision fixtu
 
 
 def responses_payload(model, marker="fixture:responses-fields fixture:vision fixture:thinking", stream=True):
-    return {
+    return without_unhonored_anthropic_params({
         "model": model,
         "stream": stream,
         "instructions": "fixture:responses-instructions",
@@ -179,7 +188,7 @@ def responses_payload(model, marker="fixture:responses-fields fixture:vision fix
             {"type": "function", "name": "read_file", "description": "read", "parameters": {"type": "object"}},
         ],
         "tool_choice": "required",
-    }
+    })
 
 def chat_tool_identity(events):
     names = set()
@@ -260,6 +269,55 @@ def expect_rejected(path, base_payload, variants, expected_status=422):
         need(status == expected_status, f"{label}: expected {expected_status}, got {status}: {body}")
 
 
+TOOL_CONTINUATION_CASES = {
+    "chat.native.openai.tool_continuation": ("chat", "syn-openai"),
+    "chat.fallback.tool_continuation": ("chat", "syn-fallback"),
+    "chat.translate.anthropic.tool_continuation": ("chat", "syn-anthropic"),
+    "messages.native.anthropic.tool_continuation": ("messages", "syn-anthropic"),
+    "messages.translate.gemini.tool_continuation": ("messages", "syn-gemini-3"),
+    "messages.translate.openai.tool_continuation": ("messages", "syn-openai"),
+    "responses.translate.openai.tool_continuation": ("responses", "syn-openai"),
+    "responses.translate.gemini.tool_continuation": ("responses", "syn-gemini-3"),
+    "responses.translate.anthropic.tool_continuation": ("responses", "syn-anthropic"),
+}
+
+
+def expect_tool_continuation(profile, model):
+    """Replay a tool call and its result; the strict upstream rejects the turn
+    unless the result still references the call in the target dialect."""
+    result = "fixture:tool-continuation 18C"
+    if profile == "chat":
+        path = "/v1/chat/completions"
+        payload = {"messages": [
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_keep_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call_keep_1", "content": result},
+        ]}
+    elif profile == "messages":
+        path = "/v1/messages"
+        payload = {"max_tokens": 64, "messages": [
+            {"role": "assistant", "content": [{
+                "type": "tool_use", "id": "toolu_keep_1", "name": "get_weather",
+                "input": {"city": "Paris"},
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": "toolu_keep_1", "content": result,
+            }]},
+        ]}
+    else:
+        path = "/v1/responses"
+        payload = {"input": [
+            {"type": "function_call", "call_id": "call_keep_resp", "name": "get_weather",
+             "arguments": "{\"city\":\"Paris\"}"},
+            {"type": "function_call_output", "call_id": "call_keep_resp", "output": result},
+        ]}
+    payload.update({"model": model, "stream": False})
+    status, _, body = request(path, payload)
+    need(status == 200, f"{path} -> {model} returned {status}: {body}")
+
+
 def run_http_case(case_id):
     path_cases = {
         "chat.native.openai.sync": ("chat", "syn-openai", False),
@@ -285,6 +343,8 @@ def run_http_case(case_id):
         profile, model, stream = path_cases[case_id]
         builder = {"chat": chat_payload, "messages": messages_payload, "responses": responses_payload}[profile]
         return expect_mixed(profile, model, builder(model, stream=stream))
+    if case_id in TOOL_CONTINUATION_CASES:
+        return expect_tool_continuation(*TOOL_CONTINUATION_CASES[case_id])
 
 
     if case_id == "chat.image.variants":
@@ -397,21 +457,6 @@ def run_http_case(case_id):
             payload["tool_choice"] = choice
             status, _, body = request("/v1/responses", payload)
             need(status == 200, f"{label}: {body}")
-        return
-
-    if case_id == "responses.translate.openai.tool_continuation":
-        payload = {
-            "model": "syn-openai",
-            "stream": False,
-            "input": [
-                {"type": "function_call", "call_id": "call_keep_resp", "name": "get_weather",
-                 "arguments": "{\"city\":\"Paris\"}"},
-                {"type": "function_call_output", "call_id": "call_keep_resp",
-                 "output": "fixture:tool-continuation 18C"},
-            ],
-        }
-        status, _, body = request("/v1/responses", payload)
-        need(status == 200, body)
         return
 
     if case_id == "responses.supported_options":
@@ -673,42 +718,6 @@ def run_http_case(case_id):
         )
         return
 
-    if case_id == "chat.fallback.tool_continuation":
-        payload = {
-            "model": "syn-fallback",
-            "stream": False,
-            "messages": [
-                {"role": "assistant", "content": None, "tool_calls": [{
-                    "id": "call_keep_1", "type": "function",
-                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
-                }]},
-                {"role": "tool", "tool_call_id": "call_keep_1", "content": "fixture:tool-continuation 18C"},
-            ],
-        }
-        status, _, body = request("/v1/chat/completions", payload)
-        need(status == 200, body)
-        return
-
-    if case_id == "messages.translate.openai.tool_continuation":
-        payload = {
-            "model": "syn-openai",
-            "stream": False,
-            "max_tokens": 64,
-            "messages": [
-                {"role": "assistant", "content": [{
-                    "type": "tool_use", "id": "toolu_keep_1", "name": "get_weather",
-                    "input": {"city": "Paris"},
-                }]},
-                {"role": "user", "content": [{
-                    "type": "tool_result", "tool_use_id": "toolu_keep_1",
-                    "content": "fixture:tool-continuation 18C",
-                }]},
-            ],
-        }
-        status, _, body = request("/v1/messages", payload)
-        need(status == 200, body)
-        return
-
     if case_id == "chat.fallback.opaque_reasoning":
         payload = {
             "model": "syn-fallback",
@@ -723,6 +732,20 @@ def run_http_case(case_id):
         need(bool(headers.get("x-kinetix-warning")), "portability warning header missing")
         return
 
+
+    if case_id == "chat.native.openai.reasoning_replay":
+        payload = {
+            "model": "syn-openai",
+            "stream": False,
+            "messages": [
+                {"role": "assistant", "content": "prior", "reasoning_content": "earlier thought", "reasoning_signature": "sig-own"},
+                {"role": "user", "content": "fixture:chat-reasoning-replay"},
+            ],
+        }
+        status, headers, body = request("/v1/chat/completions", payload)
+        need(status == 200, body)
+        need(not headers.get("x-kinetix-warning"), "same-format reasoning replay must not warn")
+        return
 
     if case_id == "messages.translate.gemini.opaque_reasoning":
         payload = {
@@ -803,7 +826,11 @@ def run_http_case(case_id):
         need(status == 200, body)
         return
 
-    if case_id == "chat.translate.gemini.unsupported_fields.reject":
+    if case_id in (
+        "chat.translate.gemini.unsupported_fields.reject",
+        "chat.translate.anthropic.unsupported_fields.reject",
+    ):
+        translated_model = "syn-anthropic" if ".anthropic." in case_id else "syn-gemini-3"
         variants = [
             ("n", {"n": 2}),
             ("logprobs", {"logprobs": True, "top_logprobs": 2}),
@@ -811,6 +838,7 @@ def run_http_case(case_id):
                 "type": "json_schema",
                 "json_schema": {"name": "answer", "schema": {"type": "object"}},
             }}),
+            ("response_format.json_object", {"response_format": {"type": "json_object"}}),
             ("modalities/audio", {"modalities": ["text", "audio"], "audio": {"voice": "alloy", "format": "wav"}}),
             ("prediction", {"prediction": {"type": "content", "content": "expected"}}),
         ]
@@ -818,6 +846,7 @@ def run_http_case(case_id):
             "n": "passthrough-n",
             "logprobs": "passthrough-logprobs",
             "response_format.json_schema": "passthrough-response-format",
+            "response_format.json_object": "passthrough-response-format",
             "modalities/audio": "passthrough-modalities-audio",
             "prediction": "passthrough-prediction",
         }
@@ -829,8 +858,46 @@ def run_http_case(case_id):
             native.update(patch)
             status, _, body = request("/v1/chat/completions", native)
             need(status == 200, f"{label}: same-format passthrough failed: {status}: {body}")
-        translated = {"model": "syn-gemini-3", "messages": [{"role": "user", "content": "translated"}]}
+        translated = {"model": translated_model, "messages": [{"role": "user", "content": "translated"}]}
         expect_rejected("/v1/chat/completions", translated, variants, expected_status=400)
+        return
+
+    if case_id == "translate.target_fields.policy":
+        # Fields outside the canonical request must be honored by the target or
+        # refused (400); never silently dropped on a translating path.
+        chat = {"model": "syn-anthropic", "stream": False, "messages": [{"role": "user", "content": "translated"}]}
+        expect_rejected("/v1/chat/completions", chat, [
+            ("seed", {"seed": 7}),
+            ("presence_penalty", {"presence_penalty": 0.5}),
+            ("service_tier", {"service_tier": "flex"}),
+            ("logit_bias", {"logit_bias": {"50256": -100}}),
+            ("verbosity", {"verbosity": "low"}),
+            ("web_search_options", {"web_search_options": {}}),
+            ("store", {"store": True}),
+            ("unknown field", {"future_semantics": {"enabled": True}}),
+        ], expected_status=400)
+        gemini_chat = dict(chat, model="syn-gemini-3")
+        expect_rejected("/v1/chat/completions", gemini_chat, [
+            ("user", {"user": "end-user-1"}),
+            ("parallel_tool_calls", {"parallel_tool_calls": False}),
+        ], expected_status=400)
+        messages = {"model": "syn-openai", "stream": False, "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "translated"}]}
+        expect_rejected("/v1/messages", messages, [
+            ("service_tier", {"service_tier": "auto"}),
+            ("container", {"container": "container_1"}),
+            ("unknown field", {"future_semantics": {"enabled": True}}),
+        ], expected_status=400)
+        expect_rejected("/v1/messages", dict(messages, model="syn-gemini-3"), [
+            ("metadata.user_id", {"metadata": {"user_id": "end-user-1"}}),
+        ], expected_status=400)
+        for path, payload in [
+            ("/v1/chat/completions", dict(chat, user="end-user-1", parallel_tool_calls=True, prompt_cache_key="pck-1")),
+            ("/v1/chat/completions", dict(chat, model="syn-gemini-3", presence_penalty=0.5, frequency_penalty=0.5)),
+            ("/v1/messages", dict(messages, metadata={"user_id": "end-user-1"})),
+        ]:
+            status, _, body = request(path, payload)
+            need(status == 200, f"{path} {payload['model']}: honored fields refused: {status}: {body}")
         return
 
     if case_id == "responses.unsupported_fields.reject":
@@ -917,6 +984,29 @@ def run_http_case(case_id):
             "syn-gemini-3" not in restricted_ids,
             f"restricted key exposed disallowed provider model: {sorted(restricted_ids)}",
         )
+
+        # Listings expose accepted capabilities and Kinetix metadata only.
+        by_id = {item.get("id"): item for item in data["data"]}
+        direct = by_id["syn-openai"]
+        need(
+            direct.get("capabilities", {}).get("tools") is True
+            and direct["capabilities"].get("images") is True
+            and direct["capabilities"].get("streaming") is True,
+            f"accepted capabilities missing from model listing: {direct}",
+        )
+        need(
+            direct.get("kinetix", {}).get("state") == "accepted"
+            and direct["kinetix"].get("transport") == "openai",
+            f"Kinetix model metadata missing: {direct}",
+        )
+        public_sources = {"operator", "models.dev", "plugin", "probe", "provider"}
+        for item in data["data"]:
+            kinetix = item.get("kinetix", {})
+            need(
+                set(kinetix) <= {"state", "transport", "provenance"}
+                and set(kinetix.get("provenance", {}).values()) <= public_sources,
+                f"model listing exposes non-public metadata: {item}",
+            )
 
         unauth_status, _, _ = request("/v1/models", None, "GET", key=None)
         need(unauth_status in (401, 403), f"models endpoint accepted unauthenticated request: {unauth_status}")

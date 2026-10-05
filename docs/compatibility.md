@@ -75,7 +75,11 @@ Supported request semantics:
   same-format passthrough);
 - `reasoning.summary` as a same-format Responses control, forwarded unchanged
   alongside the mapped `reasoning.effort`; translating paths reject it;
-- `prompt_cache_key` as a portable OpenAI prompt-cache hint;
+- `prompt_cache_key` as an advisory OpenAI prompt-cache hint: forwarded to
+  OpenAI targets, used as the Route cache-affinity key (scoped per virtual key)
+  when the Route enables affinity or sticky routing, and otherwise accepted
+  and recorded in the Route trace as `prompt_cache_key ignored: affinity
+  disabled` (never a 400);
 - streaming and non-streaming output for text and custom function calls.
 
 Streaming emits the supported semantic lifecycle events:
@@ -146,11 +150,57 @@ frontend decoding.
 The matrix is hermetic, has no paid/public provider dependency, and remains in the
 normal `scripts/run-ci.sh` gate. Real installed clients are deliberately separate.
 
+## Model listing capabilities
+
+OpenAI-format `GET /v1/models` items keep the standard `id`, `object`,
+`created`, and `owned_by` fields and add accepted model metadata:
+
+```json
+{
+  "id": "claude-sonnet-5",
+  "object": "model",
+  "owned_by": "kinetix",
+  "context_window": 200000,
+  "capabilities": {
+    "tools": true,
+    "images": true,
+    "streaming": true,
+    "structured_output": false,
+    "thinking": {"modes": ["off", "adaptive"], "levels": ["low", "medium", "high"]}
+  },
+  "kinetix": {
+    "state": "accepted",
+    "transport": "anthropic",
+    "provenance": {"context_window": "models.dev", "thinking": "operator", "transport": "provider"}
+  }
+}
+```
+
+- Values come from accepted, effective model state only. Raw discovery
+  observations stay on the admin API ([model-state.md](model-state.md)).
+- Unknown values are omitted, never guessed. `streaming` is always `true`:
+  Kinetix serves streaming requests for every listed model.
+- `thinking.modes` uses `off`, `on`, `level`, `budget`, and `adaptive`.
+- A Route reports the intersection of the targets the key can reach: a
+  capability is `true` only when every target supports it and `false` when any
+  target lacks it. Context and output limits are the smallest target limit.
+  `transport` and provenance entries appear only when all targets agree.
+- `transport` is `openai`, `openai-responses`, `anthropic`, `gemini`, or
+  `plugin`. Provenance is `operator`, `models.dev`, `provider`, `plugin`, or
+  `probe`.
+- Anthropic-format listings keep the native shape without these fields.
+
 ## Field-level v1 contract
 
 The generated field matrix lives at
-[`docs/protocol-v1-compatibility.md`](protocol-v1-compatibility.md). Its source of
-truth is `tests/fixtures/protocol-v1-compatibility.json`.
+[`docs/protocol-v1-compatibility.md`](protocol-v1-compatibility.md). The
+path-by-feature summary (tools, images, structured output, thinking, streaming,
+continuation, reasoning replay) lives at
+[`docs/generated/compatibility-matrix.md`](generated/compatibility-matrix.md); each
+cell is `native`, `translated`, `supported`, `rejected`, or `conditional` and cites
+evidence case IDs. Both are generated from
+`tests/fixtures/protocol-v1-compatibility.json` (the `matrix` section feeds the
+summary).
 
 Each semantic row cites one or more concrete evidence cases. Rows that describe both
 same-format and translated behavior cite the relevant paths independently instead of
@@ -214,6 +264,9 @@ later target succeeds. For affinity selectors, use a sticky Route with multiple
 eligible targets. Responses has no native Responses upstream passthrough in v1, so its
 real-client matrix covers each built-in translation adapter instead of inventing a
 same-format path.
+
+The Pi section also writes and gates on `pi-acceptance.json`; release candidates
+attach it to the release. See [Pi compatibility](pi-compatibility.md#tier-2-real-pi-release-gate).
 
 The runner starts `scripts/release-client-proxy.py` locally for each case. It forwards
 the real client's bytes unchanged while recording client-visible evidence: request
@@ -362,8 +415,17 @@ Kinetix keeps this state host-side instead of pushing it through the client:
   stored a signature is later routed to an OpenAI target). Compatible stored
   state is restored only after the portability decision, so a
   `strip_with_warning` boundary never deletes state that the chosen target can
-  use, and a direct cross-format target with no Route refuses known non-portable
-  state instead of silently dropping it.
+  use, and a direct target with no Route refuses known non-portable state
+  instead of silently dropping it.
+- **OpenAI Chat reasoning replay.** An OpenAI Chat assistant message carrying
+  `reasoning_content` / `reasoning_signature` sent to a same-provider OpenAI
+  Chat target on the same-format passthrough path is forwarded verbatim. The
+  upstream that produced the reasoning owns its replay semantics (some
+  OpenAI-compatible providers require it during tool loops, others reject it),
+  so Kinetix neither strips nor refuses it. Cross-format or cross-provider
+  replay still follows the Route portability policy above. This is the
+  reasoning replay column of the
+  [compatibility matrix](generated/compatibility-matrix.md).
 - **Cross-model continuation.** Exact-model scoping stops a real signature from
   being replayed onto a model that did not produce it, but leaving the
   historical `functionCall` unsigned would still fail the next `generateContent`

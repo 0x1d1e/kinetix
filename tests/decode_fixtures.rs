@@ -259,6 +259,25 @@ fn openai_unknown_top_level_fields_are_captured_as_extra() {
 }
 
 #[test]
+fn structured_response_formats_are_rejected_on_translating_paths() {
+    // A json_object hint has no equivalent on other transports; dropping it
+    // would silently change the output contract the client asked for.
+    for format in [
+        r#"{"type":"json_object"}"#,
+        r#"{"type":"json_schema","json_schema":{"name":"a","schema":{"type":"object"}}}"#,
+    ] {
+        let req = openai(&format!(
+            r#"{{"model":"m","messages":[],"response_format":{format}}}"#
+        ));
+        let issue = frontends::translation_unsupported(&req.extra)
+            .unwrap_or_else(|| panic!("{format} must be rejected"));
+        assert!(issue.contains("response_format"), "{issue}");
+    }
+    let plain = openai(r#"{"model":"m","messages":[],"response_format":{"type":"text"}}"#);
+    assert!(frontends::translation_unsupported(&plain.extra).is_none());
+}
+
+#[test]
 fn anthropic_plain_chat_tools_and_thinking_round_trip() {
     let req = anthropic(
         r#"{

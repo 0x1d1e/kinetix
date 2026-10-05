@@ -242,13 +242,11 @@
       "outbound": {
         "openai": "preserved",
         "openai-responses": "rejected",
-        "anthropic": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        },
+        "anthropic": "rejected",
         "gemini": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+          "disposition": "translated",
+          "upstream": "/generationConfig/presencePenalty",
+          "expect": 0.4411
         }
       }
     },
@@ -258,13 +256,11 @@
       "outbound": {
         "openai": "preserved",
         "openai-responses": "rejected",
-        "anthropic": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        },
+        "anthropic": "rejected",
         "gemini": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+          "disposition": "translated",
+          "upstream": "/generationConfig/frequencyPenalty",
+          "expect": 0.5511
         }
       }
     },
@@ -367,11 +363,11 @@
         "openai-responses": "preserved",
         "anthropic": {
           "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+          "note": "advisory hint with no request-level equivalent on this transport: consumed as the Route cache-affinity key (namespaced per virtual key) when the Route enables affinity or sticky routing, otherwise accepted and recorded in the Route trace as ignored"
         },
         "gemini": {
           "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
+          "note": "advisory hint with no request-level equivalent on this transport: consumed as the Route cache-affinity key (namespaced per virtual key) when the Route enables affinity or sticky routing, otherwise accepted and recorded in the Route trace as ignored"
         }
       }
     },

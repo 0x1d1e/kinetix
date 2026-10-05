@@ -476,7 +476,8 @@ fn openai_finish_str(f: &FinishReason) -> &str {
 /// client fields). Same-format passthrough preserves these verbatim, so this is
 /// only consulted when translation is required.
 ///
-/// Cosmetic/unknown fields are ignored rather than rejected.
+/// Target-dependent fields (and unknown ones) are decided by
+/// [`apply_target_field_policy`].
 pub fn translation_unsupported(
     extra: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
@@ -504,15 +505,20 @@ pub fn translation_unsupported(
     if extra.contains_key("logprobs") || extra.contains_key("top_logprobs") {
         return Some("'logprobs'/'top_logprobs' are not supported on a translating path".into());
     }
-    if let Some(rf) = extra.get("response_format") {
-        // A plain text/json_object hint is safe to drop; a json_schema constraint
-        // is not enforceable through the other formats.
-        let has_schema = rf.get("json_schema").map(|v| !v.is_null()).unwrap_or(false)
-            || rf.get("type").and_then(|v| v.as_str()) == Some("json_schema");
-        if has_schema {
-            return Some(
-                "'response_format.json_schema' is not enforceable on a translating path".into(),
-            );
+    if let Some(rf) = extra.get("response_format").filter(|rf| !rf.is_null()) {
+        // Plain text is every upstream's default output, so it is consumed.
+        // Any structured format (json_object, json_schema) is not enforceable
+        // through the other formats and would otherwise be silently dropped.
+        let plain_text = rf.get("type").and_then(Value::as_str) == Some("text")
+            && rf.get("json_schema").is_none_or(Value::is_null);
+        if !plain_text {
+            let kind = rf
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("structured");
+            return Some(format!(
+                "'response_format.{kind}' is not enforceable on a translating path"
+            ));
         }
     }
     if extra.contains_key("modalities") || extra.contains_key("audio") {
@@ -527,6 +533,135 @@ pub fn translation_unsupported(
         );
     }
     None
+}
+
+/// Per-target disposition of client fields outside the canonical request on a
+/// translating path (FR-2.8). Every such field must be honored by the target
+/// adapter (translated, or consumed by Kinetix itself). A field the target
+/// cannot honor is rejected unless the target model's parameter policy for that
+/// field name is explicitly `drop`; dropped fields are stripped from `req` and
+/// returned so the caller can record them. Unknown fields follow the same rule.
+///
+/// Also normalizes Anthropic `metadata.user_id` into the Chat `user` key that
+/// adapters read, so no adapter has to know the client's wire format.
+pub fn apply_target_field_policy(
+    frontend: FrontendFormat,
+    transport: &crate::adapters::TargetTransport,
+    req: &mut InternalRequest,
+    params: &std::collections::HashMap<String, crate::types::ParamSpec>,
+) -> Result<Vec<String>, String> {
+    use crate::adapters::TargetTransport as T;
+    // Plugin adapters receive the canonical request, including `extra`, as is.
+    if matches!(transport, T::Plugin(_)) {
+        return Ok(Vec::new());
+    }
+
+    let mut unhonored = Vec::new();
+    if *transport == T::Anthropic {
+        // Anthropic Messages has no seed or sampling penalties.
+        for (name, requested) in [
+            ("seed", req.params.seed.is_some()),
+            ("presence_penalty", req.params.presence_penalty.is_some()),
+            ("frequency_penalty", req.params.frequency_penalty.is_some()),
+        ] {
+            if requested {
+                unhonored.push(name.to_string());
+            }
+        }
+    }
+    for (key, value) in &req.extra {
+        if value.is_null() || key.starts_with("__kinetix_") {
+            continue;
+        }
+        if !extra_field_honored(frontend, transport, key, value) {
+            unhonored.push(key.clone());
+        }
+    }
+
+    let (dropped, refused): (Vec<String>, Vec<String>) = unhonored.into_iter().partition(|name| {
+        params
+            .get(name)
+            .is_some_and(|spec| spec.policy == crate::types::ParamPolicy::Drop)
+    });
+    if !refused.is_empty() {
+        return Err(format!(
+            "{} cannot be honored by this target; remove {}, use a target that supports {}, \
+             or set the model parameter policy to 'drop'",
+            refused
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if refused.len() == 1 { "it" } else { "them" },
+            if refused.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    for name in &dropped {
+        match name.as_str() {
+            "seed" => req.params.seed = None,
+            "presence_penalty" => req.params.presence_penalty = None,
+            "frequency_penalty" => req.params.frequency_penalty = None,
+            _ => {
+                req.extra.remove(name);
+            }
+        }
+    }
+
+    if frontend == FrontendFormat::Anthropic {
+        if let Some(metadata) = req.extra.remove("metadata") {
+            if let Some(user) = metadata.get("user_id").filter(|user| !user.is_null()) {
+                req.extra.insert("user".into(), user.clone());
+            }
+        }
+    }
+    Ok(dropped)
+}
+
+/// Whether the adapter for `transport` honors a non-canonical client field.
+fn extra_field_honored(
+    frontend: FrontendFormat,
+    transport: &crate::adapters::TargetTransport,
+    key: &str,
+    value: &Value,
+) -> bool {
+    use crate::adapters::TargetTransport as T;
+    let openai_target = matches!(transport, T::OpenAiChat | T::OpenAiResponses);
+    match frontend {
+        FrontendFormat::OpenAi => match key {
+            // Validated (or rejected) by `translation_unsupported`.
+            "n" | "logprobs" | "top_logprobs" | "response_format" | "modalities" | "audio"
+            | "prediction" => true,
+            // Forwarded to OpenAI transports; the cache-affinity key elsewhere.
+            "prompt_cache_key" => true,
+            // Only annotates stored completions; translating paths never store
+            // (`store: true` is refused below).
+            "metadata" => true,
+            "store" => value.as_bool() != Some(true),
+            "user" => value.is_string() && *transport != T::Gemini,
+            // Parallel calls are the default everywhere; only Gemini cannot
+            // disable them.
+            "parallel_tool_calls" => {
+                value.is_boolean() && (*transport != T::Gemini || value.as_bool() == Some(true))
+            }
+            "service_tier" | "verbosity" => openai_target,
+            "logit_bias" => {
+                *transport == T::OpenAiChat || value.as_object().is_some_and(|m| m.is_empty())
+            }
+            "web_search_options" => *transport == T::OpenAiChat,
+            _ => false,
+        },
+        FrontendFormat::Anthropic => match key {
+            // Anthropic metadata defines only `user_id`, normalized to `user`.
+            "metadata" => value.as_object().is_some_and(|metadata| {
+                metadata.iter().all(|(field, user)| {
+                    field == "user_id"
+                        && (user.is_null() || (user.is_string() && *transport != T::Gemini))
+                })
+            }),
+            _ => false,
+        },
+        FrontendFormat::OpenAiResponses => key == "prompt_cache_key",
+    }
 }
 
 #[cfg(test)]

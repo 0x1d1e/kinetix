@@ -282,6 +282,8 @@ pub trait HostBacking: Send + Sync {
 #[derive(Clone)]
 pub struct PluginRuntime {
     engine: Engine,
+    /// Component instantiations per plugin id, for the idle contract (#199).
+    instantiations: Arc<dashmap::DashMap<String, u64>>,
 }
 
 impl PluginRuntime {
@@ -297,7 +299,10 @@ impl PluginRuntime {
         config.max_wasm_stack(1024 * 1024);
         let engine =
             Engine::new(&config).map_err(|e| anyhow::anyhow!("building wasmtime engine: {e}"))?;
-        Ok(PluginRuntime { engine })
+        Ok(PluginRuntime {
+            engine,
+            instantiations: Default::default(),
+        })
     }
 
     pub fn engine(&self) -> &Engine {
@@ -343,6 +348,29 @@ impl PluginRuntime {
         Linker::new(&self.engine)
     }
 
+    fn record_instantiation(&self, store: &Store<HostCtx>) {
+        *self
+            .instantiations
+            .entry(store.data().plugin_id.clone())
+            .or_default() += 1;
+    }
+
+    /// Component instantiations recorded for one plugin.
+    pub fn instantiations_for(&self, plugin_id: &str) -> u64 {
+        self.instantiations.get(plugin_id).map_or(0, |n| *n)
+    }
+
+    /// Component instantiations per plugin id.
+    pub fn instantiations(&self) -> Vec<(String, u64)> {
+        let mut rows: Vec<(String, u64)> = self
+            .instantiations
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect();
+        rows.sort();
+        rows
+    }
+
     /// Instantiate a component against a prepared linker/store.
     pub async fn instantiate(
         &self,
@@ -350,6 +378,7 @@ impl PluginRuntime {
         store: &mut Store<HostCtx>,
         component: &Component,
     ) -> Result<bindings::Plugin> {
+        self.record_instantiation(store);
         bindings::Plugin::instantiate_async(store, component, linker)
             .await
             .map_err(|e| anyhow::anyhow!("instantiating plugin component: {e}"))
@@ -370,6 +399,7 @@ impl PluginRuntime {
         store: &mut Store<HostCtx>,
         component: &Component,
     ) -> Result<health_v2_bindings::PluginHealthV2> {
+        self.record_instantiation(store);
         health_v2_bindings::PluginHealthV2::instantiate_async(store, component, linker)
             .await
             .map_err(|e| anyhow::anyhow!("instantiating plugin health-v2 component: {e}"))
@@ -382,6 +412,7 @@ impl PluginRuntime {
         store: &mut Store<HostCtx>,
         component: &Component,
     ) -> Result<auth_bindings::PluginAuth> {
+        self.record_instantiation(store);
         auth_bindings::PluginAuth::instantiate_async(store, component, linker)
             .await
             .map_err(|e| anyhow::anyhow!("instantiating plugin auth component: {e}"))
@@ -394,6 +425,7 @@ impl PluginRuntime {
         store: &mut Store<HostCtx>,
         component: &Component,
     ) -> Result<model_source_bindings::PluginModelSource> {
+        self.record_instantiation(store);
         model_source_bindings::PluginModelSource::instantiate_async(store, component, linker)
             .await
             .map_err(|e| anyhow::anyhow!("instantiating plugin model-source component: {e}"))
@@ -407,6 +439,7 @@ impl PluginRuntime {
         store: &mut Store<HostCtx>,
         component: &Component,
     ) -> Result<adapter_bindings::PluginAdapter> {
+        self.record_instantiation(store);
         adapter_bindings::PluginAdapter::instantiate_async(store, component, linker)
             .await
             .map_err(|e| anyhow::anyhow!("instantiating plugin adapter component: {e}"))
@@ -419,6 +452,7 @@ impl PluginRuntime {
         store: &mut Store<HostCtx>,
         component: &Component,
     ) -> Result<adapter_v2_bindings::PluginAdapterV2> {
+        self.record_instantiation(store);
         adapter_v2_bindings::PluginAdapterV2::instantiate_async(store, component, linker)
             .await
             .map_err(|e| anyhow::anyhow!("instantiating plugin API v2 adapter component: {e}"))
@@ -431,6 +465,7 @@ impl PluginRuntime {
         store: &mut Store<HostCtx>,
         component: &Component,
     ) -> Result<adapter_v3_bindings::PluginAdapterV3> {
+        self.record_instantiation(store);
         adapter_v3_bindings::PluginAdapterV3::instantiate_async(store, component, linker)
             .await
             .map_err(|e| anyhow::anyhow!("instantiating plugin API v3 adapter component: {e}"))

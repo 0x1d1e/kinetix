@@ -172,6 +172,11 @@ Per-day exports are written to `$KINETIX_DATA_DIR/exports`:
 - `usage-<day>.csv` — a flat per-request table.
 - `summary-<day>.csv` — day totals.
 
+Requests served by a plugin adapter record the plugin package SHA-256
+(`plugin_package_sha256`, empty for built-in adapters) in request logs, the
+per-request export, and the dashboard request detail. See
+[guarantees](../guarantees.md#artifact-provenance).
+
 An hourly task exports the last 40 days (skipping days already exported) and
 prunes files older than `KINETIX_EXPORT_RETENTION_DAYS` (default 30). You can also
 export on demand from the dashboard or with `kinetix export run [--day DATE]`.

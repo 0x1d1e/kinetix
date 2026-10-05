@@ -86,6 +86,7 @@ struct LastPrecommitFailure {
 
 struct ActivePrecommitAttempt {
     target: ResolvedTarget,
+    adapter: Arc<dyn Adapter>,
     attempt_number: usize,
     opaque_route_id: String,
     upstream_request_id: Option<String>,
@@ -108,6 +109,9 @@ pub struct RequestMeta {
     pub cache_status: &'static str,
     pub commit_state: &'static str,
     pub session: Option<String>,
+    /// Routing-only affinity key derived from the client's `prompt_cache_key`
+    /// (namespaced per virtual key). Never used for opaque-state provenance.
+    pub cache_affinity_key: Option<String>,
     /// Atomic RPM/TPM/budget reservation owned by this request. A dispatched
     /// failure or disconnect reconciles it as incomplete instead of canceling it.
     pub admission: Option<crate::admission::AdmissionReservation>,
@@ -153,6 +157,7 @@ impl RequestMeta {
             cache_status: "bypass",
             commit_state: "",
             session: None,
+            cache_affinity_key: None,
             admission: None,
             concurrency: None,
             partial_attempts: Vec::new(),
@@ -210,6 +215,7 @@ impl RequestMeta {
                 termination,
                 Some("client disconnected before response commit"),
                 &active.opaque_route_id,
+                active.adapter.plugin_package_sha256(),
             );
             row.key_id = self.key_id.clone();
             row.key_name = self.key_name.clone();
@@ -256,6 +262,7 @@ impl RequestMeta {
             serving_account_id: last_attempt.row.serving_account_id.clone(),
             serving_account: last_attempt.row.serving_account.clone(),
             serving_provider: last_attempt.row.serving_provider.clone(),
+            plugin_package_sha256: last_attempt.row.plugin_package_sha256.clone(),
             upstream_request_id: last_attempt.row.upstream_request_id.clone(),
             flagged: 0,
             error_message: Some("client disconnected before response commit".into()),
@@ -599,6 +606,8 @@ struct Attempt {
     /// validation. This is a per-gap timer, never a total stream lifetime.
     idle_timeout: Duration,
     adapter: Arc<dyn Adapter>,
+    /// Package digest of the plugin adapter that served this attempt (#206).
+    plugin_package_sha256: Option<String>,
     is_sse: bool,
     /// Same-format passthrough is only possible when the upstream is actually
     /// SSE. A JSON response is normalized through parse_full_response().
@@ -705,6 +714,7 @@ pub(crate) async fn run_with_disconnect(
         allow_fallback,
     );
     meta.session = session.clone();
+    meta.cache_affinity_key = cache_affinity_key(key.as_ref(), &req);
     meta.client_disconnect = client_disconnect;
     meta.log_queue = Some(state.log_queue.clone());
     meta.admission = admission;
@@ -1018,7 +1028,13 @@ pub(crate) async fn run_with_disconnect(
     // The shared planner owns affinity promotion as well as the ordered
     // pre-dispatch frontier. Runtime supplies its realized strategy order and
     // executes the resulting candidate plan.
-    let affinity_candidate_id = match (route.as_ref(), session_origin_key.as_ref()) {
+    // Affinity prefers the explicit session, then the client's prompt-cache key.
+    let affinity_key = session_origin_key.clone().or_else(|| {
+        meta.cache_affinity_key
+            .as_deref()
+            .and_then(|key| state.sticky_lookup(key, STICKY_TTL))
+    });
+    let affinity_candidate_id = match (route.as_ref(), affinity_key.as_ref()) {
         (Some(route), Some(sticky_key))
             if route.cache_affinity != 0 || route.sticky_routing != 0 =>
         {
@@ -1158,6 +1174,14 @@ pub(crate) async fn run_with_disconnect(
     let attempt_budget = AttemptBudget::pre_commit(max_attempts);
     let mut auth_retried_accounts = std::collections::HashSet::new();
     let mut last_precommit_failure: Option<LastPrecommitFailure> = None;
+
+    // Every candidate Provider is demanded, including ones skipped below, so
+    // demand-driven health probes keep evaluating a cooling-down Provider.
+    for target in &pending_targets {
+        state
+            .integrations
+            .note_demand(&crate::integrations::provider_key(&target.provider.id));
+    }
 
     while let Some(target_owned) = pending_targets.pop_front() {
         let target = &target_owned;
@@ -1446,14 +1470,23 @@ pub(crate) async fn run_with_disconnect(
         // A translated frontend may replay a signed thinking block from this
         // plugin/Gemini target. The transport name cannot establish its origin;
         // a matching scoped, producer/model-compatible stored signature can.
-        let inline_opaque = request_has_nonportable_inline_state(
-            &target_req,
-            preserves_anthropic_thinking,
-            cross_provider || cross_format,
-            adapter
-                .opaque_state_target(&target.model)
-                .map(|_| &opaque_report),
-        );
+        //
+        // OpenAI Chat `reasoning_content`/`reasoning_signature` replayed to a
+        // same-provider OpenAI Chat passthrough target is forwarded verbatim:
+        // the upstream that produced it owns its replay semantics (#207).
+        let chat_reasoning_passthrough = format == FrontendFormat::OpenAi
+            && !cross_format
+            && !cross_provider
+            && target_req.raw_body.is_some();
+        let inline_opaque = !chat_reasoning_passthrough
+            && request_has_nonportable_inline_state(
+                &target_req,
+                preserves_anthropic_thinking,
+                cross_provider || cross_format,
+                adapter
+                    .opaque_state_target(&target.model)
+                    .map(|_| &opaque_report),
+            );
 
         // `opaque_report.nonportable()` must independently enter portability
         // handling: stored state can be incompatible with a target even when
@@ -1509,17 +1542,15 @@ pub(crate) async fn run_with_disconnect(
             } else if inline_opaque || opaque_report.nonportable() {
                 // A direct target with no Route policy must not silently drop
                 // known non-portable continuation state (§24).
-                return Err(
-                    finish_policy_rejection(
-                        state,
-                        &meta,
-                        &mut trace,
-                        Some(target.account.label.clone()),
-                        "non-portable provider continuation state cannot be sent to a direct cross-format target",
-                        started,
-                    )
-                    .await,
-                );
+                return Err(finish_policy_rejection(
+                    state,
+                    &meta,
+                    &mut trace,
+                    Some(target.account.label.clone()),
+                    "non-portable provider continuation state cannot be sent to this direct target",
+                    started,
+                )
+                .await);
             }
         }
 
@@ -1605,6 +1636,51 @@ pub(crate) async fn run_with_disconnect(
                 )
                 .await);
             }
+            match crate::frontends::apply_target_field_policy(
+                format,
+                &profile.transport,
+                &mut target_req,
+                &profile.parameters,
+            ) {
+                Ok(dropped) if !dropped.is_empty() => {
+                    let dropped = dropped.join(", ");
+                    tracing::info!(
+                        request_id = %meta.request_id,
+                        model = %target.model.display_name,
+                        dropped = %dropped,
+                        "dropped client fields under operator 'drop' parameter policy"
+                    );
+                    trace.step(
+                        "candidate",
+                        Some(target.account.label.clone()),
+                        format!("dropped fields under operator 'drop' policy: {dropped}"),
+                    );
+                }
+                Ok(_) => {}
+                Err(msg) => {
+                    return Err(finish_policy_rejection(
+                        state,
+                        &meta,
+                        &mut trace,
+                        Some(target.account.label.clone()),
+                        msg,
+                        started,
+                    )
+                    .await);
+                }
+            }
+            if prompt_cache_key_ignored(&profile.transport, &target_req, route.as_ref()) {
+                tracing::info!(
+                    request_id = %meta.request_id,
+                    model = %target.model.display_name,
+                    "prompt_cache_key ignored: affinity disabled"
+                );
+                trace.step(
+                    "candidate",
+                    Some(target.account.label.clone()),
+                    "prompt_cache_key ignored: affinity disabled",
+                );
+            }
             if let Err(error) = check_resolved_thinking_translation(
                 adapter.as_ref(),
                 &target.model.display_name,
@@ -1645,7 +1721,7 @@ pub(crate) async fn run_with_disconnect(
             let key = traffic_key(target);
             let affinity = route.as_ref().is_some_and(|route| {
                 (route.cache_affinity != 0 || route.sticky_routing != 0)
-                    && session_origin_key
+                    && affinity_key
                         .as_ref()
                         .is_some_and(|sticky| target_key(route, target) == *sticky)
             });
@@ -1772,6 +1848,7 @@ pub(crate) async fn run_with_disconnect(
 
         meta.active_precommit_attempt = Some(ActivePrecommitAttempt {
             target: target.clone(),
+            adapter: adapter.clone(),
             attempt_number: meta.partial_attempts.len() + 1,
             opaque_route_id: trace.opaque_route_id.clone(),
             upstream_request_id: None,
@@ -1915,6 +1992,7 @@ pub(crate) async fn run_with_disconnect(
                                 precommit_usage,
                                 &failure,
                                 termination,
+                                adapter.plugin_package_sha256(),
                             )
                             .await;
                             if let Some(permit) = traffic_permit.as_ref() {
@@ -2057,6 +2135,7 @@ pub(crate) async fn run_with_disconnect(
                         precommit_usage: prepared.precommit_usage,
                         idle_timeout: provider_timeout,
                         adapter: adapter.clone(),
+                        plugin_package_sha256: adapter.plugin_package_sha256(),
                         is_sse: prepared.is_sse,
                         passthrough: use_passthrough && prepared.is_sse,
                         traffic_permit,
@@ -2147,6 +2226,7 @@ pub(crate) async fn run_with_disconnect(
                     TokenUsage::default(),
                     &failure,
                     termination,
+                    adapter.plugin_package_sha256(),
                 )
                 .await;
                 last_precommit_failure = Some(LastPrecommitFailure {
@@ -2426,6 +2506,7 @@ pub(crate) async fn run_with_disconnect(
                     TokenUsage::default(),
                     &failure,
                     termination,
+                    adapter.plugin_package_sha256(),
                 )
                 .await;
                 last_precommit_failure = Some(LastPrecommitFailure {
@@ -2671,6 +2752,7 @@ fn enqueue_precommit_failure_at(
             serving_account_id: None,
             serving_account: None,
             serving_provider: None,
+            plugin_package_sha256: None,
             upstream_request_id: None,
             flagged: 0,
             error_message: None,
@@ -4306,6 +4388,11 @@ async fn gather_plugin_facts(
         // on its background schedule. No guest call, no network, no wall time on
         // the request path — the determinism guarantee.
         if manifest.routing_facts_mode == "cached" {
+            // Reading the snapshot keeps the background refresher scheduling
+            // this plugin; without recent demand it stays idle (#199).
+            state
+                .integrations
+                .note_demand(&crate::integrations::plugin_key(&row.id));
             match manager.cached_facts(&row.id).await {
                 Ok(entries) => {
                     for (name, value, observed, max_age) in entries {
@@ -5343,6 +5430,36 @@ fn predicate_capabilities(
     (flags, Value::Object(raw))
 }
 
+/// Sticky-store key for a client `prompt_cache_key`. The control-character
+/// separators cannot occur in an HTTP session header, so the namespace never
+/// collides with explicit sessions; the virtual key keeps tenants apart.
+/// `prompt_cache_key` is an advisory hint: OpenAI transports forward it, and
+/// otherwise it is consumed as the Route cache-affinity key. When neither
+/// applies, Kinetix still accepts it but records that it was ignored.
+fn prompt_cache_key_ignored(
+    transport: &crate::adapters::TargetTransport,
+    req: &InternalRequest,
+    route: Option<&db::RouteRow>,
+) -> bool {
+    use crate::adapters::TargetTransport as T;
+    matches!(transport, T::Anthropic | T::Gemini)
+        && req
+            .extra
+            .get("prompt_cache_key")
+            .is_some_and(|value| !value.is_null())
+        && !route.is_some_and(|route| route.cache_affinity != 0 || route.sticky_routing != 0)
+}
+
+fn cache_affinity_key(key: Option<&db::VirtualKeyRow>, req: &InternalRequest) -> Option<String> {
+    const MAX_PROMPT_CACHE_KEY_LEN: usize = 256;
+    let value = req.extra.get("prompt_cache_key")?.as_str()?;
+    if value.is_empty() || value.len() > MAX_PROMPT_CACHE_KEY_LEN {
+        return None;
+    }
+    let tenant = key.map_or("", |key| key.id.as_str());
+    Some(format!("\u{1f}prompt_cache_key\u{1f}{tenant}\u{1f}{value}"))
+}
+
 fn check_param_policy(
     target: &ResolvedTarget,
     profile: &crate::adapters::ResolvedExecutionProfile,
@@ -5467,7 +5584,10 @@ async fn stream_response(
         };
 
         let passthrough = attempt.passthrough;
-        tokio::spawn(async move {
+        // Tracked so graceful shutdown drains committed streams; the driver
+        // observes the abort token itself so it always finalizes accounting.
+        let lifecycle = state.lifecycle.clone();
+        lifecycle.spawn_tracked(async move {
             if passthrough {
                 drive_stream_passthrough(
                     state,
@@ -5996,6 +6116,7 @@ async fn drive_stream(
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut idle_deadline = tokio::time::Instant::now() + attempt.idle_timeout;
 
+    let shutdown_abort = state.lifecycle.abort_token();
     'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
             record_cancel(&state, &meta, started);
@@ -6015,6 +6136,13 @@ async fn drive_stream(
                     stream_outcome = output_abort_outcome(&state, &meta, started);
                     break;
                 }
+            }
+            _ = shutdown_abort.cancelled() => {
+                // Graceful-shutdown deadline (#199): end the stream with an
+                // explicit error and account it instead of being dropped.
+                stream_outcome = StreamOutcome::GatewayAbort;
+                error_message = Some(SHUTDOWN_ABORT_MESSAGE.into());
+                break 'outer;
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
                 stream_outcome = StreamOutcome::Timeout;
@@ -6129,6 +6257,10 @@ async fn drive_stream(
         for frame in encoder.error_frame(message) {
             let _ = tx.send(Ok(frame)).await;
         }
+    } else if shutdown_abort.is_cancelled() && stream_outcome == StreamOutcome::GatewayAbort {
+        for frame in encoder.error_frame(SHUTDOWN_ABORT_MESSAGE) {
+            let _ = tx.send(Ok(frame)).await;
+        }
     } else if stream_outcome == StreamOutcome::Completed {
         for frame in encoder.finalize() {
             if tx.send(Ok(frame)).await.is_err() {
@@ -6198,6 +6330,7 @@ async fn drive_stream_passthrough(
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut idle_deadline = tokio::time::Instant::now() + attempt.idle_timeout;
 
+    let shutdown_abort = state.lifecycle.abort_token();
     'outer: loop {
         if meta.disconnected.load(Ordering::Relaxed) {
             record_cancel(&state, &meta, started);
@@ -6217,6 +6350,13 @@ async fn drive_stream_passthrough(
                     stream_outcome = output_abort_outcome(&state, &meta, started);
                     break;
                 }
+            }
+            _ = shutdown_abort.cancelled() => {
+                // Graceful-shutdown deadline (#199): end the stream with an
+                // explicit error and account it instead of being dropped.
+                stream_outcome = StreamOutcome::GatewayAbort;
+                error_message = Some(SHUTDOWN_ABORT_MESSAGE.into());
+                break 'outer;
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
                 stream_outcome = StreamOutcome::Timeout;
@@ -6383,6 +6523,11 @@ async fn drive_stream_passthrough(
                 let _ = tx.send(Ok(frame)).await;
             }
         }
+    } else if shutdown_abort.is_cancelled() && stream_outcome == StreamOutcome::GatewayAbort {
+        let mut encoder = Encoder::new(format, encoder_ctx);
+        for frame in encoder.error_frame(SHUTDOWN_ABORT_MESSAGE) {
+            let _ = tx.send(Ok(frame)).await;
+        }
     }
 
     finalize_log(
@@ -6402,6 +6547,10 @@ async fn drive_stream_passthrough(
     )
     .await;
 }
+
+/// Terminal stream error sent when the graceful-shutdown deadline cuts a
+/// stream short.
+const SHUTDOWN_ABORT_MESSAGE: &str = "gateway shutting down";
 
 /// Flips a disconnect flag (and wakes waiters) when the response body is
 /// dropped, i.e. when the client stops reading (FR-2.9, NFR-1.10).
@@ -6774,6 +6923,7 @@ async fn record_precommit_attempt_usage(
     usage: TokenUsage,
     failure: &UpstreamFailure,
     termination: StreamTermination,
+    plugin_package_sha256: Option<String>,
 ) {
     let computed_cost = (usage.input.is_some() && usage.output.is_some())
         .then(|| cost::compute_cost(&target.model.prices(), &usage))
@@ -6791,6 +6941,7 @@ async fn record_precommit_attempt_usage(
         termination,
         Some(&failure.message),
         &trace.opaque_route_id,
+        plugin_package_sha256,
     );
     let staged_attempt_index = meta.partial_attempts.len();
     meta.partial_attempts.push(PartialAttemptUsage {
@@ -6842,6 +6993,7 @@ fn usage_attempt_row(
     termination: StreamTermination,
     error_message: Option<&str>,
     opaque_route_id: &str,
+    plugin_package_sha256: Option<String>,
 ) -> db::UsageAttemptRow {
     db::UsageAttemptRow {
         id: format!("usage_attempt_{}", uuid::Uuid::new_v4().simple()),
@@ -6875,6 +7027,7 @@ fn usage_attempt_row(
         commit_state: termination.commit_state.as_usage_str().to_string(),
         error_message: error_message.map(str::to_owned),
         opaque_route_id: Some(opaque_route_id.to_string()),
+        plugin_package_sha256,
     }
 }
 
@@ -6958,6 +7111,10 @@ fn record_precommit_request_log(
         serving_account_id: Some(target.account.id.clone()),
         serving_account: Some(target.account.label.clone()),
         serving_provider: Some(target.provider.name.clone()),
+        plugin_package_sha256: meta
+            .partial_attempts
+            .last()
+            .and_then(|attempt| attempt.row.plugin_package_sha256.clone()),
         upstream_request_id: upstream_request_id.map(str::to_owned),
         flagged: 0,
         error_message: Some(failure.message.clone()),
@@ -7148,6 +7305,7 @@ async fn finalize_log(
         termination,
         error_message.as_deref(),
         &trace.opaque_route_id,
+        attempt.plugin_package_sha256.clone(),
     );
     let (request_usage, request_cost) = aggregate_request_accounting(meta, Some(&usage), cost);
 
@@ -7186,15 +7344,18 @@ async fn finalize_log(
     // Persist the successful session target for both affinity and opaque-state
     // provenance. Affinity only changes routing when its route switch is enabled;
     // provenance is read by FR-2.11 to identify first-attempt provider changes.
-    if let (Some(session), Some(route_id)) = (&meta.session, &meta.route_id) {
+    if let Some(route_id) = &meta.route_id {
         if snap.routes.contains_key(route_id) && status == "success" {
-            state.sticky_remember(
-                session,
-                format!(
-                    "{}|{}|{}",
-                    route_id, attempt.target.account.id, attempt.target.model.id
-                ),
+            let target_key = format!(
+                "{}|{}|{}",
+                route_id, attempt.target.account.id, attempt.target.model.id
             );
+            for key in [&meta.session, &meta.cache_affinity_key]
+                .into_iter()
+                .flatten()
+            {
+                state.sticky_remember(key, target_key.clone());
+            }
         }
     }
 
@@ -7264,6 +7425,7 @@ async fn finalize_log(
         route_trace_id: Some(trace.opaque_route_id.clone()),
         opaque_route_id: Some(trace.opaque_route_id.clone()),
         admission_cost_usd,
+        plugin_package_sha256: attempt.plugin_package_sha256.clone(),
     };
     let mut attempt_rows = meta
         .partial_attempts
@@ -8085,6 +8247,33 @@ mod route_policy_tests {
             enabled: 1,
             created_at: "2026-01-01T00:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn prompt_cache_key_is_reported_ignored_only_without_affinity_or_forwarding() {
+        use crate::adapters::TargetTransport as T;
+        let mut req = request();
+        assert!(!prompt_cache_key_ignored(&T::Anthropic, &req, None));
+        req.extra
+            .insert("prompt_cache_key".into(), serde_json::json!("pck"));
+
+        let plain = route(serde_json::json!({}));
+        assert!(prompt_cache_key_ignored(&T::Anthropic, &req, None));
+        assert!(prompt_cache_key_ignored(&T::Gemini, &req, Some(&plain)));
+        // Forwarded upstream by OpenAI transports.
+        assert!(!prompt_cache_key_ignored(&T::OpenAiChat, &req, None));
+        assert!(!prompt_cache_key_ignored(&T::OpenAiResponses, &req, None));
+        // Consumed as the Route cache-affinity key.
+        let mut sticky = plain.clone();
+        sticky.sticky_routing = 1;
+        assert!(!prompt_cache_key_ignored(
+            &T::Anthropic,
+            &req,
+            Some(&sticky)
+        ));
+        let mut affine = plain;
+        affine.cache_affinity = 1;
+        assert!(!prompt_cache_key_ignored(&T::Gemini, &req, Some(&affine)));
     }
 
     fn provider(rules: Value) -> db::ProviderRow {

@@ -302,6 +302,7 @@ export function mapRequest(j: any): RequestLog {
     usageConfidence: (j.usage_confidence as RequestLog['usageConfidence']) || 'unknown',
     commitState: str(j.commit_state),
     retryCount: num(j.retry_count),
+    pluginPackageSha256: j.plugin_package_sha256 ?? undefined,
     promptPreview: str(j.error_message) || '',
     responsePreview: '',
   };

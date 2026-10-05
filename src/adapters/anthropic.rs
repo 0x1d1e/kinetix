@@ -487,8 +487,27 @@ impl Adapter for AnthropicAdapter {
             }
             body.insert("tools".to_string(), tools);
         }
-        if let Some(tc) = Self::build_tool_choice(req) {
+        let mut tool_choice = Self::build_tool_choice(req);
+        // Chat `parallel_tool_calls: false` maps to Anthropic's
+        // `tool_choice.disable_parallel_tool_use` (meaningless without tools
+        // or with `tool_choice: none`).
+        if !req.tools.is_empty()
+            && req.tool_choice != Some(ToolChoice::None)
+            && req
+                .extra
+                .get("parallel_tool_calls")
+                .and_then(Value::as_bool)
+                == Some(false)
+        {
+            let choice = tool_choice.get_or_insert_with(|| json!({ "type": "auto" }));
+            choice["disable_parallel_tool_use"] = json!(true);
+        }
+        if let Some(tc) = tool_choice {
             body.insert("tool_choice".to_string(), tc);
+        }
+        // End-user identity hint (Chat `user`) is Anthropic `metadata.user_id`.
+        if let Some(user) = req.extra.get("user").and_then(Value::as_str) {
+            body.insert("metadata".to_string(), json!({ "user_id": user }));
         }
 
         // Thinking map.

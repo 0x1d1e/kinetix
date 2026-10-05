@@ -351,37 +351,27 @@
       },
       "outbound": {
         "openai": {
-          "disposition": "consumed",
-          "note": "identity/telemetry hint with no upstream equivalent; dropped by the default compatibility policy"
+          "disposition": "translated",
+          "upstream": "/user",
+          "expect": "usermarker"
         },
         "openai-responses": {
-          "disposition": "consumed",
-          "note": "identity/telemetry hint with no upstream equivalent; dropped by the default compatibility policy"
+          "disposition": "translated",
+          "upstream": "/user",
+          "expect": "usermarker"
         },
         "anthropic": "preserved",
-        "gemini": {
-          "disposition": "consumed",
-          "note": "identity/telemetry hint with no upstream equivalent; dropped by the default compatibility policy"
-        }
+        "gemini": "rejected"
       }
     },
     {
       "field": "service_tier",
       "sample": "auto",
       "outbound": {
-        "openai": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        },
-        "openai-responses": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        },
+        "openai": "rejected",
+        "openai-responses": "rejected",
         "anthropic": "preserved",
-        "gemini": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        }
+        "gemini": "rejected"
       }
     },
     {
@@ -394,38 +384,20 @@
         }
       ],
       "outbound": {
-        "openai": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        },
-        "openai-responses": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        },
+        "openai": "rejected",
+        "openai-responses": "rejected",
         "anthropic": "preserved",
-        "gemini": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        }
+        "gemini": "rejected"
       }
     },
     {
       "field": "container",
       "sample": "containermarker",
       "outbound": {
-        "openai": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        },
-        "openai-responses": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        },
+        "openai": "rejected",
+        "openai-responses": "rejected",
         "anthropic": "preserved",
-        "gemini": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        }
+        "gemini": "rejected"
       }
     },
     {
@@ -442,19 +414,10 @@
         ]
       },
       "outbound": {
-        "openai": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        },
-        "openai-responses": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        },
+        "openai": "rejected",
+        "openai-responses": "rejected",
         "anthropic": "preserved",
-        "gemini": {
-          "disposition": "consumed",
-          "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-        }
+        "gemini": "rejected"
       }
     }
   ],
@@ -464,19 +427,10 @@
       "nested": "vendormarker"
     },
     "outbound": {
-      "openai": {
-        "disposition": "consumed",
-        "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-      },
-      "openai-responses": {
-        "disposition": "consumed",
-        "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-      },
+      "openai": "rejected",
+      "openai-responses": "rejected",
       "anthropic": "preserved",
-      "gemini": {
-        "disposition": "consumed",
-        "note": "gap: no equivalent in the target API; silently dropped by the default compatibility policy"
-      }
+      "gemini": "rejected"
     }
   },
   "adapter_owned": {

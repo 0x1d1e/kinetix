@@ -100,6 +100,7 @@ impl TelemetryEvent {
 #[derive(Clone)]
 pub struct TargetTelemetry {
     tx: tokio::sync::mpsc::Sender<TelemetryEvent>,
+    flush_tx: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
     dropped_queue: Arc<AtomicU64>,
     dropped_persistence: Arc<AtomicU64>,
 }
@@ -107,11 +108,13 @@ pub struct TargetTelemetry {
 impl TargetTelemetry {
     pub fn new(pool: Pool) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+        let (flush_tx, flush_rx) = tokio::sync::mpsc::channel(4);
         let dropped_queue = Arc::new(AtomicU64::new(0));
         let dropped_persistence = Arc::new(AtomicU64::new(0));
-        spawn_worker(pool, rx, dropped_persistence.clone());
+        spawn_worker(pool, rx, flush_rx, dropped_persistence.clone());
         Self {
             tx,
+            flush_tx,
             dropped_queue,
             dropped_persistence,
         }
@@ -120,6 +123,15 @@ impl TargetTelemetry {
     pub fn record(&self, event: TelemetryEvent) {
         if self.tx.try_send(event).is_err() {
             self.dropped_queue.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Persist every queued event now (graceful shutdown). Resolves once the
+    /// worker wrote them, or immediately if the worker is gone.
+    pub async fn flush(&self) {
+        let (ack, done) = tokio::sync::oneshot::channel();
+        if self.flush_tx.send(ack).await.is_ok() {
+            let _ = done.await;
         }
     }
 
@@ -312,6 +324,7 @@ fn add_event(pending: &mut HashMap<BucketKey, BucketAggregate>, event: Telemetry
 fn spawn_worker(
     pool: Pool,
     mut rx: tokio::sync::mpsc::Receiver<TelemetryEvent>,
+    mut flush_rx: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<()>>,
     dropped_persistence: Arc<AtomicU64>,
 ) {
     tokio::spawn(async move {
@@ -339,6 +352,18 @@ fn spawn_worker(
                         }
                         pending_events = 0;
                     }
+                }
+                Some(ack) = flush_rx.recv() => {
+                    while let Ok(event) = rx.try_recv() {
+                        add_event(&mut pending, event);
+                        pending_events = pending_events.saturating_add(1);
+                    }
+                    if let Err(error) = flush(&pool, &mut pending).await {
+                        dropped_persistence.fetch_add(pending_events, Ordering::Relaxed);
+                        tracing::warn!(%error, "target telemetry flush failed");
+                    }
+                    pending_events = 0;
+                    let _ = ack.send(());
                 }
                 _ = tick.tick() => {
                     if pending.is_empty() {
@@ -617,8 +642,10 @@ mod tests {
         flush(&pool, &mut pending).await.unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (flush_tx, _flush_rx) = tokio::sync::mpsc::channel(1);
         let telemetry = TargetTelemetry {
             tx,
+            flush_tx,
             dropped_queue: Arc::new(AtomicU64::new(0)),
             dropped_persistence: Arc::new(AtomicU64::new(0)),
         };

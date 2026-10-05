@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Render the v1 field compatibility reference from the executable contract fixture."""
+"""Render the v1 field compatibility reference and the path/feature compatibility
+matrix from the executable contract fixture."""
 
 import argparse
 import json
@@ -8,6 +9,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests/fixtures/protocol-v1-compatibility.json"
+MATRIX_STATUSES = {"native", "translated", "supported", "rejected", "conditional"}
 
 
 def load_contract():
@@ -30,7 +32,33 @@ def load_contract():
                 raise SystemExit(
                     f"unknown evidence case(s) {unknown!r} for {api['endpoint']} row {row[0]!r}"
                 )
+    validate_matrix(data["matrix"], known)
     return data
+
+
+def validate_matrix(matrix, known):
+    statuses = set(matrix["statuses"])
+    if statuses != MATRIX_STATUSES:
+        raise SystemExit(f"matrix statuses must be exactly {sorted(MATRIX_STATUSES)}")
+    paths = [path["id"] for path in matrix["paths"]]
+    features = [feature["id"] for feature in matrix["features"]]
+    if len(paths) != len(set(paths)) or len(features) != len(set(features)):
+        raise SystemExit("duplicate matrix path or feature")
+    seen = set()
+    for entry in matrix["cells"]:
+        key = (entry["path"], entry["feature"])
+        if entry["path"] not in paths or entry["feature"] not in features:
+            raise SystemExit(f"unknown matrix path/feature {key!r}")
+        if key in seen:
+            raise SystemExit(f"duplicate matrix cell {key!r}")
+        seen.add(key)
+        if entry["status"] not in statuses:
+            raise SystemExit(f"invalid matrix status {entry['status']!r} for {key!r}")
+        if not entry["evidence"]:
+            raise SystemExit(f"missing evidence for matrix cell {key!r}")
+        unknown = [case_id for case_id in entry["evidence"] if case_id not in known]
+        if unknown:
+            raise SystemExit(f"unknown evidence case(s) {unknown!r} for matrix cell {key!r}")
 
 
 def cell(value):
@@ -113,25 +141,104 @@ def render(data):
     return "\n".join(lines)
 
 
+def render_matrix(data):
+    q = chr(96)
+    matrix = data["matrix"]
+    cells = {(entry["path"], entry["feature"]): entry for entry in matrix["cells"]}
+    features = matrix["features"]
+    lines = [
+        "# Compatibility matrix",
+        "",
+        "<!-- GENERATED: scripts/render-protocol-v1-compat.py; edit the " + q + "matrix" + q
+        + " section of tests/fixtures/protocol-v1-compatibility.json instead. -->",
+        "",
+        "Compatibility by request path and feature. Every cell is backed by executable evidence",
+        "from the deterministic protocol matrix or Rust tests; field-level detail lives in",
+        "[protocol-v1-compatibility.md](../protocol-v1-compatibility.md).",
+        "",
+        "## Status semantics",
+        "",
+    ]
+    for status, meaning in matrix["statuses"].items():
+        lines.append(f"- **{status}**: {meaning}")
+    lines += [
+        "- **-**: not claimed; no v1 contract or no executable evidence for this path yet.",
+        "",
+        "## Features",
+        "",
+    ]
+    for feature in features:
+        lines.append(f"- **{feature['label']}**: {feature['definition']}")
+    lines += [
+        "",
+        "## Matrix",
+        "",
+        "| Path | " + " | ".join(feature["label"] for feature in features) + " |",
+        "|---|" + "---|" * len(features),
+    ]
+    for path in matrix["paths"]:
+        row = [path["label"]]
+        for feature in features:
+            entry = cells.get((path["id"], feature["id"]))
+            if entry is None:
+                row.append("-")
+            else:
+                row.append(entry["status"] + ("*" if entry.get("note") else ""))
+        lines.append("| " + " | ".join(cell(value) for value in row) + " |")
+    lines += [
+        "",
+        "\\* See the cell note below.",
+        "",
+        "## Evidence",
+        "",
+        "| Path | Feature | Status | Evidence | Note |",
+        "|---|---|---|---|---|",
+    ]
+    labels = {feature["id"]: feature["label"] for feature in features}
+    for path in matrix["paths"]:
+        for feature in features:
+            entry = cells.get((path["id"], feature["id"]))
+            if entry is None:
+                continue
+            evidence = "<br>".join(q + cell(case_id) + q for case_id in entry["evidence"])
+            lines.append(
+                "| " + " | ".join((
+                    cell(path["label"]),
+                    cell(labels[feature["id"]]),
+                    cell(entry["status"]),
+                    evidence,
+                    cell(entry.get("note", "")),
+                )) + " |"
+            )
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
 
     data = load_contract()
-    output = ROOT / data["generated_doc"]
-    rendered = render(data) + "\n"
+    outputs = [
+        (ROOT / data["generated_doc"], render(data) + "\n"),
+        (ROOT / data["matrix"]["generated_doc"], render_matrix(data) + "\n"),
+    ]
 
     if args.check:
-        current = output.read_text() if output.exists() else ""
-        if current != rendered:
-            print(f"{output.relative_to(ROOT)} is stale; run scripts/render-protocol-v1-compat.py", file=sys.stderr)
-            return 1
-        print(f"{output.relative_to(ROOT)} is up to date")
-        return 0
+        stale = False
+        for output, rendered in outputs:
+            current = output.read_text() if output.exists() else ""
+            if current != rendered:
+                print(f"{output.relative_to(ROOT)} is stale; run scripts/render-protocol-v1-compat.py", file=sys.stderr)
+                stale = True
+            else:
+                print(f"{output.relative_to(ROOT)} is up to date")
+        return 1 if stale else 0
 
-    output.write_text(rendered)
-    print(output.relative_to(ROOT))
+    for output, rendered in outputs:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered)
+        print(output.relative_to(ROOT))
     return 0
 
 

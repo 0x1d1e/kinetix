@@ -203,6 +203,7 @@ export interface RequestLog {
   usageConfidence: 'provider_reported' | 'estimated' | 'unknown' | 'not_dispatched';
   commitState: string;
   retryCount: number;
+  pluginPackageSha256?: string;
   promptPreview: string;
   responsePreview: string;
 }
