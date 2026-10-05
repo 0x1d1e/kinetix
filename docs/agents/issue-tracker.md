@@ -2,6 +2,11 @@
 
 Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all operations.
 
+**Exception: 0.1.0 reboot work.** Reboot tickets live in `docs/reboot/NNN-<name>.md`, not GitHub issues.
+Each ticket has `Status: open | in progress | done` and a `Blocked by:` line; a ticket is ready when every blocker is `done`.
+Claim by setting `in progress`; resolve by setting `done` and ticking its Acceptance list. New tickets take the next free number.
+The plan is [docs/reboot.md](../reboot.md).
+
 ## Conventions
 
 - **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.

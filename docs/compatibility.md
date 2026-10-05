@@ -57,11 +57,12 @@ Claude models is expected to miss.
 
 ## OpenAI Responses API Clients (Next-Gen Coding Agents)
 
-Kinetix serves an **explicit translated subset** of `POST /v1/responses`. It
-normalizes supported Responses requests into Kinetix's canonical request model
-and routes them through Gemini, OpenAI-compatible Chat Completions, Anthropic,
-or plugin adapters. There is currently **no native Responses upstream
-passthrough or Responses object store**.
+Kinetix serves an **explicit subset** of `POST /v1/responses`. Supported
+requests to an `openai-responses` Target are forwarded by same-format
+passthrough with upstream `store` forced to `false`. For other Targets,
+Kinetix normalizes the request into its canonical model and translates it
+through the Gemini, OpenAI-compatible Chat Completions, Anthropic, or plugin
+adapters. Kinetix has **no Responses object store**.
 
 Supported request semantics:
 
@@ -261,9 +262,8 @@ dashboard.
 
 For the fallback selectors, configure a Route whose first eligible target fails and a
 later target succeeds. For affinity selectors, use a sticky Route with multiple
-eligible targets. Responses has no native Responses upstream passthrough in v1, so its
-real-client matrix covers each built-in translation adapter instead of inventing a
-same-format path.
+eligible targets. The Responses real-client matrix covers each built-in translation
+adapter; native `openai-responses` passthrough is not yet in the matrix.
 
 The Pi section also writes and gates on `pi-acceptance.json`; release candidates
 attach it to the release. See [Pi compatibility](pi-compatibility.md#tier-2-real-pi-release-gate).

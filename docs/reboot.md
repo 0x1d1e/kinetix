@@ -1,13 +1,13 @@
 # Kinetix 0.1.0 reboot
 
-Status: draft plan. Once 0.1.0 ships, move this to `docs/archive/`. Durable
-decisions live in [docs/adr/](adr/). Earlier research notes are in
-[archive/reboot-research](archive/reboot-research/index.md).
-
-The reboot changes contracts, not the codebase as a whole. Kinetix and
-kinetix-plugins restart together at 0.1.0 ([ADR-0001](adr/0001-reboot-versioning.md)).
+Status: draft plan; ADRs 0001-0005 are accepted. Once 0.1.0 ships, move this
+and [docs/reboot/](reboot/) to `docs/archive/`. Durable decisions live in [docs/adr/](adr/). Earlier
+research notes are in [archive/reboot-research](archive/reboot-research/index.md).
 Domain terms are in [CONTEXT.md](../CONTEXT.md).
-Breaking changes are allowed. Proven code stays.
+
+The reboot replaces public contracts and keeps proven code. Breaking changes
+are allowed. Kinetix and kinetix-plugins restart together at 0.1.0
+([ADR-0001](adr/0001-reboot-versioning.md)).
 
 ## Problem
 
@@ -17,8 +17,10 @@ pieces rather than whole transactions. Evidence at `ba4ee06`:
 
 - **Responses.** `previous_response_id`, `store`, `include`, structured
   `text.format`, and reasoning output items are rejected
-  ([compatibility.md](compatibility.md)). No Target gets native Responses
-  passthrough. Codex CLI speaks Responses.
+  ([compatibility.md](compatibility.md)). The rejection also applies on
+  same-format passthrough to `openai-responses` Targets
+  (`src/passthrough.rs:33`), which forces upstream `store: false`. Codex CLI
+  needs `include: ["reasoning.encrypted_content"]` and reasoning-item replay.
 - **Tool schemas.** Gemini schemas go through two engines with different
   policies: core `sanitize_schema` (`src/adapters/gemini.rs:446`) and the SDK
   `schema` module used by `antigravity-oauth` and `opencode-free`. The same
@@ -73,9 +75,13 @@ Streaming is the primary path. Ownership:
 | canonical events -> client wire framing | frontend encoder |
 | commit point, cancellation, backpressure, bounded buffers | core |
 
+On the passthrough lane, native frames go to the client unchanged instead of
+through canonical events and the frontend encoder. Core still owns framing,
+the commit point, and the terminal error event; the Codec still extracts
+usage and failure evidence from the native frames.
+
 The commit point is unchanged: the moment the response becomes
-client-visible. Before it, a failure goes
-through recovery (ADR-0004). After it, the stream ends with a client-visible
+client-visible. Before it, a failure goes through recovery (ADR-0004). After it, the stream ends with a client-visible
 error event in the client's protocol and is never retried. The canonical
 request and event types are versioned together with the WIT contract, since
 plugin Codecs emit canonical events.
@@ -118,8 +124,8 @@ Portable state may survive fallback. Opaque state replays only where its
 provenance permits, and every opaque type has explicit rules for same
 Account, same Provider/other Account, same wire format/other Provider,
 cross-model, and cross-format. Portability is never inferred from wire
-format. This formalizes the existing `opaque_state.rs` and continuation
-families. It does not replace them.
+format. This builds on the existing `opaque_state.rs` and continuation
+families.
 
 Responses `previous_response_id` is upstream-owned and Kinetix retains no
 transcripts by default ([ADR-0005](adr/0005-responses-continuation-retention.md)):
@@ -130,7 +136,14 @@ transcripts by default ([ADR-0005](adr/0005-responses-continuation-retention.md)
   any other Target                      -> explicit rejection
 ```
 
-`store: false` means Kinetix persists nothing for the request.
+Responses reasoning items carrying `encrypted_content` (requested with
+`include: ["reasoning.encrypted_content"]`, the stateless `store: false` mode
+Codex CLI uses) are opaque state. They are forwarded on native Responses
+Targets and rejected elsewhere. Their account and model scope must be
+confirmed from observed upstream behavior before step 6.
+
+`store: false` means Kinetix persists no request or response content,
+including body logs. Usage and accounting records are still written.
 
 ### Failure recovery
 
@@ -174,7 +187,12 @@ client request
 ```
 
 One data-driven runner executes every case against the native and plugin
-integrations for the Target.
+integrations for the Target. Plugin parity uses `b-ai` (OpenAI Chat),
+`claude-code-oauth` (Anthropic), and `ai-studio` (Gemini).
+
+Cases not yet passing are listed in an expected-failure manifest so
+`scripts/run-ci.sh` stays green. A listed case that passes also fails CI, so
+the manifest only shrinks. Each Sequence step removes the entries it fixes.
 
 Required case groups:
 
@@ -187,8 +205,8 @@ Required case groups:
 - **Thinking:** every `ThinkingIntent` variant, pinned to exact upstream
   JSON or a rejection.
 - **Continuation:** Gemini thought signatures, Anthropic thinking blocks,
-  `previous_response_id`, tool-call continuation, and rejection of
-  non-portable state.
+  `previous_response_id`, Responses encrypted reasoning-item replay,
+  tool-call continuation, and rejection of non-portable state.
 - **Streaming:** arbitrary chunk boundaries, split UTF-8, multiple events per
   chunk, usage events, thinking/text/tool ordering, `[DONE]`, early close,
   error before and after commit.
@@ -196,7 +214,7 @@ Required case groups:
   5xx, timeout before commit, failure after commit.
 - **Client captures:** real request payloads from Pi, Claude Code, Codex
   CLI, and OpenCode.
-- **Reference regressions:** the cases below, mandatory.
+- **Reference regressions:** every case in the table below.
 
 ### Reference regressions
 
@@ -235,7 +253,7 @@ not depend on it.
 | --- | --- |
 | Pi | text, tools, thinking, streaming |
 | Claude Code | text, tools, thinking, streaming |
-| Codex CLI | Responses, tools, reasoning, streaming; `previous_response_id` on native Responses Targets |
+| Codex CLI | Responses, tools, reasoning, streaming; encrypted reasoning-item replay and `previous_response_id` on native Responses Targets |
 | OpenCode | text, tools, reasoning, streaming |
 
 The corpus must pass against OpenAI, Anthropic, and Gemini Targets, with
@@ -243,19 +261,38 @@ native/plugin parity and the full schema, continuation, and failure groups.
 
 ## Sequence
 
-1. Accept ADRs 0001-0005 and cut `legacy/v0.6` in both repos.
+Tickets live in [docs/reboot/](reboot/); each lists its blockers.
+
+1. Cut `legacy/v0.6` in both repos ([001](reboot/001-legacy-branch.md)).
 2. Restructure fixtures into the transaction corpus, add client captures and
-   every reference regression. Expect red. No implementation step starts
-   before this is done.
+   every reference regression. Failing cases go into the expected-failure
+   manifest. No implementation step starts before this is done
+   ([002](reboot/002-corpus-runner.md)-[011](reboot/011-reference-regressions.md)).
 3. Failure recovery mapping (ADR-0004). This is the largest single
-   simplification of `pipeline.rs`.
-4. Schema engine consolidation (ADR-0003).
-5. `ThinkingIntent`.
-6. Request lanes, `ReasoningSummary`, and upstream-owned
-   `previous_response_id` (ADR-0005).
+   simplification of `pipeline.rs`
+   ([013](reboot/013-failure-recovery-mapping.md),
+   [014](reboot/014-pipeline-attempt-loop.md)).
+4. Schema engine consolidation (ADR-0003). Built-in adapters move to the
+   core engine. The SDK `schema` module stays until step 7, because plugins
+   cannot hand schema handling to core before the WIT change
+   ([015](reboot/015-schema-engine.md)).
+5. `ThinkingIntent` ([016](reboot/016-thinking-intent.md)).
+6. Request lanes, `ReasoningSummary`, upstream-owned
+   `previous_response_id`, encrypted reasoning-item replay, and the body-log
+   `store` check (ADR-0005)
+   ([012](reboot/012-responses-upstream-observation.md),
+   [017](reboot/017-request-lanes.md)-[020](reboot/020-store-false-no-content.md)).
 7. Integration seam split (ADR-0002) with matching WIT changes, mirrored to
-   kinetix-plugins.
-8. Gate green, then delete old releases and publish 0.1.0 (ADR-0001).
+   kinetix-plugins. Remove the SDK `schema` module
+   ([021](reboot/021-integration-seams.md)-[023](reboot/023-antigravity-reduce.md),
+   then [025](reboot/025-delete-uncontracted-provider-logic.md)).
+8. Gate green with an empty expected-failure manifest, then delete old
+   releases and publish 0.1.0 (ADR-0001)
+   ([027](reboot/027-release-0-1-0.md)).
+
+The `admin.rs`/`db.rs` split ([024](reboot/024-admin-db-split.md)) runs in
+parallel after step 2. `--live` replay ([026](reboot/026-live-replay.md)) is
+optional and outside the gate.
 
 ## Risks
 
@@ -264,8 +301,10 @@ native/plugin parity and the full schema, continuation, and failure groups.
   ([ADR-0001](adr/0001-reboot-versioning.md)).
 - **Silent schema weakening.** `compatible` mode weakens validation. Each
   weakening is recorded in the Route Trace, and `strict` remains available.
-- **Responses clients on translated Targets.** `previous_response_id` is
-  rejected there (ADR-0005). Clients that resend history are unaffected.
+- **Responses clients on translated Targets.** `previous_response_id` and
+  encrypted reasoning items are rejected there (ADR-0005). Clients that
+  resend plain history are unaffected, but a Codex session cannot fall back
+  from a native Responses Target to a translated one mid-conversation.
 - **Scope creep.** Every feature outside the gate waits for 0.1.0.
 
 ## Reference projects
